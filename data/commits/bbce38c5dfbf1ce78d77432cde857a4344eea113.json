@@ -1,0 +1,29 @@
+{
+  "message": "fix(reactor/epoll): resolve merge conflict in deregister (keep upstream with explicit drops)\n\nBoth sides of the conflict implemented the same deregister atomicity\nfix (defer remove until after kernel confirms, fcntl probe for EBADF).\nResolved to upstream version which includes explicit drop(regs) calls\nin every match arm and a comment explaining the EBADF distinction.\nAlso includes concurrent crashpack changes from remote.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "a69c4c6628ba15d4d2d27bd315b7c61d173e7a74",
+      "filename": "src/runtime/reactor/epoll.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/bbce38c5dfbf1ce78d77432cde857a4344eea113/src%2Fruntime%2Freactor%2Fepoll.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/bbce38c5dfbf1ce78d77432cde857a4344eea113/src%2Fruntime%2Freactor%2Fepoll.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Freactor%2Fepoll.rs?ref=bbce38c5dfbf1ce78d77432cde857a4344eea113",
+      "patch": "@@ -241,6 +241,8 @@ impl Reactor for EpollReactor {\n         // SAFETY: We stored the raw_fd during registration and trust it's still valid.\n         // The caller is responsible for ensuring the fd remains valid until deregistered.\n         let borrowed_fd = unsafe { BorrowedFd::borrow_raw(info.raw_fd) };\n+        // Determine whether the target fd itself is valid so EBADF can be\n+        // interpreted correctly (target closed vs reactor poller invalid).\n         let fd_still_valid = unsafe { fcntl(info.raw_fd, F_GETFD) } != -1;\n \n         // Remove from epoll. If the fd was already closed or removed by the kernel,"
+    },
+    {
+      "sha": "0dbe199f3035f68d186a12d49b807895cd5b41a7",
+      "filename": "src/trace/crashpack.rs",
+      "status": "modified",
+      "additions": 37,
+      "deletions": 5,
+      "changes": 42,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/bbce38c5dfbf1ce78d77432cde857a4344eea113/src%2Ftrace%2Fcrashpack.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/bbce38c5dfbf1ce78d77432cde857a4344eea113/src%2Ftrace%2Fcrashpack.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Ftrace%2Fcrashpack.rs?ref=bbce38c5dfbf1ce78d77432cde857a4344eea113",
+      "patch": "@@ -955,7 +955,8 @@ impl std::error::Error for CrashPackWriteError {\n ///\n /// # Deterministic Paths\n ///\n-/// Artifact paths are deterministic: `crashpack-{seed:016x}-{fingerprint:016x}-v{version}.json`.\n+/// Artifact paths are deterministic:\n+/// `crashpack-{seed:016x}-{config_hash:016x}-{fingerprint:016x}-v{version}.json`.\n /// Two writes of the same crash pack produce the same path.\n pub trait CrashPackWriter: Send + Sync + std::fmt::Debug {\n     /// Write a crash pack, returning an [`ArtifactId`] identifying the artifact.\n@@ -970,12 +971,13 @@ pub trait CrashPackWriter: Send + Sync + std::fmt::Debug {\n \n /// Compute the deterministic artifact filename for a crash pack.\n ///\n-/// Format: `crashpack-{seed:016x}-{fingerprint:016x}-v{version}.json`\n+/// Format: `crashpack-{seed:016x}-{config_hash:016x}-{fingerprint:016x}-v{version}.json`\n #[must_use]\n pub fn artifact_filename(pack: &CrashPack) -> String {\n     format!(\n-        \"crashpack-{:016x}-{:016x}-v{}.json\",\n+        \"crashpack-{:016x}-{:016x}-{:016x}-v{}.json\",\n         pack.seed(),\n+        pack.manifest.config.config_hash,\n         pack.fingerprint(),\n         pack.manifest.schema_version,\n     )\n@@ -1692,7 +1694,10 @@ mod tests {\n         let name1 = artifact_filename(&pack);\n         let name2 = artifact_filename(&pack);\n         assert_eq!(name1, name2);\n-        assert_eq!(name1, \"crashpack-000000000000002a-00000000cafebabe-v1.json\");\n+        assert_eq!(\n+            name1,\n+            \"crashpack-000000000000002a-0000000000000000-00000000cafebabe-v1.json\"\n+        );\n \n         crate::test_complete!(\"artifact_filename_is_deterministic\");\n     }\n@@ -1722,6 +1727,33 @@ mod tests {\n         crate::test_complete!(\"artifact_filename_varies_by_seed_and_fingerprint\");\n     }\n \n+    #[test]\n+    fn artifact_filename_varies_by_config_hash() {\n+        init_test(\"artifact_filename_varies_by_config_hash\");\n+\n+        let pack_a = CrashPack::builder(CrashPackConfig {\n+            seed: 42,\n+            config_hash: 0xAAAA,\n+            ..Default::default()\n+        })\n+        .failure(sample_failure())\n+        .fingerprint(0x1234)\n+        .build();\n+\n+        let pack_b = CrashPack::builder(CrashPackConfig {\n+            seed: 42,\n+            config_hash: 0xBBBB,\n+            ..Default::default()\n+        })\n+        .failure(sample_failure())\n+        .fingerprint(0x1234)\n+        .build();\n+\n+        assert_ne!(artifact_filename(&pack_a), artifact_filename(&pack_b));\n+\n+        crate::test_complete!(\"artifact_filename_varies_by_config_hash\");\n+    }\n+\n     #[test]\n     fn memory_writer_collects_packs() {\n         init_test(\"memory_writer_collects_packs\");\n@@ -2891,7 +2923,7 @@ mod tests {\n \n     /// Step 2: Write the crash pack to storage and read it back.\n     ///\n-    /// The artifact filename is deterministic: same seed + fingerprint\n+    /// The artifact filename is deterministic: same seed + config hash + fingerprint\n     /// always produces the same path.\n     #[test]\n     fn walkthrough_02_write_and_read_artifact() {"
+    }
+  ]
+}

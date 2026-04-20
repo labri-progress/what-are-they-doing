@@ -1,0 +1,53 @@
+{
+  "message": "fix(codegen): Fix nested list type inference and generation\n\nNested lists now correctly generate as ArrayListUnmanaged at all levels.\n\nKey fixes:\n1. Type inference: Always use list type for list literals, never array\n   - Array type [N]T caused mismatches with codegen which produces ArrayList\n   - Nested lists especially broke because inner arrays didn't match outer ArrayList\n\n2. Codegen: Track inside_list_depth to prevent array literal optimization\n   - inner lists inside outer lists must be ArrayLists\n   - Added depth tracking in genArrayListInit for assignment-based list init\n\n3. Skip comptime path for lists containing nested lists\n   - InferListType can't handle ArrayList element types correctly\n\nTest case now compiles correctly:\n    a = [[0, 1], [2, 3]]  # ArrayList(ArrayList(i64))\n    b = [[[1,2],[3,4]], [[5,6],[7,8]]]  # 3 levels\n\nNote: Subscript access (a[0][0]) still needs .items access fix.",
+  "files": [
+    {
+      "sha": "3f489b8d78cd3c86070aab7acbe1c5e67c701329",
+      "filename": "src/analysis/native_types/expressions.zig",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 16,
+      "changes": 26,
+      "blob_url": "https://github.com/teamchong/metal0/blob/1a5108ad7e043c0b78ec1cf2ddef0226c50fc781/src%2Fanalysis%2Fnative_types%2Fexpressions.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/1a5108ad7e043c0b78ec1cf2ddef0226c50fc781/src%2Fanalysis%2Fnative_types%2Fexpressions.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/src%2Fanalysis%2Fnative_types%2Fexpressions.zig?ref=1a5108ad7e043c0b78ec1cf2ddef0226c50fc781",
+      "patch": "@@ -424,22 +424,16 @@ pub fn inferExprWithInferrer(\n                 }\n             }\n \n-            // Check if this is a constant, homogeneous list with array-compatible element type\n-            // \u2192 use array type for fixed-size arrays\n-            if (core.isConstantList(l) and core.allSameType(l.elts)) {\n-                const elem_tag = @as(std.meta.Tag(NativeType), elem_type);\n-                // Only use array type if element type is primitive or array (not list/pyvalue)\n-                if (elem_tag != .list and elem_tag != .pyvalue and elem_tag != .unknown) {\n-                    const elem_ptr = try allocator.create(NativeType);\n-                    elem_ptr.* = elem_type;\n-                    break :blk .{ .array = .{\n-                        .element_type = elem_ptr,\n-                        .length = l.elts.len,\n-                    } };\n-                }\n-            }\n-\n-            // Otherwise, use ArrayList for dynamic lists\n+            // IMPORTANT: Always use ArrayList type for list literals, NEVER array type.\n+            // Python lists are mutable and can grow/shrink, so they map to ArrayList.\n+            // Using array type [N]T causes mismatches between type inference and codegen,\n+            // especially for nested lists where inner lists generate as ArrayList but\n+            // type inference said they should be arrays.\n+            //\n+            // The array type optimization is handled by genList/genArrayLiteral at codegen\n+            // time for top-level constant lists, but type inference should always report list.\n+\n+            // Use ArrayList for all lists\n             const elem_ptr = try allocator.create(NativeType);\n             elem_ptr.* = elem_type;\n             break :blk .{ .list = elem_ptr };"
+    },
+    {
+      "sha": "1ddcd71b3bbb79fa127a9d4b7856d28ee5238ff5",
+      "filename": "src/codegen/native/expressions/collections.zig",
+      "status": "modified",
+      "additions": 24,
+      "deletions": 3,
+      "changes": 27,
+      "blob_url": "https://github.com/teamchong/metal0/blob/1a5108ad7e043c0b78ec1cf2ddef0226c50fc781/src%2Fcodegen%2Fnative%2Fexpressions%2Fcollections.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/1a5108ad7e043c0b78ec1cf2ddef0226c50fc781/src%2Fcodegen%2Fnative%2Fexpressions%2Fcollections.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/src%2Fcodegen%2Fnative%2Fexpressions%2Fcollections.zig?ref=1a5108ad7e043c0b78ec1cf2ddef0226c50fc781",
+      "patch": "@@ -211,11 +211,31 @@ pub fn genList(self: *NativeCodegen, list: ast.Node.List) CodegenError!void {\n     }\n \n     // Check if we can optimize to fixed-size array (constant + homogeneous)\n-    if (isConstantList(list) and allSameType(list.elts)) {\n+    // BUT: Only use array optimization at the top level (inside_list_depth == 0)\n+    // Nested lists (inside other lists) must be ArrayLists to match parent's element type\n+    // Also skip array optimization if elements are themselves lists (nested lists)\n+    const has_nested_lists = blk: {\n+        for (list.elts) |elem| {\n+            if (elem == .list) break :blk true;\n+        }\n+        break :blk false;\n+    };\n+    // Only use array literal if:\n+    // 1. We're at top level (not inside another list)\n+    // 2. Elements are constants\n+    // 3. Elements are homogeneous\n+    // 4. No nested lists (which require ArrayList type)\n+    if (self.inside_list_depth == 0 and isConstantList(list) and allSameType(list.elts) and !has_nested_lists) {\n         return try genArrayLiteral(self, list);\n     }\n \n+    // Track that we're inside a list for nested list generation\n+    self.inside_list_depth += 1;\n+    defer self.inside_list_depth -= 1;\n+\n     // Check if all elements are compile-time constants \u2192 use comptime optimization!\n+    // BUT: Skip comptime path if we have nested lists - the type inference doesn't\n+    // work correctly for nested ArrayList structures\n     var all_comptime = true;\n     for (list.elts) |elem| {\n         if (!isComptimeConstant(elem)) {\n@@ -224,8 +244,9 @@ pub fn genList(self: *NativeCodegen, list: ast.Node.List) CodegenError!void {\n         }\n     }\n \n-    // COMPTIME PATH: All elements known at compile time\n-    if (all_comptime) {\n+    // COMPTIME PATH: All elements known at compile time AND no nested lists\n+    // Nested lists need runtime path because InferListType can't handle ArrayList element types\n+    if (all_comptime and !has_nested_lists) {\n         try genListComptime(self, list);\n         return;\n     }"
+    },
+    {
+      "sha": "f4d383e193e7fdb8f68799111839d2cfa2a7b00b",
+      "filename": "src/codegen/native/main/core.zig",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/teamchong/metal0/blob/1a5108ad7e043c0b78ec1cf2ddef0226c50fc781/src%2Fcodegen%2Fnative%2Fmain%2Fcore.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/1a5108ad7e043c0b78ec1cf2ddef0226c50fc781/src%2Fcodegen%2Fnative%2Fmain%2Fcore.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/src%2Fcodegen%2Fnative%2Fmain%2Fcore.zig?ref=1a5108ad7e043c0b78ec1cf2ddef0226c50fc781",
+      "patch": "@@ -450,6 +450,10 @@ pub const NativeCodegen = struct {\n     // Set during assignment generation, null otherwise\n     current_assign_target: ?[]const u8,\n \n+    // Depth of nested list literal context (> 0 means we're inside a list literal)\n+    // Used to ensure inner lists generate as ArrayList, not fixed arrays\n+    inside_list_depth: usize,\n+\n     // Captured variables for the current class (from parent scope)\n     // Set when entering a class with captured variables, null otherwise\n     // Used by expression generator to convert `var_name` to `self.__captured_var_name.*`\n@@ -748,6 +752,7 @@ pub const NativeCodegen = struct {\n             .current_class_name = null,\n             .current_class_body = null,\n             .current_assign_target = null,\n+            .inside_list_depth = 0,\n             .current_class_captures = null,\n             .inside_init_method = false,\n             .inside_new_method = false,"
+    },
+    {
+      "sha": "96c7a185d9e7ccdbacce0bc6e3b4a2f72eaed73e",
+      "filename": "src/codegen/native/statements/assign/value_generation.zig",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/teamchong/metal0/blob/1a5108ad7e043c0b78ec1cf2ddef0226c50fc781/src%2Fcodegen%2Fnative%2Fstatements%2Fassign%2Fvalue_generation.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/1a5108ad7e043c0b78ec1cf2ddef0226c50fc781/src%2Fcodegen%2Fnative%2Fstatements%2Fassign%2Fvalue_generation.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/src%2Fcodegen%2Fnative%2Fstatements%2Fassign%2Fvalue_generation.zig?ref=1a5108ad7e043c0b78ec1cf2ddef0226c50fc781",
+      "patch": "@@ -569,6 +569,11 @@ pub fn genArrayListInit(self: *NativeCodegen, var_name: []const u8, list: ast.No\n     const is_callable_list = type_traits.isCallable(elem_type);\n     const is_pyvalue_list = (elem_type == .pyvalue);\n \n+    // Track that we're inside a list for nested list generation\n+    // This ensures nested lists generate as ArrayList, not fixed arrays\n+    self.inside_list_depth += 1;\n+    defer self.inside_list_depth -= 1;\n+\n     // Append elements\n     for (list.elts) |elem| {\n         try self.emitIndent();"
+    }
+  ]
+}

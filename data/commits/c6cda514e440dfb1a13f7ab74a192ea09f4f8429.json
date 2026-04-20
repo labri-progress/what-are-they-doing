@@ -1,0 +1,29 @@
+{
+  "message": "Fix race condition in UpdateRequestStatus with optimistic locking\n\nThis prevents multiple agents from simultaneously executing the same approved request by enforcing that the status hasn't changed between read and write.\n\nIncludes a regression test to verify concurrency safety.",
+  "files": [
+    {
+      "sha": "78d11b3ca601714521c1a4459c506572b9fa6337",
+      "filename": "internal/db/race_test.go",
+      "status": "added",
+      "additions": 59,
+      "deletions": 0,
+      "changes": 59,
+      "blob_url": "https://github.com/Dicklesworthstone/slb/blob/c6cda514e440dfb1a13f7ab74a192ea09f4f8429/internal%2Fdb%2Frace_test.go",
+      "raw_url": "https://github.com/Dicklesworthstone/slb/raw/c6cda514e440dfb1a13f7ab74a192ea09f4f8429/internal%2Fdb%2Frace_test.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/slb/contents/internal%2Fdb%2Frace_test.go?ref=c6cda514e440dfb1a13f7ab74a192ea09f4f8429",
+      "patch": "@@ -0,0 +1,59 @@\n+package db\n+\n+import (\n+\t\"errors\"\n+\t\"sync\"\n+\t\"testing\"\n+)\n+\n+func TestUpdateRequestStatus_RaceCondition(t *testing.T) {\n+\tdb := setupTestDB(t)\n+\tdefer db.Close()\n+\n+\t_, r := createTestRequest(t, db)\n+\n+\t// Transition to Approved\n+\tif err := db.UpdateRequestStatus(r.ID, StatusApproved); err != nil {\n+\t\tt.Fatalf(\"Failed to approve request: %v\", err)\n+\t}\n+\n+\t// Try to execute from two goroutines concurrently\n+\tvar wg sync.WaitGroup\n+\tresults := make(chan error, 2)\n+\n+\tfor i := 0; i < 2; i++ {\n+\t\twg.Add(1)\n+\t\tgo func() {\n+\t\t\tdefer wg.Done()\n+\t\t\tresults <- db.UpdateRequestStatus(r.ID, StatusExecuting)\n+\t\t}()\n+\t}\n+\n+\twg.Wait()\n+\tclose(results)\n+\n+\tsuccessCount := 0\n+\terrorCount := 0\n+\tvar lastErr error\n+\n+\tfor err := range results {\n+\t\tif err == nil {\n+\t\t\tsuccessCount++\n+\t\t} else {\n+\t\t\terrorCount++\n+\t\t\tlastErr = err\n+\t\t}\n+\t}\n+\n+\tif successCount != 1 {\n+\t\tt.Errorf(\"Expected exactly 1 success, got %d\", successCount)\n+\t}\n+\tif errorCount != 1 {\n+\t\tt.Errorf(\"Expected exactly 1 error, got %d\", errorCount)\n+\t}\n+\n+\t// Verify the error is related to invalid transition (concurrent update)\n+\tif !errors.Is(lastErr, ErrInvalidTransition) {\n+\t\tt.Errorf(\"Expected ErrInvalidTransition, got %v\", lastErr)\n+\t}\n+}"
+    },
+    {
+      "sha": "8c8da5c69c4c15ff46b10c77a35ccca340cfd49d",
+      "filename": "internal/db/requests.go",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 3,
+      "changes": 16,
+      "blob_url": "https://github.com/Dicklesworthstone/slb/blob/c6cda514e440dfb1a13f7ab74a192ea09f4f8429/internal%2Fdb%2Frequests.go",
+      "raw_url": "https://github.com/Dicklesworthstone/slb/raw/c6cda514e440dfb1a13f7ab74a192ea09f4f8429/internal%2Fdb%2Frequests.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/slb/contents/internal%2Fdb%2Frequests.go?ref=c6cda514e440dfb1a13f7ab74a192ea09f4f8429",
+      "patch": "@@ -265,9 +265,10 @@ func (db *DB) UpdateRequestStatus(id string, status RequestStatus) error {\n \t\tresolvedAt = sql.NullString{String: now, Valid: true}\n \t}\n \n+\t// Optimistic locking: ensure status hasn't changed since we read it\n \tresult, err := db.Exec(`\n-\t\tUPDATE requests SET status = ?, resolved_at = ? WHERE id = ?\n-\t`, string(status), resolvedAt, id)\n+\t\tUPDATE requests SET status = ?, resolved_at = ? WHERE id = ? AND status = ?\n+\t`, string(status), resolvedAt, id, string(r.Status))\n \tif err != nil {\n \t\treturn fmt.Errorf(\"updating request status: %w\", err)\n \t}\n@@ -277,7 +278,16 @@ func (db *DB) UpdateRequestStatus(id string, status RequestStatus) error {\n \t\treturn fmt.Errorf(\"getting rows affected: %w\", err)\n \t}\n \tif rowsAffected == 0 {\n-\t\treturn ErrRequestNotFound\n+\t\t// Check if request disappeared or status changed\n+\t\tlatest, err := db.GetRequest(id)\n+\t\tif err != nil {\n+\t\t\tif errors.Is(err, ErrRequestNotFound) {\n+\t\t\t\treturn ErrRequestNotFound\n+\t\t\t}\n+\t\t\treturn fmt.Errorf(\"checking request status after failed update: %w\", err)\n+\t\t}\n+\t\t// Status changed concurrently\n+\t\treturn fmt.Errorf(\"%w: concurrent update detected (wanted %s, got %s)\", ErrInvalidTransition, r.Status, latest.Status)\n \t}\n \n \treturn nil"
+    }
+  ]
+}

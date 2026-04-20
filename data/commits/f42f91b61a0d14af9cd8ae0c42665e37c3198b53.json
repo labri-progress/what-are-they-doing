@@ -1,0 +1,137 @@
+{
+  "message": "Add 10M Kafka benchmark fixture setup",
+  "files": [
+    {
+      "sha": "af813d1cf82eb56003d9893bf82c00c6cfdd0a1a",
+      "filename": "test/fixtures/kafka.py",
+      "status": "modified",
+      "additions": 113,
+      "deletions": 19,
+      "changes": 132,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/f42f91b61a0d14af9cd8ae0c42665e37c3198b53/test%2Ffixtures%2Fkafka.py",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/f42f91b61a0d14af9cd8ae0c42665e37c3198b53/test%2Ffixtures%2Fkafka.py",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ffixtures%2Fkafka.py?ref=f42f91b61a0d14af9cd8ae0c42665e37c3198b53",
+      "patch": "@@ -16,6 +16,7 @@\n import logging\n import uuid\n from dataclasses import dataclass\n+from pathlib import Path\n from typing import Iterator\n \n from tenzir_test import fixture\n@@ -37,17 +38,25 @@\n KAFKA_IMAGE = \"apache/kafka:latest\"\n STARTUP_TIMEOUT = 120  # seconds\n HEALTH_CHECK_INTERVAL = 2  # seconds\n+ALLOWED_COMPRESSION_TYPES = {\"none\", \"gzip\", \"snappy\", \"lz4\", \"zstd\"}\n \n \n @dataclass(frozen=True)\n class KafkaOptions:\n     topic: str = \"tenzir_test\"\n     partitions: int = 1\n-    seed_messages: int = 0\n+    messages: int = 0\n+    compression: str = \"none\"\n+    payload_file: str = \"\"\n     image: str = KAFKA_IMAGE\n \n \n-def _start_kafka(runtime: RuntimeSpec, port: int, image: str) -> ManagedContainer:\n+def _start_kafka(\n+    runtime: RuntimeSpec,\n+    port: int,\n+    image: str,\n+    payload_file: str,\n+) -> ManagedContainer:\n     \"\"\"Start Kafka container and return a managed container.\"\"\"\n     container_name = f\"tenzir-test-kafka-{uuid.uuid4().hex[:8]}\"\n     run_args = [\n@@ -76,8 +85,15 @@ def _start_kafka(runtime: RuntimeSpec, port: int, image: str) -> ManagedContaine\n         \"KAFKA_AUTO_CREATE_TOPICS_ENABLE=true\",\n         \"-e\",\n         \"KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1\",\n-        image,\n     ]\n+    if payload_file:\n+        run_args.extend(\n+            [\n+                \"-v\",\n+                f\"{payload_file}:/tmp/tenzir-payload.log:ro\",\n+            ]\n+        )\n+    run_args.append(image)\n     logger.info(\"Starting Kafka container with %s\", runtime.binary)\n     container = start_detached(runtime, run_args)\n     logger.info(\"Kafka container started: %s\", container.container_id[:12])\n@@ -157,25 +173,82 @@ def _create_topic(container: ManagedContainer, topic: str, partitions: int) -> N\n         raise RuntimeError(f\"Failed to create topic: {result.stderr}\")\n \n \n-def _seed_topic(container: ManagedContainer, topic: str, count: int) -> None:\n-    \"\"\"Seed a topic with deterministic messages.\"\"\"\n-    if count <= 0:\n-        return\n+def _seed_topic_with_console_producer(\n+    container: ManagedContainer,\n+    topic: str,\n+    count: int,\n+    compression: str,\n+) -> None:\n+    \"\"\"Seed a topic with deterministic messages via kafka-console-producer.\"\"\"\n+    cmd = [\n+        \"/opt/kafka/bin/kafka-console-producer.sh\",\n+        \"--bootstrap-server\",\n+        \"localhost:9092\",\n+        \"--topic\",\n+        topic,\n+    ]\n+    if compression != \"none\":\n+        cmd.extend([\"--producer-property\", f\"compression.type={compression}\"])\n     payload = \"\".join(f\"message-{index:04d}\\n\" for index in range(1, count + 1))\n-    result = container.exec(\n+    result = container.exec(cmd, input=payload)\n+    if result.returncode != 0:\n+        raise RuntimeError(f\"Failed to seed topic: {result.stderr}\")\n+\n+\n+def _seed_topic_with_perf_producer(\n+    container: ManagedContainer,\n+    topic: str,\n+    count: int,\n+    compression: str,\n+) -> None:\n+    \"\"\"Seed a topic quickly from a payload sample via producer-perf-test.\"\"\"\n+    cmd = [\n+        \"/opt/kafka/bin/kafka-producer-perf-test.sh\",\n+        \"--topic\",\n+        topic,\n+        \"--num-records\",\n+        str(count),\n+        \"--payload-file\",\n+        \"/tmp/tenzir-payload.log\",\n+    ]\n+    cmd.extend(\n         [\n-            \"/opt/kafka/bin/kafka-console-producer.sh\",\n-            \"--bootstrap-server\",\n-            \"localhost:9092\",\n-            \"--topic\",\n-            topic,\n-        ],\n-        input=payload,\n+            \"--throughput\",\n+            \"-1\",\n+            \"--producer-props\",\n+            \"bootstrap.servers=localhost:9092\",\n+            \"acks=1\",\n+            \"linger.ms=20\",\n+            \"batch.size=262144\",\n+            f\"compression.type={compression}\",\n+        ]\n     )\n+    result = container.exec(cmd)\n     if result.returncode != 0:\n         raise RuntimeError(f\"Failed to seed topic: {result.stderr}\")\n \n \n+def _seed_topic(\n+    container: ManagedContainer,\n+    topic: str,\n+    messages: int,\n+    compression: str,\n+    payload_file: str,\n+) -> None:\n+    \"\"\"Seed a topic from a sample file or deterministic fallback messages.\"\"\"\n+    if messages <= 0:\n+        return\n+    if payload_file:\n+        _seed_topic_with_perf_producer(\n+            container,\n+            topic,\n+            messages,\n+            compression,\n+        )\n+    else:\n+        _seed_topic_with_console_producer(container, topic, messages, compression)\n+\n+\n @fixture(options=KafkaOptions)\n def kafka() -> Iterator[dict[str, str]]:\n     \"\"\"Start Kafka and yield environment variables for broker access.\"\"\"\n@@ -187,15 +260,36 @@ def kafka() -> Iterator[dict[str, str]]:\n         )\n     if opts.partitions < 1:\n         raise RuntimeError(\"kafka fixture option `partitions` must be >= 1\")\n-    if opts.seed_messages < 0:\n-        raise RuntimeError(\"kafka fixture option `seed_messages` must be >= 0\")\n+    if opts.messages < 0:\n+        raise RuntimeError(\"kafka fixture option `messages` must be >= 0\")\n+    compression = opts.compression.lower()\n+    if compression not in ALLOWED_COMPRESSION_TYPES:\n+        allowed = \", \".join(sorted(ALLOWED_COMPRESSION_TYPES))\n+        raise RuntimeError(\n+            f\"kafka fixture option `compression` must be one of: {allowed}\"\n+        )\n+    if opts.payload_file:\n+        payload_path = Path(opts.payload_file)\n+        if not payload_path.is_file():\n+            raise RuntimeError(\n+                \"kafka fixture option `payload_file` must reference a file\"\n+            )\n+        payload_file = str(payload_path.resolve())\n+    else:\n+        payload_file = \"\"\n     port = find_free_port()\n     container: ManagedContainer | None = None\n     try:\n-        container = _start_kafka(runtime, port, opts.image)\n+        container = _start_kafka(runtime, port, opts.image, payload_file)\n         _wait_for_kafka(container, STARTUP_TIMEOUT)\n         _create_topic(container, opts.topic, opts.partitions)\n-        _seed_topic(container, opts.topic, opts.seed_messages)\n+        _seed_topic(\n+            container,\n+            opts.topic,\n+            opts.messages,\n+            compression,\n+            payload_file,\n+        )\n         bootstrap = f\"127.0.0.1:{port}\"\n         env: dict[str, str] = {\n             \"KAFKA_HOST\": \"127.0.0.1\","
+    },
+    {
+      "sha": "759701e621300293b93a5c1b417b3eb9a6bc3434",
+      "filename": "test/tests/fixtures/kafka/test.yaml",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/f42f91b61a0d14af9cd8ae0c42665e37c3198b53/test%2Ftests%2Ffixtures%2Fkafka%2Ftest.yaml",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/f42f91b61a0d14af9cd8ae0c42665e37c3198b53/test%2Ftests%2Ffixtures%2Fkafka%2Ftest.yaml",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Ffixtures%2Fkafka%2Ftest.yaml?ref=f42f91b61a0d14af9cd8ae0c42665e37c3198b53",
+      "patch": "@@ -3,7 +3,7 @@ fixtures:\n   - kafka:\n       topic: fixture_kafka_test\n       partitions: 1\n-      seed_messages: 1\n+      messages: 1\n timeout: 180\n skip:\n   on: fixture-unavailable"
+    },
+    {
+      "sha": "bfbdd628f6eb45a0aff94e4f960eb26082533bc3",
+      "filename": "test/tests/operators/from_kafka/test.yaml",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/f42f91b61a0d14af9cd8ae0c42665e37c3198b53/test%2Ftests%2Foperators%2Ffrom_kafka%2Ftest.yaml",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/f42f91b61a0d14af9cd8ae0c42665e37c3198b53/test%2Ftests%2Foperators%2Ffrom_kafka%2Ftest.yaml",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Ffrom_kafka%2Ftest.yaml?ref=f42f91b61a0d14af9cd8ae0c42665e37c3198b53",
+      "patch": "@@ -3,7 +3,7 @@ fixtures:\n   - kafka:\n       topic: from_kafka_test\n       partitions: 1\n-      seed_messages: 3\n+      messages: 3\n timeout: 180\n skip:\n   on: fixture-unavailable"
+    },
+    {
+      "sha": "7dcd72a0186646af08171a975378be3e69df47cb",
+      "filename": "test/tests/operators/to_kafka/test.yaml",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/f42f91b61a0d14af9cd8ae0c42665e37c3198b53/test%2Ftests%2Foperators%2Fto_kafka%2Ftest.yaml",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/f42f91b61a0d14af9cd8ae0c42665e37c3198b53/test%2Ftests%2Foperators%2Fto_kafka%2Ftest.yaml",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fto_kafka%2Ftest.yaml?ref=f42f91b61a0d14af9cd8ae0c42665e37c3198b53",
+      "patch": "@@ -3,7 +3,7 @@ fixtures:\n   - kafka:\n       topic: to_kafka_source\n       partitions: 1\n-      seed_messages: 1\n+      messages: 1\n timeout: 180\n skip:\n   on: fixture-unavailable"
+    },
+    {
+      "sha": "e308d131a787629f71984c05008086f25ed00eff",
+      "filename": "test/tests/perf/from_kafka_1m/README.md",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 4,
+      "changes": 15,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/f42f91b61a0d14af9cd8ae0c42665e37c3198b53/test%2Ftests%2Fperf%2Ffrom_kafka_1m%2FREADME.md",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/f42f91b61a0d14af9cd8ae0c42665e37c3198b53/test%2Ftests%2Fperf%2Ffrom_kafka_1m%2FREADME.md",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Fperf%2Ffrom_kafka_1m%2FREADME.md?ref=f42f91b61a0d14af9cd8ae0c42665e37c3198b53",
+      "patch": "@@ -1,7 +1,7 @@\n-# from_kafka 1M Perf Runner\n+# from_kafka 10M Perf Runner\n \n This directory contains a reproducible manual benchmark for `from_kafka` using\n-our canonical perf fixture settings (`1M` seeded messages).\n+our canonical perf fixture settings (`10M` seeded messages).\n \n Run from repository root:\n \n@@ -14,12 +14,19 @@ The runner:\n - Waits until the fixture exports `KAFKA_BOOTSTRAP_SERVERS` and `KAFKA_TOPIC`.\n - Executes `tenzir --neo` with `TENZIR_KAFKA_FROM_PERF_STATS=1`.\n - Prints wall time (`/usr/bin/time -p`) and `from_kafka` stage counters.\n+- Uses `test/tests/perf/from_kafka_1m/route53_sample.ndjson` by default.\n+- Seeding scale/trim is controlled by two fixture options:\n+  `messages` and `payload_file`.\n+  The fixture reuses payload lines as needed and emits exactly `messages`.\n \n Common overrides:\n \n ```bash\n-BATCH_SIZE=50k FETCH_WAIT_TIMEOUT=16ms SINK=discard test/tests/perf/from_kafka_1m/run.sh\n-PARTITIONS=8 SEED_MESSAGES=1000000 test/tests/perf/from_kafka_1m/run.sh\n+PARTITIONS=1 MESSAGES=10000000 COMPRESSION=none test/tests/perf/from_kafka_1m/run.sh\n+PARTITIONS=4 MESSAGES=10000000 COMPRESSION=none test/tests/perf/from_kafka_1m/run.sh\n+PARTITIONS=1 MESSAGES=10000000 COMPRESSION=zstd test/tests/perf/from_kafka_1m/run.sh\n+PARTITIONS=4 MESSAGES=10000000 COMPRESSION=zstd test/tests/perf/from_kafka_1m/run.sh\n+PAYLOAD_FILE=test/tests/perf/from_kafka_1m/route53_sample.ndjson PARTITIONS=4 MESSAGES=10000000 test/tests/perf/from_kafka_1m/run.sh\n TENZIR_BIN=./build/xcode/relwithdebinfo/bin/tenzir test/tests/perf/from_kafka_1m/run.sh\n ```\n "
+    },
+    {
+      "sha": "c5b19b849eb20b9cc23295a6bd2b83f0e22c7c22",
+      "filename": "test/tests/perf/from_kafka_1m/discard_10m.tql",
+      "status": "added",
+      "additions": 10,
+      "deletions": 0,
+      "changes": 10,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/f42f91b61a0d14af9cd8ae0c42665e37c3198b53/test%2Ftests%2Fperf%2Ffrom_kafka_1m%2Fdiscard_10m.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/f42f91b61a0d14af9cd8ae0c42665e37c3198b53/test%2Ftests%2Fperf%2Ffrom_kafka_1m%2Fdiscard_10m.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Fperf%2Ffrom_kafka_1m%2Fdiscard_10m.tql?ref=f42f91b61a0d14af9cd8ae0c42665e37c3198b53",
+      "patch": "@@ -0,0 +1,10 @@\n+from_kafka env(\"KAFKA_TOPIC\"),\n+           count=10M,\n+           offset=\"beginning\",\n+           batch_size=10k,\n+           _batch_timeout=1s,\n+            options={\n+              \"bootstrap.servers\": env(\"KAFKA_BOOTSTRAP_SERVERS\"),\n+              \"group.id\": \"tenzir-test-from-kafka-perf-10m\"\n+            }\n+discard"
+    },
+    {
+      "sha": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "filename": "test/tests/perf/from_kafka_1m/discard_10m.txt",
+      "status": "renamed",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/f42f91b61a0d14af9cd8ae0c42665e37c3198b53/test%2Ftests%2Fperf%2Ffrom_kafka_1m%2Fdiscard_10m.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/f42f91b61a0d14af9cd8ae0c42665e37c3198b53/test%2Ftests%2Fperf%2Ffrom_kafka_1m%2Fdiscard_10m.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Fperf%2Ffrom_kafka_1m%2Fdiscard_10m.txt?ref=f42f91b61a0d14af9cd8ae0c42665e37c3198b53",
+      "previous_filename": "test/tests/perf/from_kafka_1m/tail_1m.txt"
+    },
+    {
+      "sha": "ee226ea827f273513370833c1c8019d6f503ca4e",
+      "filename": "test/tests/perf/from_kafka_1m/route53_sample.ndjson",
+      "status": "added",
+      "additions": 8,
+      "deletions": 0,
+      "changes": 8,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/f42f91b61a0d14af9cd8ae0c42665e37c3198b53/test%2Ftests%2Fperf%2Ffrom_kafka_1m%2Froute53_sample.ndjson",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/f42f91b61a0d14af9cd8ae0c42665e37c3198b53/test%2Ftests%2Fperf%2Ffrom_kafka_1m%2Froute53_sample.ndjson",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Fperf%2Ffrom_kafka_1m%2Froute53_sample.ndjson?ref=f42f91b61a0d14af9cd8ae0c42665e37c3198b53",
+      "patch": "@@ -0,0 +1,8 @@\n+{\"version\":\"1.100000\",\"account_id\":\"612642570909\",\"region\":\"eu-west-1\",\"vpc_id\":\"vpc-0145e24d59ff4b09b\",\"query_timestamp\":\"2026-02-02T02:02:15Z\",\"query_name\":\"logs.eu-west-1.amazonaws.com.\",\"query_type\":\"AAAA\",\"query_class\":\"IN\",\"rcode\":\"NOERROR\",\"answers\":[],\"srcaddr\":\"10.1.102.49\",\"srcport\":\"50755\",\"transport\":\"UDP\",\"srcids\":{\"instance\":\"i-0954f061d2d931a0b\"}}\n+{\"version\":\"1.100000\",\"account_id\":\"612642570909\",\"region\":\"eu-west-1\",\"vpc_id\":\"vpc-0145e24d59ff4b09b\",\"query_timestamp\":\"2026-02-02T02:02:15Z\",\"query_name\":\"612642570909.dkr.ecr.eu-west-1.amazonaws.com.\",\"query_type\":\"AAAA\",\"query_class\":\"IN\",\"rcode\":\"NOERROR\",\"answers\":[],\"srcaddr\":\"10.1.102.49\",\"srcport\":\"39087\",\"transport\":\"UDP\",\"srcids\":{\"instance\":\"i-0954f061d2d931a0b\"}}\n+{\"version\":\"1.100000\",\"account_id\":\"612642570909\",\"region\":\"eu-west-1\",\"vpc_id\":\"vpc-0145e24d59ff4b09b\",\"query_timestamp\":\"2026-02-02T02:02:39Z\",\"query_name\":\"logs.eu-west-1.amazonaws.com.\",\"query_type\":\"AAAA\",\"query_class\":\"IN\",\"rcode\":\"NOERROR\",\"answers\":[],\"srcaddr\":\"10.1.101.73\",\"srcport\":\"44690\",\"transport\":\"UDP\",\"srcids\":{\"instance\":\"i-0f7eade87beddd6e8\"}}\n+{\"version\":\"1.100000\",\"account_id\":\"612642570909\",\"region\":\"eu-west-1\",\"vpc_id\":\"vpc-0145e24d59ff4b09b\",\"query_timestamp\":\"2026-02-02T02:03:39Z\",\"query_name\":\"logs.eu-west-1.amazonaws.com.\",\"query_type\":\"AAAA\",\"query_class\":\"IN\",\"rcode\":\"NOERROR\",\"answers\":[],\"srcaddr\":\"10.1.101.73\",\"srcport\":\"43893\",\"transport\":\"UDP\",\"srcids\":{\"instance\":\"i-0f7eade87beddd6e8\"}}\n+{\"version\":\"1.100000\",\"account_id\":\"612642570909\",\"region\":\"eu-west-1\",\"vpc_id\":\"vpc-0145e24d59ff4b09b\",\"query_timestamp\":\"2026-02-02T02:03:51Z\",\"query_name\":\"612642570909.dkr.ecr.eu-west-1.amazonaws.com.\",\"query_type\":\"AAAA\",\"query_class\":\"IN\",\"rcode\":\"NOERROR\",\"answers\":[],\"srcaddr\":\"10.1.102.181\",\"srcport\":\"60906\",\"transport\":\"UDP\",\"srcids\":{\"instance\":\"i-0be9b6e41e067c967\"}}\n+{\"version\":\"1.100000\",\"account_id\":\"612642570909\",\"region\":\"eu-west-1\",\"vpc_id\":\"vpc-0145e24d59ff4b09b\",\"query_timestamp\":\"2026-02-02T02:03:51Z\",\"query_name\":\"logs.eu-west-1.amazonaws.com.\",\"query_type\":\"AAAA\",\"query_class\":\"IN\",\"rcode\":\"NOERROR\",\"answers\":[],\"srcaddr\":\"10.1.102.181\",\"srcport\":\"47664\",\"transport\":\"UDP\",\"srcids\":{\"instance\":\"i-0be9b6e41e067c967\"}}\n+{\"version\":\"1.100000\",\"account_id\":\"612642570909\",\"region\":\"eu-west-1\",\"vpc_id\":\"vpc-0145e24d59ff4b09b\",\"query_timestamp\":\"2026-02-02T02:04:14Z\",\"query_name\":\"logs.eu-west-1.amazonaws.com.\",\"query_type\":\"AAAA\",\"query_class\":\"IN\",\"rcode\":\"NOERROR\",\"answers\":[],\"srcaddr\":\"10.1.102.181\",\"srcport\":\"52263\",\"transport\":\"UDP\",\"srcids\":{\"instance\":\"i-0be9b6e41e067c967\"}}\n+{\"version\":\"1.100000\",\"account_id\":\"612642570909\",\"region\":\"eu-west-1\",\"vpc_id\":\"vpc-0145e24d59ff4b09b\",\"query_timestamp\":\"2026-02-02T02:04:39Z\",\"query_name\":\"logs.eu-west-1.amazonaws.com.\",\"query_type\":\"AAAA\",\"query_class\":\"IN\",\"rcode\":\"NOERROR\",\"answers\":[],\"srcaddr\":\"10.1.101.73\",\"srcport\":\"32961\",\"transport\":\"UDP\",\"srcids\":{\"instance\":\"i-0f7eade87beddd6e8\"}}"
+    },
+    {
+      "sha": "da5e04b64de8374d1d928ee1916d2c4f9e725e17",
+      "filename": "test/tests/perf/from_kafka_1m/run.sh",
+      "status": "modified",
+      "additions": 18,
+      "deletions": 9,
+      "changes": 27,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/f42f91b61a0d14af9cd8ae0c42665e37c3198b53/test%2Ftests%2Fperf%2Ffrom_kafka_1m%2Frun.sh",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/f42f91b61a0d14af9cd8ae0c42665e37c3198b53/test%2Ftests%2Fperf%2Ffrom_kafka_1m%2Frun.sh",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Fperf%2Ffrom_kafka_1m%2Frun.sh?ref=f42f91b61a0d14af9cd8ae0c42665e37c3198b53",
+      "patch": "@@ -2,25 +2,29 @@\n \n set -euo pipefail\n \n-# Reproducible from_kafka 1M benchmark using the canonical perf fixture setup.\n+# Reproducible from_kafka 10M benchmark using the canonical perf fixture setup.\n \n SCRIPT_DIR=$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd)\n ROOT_DIR=$(cd \"$SCRIPT_DIR/../../../..\" && pwd)\n \n TENZIR_BIN=${TENZIR_BIN:-tenzir}\n-COUNT=${COUNT:-1M}\n+COUNT=${COUNT:-10M}\n BATCH_SIZE=${BATCH_SIZE:-50k}\n BATCH_TIMEOUT=${BATCH_TIMEOUT:-1s}\n FETCH_WAIT_TIMEOUT=${FETCH_WAIT_TIMEOUT:-16ms}\n SINK=${SINK:-discard}\n PARTITIONS=${PARTITIONS:-1}\n-SEED_MESSAGES=${SEED_MESSAGES:-1000000}\n-TOPIC=${TOPIC:-from_kafka_perf_1m}\n-GROUP_ID=${GROUP_ID:-tenzir-perf-from-kafka-1m-$(date +%s)}\n+MESSAGES=${MESSAGES:-10000000}\n+COMPRESSION=${COMPRESSION:-none}\n+PAYLOAD_FILE=${PAYLOAD_FILE:-$SCRIPT_DIR/route53_sample.ndjson}\n+TOPIC=${TOPIC:-from_kafka_perf_10m}\n+GROUP_ID=${GROUP_ID:-tenzir-perf-from-kafka-10m-$(date +%s)}\n \n fixture_log=$(mktemp)\n pipeline_file=$(mktemp)\n fixture_pid=\"\"\n+KAFKA_BOOTSTRAP_SERVERS=\"\"\n+KAFKA_TOPIC=\"\"\n \n cleanup() {\n   if [[ -n \"$fixture_pid\" ]] && kill -0 \"$fixture_pid\" 2>/dev/null; then\n@@ -33,8 +37,13 @@ trap cleanup EXIT INT TERM\n \n cd \"$ROOT_DIR\"\n \n+fixture_options=\"kafka: {topic: $TOPIC, partitions: $PARTITIONS, messages: $MESSAGES, compression: \\\"$COMPRESSION\\\"}\"\n+if [[ -n \"$PAYLOAD_FILE\" ]]; then\n+  fixture_options=\"kafka: {topic: $TOPIC, partitions: $PARTITIONS, messages: $MESSAGES, compression: \\\"$COMPRESSION\\\", payload_file: \\\"$PAYLOAD_FILE\\\"}\"\n+fi\n+\n uvx tenzir-test --root test \\\n-  --fixture \"kafka: {topic: $TOPIC, partitions: $PARTITIONS, seed_messages: $SEED_MESSAGES}\" \\\n+  --fixture \"$fixture_options\" \\\n   --debug >\"$fixture_log\" 2>&1 &\n fixture_pid=$!\n \n@@ -66,16 +75,16 @@ from_kafka \"$KAFKA_TOPIC\",\n            count=$COUNT,\n            offset=\"beginning\",\n            batch_size=$BATCH_SIZE,\n-           batch_timeout=$BATCH_TIMEOUT,\n-           fetch_wait_timeout=$FETCH_WAIT_TIMEOUT,\n+           _batch_timeout=$BATCH_TIMEOUT,\n+           _fetch_wait_timeout=$FETCH_WAIT_TIMEOUT,\n            options={\n              \"bootstrap.servers\": \"$KAFKA_BOOTSTRAP_SERVERS\",\n              \"group.id\": \"$GROUP_ID\"\n            }\n $SINK\n PIPELINE\n \n-echo \"fixture: bootstrap=$KAFKA_BOOTSTRAP_SERVERS topic=$KAFKA_TOPIC partitions=$PARTITIONS seed_messages=$SEED_MESSAGES\"\n+echo \"fixture: bootstrap=$KAFKA_BOOTSTRAP_SERVERS topic=$KAFKA_TOPIC partitions=$PARTITIONS messages=$MESSAGES compression=$COMPRESSION payload_file=${PAYLOAD_FILE:-none}\"\n echo \"bench: count=$COUNT batch_size=$BATCH_SIZE batch_timeout=$BATCH_TIMEOUT fetch_wait_timeout=$FETCH_WAIT_TIMEOUT sink=$SINK group_id=$GROUP_ID\"\n \n TENZIR_KAFKA_FROM_PERF_STATS=1 /usr/bin/time -p \"$TENZIR_BIN\" --neo -f \"$pipeline_file\""
+    },
+    {
+      "sha": "2fdd01633480a3be010bfcbf1aa7cb0122c0506b",
+      "filename": "test/tests/perf/from_kafka_1m/tail_1m.tql",
+      "status": "removed",
+      "additions": 0,
+      "deletions": 10,
+      "changes": 10,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/5eb45bda66fdcf6b0e55d39b789ca663250068e1/test%2Ftests%2Fperf%2Ffrom_kafka_1m%2Ftail_1m.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/5eb45bda66fdcf6b0e55d39b789ca663250068e1/test%2Ftests%2Fperf%2Ffrom_kafka_1m%2Ftail_1m.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Fperf%2Ffrom_kafka_1m%2Ftail_1m.tql?ref=5eb45bda66fdcf6b0e55d39b789ca663250068e1",
+      "patch": "@@ -1,10 +0,0 @@\n-from_kafka env(\"KAFKA_TOPIC\"),\n-           count=1M,\n-           offset=\"beginning\",\n-           batch_size=10k,\n-           batch_timeout=1s,\n-           options={\n-             \"bootstrap.servers\": env(\"KAFKA_BOOTSTRAP_SERVERS\"),\n-             \"group.id\": \"tenzir-test-from-kafka-perf-1m\"\n-           }\n-tail 1"
+    },
+    {
+      "sha": "6d20b15b9ab68038f634c06c6d89e57bf693ee61",
+      "filename": "test/tests/perf/from_kafka_1m/test.yaml",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 3,
+      "changes": 7,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/f42f91b61a0d14af9cd8ae0c42665e37c3198b53/test%2Ftests%2Fperf%2Ffrom_kafka_1m%2Ftest.yaml",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/f42f91b61a0d14af9cd8ae0c42665e37c3198b53/test%2Ftests%2Fperf%2Ffrom_kafka_1m%2Ftest.yaml",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Fperf%2Ffrom_kafka_1m%2Ftest.yaml?ref=f42f91b61a0d14af9cd8ae0c42665e37c3198b53",
+      "patch": "@@ -1,7 +1,8 @@\n-suite: from-kafka-1m-perf\n+suite: from-kafka-10m-perf\n fixtures:\n   - kafka:\n-      topic: from_kafka_perf_1m\n+      topic: from_kafka_perf_10m\n       partitions: 1\n-      seed_messages: 1000000\n+      messages: 10000000\n+      payload_file: test/tests/perf/from_kafka_1m/route53_sample.ndjson\n timeout: 1800"
+    }
+  ]
+}

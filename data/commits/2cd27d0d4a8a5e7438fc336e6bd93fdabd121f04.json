@@ -1,0 +1,41 @@
+{
+  "message": "Relay: enforce single instance lock",
+  "files": [
+    {
+      "sha": "12f45c7d83990abddcc79488577c63ac76e4e967",
+      "filename": "src/cli/program.ts",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 0,
+      "changes": 14,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/2cd27d0d4a8a5e7438fc336e6bd93fdabd121f04/src%2Fcli%2Fprogram.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/2cd27d0d4a8a5e7438fc336e6bd93fdabd121f04/src%2Fcli%2Fprogram.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fcli%2Fprogram.ts?ref=2cd27d0d4a8a5e7438fc336e6bd93fdabd121f04",
+      "patch": "@@ -8,6 +8,7 @@ import { statusCommand } from \"../commands/status.js\";\n import { loadConfig } from \"../config/config.js\";\n import { danger, info, setVerbose } from \"../globals.js\";\n import { startControlChannel } from \"../infra/control-channel.js\";\n+import { acquireRelayLock, RelayLockError } from \"../infra/relay-lock.js\";\n import { getResolvedLoggerSettings } from \"../logging.js\";\n import {\n   loginWeb,\n@@ -383,6 +384,18 @@ Examples:\n       const { file: logFile, level: logLevel } = getResolvedLoggerSettings();\n       defaultRuntime.log(info(`logs: ${logFile} (level ${logLevel})`));\n \n+      let releaseRelayLock: (() => Promise<void>) | null = null;\n+      try {\n+        releaseRelayLock = await acquireRelayLock();\n+      } catch (err) {\n+        if (err instanceof RelayLockError) {\n+          defaultRuntime.error(danger(`Relay already running: ${err.message}`));\n+          defaultRuntime.exit(1);\n+          return;\n+        }\n+        throw err;\n+      }\n+\n       const providerOpt = (opts.provider ?? \"auto\").toLowerCase();\n       const cfg = loadConfig();\n       const telegramToken =\n@@ -589,6 +602,7 @@ Examples:\n         defaultRuntime.error(danger(`Relay failed: ${String(err)}`));\n         defaultRuntime.exit(1);\n       } finally {\n+        if (releaseRelayLock) await releaseRelayLock();\n         if (control) await control.close();\n       }\n     });"
+    },
+    {
+      "sha": "d931ed9402dc68c38346a9915db6681dd22988f7",
+      "filename": "src/infra/relay-lock.test.ts",
+      "status": "added",
+      "additions": 29,
+      "deletions": 0,
+      "changes": 29,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/2cd27d0d4a8a5e7438fc336e6bd93fdabd121f04/src%2Finfra%2Frelay-lock.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/2cd27d0d4a8a5e7438fc336e6bd93fdabd121f04/src%2Finfra%2Frelay-lock.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Frelay-lock.test.ts?ref=2cd27d0d4a8a5e7438fc336e6bd93fdabd121f04",
+      "patch": "@@ -0,0 +1,29 @@\n+import fs from \"node:fs\";\n+import os from \"node:os\";\n+import path from \"node:path\";\n+\n+import { describe, expect, it } from \"vitest\";\n+\n+import { acquireRelayLock, RelayLockError } from \"./relay-lock.js\";\n+\n+const newLockPath = () =>\n+  path.join(os.tmpdir(), `clawdis-relay-lock-test-${process.pid}-${Math.random().toString(16).slice(2)}.sock`);\n+\n+describe(\"relay-lock\", () => {\n+  it(\"prevents concurrent relay instances and releases cleanly\", async () => {\n+    const lockPath = newLockPath();\n+\n+    const release1 = await acquireRelayLock(lockPath);\n+    expect(fs.existsSync(lockPath)).toBe(true);\n+\n+    await expect(acquireRelayLock(lockPath)).rejects.toBeInstanceOf(RelayLockError);\n+\n+    await release1();\n+    expect(fs.existsSync(lockPath)).toBe(false);\n+\n+    // After release, lock can be reacquired.\n+    const release2 = await acquireRelayLock(lockPath);\n+    await release2();\n+    expect(fs.existsSync(lockPath)).toBe(false);\n+  });\n+});"
+    },
+    {
+      "sha": "40a60db3e9c653e3b93cb7dbdffe29c5b05542ff",
+      "filename": "src/infra/relay-lock.ts",
+      "status": "added",
+      "additions": 94,
+      "deletions": 0,
+      "changes": 94,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/2cd27d0d4a8a5e7438fc336e6bd93fdabd121f04/src%2Finfra%2Frelay-lock.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/2cd27d0d4a8a5e7438fc336e6bd93fdabd121f04/src%2Finfra%2Frelay-lock.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Frelay-lock.ts?ref=2cd27d0d4a8a5e7438fc336e6bd93fdabd121f04",
+      "patch": "@@ -0,0 +1,94 @@\n+import fs from \"node:fs\";\n+import net from \"node:net\";\n+import os from \"node:os\";\n+import path from \"node:path\";\n+\n+const DEFAULT_LOCK_PATH = path.join(os.tmpdir(), \"clawdis-relay.lock\");\n+\n+export class RelayLockError extends Error {}\n+\n+type ReleaseFn = () => Promise<void>;\n+\n+/**\n+ * Acquire an exclusive single-instance lock for the relay using a Unix domain socket.\n+ *\n+ * Why a socket? If the process crashes or is SIGKILLed, the socket file remains but\n+ * the next start will detect ECONNREFUSED when connecting and clean the stale path\n+ * before retrying. This keeps the lock self-healing without manual pidfile cleanup.\n+ */\n+export async function acquireRelayLock(lockPath = DEFAULT_LOCK_PATH): Promise<ReleaseFn> {\n+  // Fast path: try to listen on the lock path.\n+  const attemptListen = (): Promise<net.Server> =>\n+    new Promise((resolve, reject) => {\n+      const server = net.createServer();\n+\n+      server.once(\"error\", async (err: NodeJS.ErrnoException) => {\n+        if (err.code !== \"EADDRINUSE\") {\n+          reject(new RelayLockError(`lock listen failed: ${err.message}`));\n+          return;\n+        }\n+\n+        // Something is already bound. Try to connect to see if it is alive.\n+        const client = net.connect({ path: lockPath });\n+\n+        client.once(\"connect\", () => {\n+          client.destroy();\n+          reject(new RelayLockError(\"another relay instance is already running\"));\n+        });\n+\n+        client.once(\"error\", (connErr: NodeJS.ErrnoException) => {\n+          // Nothing is listening -> stale socket file. Remove and retry once.\n+          if (connErr.code === \"ECONNREFUSED\" || connErr.code === \"ENOENT\") {\n+            try {\n+              fs.rmSync(lockPath, { force: true });\n+            } catch (rmErr) {\n+              reject(\n+                new RelayLockError(\n+                  `failed to clean stale lock at ${lockPath}: ${String(rmErr)}`,\n+                ),\n+              );\n+              return;\n+            }\n+            attemptListen().then(resolve, reject);\n+            return;\n+          }\n+\n+          reject(\n+            new RelayLockError(\n+              `failed to connect to existing lock (${lockPath}): ${connErr.message}`,\n+            ),\n+          );\n+        });\n+      });\n+\n+      server.listen(lockPath, () => resolve(server));\n+    });\n+\n+  const server = await attemptListen();\n+\n+  let released = false;\n+  const release = async (): Promise<void> => {\n+    if (released) return;\n+    released = true;\n+    await new Promise<void>((resolve) => server.close(() => resolve()));\n+    try {\n+      fs.rmSync(lockPath, { force: true });\n+    } catch {\n+      /* ignore */\n+    }\n+  };\n+\n+  const cleanupSignals: NodeJS.Signals[] = [\"SIGINT\", \"SIGTERM\", \"SIGHUP\"];\n+  const handleSignal = async () => {\n+    await release();\n+    process.exit(0);\n+  };\n+\n+  cleanupSignals.forEach((sig) => process.once(sig, handleSignal));\n+  process.once(\"exit\", () => {\n+    // Exit handler must be sync-safe; release is async but close+rm are fast.\n+    void release();\n+  });\n+\n+  return release;\n+}"
+    }
+  ]
+}

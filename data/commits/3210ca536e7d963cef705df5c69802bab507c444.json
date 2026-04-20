@@ -1,0 +1,41 @@
+{
+  "message": "feat(ffs-cli): add scrub subcommand for read-only integrity scanning (bd-m35)\n\nAdds `ffs scrub <image> [--json]` that detects the filesystem type, creates\na block device, and runs the ffs-repair scrub pipeline. Reports findings in\nhuman-readable or JSON format. Exits with status 2 if Error-level or above\ncorruption is detected.\n\nCurrently uses ZeroCheckValidator as a baseline; format-specific validators\n(ext4 metadata_csum, btrfs csum) will be plugged in as implemented.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "00bacbed7e1f4d57050f2c435d8d5f0173104bd7",
+      "filename": "Cargo.lock",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/3210ca536e7d963cef705df5c69802bab507c444/Cargo.lock",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/3210ca536e7d963cef705df5c69802bab507c444/Cargo.lock",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/Cargo.lock?ref=3210ca536e7d963cef705df5c69802bab507c444",
+      "patch": "@@ -450,9 +450,11 @@ dependencies = [\n  \"anyhow\",\n  \"asupersync\",\n  \"clap\",\n+ \"ffs-block\",\n  \"ffs-core\",\n  \"ffs-fuse\",\n  \"ffs-harness\",\n+ \"ffs-repair\",\n  \"serde\",\n  \"serde_json\",\n ]"
+    },
+    {
+      "sha": "8d74b8d9a81f051a4cc7c81a87bc1703132c0707",
+      "filename": "crates/ffs-cli/Cargo.toml",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/3210ca536e7d963cef705df5c69802bab507c444/crates%2Fffs-cli%2FCargo.toml",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/3210ca536e7d963cef705df5c69802bab507c444/crates%2Fffs-cli%2FCargo.toml",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/crates%2Fffs-cli%2FCargo.toml?ref=3210ca536e7d963cef705df5c69802bab507c444",
+      "patch": "@@ -10,9 +10,11 @@ rust-version.workspace = true\n anyhow = { workspace = true }\n asupersync = { workspace = true }\n clap = { workspace = true }\n+ffs-block = { workspace = true }\n ffs-core = { workspace = true }\n ffs-fuse = { workspace = true }\n ffs-harness = { workspace = true }\n+ffs-repair = { workspace = true }\n serde = { workspace = true }\n serde_json = { workspace = true }\n "
+    },
+    {
+      "sha": "012d93801bdb246eacb04edd92ad22c0852052c0",
+      "filename": "crates/ffs-cli/src/main.rs",
+      "status": "modified",
+      "additions": 106,
+      "deletions": 0,
+      "changes": 106,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/3210ca536e7d963cef705df5c69802bab507c444/crates%2Fffs-cli%2Fsrc%2Fmain.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/3210ca536e7d963cef705df5c69802bab507c444/crates%2Fffs-cli%2Fsrc%2Fmain.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/crates%2Fffs-cli%2Fsrc%2Fmain.rs?ref=3210ca536e7d963cef705df5c69802bab507c444",
+      "patch": "@@ -3,9 +3,11 @@\n use anyhow::{Context, Result, bail};\n use asupersync::{Budget, Cx};\n use clap::{Parser, Subcommand};\n+use ffs_block::{BlockDevice, ByteBlockDevice, FileByteDevice};\n use ffs_core::{FsFlavor, FsOps, OpenFs, detect_filesystem_at_path};\n use ffs_fuse::MountOptions;\n use ffs_harness::ParityReport;\n+use ffs_repair::scrub::{BlockValidator, Scrubber, Severity, ZeroCheckValidator};\n use serde::Serialize;\n use std::path::PathBuf;\n \n@@ -49,6 +51,14 @@ enum Command {\n         #[arg(long)]\n         allow_other: bool,\n     },\n+    /// Run a read-only integrity scan (scrub) on a filesystem image.\n+    Scrub {\n+        /// Path to the filesystem image.\n+        image: PathBuf,\n+        /// Output in JSON format.\n+        #[arg(long)]\n+        json: bool,\n+    },\n     /// Show feature parity coverage report.\n     Parity {\n         /// Output in JSON format.\n@@ -95,6 +105,7 @@ fn run() -> Result<()> {\n             mountpoint,\n             allow_other,\n         } => mount_cmd(&image, &mountpoint, allow_other),\n+        Command::Scrub { image, json } => scrub_cmd(&image, json),\n         Command::Parity { json } => parity(json),\n     }\n }\n@@ -192,6 +203,101 @@ fn mount_cmd(image_path: &PathBuf, mountpoint: &PathBuf, allow_other: bool) -> R\n     Ok(())\n }\n \n+// \u2500\u2500 Scrub command \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n+\n+#[derive(Debug, Serialize)]\n+struct ScrubOutput {\n+    blocks_scanned: u64,\n+    blocks_corrupt: u64,\n+    blocks_io_error: u64,\n+    findings: Vec<ScrubFindingOutput>,\n+}\n+\n+#[derive(Debug, Serialize)]\n+struct ScrubFindingOutput {\n+    block: u64,\n+    kind: String,\n+    severity: String,\n+    detail: String,\n+}\n+\n+fn scrub_cmd(path: &PathBuf, json: bool) -> Result<()> {\n+    let cx = cli_cx();\n+\n+    // Detect filesystem to get the block size.\n+    let flavor = detect_filesystem_at_path(&cx, path)\n+        .with_context(|| format!(\"failed to detect ext4/btrfs metadata in {}\", path.display()))?;\n+\n+    let block_size = match &flavor {\n+        FsFlavor::Ext4(sb) => sb.block_size,\n+        FsFlavor::Btrfs(sb) => sb.nodesize,\n+    };\n+\n+    let byte_dev = FileByteDevice::open(path)\n+        .with_context(|| format!(\"failed to open image: {}\", path.display()))?;\n+    let block_dev = ByteBlockDevice::new(byte_dev, block_size)\n+        .with_context(|| format!(\"failed to create block device (block_size={block_size})\"))?;\n+\n+    // Use the zero-check validator as a baseline. Format-specific validators\n+    // (ext4 metadata_csum, btrfs csum) will be added as they're implemented.\n+    let validator: Box<dyn BlockValidator> = Box::new(ZeroCheckValidator);\n+\n+    if !json {\n+        let fs_name = match &flavor {\n+            FsFlavor::Ext4(_) => \"ext4\",\n+            FsFlavor::Btrfs(_) => \"btrfs\",\n+        };\n+        eprintln!(\n+            \"Scrubbing {fs_name} image: {} ({} blocks, block_size={block_size})\",\n+            path.display(),\n+            block_dev.block_count(),\n+        );\n+    }\n+\n+    let report = Scrubber::new(&block_dev, &*validator)\n+        .scrub_all(&cx)\n+        .with_context(|| \"scrub failed\")?;\n+\n+    let output = ScrubOutput {\n+        blocks_scanned: report.blocks_scanned,\n+        blocks_corrupt: report.blocks_corrupt,\n+        blocks_io_error: report.blocks_io_error,\n+        findings: report\n+            .findings\n+            .iter()\n+            .map(|f| ScrubFindingOutput {\n+                block: f.block.0,\n+                kind: f.kind.to_string(),\n+                severity: f.severity.to_string(),\n+                detail: f.detail.clone(),\n+            })\n+            .collect(),\n+    };\n+\n+    if json {\n+        println!(\n+            \"{}\",\n+            serde_json::to_string_pretty(&output).context(\"serialize scrub report\")?\n+        );\n+    } else {\n+        println!(\"FrankenFS Scrub Report\");\n+        println!(\"{report}\");\n+        if !report.findings.is_empty() {\n+            println!();\n+            for f in &report.findings {\n+                println!(\"  {f}\");\n+            }\n+        }\n+    }\n+\n+    // Exit with non-zero status if corruption found at Error or above.\n+    if report.count_at_severity(Severity::Error) > 0 {\n+        std::process::exit(2);\n+    }\n+\n+    Ok(())\n+}\n+\n fn parity(json: bool) -> Result<()> {\n     let report = ParityReport::current();\n "
+    }
+  ]
+}

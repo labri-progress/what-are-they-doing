@@ -1,0 +1,113 @@
+{
+  "message": "Add raw_message parameter to read_syslog operator\n\nThe read_syslog operator now supports an optional raw_message parameter\nthat stores the original, unparsed syslog message in a user-specified\nfield. This allows users to preserve the complete input when parsing\nsyslog data for debugging, audit, or retention purposes.\n\nThe feature works with both RFC 5424 and RFC 3164 (legacy) formats,\nand correctly handles multiline syslog messages by concatenating all\nlines into the raw message field.\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "8f3c78f215f7bfe8e7a8ffcd1a3532150866c35a",
+      "filename": "libtenzir/builtins/formats/syslog.cpp",
+      "status": "modified",
+      "additions": 60,
+      "deletions": 20,
+      "changes": 80,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/07b849bab632ab2ba521ac2f7c8c4697a0a1ddaf/libtenzir%2Fbuiltins%2Fformats%2Fsyslog.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/07b849bab632ab2ba521ac2f7c8c4697a0a1ddaf/libtenzir%2Fbuiltins%2Fformats%2Fsyslog.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Fbuiltins%2Fformats%2Fsyslog.cpp?ref=07b849bab632ab2ba521ac2f7c8c4697a0a1ddaf",
+      "patch": "@@ -435,8 +435,10 @@ struct legacy_message_parser : parser_base<legacy_message_parser> {\n \n template <typename Message>\n struct syslog_row {\n-  syslog_row(Message msg, size_t line_no)\n-    : parsed(std::move(msg)), starting_line_no(line_no) {\n+  syslog_row(Message msg, size_t line_no, std::string raw = {})\n+    : parsed(std::move(msg)),\n+      starting_line_no(line_no),\n+      raw_message(std::move(raw)) {\n   }\n \n   void emit_diag(std::string_view parser_name, diagnostic_handler& diag) const {\n@@ -455,15 +457,20 @@ struct syslog_row {\n   Message parsed;\n   size_t starting_line_no;\n   size_t line_count{1};\n+  std::string raw_message;\n };\n \n struct syslog_builder {\n public:\n   using message_type = message;\n   using row_type = syslog_row<message_type>;\n \n-  syslog_builder(multi_series_builder::options opts, diagnostic_handler& dh)\n-    : timeout{opts.settings.timeout}, builder{std::move(opts), dh} {\n+  syslog_builder(multi_series_builder::options opts, diagnostic_handler& dh,\n+                 const std::optional<ast::field_path>& raw_message_field\n+                 = std::nullopt)\n+    : timeout{opts.settings.timeout},\n+      builder{std::move(opts), dh},\n+      raw_message_field_{raw_message_field ? &*raw_message_field : nullptr} {\n   }\n \n   auto add_new(row_type&& row) -> void {\n@@ -485,6 +492,10 @@ struct syslog_builder {\n       latest.parsed.msg->push_back('\\n');\n       latest.parsed.msg->append(line);\n     }\n+    if (raw_message_field_) {\n+      latest.raw_message.push_back('\\n');\n+      latest.raw_message.append(line);\n+    }\n     ++latest.line_count;\n     return true;\n   }\n@@ -524,13 +535,17 @@ struct syslog_builder {\n     r.exact_field(\"message_id\").data(std::move(row.hdr.msg_id));\n     r.exact_field(\"structured_data\").data(std::move(row.data));\n     r.exact_field(\"message\").data(std::move(row.msg));\n+    if (raw_message_field_) {\n+      r.field(*raw_message_field_).data(std::move(last_message->raw_message));\n+    }\n     last_message.reset();\n   }\n \n   duration timeout;\n   multi_series_builder builder;\n   time last_message_time;\n   std::optional<row_type> last_message{};\n+  const ast::field_path* raw_message_field_ = nullptr;\n };\n \n struct legacy_syslog_builder {\n@@ -539,8 +554,12 @@ struct legacy_syslog_builder {\n   using row_type = syslog_row<message_type>;\n \n   legacy_syslog_builder(multi_series_builder::options opts,\n-                        diagnostic_handler& dh)\n-    : timeout{opts.settings.timeout}, builder{std::move(opts), dh} {\n+                        diagnostic_handler& dh,\n+                        const std::optional<ast::field_path>& raw_message_field\n+                        = std::nullopt)\n+    : timeout{opts.settings.timeout},\n+      builder{std::move(opts), dh},\n+      raw_message_field_{raw_message_field ? &*raw_message_field : nullptr} {\n   }\n \n   auto add_new(row_type&& row) -> void {\n@@ -579,6 +598,10 @@ struct legacy_syslog_builder {\n     auto& latest = *last_message;\n     latest.parsed.content.push_back('\\n');\n     latest.parsed.content.append(line);\n+    if (raw_message_field_) {\n+      latest.raw_message.push_back('\\n');\n+      latest.raw_message.append(line);\n+    }\n     ++latest.line_count;\n     return true;\n   }\n@@ -594,13 +617,17 @@ struct legacy_syslog_builder {\n     r.exact_field(\"app_name\").data(std::move(msg.tag));\n     r.exact_field(\"process_id\").data(std::move(msg.process_id));\n     r.exact_field(\"content\").data(msg.content);\n+    if (raw_message_field_) {\n+      r.field(*raw_message_field_).data(std::move(last_message->raw_message));\n+    }\n     last_message.reset();\n   }\n \n   duration timeout;\n   multi_series_builder builder;\n   time last_message_time;\n   std::optional<row_type> last_message{};\n+  const ast::field_path* raw_message_field_ = nullptr;\n };\n \n struct unknown_syslog_builder {\n@@ -656,15 +683,19 @@ auto infuse_legacy_schema(multi_series_builder::options o)\n \n auto parse_loop(generator<std::optional<std::string_view>> lines,\n                 operator_control_plane& ctrl,\n-                multi_series_builder::options opts) -> generator<table_slice> {\n+                multi_series_builder::options opts,\n+                const std::optional<ast::field_path>& raw_message_field\n+                = std::nullopt) -> generator<table_slice> {\n   auto dh = transforming_diagnostic_handler{\n     ctrl.diagnostics(), [](auto diag) {\n       diag.message = fmt::format(\"syslog parser: {}\", diag.message);\n       return diag;\n     }};\n   const auto ordered = opts.settings.ordered;\n-  auto new_builder = syslog_builder{infuse_new_schema(opts), dh};\n-  auto legacy_builder = legacy_syslog_builder{infuse_legacy_schema(opts), dh};\n+  auto new_builder\n+    = syslog_builder{infuse_new_schema(opts), dh, raw_message_field};\n+  auto legacy_builder\n+    = legacy_syslog_builder{infuse_legacy_schema(opts), dh, raw_message_field};\n   auto unknown_builder = unknown_syslog_builder{opts, dh};\n   auto last = builder_tag::unknown_syslog_builder;\n   const auto maybe_flush\n@@ -715,14 +746,16 @@ auto parse_loop(generator<std::optional<std::string_view>> lines,\n         co_yield std::move(s);\n       }\n       last = builder_tag::syslog_builder;\n-      new_builder.add_new({std::move(msg), line_nr});\n+      auto raw = raw_message_field ? std::string{*line} : std::string{};\n+      new_builder.add_new({std::move(msg), line_nr, std::move(raw)});\n     } else if (auto legacy_parser = legacy_message_parser{};\n                legacy_parser(f, l, legacy_msg)) {\n       for (auto&& s : maybe_flush(builder_tag::legacy_syslog_builder)) {\n         co_yield std::move(s);\n       }\n       last = builder_tag::legacy_syslog_builder;\n-      legacy_builder.add_new({std::move(legacy_msg), line_nr});\n+      auto raw = raw_message_field ? std::string{*line} : std::string{};\n+      legacy_builder.add_new({std::move(legacy_msg), line_nr, std::move(raw)});\n     } else if (last == builder_tag::syslog_builder\n                and new_builder.add_line_to_latest(*line)) {\n       continue;\n@@ -816,8 +849,11 @@ class syslog_parser final : public plugin_parser {\n public:\n   syslog_parser() = default;\n \n-  syslog_parser(multi_series_builder::options opts, bool octet_counting)\n-    : opts_{std::move(opts)}, octet_counting_{octet_counting} {\n+  syslog_parser(multi_series_builder::options opts, bool octet_counting,\n+                std::optional<ast::field_path> raw_message_field = std::nullopt)\n+    : opts_{std::move(opts)},\n+      octet_counting_{octet_counting},\n+      raw_message_field_{std::move(raw_message_field)} {\n   }\n \n   auto name() const -> std::string override {\n@@ -829,20 +865,22 @@ class syslog_parser final : public plugin_parser {\n     -> std::optional<generator<table_slice>> override {\n     if (octet_counting_) {\n       return parse_loop(split_octet(std::move(input), ctrl.diagnostics()), ctrl,\n-                        opts_);\n-    } else {\n-      return parse_loop(to_lines(std::move(input)), ctrl, opts_);\n+                        opts_, raw_message_field_);\n     }\n+    return parse_loop(to_lines(std::move(input)), ctrl, opts_,\n+                      raw_message_field_);\n   }\n \n   friend auto inspect(auto& f, syslog_parser& x) -> bool {\n-    return f.object(x).fields(f.field(\"octet\", x.octet_counting_),\n-                              f.field(\"opts\", x.opts_));\n+    return f.object(x).fields(\n+      f.field(\"octet\", x.octet_counting_), f.field(\"opts\", x.opts_),\n+      f.field(\"raw_message_field\", x.raw_message_field_));\n   }\n \n private:\n   multi_series_builder::options opts_;\n   bool octet_counting_ = false;\n+  std::optional<ast::field_path> raw_message_field_;\n };\n \n auto make_root_field(std::string field) -> ast::root_field {\n@@ -1193,13 +1231,15 @@ class read_syslog final\n     -> failure_or<operator_ptr> override {\n     auto parser = argument_parser2::operator_(\"read_syslog\");\n     bool octet_counting = false;\n+    std::optional<ast::field_path> raw_message_field;\n     parser.named_optional(\"octet_counting\", octet_counting);\n+    parser.named(\"raw_message\", raw_message_field);\n     auto msb_parser = multi_series_builder_argument_parser{};\n     msb_parser.add_all_to_parser(parser);\n     TRY(parser.parse(inv, ctx));\n     TRY(auto opts, msb_parser.get_options(ctx.dh()));\n-    return std::make_unique<parser_adapter<syslog_parser>>(\n-      syslog_parser{std::move(opts), octet_counting});\n+    return std::make_unique<parser_adapter<syslog_parser>>(syslog_parser{\n+      std::move(opts), octet_counting, std::move(raw_message_field)});\n   }\n };\n "
+    },
+    {
+      "sha": "8b05e5a3bc123c0c3bdcb566421fa6bcc3f2cb29",
+      "filename": "test/tests/operators/read_syslog/raw_message_multiline.tql",
+      "status": "added",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/07b849bab632ab2ba521ac2f7c8c4697a0a1ddaf/test%2Ftests%2Foperators%2Fread_syslog%2Fraw_message_multiline.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/07b849bab632ab2ba521ac2f7c8c4697a0a1ddaf/test%2Ftests%2Foperators%2Fread_syslog%2Fraw_message_multiline.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fread_syslog%2Fraw_message_multiline.tql?ref=07b849bab632ab2ba521ac2f7c8c4697a0a1ddaf",
+      "patch": "@@ -0,0 +1,5 @@\n+// Test raw_message with multiline messages\n+from {x: \"<165>1 2023-01-01T00:00:00Z host app 123 - - Line1\\nLine2\\nLine3\"}\n+write_lines\n+read_syslog raw_message=raw\n+select message, raw"
+    },
+    {
+      "sha": "8a2792773749fca7d1f1f1d2d2399863660ac892",
+      "filename": "test/tests/operators/read_syslog/raw_message_multiline.txt",
+      "status": "added",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/07b849bab632ab2ba521ac2f7c8c4697a0a1ddaf/test%2Ftests%2Foperators%2Fread_syslog%2Fraw_message_multiline.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/07b849bab632ab2ba521ac2f7c8c4697a0a1ddaf/test%2Ftests%2Foperators%2Fread_syslog%2Fraw_message_multiline.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fread_syslog%2Fraw_message_multiline.txt?ref=07b849bab632ab2ba521ac2f7c8c4697a0a1ddaf",
+      "patch": "@@ -0,0 +1,4 @@\n+{\n+  message: \"Line1\\nLine2\\nLine3\",\n+  raw: \"<165>1 2023-01-01T00:00:00Z host app 123 - - Line1\\nLine2\\nLine3\",\n+}"
+    },
+    {
+      "sha": "82fa81d855dc5702cbf2e9bef21db48a637f1052",
+      "filename": "test/tests/operators/read_syslog/raw_message_nested.tql",
+      "status": "added",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/07b849bab632ab2ba521ac2f7c8c4697a0a1ddaf/test%2Ftests%2Foperators%2Fread_syslog%2Fraw_message_nested.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/07b849bab632ab2ba521ac2f7c8c4697a0a1ddaf/test%2Ftests%2Foperators%2Fread_syslog%2Fraw_message_nested.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fread_syslog%2Fraw_message_nested.tql?ref=07b849bab632ab2ba521ac2f7c8c4697a0a1ddaf",
+      "patch": "@@ -0,0 +1,5 @@\n+// Test raw_message with nested field path\n+from {x: r#\"<165>1 2023-01-01T00:00:00Z host app 123 - - Test\"#}\n+write_lines\n+read_syslog raw_message=original.line\n+select message, original"
+    },
+    {
+      "sha": "e2ba96b9bf179fa04f3a2d00087091665a476683",
+      "filename": "test/tests/operators/read_syslog/raw_message_nested.txt",
+      "status": "added",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/07b849bab632ab2ba521ac2f7c8c4697a0a1ddaf/test%2Ftests%2Foperators%2Fread_syslog%2Fraw_message_nested.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/07b849bab632ab2ba521ac2f7c8c4697a0a1ddaf/test%2Ftests%2Foperators%2Fread_syslog%2Fraw_message_nested.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fread_syslog%2Fraw_message_nested.txt?ref=07b849bab632ab2ba521ac2f7c8c4697a0a1ddaf",
+      "patch": "@@ -0,0 +1,6 @@\n+{\n+  message: \"Test\",\n+  original: {\n+    line: \"<165>1 2023-01-01T00:00:00Z host app 123 - - Test\",\n+  },\n+}"
+    },
+    {
+      "sha": "b061c1ff5af32e31d268e26def80f59611196d29",
+      "filename": "test/tests/operators/read_syslog/raw_message_rfc3164.tql",
+      "status": "added",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/07b849bab632ab2ba521ac2f7c8c4697a0a1ddaf/test%2Ftests%2Foperators%2Fread_syslog%2Fraw_message_rfc3164.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/07b849bab632ab2ba521ac2f7c8c4697a0a1ddaf/test%2Ftests%2Foperators%2Fread_syslog%2Fraw_message_rfc3164.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fread_syslog%2Fraw_message_rfc3164.tql?ref=07b849bab632ab2ba521ac2f7c8c4697a0a1ddaf",
+      "patch": "@@ -0,0 +1,5 @@\n+// Test raw_message with RFC 3164 (legacy) format\n+from {x: \"<34>Oct 11 22:14:15 mymachine su: failed login\"}\n+write_lines\n+read_syslog raw_message=raw\n+select content, raw"
+    },
+    {
+      "sha": "011bcbd8594fbbc354d74c2a20897aafd8744e89",
+      "filename": "test/tests/operators/read_syslog/raw_message_rfc3164.txt",
+      "status": "added",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/07b849bab632ab2ba521ac2f7c8c4697a0a1ddaf/test%2Ftests%2Foperators%2Fread_syslog%2Fraw_message_rfc3164.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/07b849bab632ab2ba521ac2f7c8c4697a0a1ddaf/test%2Ftests%2Foperators%2Fread_syslog%2Fraw_message_rfc3164.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fread_syslog%2Fraw_message_rfc3164.txt?ref=07b849bab632ab2ba521ac2f7c8c4697a0a1ddaf",
+      "patch": "@@ -0,0 +1,4 @@\n+{\n+  content: \"failed login\",\n+  raw: \"<34>Oct 11 22:14:15 mymachine su: failed login\",\n+}"
+    },
+    {
+      "sha": "6b4f29cef063c93be87ae2c18255e92e1d1ea586",
+      "filename": "test/tests/operators/read_syslog/raw_message_rfc5424.tql",
+      "status": "added",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/07b849bab632ab2ba521ac2f7c8c4697a0a1ddaf/test%2Ftests%2Foperators%2Fread_syslog%2Fraw_message_rfc5424.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/07b849bab632ab2ba521ac2f7c8c4697a0a1ddaf/test%2Ftests%2Foperators%2Fread_syslog%2Fraw_message_rfc5424.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fread_syslog%2Fraw_message_rfc5424.tql?ref=07b849bab632ab2ba521ac2f7c8c4697a0a1ddaf",
+      "patch": "@@ -0,0 +1,5 @@\n+// Test raw_message with RFC 5424 format\n+from {x: r#\"<165>1 2023-01-01T00:00:00Z host app 123 - - Test message\"#}\n+write_lines\n+read_syslog raw_message=raw\n+select message, raw"
+    },
+    {
+      "sha": "b27f248367edd4c269b5182c396bbfb07b3ceb7f",
+      "filename": "test/tests/operators/read_syslog/raw_message_rfc5424.txt",
+      "status": "added",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/07b849bab632ab2ba521ac2f7c8c4697a0a1ddaf/test%2Ftests%2Foperators%2Fread_syslog%2Fraw_message_rfc5424.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/07b849bab632ab2ba521ac2f7c8c4697a0a1ddaf/test%2Ftests%2Foperators%2Fread_syslog%2Fraw_message_rfc5424.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fread_syslog%2Fraw_message_rfc5424.txt?ref=07b849bab632ab2ba521ac2f7c8c4697a0a1ddaf",
+      "patch": "@@ -0,0 +1,4 @@\n+{\n+  message: \"Test message\",\n+  raw: \"<165>1 2023-01-01T00:00:00Z host app 123 - - Test message\",\n+}"
+    }
+  ]
+}

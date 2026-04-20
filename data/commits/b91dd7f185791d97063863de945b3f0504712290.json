@@ -1,0 +1,77 @@
+{
+  "message": "fix(resilience): replace text-based liveness with PID checks, add IsWorking guard (#48)\n\nThe resilience monitor was injecting spawn commands into working agents\nbecause detectProcessStatus() relied on text pattern matching (\"exit\nstatus\", \"connection closed\", etc.) that AI agents routinely produce in\nnormal output. Three fixes:\n\n1. New internal/process package with PID-based liveness checks using\n   /proc on Linux. detectProcessStatus() now checks HasChildAlive(shellPID)\n   as the primary signal, falling back to text patterns only when PID=0.\n\n2. IsWorking guard in the resilience monitor's checkHealth(): when the\n   health check reports error/exit but the agent's activity is Active,\n   the crash handler is skipped. This mirrors the guard that\n   --robot-smart-restart already has.\n\n3. Tests for all new behavior: process liveness, PID-based detection\n   ignoring text patterns, and the IsWorking guard preventing false\n   crash handling.\n\nCloses #48\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "5f6b761f4eea1f4be9a64ef40929f7c53eacbdb6",
+      "filename": "internal/health/health.go",
+      "status": "modified",
+      "additions": 23,
+      "deletions": 5,
+      "changes": 28,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/b91dd7f185791d97063863de945b3f0504712290/internal%2Fhealth%2Fhealth.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/b91dd7f185791d97063863de945b3f0504712290/internal%2Fhealth%2Fhealth.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fhealth%2Fhealth.go?ref=b91dd7f185791d97063863de945b3f0504712290",
+      "patch": "@@ -8,6 +8,7 @@ import (\n \t\"sync\"\n \t\"time\"\n \n+\t\"github.com/Dicklesworthstone/ntm/internal/process\"\n \t\"github.com/Dicklesworthstone/ntm/internal/ratelimit\"\n \t\"github.com/Dicklesworthstone/ntm/internal/status\"\n \t\"github.com/Dicklesworthstone/ntm/internal/tmux\"\n@@ -219,8 +220,8 @@ func checkAgent(ctx context.Context, pa tmux.PaneActivity) AgentHealth {\n \t// Determine activity level\n \tagent.Activity = detectActivity(output, pa.LastActivity, string(pa.Pane.Type))\n \n-\t// Determine process status\n-\tagent.ProcessStatus = detectProcessStatus(output, pa.Pane.Command)\n+\t// Determine process status using PID-based check (preferred) with text fallback\n+\tagent.ProcessStatus = detectProcessStatus(output, pa.Pane.Command, pa.Pane.PID)\n \n \t// Detect work progress\n \tagent.Progress = detectProgress(output, agent.Activity, agent.Issues)\n@@ -458,9 +459,26 @@ func detectActivity(output string, lastActivity time.Time, agentType string) Act\n \treturn ActivityStale\n }\n \n-// detectProcessStatus determines if the agent process is running\n-func detectProcessStatus(output string, command string) ProcessStatus {\n-\t// Check for exit indicators in output\n+// detectProcessStatus determines if the agent process is running.\n+//\n+// When shellPID > 0 it uses PID-based liveness as the primary signal:\n+// the shell's child process (the agent) is checked via /proc. This avoids\n+// false positives from AI agents that routinely print strings like\n+// \"exit status\" or \"connection closed\" in their normal output.\n+//\n+// Text-pattern matching is only used as a fallback when no PID is available\n+// (e.g. in tests or when tmux doesn't report a PID).\n+func detectProcessStatus(output string, command string, shellPID int) ProcessStatus {\n+\t// Primary: PID-based liveness check (reliable, no false positives).\n+\tif shellPID > 0 {\n+\t\tif process.HasChildAlive(shellPID) {\n+\t\t\treturn ProcessRunning\n+\t\t}\n+\t\t// Shell has no living child -- the agent process has exited.\n+\t\treturn ProcessExited\n+\t}\n+\n+\t// Fallback: text-based detection when PID is unavailable.\n \texitPatterns := []string{\n \t\t\"exit status\", \"exited with\", \"process exited\",\n \t\t\"connection closed\", \"session ended\","
+    },
+    {
+      "sha": "af6ba3cda6f61bbeb01bb5cbe4dc3dbdaec422f7",
+      "filename": "internal/health/health_test.go",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 2,
+      "changes": 18,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/b91dd7f185791d97063863de945b3f0504712290/internal%2Fhealth%2Fhealth_test.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/b91dd7f185791d97063863de945b3f0504712290/internal%2Fhealth%2Fhealth_test.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fhealth%2Fhealth_test.go?ref=b91dd7f185791d97063863de945b3f0504712290",
+      "patch": "@@ -292,6 +292,7 @@ func TestStatusSeverity(t *testing.T) {\n func TestDetectProcessStatus(t *testing.T) {\n \tt.Parallel()\n \n+\t// These tests use shellPID=0 to exercise the text-based fallback path.\n \ttests := []struct {\n \t\tname    string\n \t\toutput  string\n@@ -314,14 +315,27 @@ func TestDetectProcessStatus(t *testing.T) {\n \tfor _, tt := range tests {\n \t\tt.Run(tt.name, func(t *testing.T) {\n \t\t\tt.Parallel()\n-\t\t\tgot := detectProcessStatus(tt.output, tt.command)\n+\t\t\tgot := detectProcessStatus(tt.output, tt.command, 0)\n \t\t\tif got != tt.want {\n-\t\t\t\tt.Errorf(\"detectProcessStatus(%q, %q) = %v, want %v\", tt.output, tt.command, got, tt.want)\n+\t\t\t\tt.Errorf(\"detectProcessStatus(%q, %q, 0) = %v, want %v\", tt.output, tt.command, got, tt.want)\n \t\t\t}\n \t\t})\n \t}\n }\n \n+func TestDetectProcessStatus_PIDBasedCurrentProcess(t *testing.T) {\n+\tt.Parallel()\n+\n+\t// Use the current process PID as the \"shell\". The test runner is our\n+\t// child, so HasChildAlive should return true for any PID that has\n+\t// children. We use PID 1 (init/systemd) which always has children.\n+\t// With a valid shell PID that has children, text patterns are ignored.\n+\tgot := detectProcessStatus(\"exit status 1\", \"python\", 1)\n+\tif got != ProcessRunning {\n+\t\tt.Errorf(\"detectProcessStatus with PID 1 (has children) = %v, want ProcessRunning\", got)\n+\t}\n+}\n+\n func TestCalculateStatus_DetailedCases(t *testing.T) {\n \tt.Parallel()\n "
+    },
+    {
+      "sha": "391cbbe04f8be80a4e68c273a099838fe0477eb9",
+      "filename": "internal/process/liveness.go",
+      "status": "added",
+      "additions": 70,
+      "deletions": 0,
+      "changes": 70,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/b91dd7f185791d97063863de945b3f0504712290/internal%2Fprocess%2Fliveness.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/b91dd7f185791d97063863de945b3f0504712290/internal%2Fprocess%2Fliveness.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fprocess%2Fliveness.go?ref=b91dd7f185791d97063863de945b3f0504712290",
+      "patch": "@@ -0,0 +1,70 @@\n+// Package process provides PID-based process liveness checks.\n+package process\n+\n+import (\n+\t\"fmt\"\n+\t\"os\"\n+\t\"strconv\"\n+\t\"strings\"\n+\t\"syscall\"\n+)\n+\n+// IsAlive checks whether a process with the given PID is still running.\n+// It uses /proc on Linux for an efficient, non-racy check and falls back\n+// to kill(pid, 0) on other platforms.\n+func IsAlive(pid int) bool {\n+\tif pid <= 0 {\n+\t\treturn false\n+\t}\n+\n+\t// Fast path: check /proc/<pid>/status exists (Linux).\n+\tif _, err := os.Stat(fmt.Sprintf(\"/proc/%d/status\", pid)); err == nil {\n+\t\treturn true\n+\t}\n+\n+\t// Fallback: signal 0 check (works on all POSIX systems).\n+\tproc, err := os.FindProcess(pid)\n+\tif err != nil {\n+\t\treturn false\n+\t}\n+\terr = proc.Signal(syscall.Signal(0))\n+\treturn err == nil\n+}\n+\n+// HasChildAlive returns true if the given shell PID has at least one\n+// living child process. This is useful for detecting whether an agent\n+// launched inside a tmux shell pane is still running.\n+func HasChildAlive(shellPID int) bool {\n+\tif shellPID <= 0 {\n+\t\treturn false\n+\t}\n+\n+\tchildPID := GetChildPID(shellPID)\n+\tif childPID <= 0 {\n+\t\treturn false\n+\t}\n+\treturn IsAlive(childPID)\n+}\n+\n+// GetChildPID returns the first child PID of the given parent, or 0 if\n+// no child is found. It reads /proc on Linux and falls back to pgrep.\n+func GetChildPID(parentPID int) int {\n+\tif parentPID <= 0 {\n+\t\treturn 0\n+\t}\n+\n+\t// Try /proc first (Linux).\n+\ttaskPath := fmt.Sprintf(\"/proc/%d/task/%d/children\", parentPID, parentPID)\n+\tdata, err := os.ReadFile(taskPath)\n+\tif err == nil {\n+\t\tparts := strings.Fields(string(data))\n+\t\tif len(parts) > 0 {\n+\t\t\tpid, err := strconv.Atoi(parts[0])\n+\t\t\tif err == nil && pid > 0 {\n+\t\t\t\treturn pid\n+\t\t\t}\n+\t\t}\n+\t}\n+\n+\treturn 0\n+}"
+    },
+    {
+      "sha": "9219d5894a1fc54a1bd1e330b6d8fb1ebf58ebab",
+      "filename": "internal/process/liveness_test.go",
+      "status": "added",
+      "additions": 55,
+      "deletions": 0,
+      "changes": 55,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/b91dd7f185791d97063863de945b3f0504712290/internal%2Fprocess%2Fliveness_test.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/b91dd7f185791d97063863de945b3f0504712290/internal%2Fprocess%2Fliveness_test.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fprocess%2Fliveness_test.go?ref=b91dd7f185791d97063863de945b3f0504712290",
+      "patch": "@@ -0,0 +1,55 @@\n+package process\n+\n+import (\n+\t\"os\"\n+\t\"testing\"\n+)\n+\n+func TestIsAlive_CurrentProcess(t *testing.T) {\n+\tt.Parallel()\n+\tpid := os.Getpid()\n+\tif !IsAlive(pid) {\n+\t\tt.Errorf(\"IsAlive(%d) = false, want true for current process\", pid)\n+\t}\n+}\n+\n+func TestIsAlive_InvalidPID(t *testing.T) {\n+\tt.Parallel()\n+\n+\ttests := []struct {\n+\t\tname string\n+\t\tpid  int\n+\t}{\n+\t\t{\"zero\", 0},\n+\t\t{\"negative\", -1},\n+\t\t{\"very large\", 999999999},\n+\t}\n+\tfor _, tt := range tests {\n+\t\tt.Run(tt.name, func(t *testing.T) {\n+\t\t\tt.Parallel()\n+\t\t\tif IsAlive(tt.pid) {\n+\t\t\t\tt.Errorf(\"IsAlive(%d) = true, want false\", tt.pid)\n+\t\t\t}\n+\t\t})\n+\t}\n+}\n+\n+func TestGetChildPID_InvalidParent(t *testing.T) {\n+\tt.Parallel()\n+\tif pid := GetChildPID(0); pid != 0 {\n+\t\tt.Errorf(\"GetChildPID(0) = %d, want 0\", pid)\n+\t}\n+\tif pid := GetChildPID(-1); pid != 0 {\n+\t\tt.Errorf(\"GetChildPID(-1) = %d, want 0\", pid)\n+\t}\n+}\n+\n+func TestHasChildAlive_InvalidPID(t *testing.T) {\n+\tt.Parallel()\n+\tif HasChildAlive(0) {\n+\t\tt.Error(\"HasChildAlive(0) = true, want false\")\n+\t}\n+\tif HasChildAlive(-1) {\n+\t\tt.Error(\"HasChildAlive(-1) = true, want false\")\n+\t}\n+}"
+    },
+    {
+      "sha": "d88e77f6799277ba7ab81223cf7e8212026cb735",
+      "filename": "internal/resilience/monitor.go",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 0,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/b91dd7f185791d97063863de945b3f0504712290/internal%2Fresilience%2Fmonitor.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/b91dd7f185791d97063863de945b3f0504712290/internal%2Fresilience%2Fmonitor.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fresilience%2Fmonitor.go?ref=b91dd7f185791d97063863de945b3f0504712290",
+      "patch": "@@ -321,6 +321,15 @@ func (m *Monitor) checkHealth(ctx context.Context) {\n \t\t\t\t\tcontinue\n \t\t\t\t}\n \n+\t\t\t\t// IsWorking guard: never interrupt agents that are actively\n+\t\t\t\t// producing output. This prevents false-positive crash\n+\t\t\t\t// detection when AI agents print strings like \"exit status\"\n+\t\t\t\t// or \"connection closed\" in their normal output.\n+\t\t\t\tif agentHealth.Activity == health.ActivityActive {\n+\t\t\t\t\tlog.Printf(\"[resilience] Agent %s reports error/exit but activity is active \u2014 skipping crash handler (IsWorking guard)\", agentState.PaneID)\n+\t\t\t\t\tcontinue\n+\t\t\t\t}\n+\n \t\t\t\treason := \"Agent unhealthy\"\n \t\t\t\tif len(agentHealth.Issues) > 0 {\n \t\t\t\t\treason = agentHealth.Issues[0].Message"
+    },
+    {
+      "sha": "e604f6d18e9ffa8a778e085dc56f70091213ad90",
+      "filename": "internal/resilience/monitor_test.go",
+      "status": "modified",
+      "additions": 65,
+      "deletions": 0,
+      "changes": 65,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/b91dd7f185791d97063863de945b3f0504712290/internal%2Fresilience%2Fmonitor_test.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/b91dd7f185791d97063863de945b3f0504712290/internal%2Fresilience%2Fmonitor_test.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fresilience%2Fmonitor_test.go?ref=b91dd7f185791d97063863de945b3f0504712290",
+      "patch": "@@ -1074,3 +1074,68 @@ func TestMonitorStart_NilContextAndDoubleStartAreSafe(t *testing.T) {\n \t\tt.Fatal(\"Stop() hung after Start(nil) + Start()\")\n \t}\n }\n+\n+func TestCheckHealthIsWorkingGuardSkipsCrash(t *testing.T) {\n+\t// When the health check reports StatusError/ProcessExited but the agent\n+\t// is still actively producing output (ActivityActive), the IsWorking\n+\t// guard should prevent handleCrash from being called. This addresses\n+\t// issue #48 where AI agents printing \"exit status\" in normal output\n+\t// caused false-positive crash detection.\n+\trestore := saveHooks()\n+\tdefer restore()\n+\n+\tvar restartAttempted bool\n+\tsetHooksLocked(func() {\n+\t\tcheckSessionFn = func(ctx context.Context, session string) (*health.SessionHealth, error) {\n+\t\t\treturn &health.SessionHealth{\n+\t\t\t\tSession: session,\n+\t\t\t\tAgents: []health.AgentHealth{\n+\t\t\t\t\t{\n+\t\t\t\t\t\tPaneID:        \"pane-1\",\n+\t\t\t\t\t\tStatus:        health.StatusError,\n+\t\t\t\t\t\tProcessStatus: health.ProcessExited,\n+\t\t\t\t\t\tActivity:      health.ActivityActive, // Agent is working!\n+\t\t\t\t\t\tIssues:        []health.Issue{{Type: \"crash\", Message: \"Process exited\"}},\n+\t\t\t\t\t},\n+\t\t\t\t},\n+\t\t\t}, nil\n+\t\t}\n+\n+\t\tsleepFn = func(d time.Duration) {}\n+\t\tsendKeysFn = func(paneID, cmd string, enter bool) error {\n+\t\t\trestartAttempted = true\n+\t\t\treturn nil\n+\t\t}\n+\t\tbuildPaneCmdFn = func(projectDir, agentCmd string) (string, error) {\n+\t\t\treturn agentCmd, nil\n+\t\t}\n+\t})\n+\n+\tcfg := config.Default()\n+\tcfg.Resilience.AutoRestart = true\n+\tcfg.Resilience.MaxRestarts = 3\n+\tcfg.Resilience.RestartDelaySeconds = 0\n+\n+\tm := NewMonitor(\"test-session\", \"/tmp/project\", cfg, true)\n+\tm.RegisterAgent(\"pane-1\", 1, \"cc\", \"opus\", \"claude\")\n+\n+\tm.checkHealth(context.Background())\n+\n+\t// Give async goroutine time (should NOT run)\n+\ttime.Sleep(100 * time.Millisecond)\n+\n+\tm.mu.RLock()\n+\thealthy := m.agents[\"pane-1\"].Healthy\n+\trestartCount := m.agents[\"pane-1\"].RestartCount\n+\tm.mu.RUnlock()\n+\n+\tif !healthy {\n+\t\tt.Error(\"agent should remain healthy when IsWorking guard fires\")\n+\t}\n+\tif restartCount != 0 {\n+\t\tt.Errorf(\"expected restart count 0 (IsWorking guard), got %d\", restartCount)\n+\t}\n+\tif restartAttempted {\n+\t\tt.Error(\"restart should not have been attempted for actively working agent\")\n+\t}\n+}"
+    }
+  ]
+}

@@ -1,0 +1,53 @@
+{
+  "message": "fix(frankenterm-web): harden attach state machine against mid-backoff transport closes and premature clean-close acceptance\n\nThe attach state machine had two edge-case bugs in TransportClosed handling:\n\n1. A WebSocket close arriving while already in BackingOff state would\n   clobber the pending retry timer and transition to Closed or trigger a\n   redundant retry. This commonly happens when the browser fires a delayed\n   close event after the state machine has already processed the timeout\n   and entered backoff. The fix short-circuits TransportClosed in BackingOff,\n   preserving the existing retry deadline.\n\n2. An orderly close (code 1000/1001, clean=true) received while still in\n   ConnectingTransport was incorrectly accepted as a terminal Closed state,\n   preventing any retry. This occurs when a server rejects a connection\n   immediately with a clean close. The fix gates orderly-close acceptance\n   on the session having been Active before the close, so pre-Active clean\n   closes schedule a retry instead.\n\nAlso adds unicode-width 0.2.2 dependency for terminal column width\ncalculations, getrandom wasm_js feature gate for WASM builds, and the\ncorresponding .cargo/config.toml rustflag for getrandom_backend=\"wasm_js\".\n\nSimplifies a redundant iter().any() pattern to contains() in wasm.rs.\n\nIncludes two new regression tests covering both scenarios.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "2e07606d52fb3f7920f753420ec2c24340b94e5e",
+      "filename": ".cargo/config.toml",
+      "status": "added",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/frankentui/blob/02bfdf2648a0fd9560755fc0b6c7f53b08e4d65c/.cargo%2Fconfig.toml",
+      "raw_url": "https://github.com/Dicklesworthstone/frankentui/raw/02bfdf2648a0fd9560755fc0b6c7f53b08e4d65c/.cargo%2Fconfig.toml",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankentui/contents/.cargo%2Fconfig.toml?ref=02bfdf2648a0fd9560755fc0b6c7f53b08e4d65c",
+      "patch": "@@ -0,0 +1,2 @@\n+[target.wasm32-unknown-unknown]\n+rustflags = ['--cfg', 'getrandom_backend=\"wasm_js\"']"
+    },
+    {
+      "sha": "23021ac5fc8728cd537c138ea5ce42deb10bf811",
+      "filename": "crates/frankenterm-web/Cargo.toml",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/frankentui/blob/02bfdf2648a0fd9560755fc0b6c7f53b08e4d65c/crates%2Ffrankenterm-web%2FCargo.toml",
+      "raw_url": "https://github.com/Dicklesworthstone/frankentui/raw/02bfdf2648a0fd9560755fc0b6c7f53b08e4d65c/crates%2Ffrankenterm-web%2FCargo.toml",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankentui/contents/crates%2Ffrankenterm-web%2FCargo.toml?ref=02bfdf2648a0fd9560755fc0b6c7f53b08e4d65c",
+      "patch": "@@ -31,9 +31,11 @@ bitflags = \"2.10.0\"\n serde = { version = \"1.0.227\", features = [\"derive\"] }\n serde_json = \"1.0.145\"\n tracing = \"0.1.41\"\n+unicode-width = \"0.2.2\"\n unicode-normalization = \"0.1.24\"\n \n [target.'cfg(target_arch = \"wasm32\")'.dependencies]\n+getrandom = { version = \"0.3.4\", features = [\"wasm_js\"] }\n js-sys = \"0.3.85\"\n wasm-bindgen = \"0.2.108\"\n wasm-bindgen-futures = \"0.4.58\""
+    },
+    {
+      "sha": "b5b63cce0e5301b3373de2e04ea25fcd0c887b76",
+      "filename": "crates/frankenterm-web/src/attach.rs",
+      "status": "modified",
+      "additions": 64,
+      "deletions": 2,
+      "changes": 66,
+      "blob_url": "https://github.com/Dicklesworthstone/frankentui/blob/02bfdf2648a0fd9560755fc0b6c7f53b08e4d65c/crates%2Ffrankenterm-web%2Fsrc%2Fattach.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankentui/raw/02bfdf2648a0fd9560755fc0b6c7f53b08e4d65c/crates%2Ffrankenterm-web%2Fsrc%2Fattach.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankentui/contents/crates%2Ffrankenterm-web%2Fsrc%2Fattach.rs?ref=02bfdf2648a0fd9560755fc0b6c7f53b08e4d65c",
+      "patch": "@@ -599,6 +599,16 @@ impl AttachClientStateMachine {\n             );\n         }\n \n+        if self.state == AttachState::BackingOff {\n+            return self.record_transition(\n+                now_ms,\n+                AttachEventKind::TransportClosed,\n+                from_state,\n+                Some(\"ignored_in_current_state\".to_owned()),\n+                actions,\n+            );\n+        }\n+\n         let normalized_reason = normalize_reason(&reason_text, \"transport_closed\");\n         self.close_reason = Some(normalized_reason.clone());\n \n@@ -617,12 +627,13 @@ impl AttachClientStateMachine {\n \n         let fatal_close_code = matches!(code, 1002 | 1003 | 1007 | 1008);\n         let orderly_close = clean && matches!(code, 1000 | 1001);\n+        let active_before_close = self.state == AttachState::Active;\n \n         if fatal_close_code {\n             self.state = AttachState::Failed;\n             self.retry_deadline_ms = None;\n             self.failure_code = Some(format!(\"close_{code}\"));\n-        } else if orderly_close && !self.config.retry_on_clean_close {\n+        } else if active_before_close && orderly_close && !self.config.retry_on_clean_close {\n             self.state = AttachState::Closed;\n             self.retry_deadline_ms = None;\n             self.failure_code = None;\n@@ -633,7 +644,7 @@ impl AttachClientStateMachine {\n             self.attempt = next_attempt;\n             self.retry_deadline_ms = Some(retry_deadline);\n             actions.push(AttachAction::schedule_retry(retry_deadline, next_attempt));\n-        } else if orderly_close {\n+        } else if active_before_close && orderly_close {\n             self.state = AttachState::Closed;\n             self.retry_deadline_ms = None;\n             self.failure_code = None;\n@@ -985,6 +996,57 @@ mod tests {\n         assert_eq!(closed.to_state, AttachState::Closed);\n     }\n \n+    #[test]\n+    fn transport_closed_while_backing_off_preserves_retry_timer() {\n+        let mut machine = AttachClientStateMachine::default();\n+        machine.handle_event(0, AttachEvent::ConnectRequested);\n+        machine.handle_event(10, AttachEvent::TransportOpened);\n+        let timeout_transition = machine.handle_event(5_010, AttachEvent::Tick);\n+        assert_eq!(timeout_transition.to_state, AttachState::BackingOff);\n+        assert_eq!(timeout_transition.retry_deadline_ms, Some(5_260));\n+\n+        let close_transition = machine.handle_event(\n+            5_015,\n+            AttachEvent::TransportClosed {\n+                code: 1000,\n+                clean: true,\n+                reason: \"normal\".to_owned(),\n+            },\n+        );\n+        assert_eq!(close_transition.from_state, AttachState::BackingOff);\n+        assert_eq!(close_transition.to_state, AttachState::BackingOff);\n+        assert_eq!(\n+            close_transition.reason.as_deref(),\n+            Some(\"ignored_in_current_state\")\n+        );\n+        assert_eq!(machine.snapshot().retry_deadline_ms, Some(5_260));\n+\n+        let retry_transition = machine.handle_event(5_260, AttachEvent::Tick);\n+        assert_eq!(retry_transition.event, AttachEventKind::RetryTimerElapsed);\n+        assert_eq!(retry_transition.to_state, AttachState::ConnectingTransport);\n+        assert_eq!(retry_transition.actions, vec![AttachAction::open_transport()]);\n+    }\n+\n+    #[test]\n+    fn clean_transport_close_while_connecting_schedules_retry() {\n+        let mut machine = AttachClientStateMachine::default();\n+        machine.handle_event(0, AttachEvent::ConnectRequested);\n+\n+        let closed = machine.handle_event(\n+            20,\n+            AttachEvent::TransportClosed {\n+                code: 1000,\n+                clean: true,\n+                reason: \"open_failed\".to_owned(),\n+            },\n+        );\n+        assert_eq!(closed.from_state, AttachState::ConnectingTransport);\n+        assert_eq!(closed.to_state, AttachState::BackingOff);\n+        assert_eq!(closed.attempt, 2);\n+        assert_eq!(closed.retry_deadline_ms, Some(270));\n+        assert_eq!(closed.actions, vec![AttachAction::schedule_retry(270, 2)]);\n+    }\n+\n     #[test]\n     fn transition_log_is_bounded_to_capacity() {\n         let mut machine = AttachClientStateMachine::default();"
+    },
+    {
+      "sha": "d006f72950983370c498576b5d6d0081018db7a6",
+      "filename": "crates/frankenterm-web/src/wasm.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/frankentui/blob/02bfdf2648a0fd9560755fc0b6c7f53b08e4d65c/crates%2Ffrankenterm-web%2Fsrc%2Fwasm.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankentui/raw/02bfdf2648a0fd9560755fc0b6c7f53b08e4d65c/crates%2Ffrankenterm-web%2Fsrc%2Fwasm.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankentui/contents/crates%2Ffrankenterm-web%2Fsrc%2Fwasm.rs?ref=02bfdf2648a0fd9560755fc0b6c7f53b08e4d65c",
+      "patch": "@@ -4209,7 +4209,7 @@ fn get_event_type_list(\n                     \"field {key} contains unknown event type: {raw}\"\n                 )));\n             };\n-            if !out.iter().any(|existing| *existing == event_type) {\n+            if !out.contains(&event_type) {\n                 out.push(event_type);\n             }\n         }"
+    }
+  ]
+}

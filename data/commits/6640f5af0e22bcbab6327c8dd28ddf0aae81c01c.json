@@ -1,0 +1,53 @@
+{
+  "message": "Add Copy-on-Write (COW) strings for zero-copy slicing\n\nPyString now has optional 'source' field:\n- null: owned string, we allocated it\n- non-null: borrowed slice, source keeps refcount\n\nBenefits:\n- s[1:5] is now zero-copy (borrows from original)\n- Source string kept alive via refcount\n- decref handles both owned and borrowed correctly\n\nThis is \"lazy by default\" - defer copying until mutation needed.\nSince Python strings are immutable, COW is safe.",
+  "files": [
+    {
+      "sha": "9a4d66f1da73a1a3f69a53ef746841d59895c981",
+      "filename": "packages/runtime/src/pystring.zig",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 1,
+      "changes": 6,
+      "blob_url": "https://github.com/teamchong/metal0/blob/6640f5af0e22bcbab6327c8dd28ddf0aae81c01c/packages%2Fruntime%2Fsrc%2Fpystring.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/6640f5af0e22bcbab6327c8dd28ddf0aae81c01c/packages%2Fruntime%2Fsrc%2Fpystring.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/packages%2Fruntime%2Fsrc%2Fpystring.zig?ref=6640f5af0e22bcbab6327c8dd28ddf0aae81c01c",
+      "patch": "@@ -7,13 +7,17 @@ const transform = @import(\"pystring/transform.zig\");\n const search = @import(\"pystring/search.zig\");\n const manipulate = @import(\"pystring/manipulate.zig\");\n \n-// Re-export PyString struct type\n+// Re-export PyString struct type with COW support\n pub const PyString = struct {\n     data: []const u8,\n+    source: ?*@import(\"runtime.zig\").PyObject = null, // COW: borrowed from this\n \n     // Core operations\n     pub const create = core.PyString.create;\n     pub const createOwned = core.PyString.createOwned;\n+    pub const createBorrowed = core.PyString.createBorrowed;\n+    pub const isBorrowed = core.PyString.isBorrowed;\n+    pub const deinit = core.PyString.deinit;\n     pub const getValue = core.PyString.getValue;\n     pub const len = core.PyString.len;\n     pub const getItem = core.PyString.getItem;"
+    },
+    {
+      "sha": "ece76cfbc2ca72de342a03f71c0f319d2451de0d",
+      "filename": "packages/runtime/src/pystring/core.zig",
+      "status": "modified",
+      "additions": 50,
+      "deletions": 3,
+      "changes": 53,
+      "blob_url": "https://github.com/teamchong/metal0/blob/6640f5af0e22bcbab6327c8dd28ddf0aae81c01c/packages%2Fruntime%2Fsrc%2Fpystring%2Fcore.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/6640f5af0e22bcbab6327c8dd28ddf0aae81c01c/packages%2Fruntime%2Fsrc%2Fpystring%2Fcore.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/packages%2Fruntime%2Fsrc%2Fpystring%2Fcore.zig?ref=6640f5af0e22bcbab6327c8dd28ddf0aae81c01c",
+      "patch": "@@ -1,18 +1,22 @@\n /// Core PyString operations - creation, access, concatenation\n+/// Supports Copy-on-Write (COW) for zero-copy slicing and sharing\n const std = @import(\"std\");\n const runtime = @import(\"../runtime.zig\");\n const PyObject = runtime.PyObject;\n const PythonError = runtime.PythonError;\n \n-/// Python string type\n+/// Python string type with COW support\n+/// - owned: we allocated data, must free it\n+/// - borrowed: slice into another PyString, source keeps ref\n pub const PyString = struct {\n     data: []const u8,\n+    source: ?*PyObject = null, // If non-null, we borrowed from this (COW)\n \n     pub fn create(allocator: std.mem.Allocator, str: []const u8) !*PyObject {\n         const obj = try allocator.create(PyObject);\n         const str_data = try allocator.create(PyString);\n         const owned = try allocator.dupe(u8, str);\n-        str_data.data = owned;\n+        str_data.* = .{ .data = owned, .source = null };\n \n         obj.* = PyObject{\n             .ref_count = 1,\n@@ -22,12 +26,55 @@ pub const PyString = struct {\n         return obj;\n     }\n \n+    /// Check if this string is borrowed (COW) or owned\n+    pub fn isBorrowed(obj: *PyObject) bool {\n+        std.debug.assert(obj.type_id == .string);\n+        const data: *PyString = @ptrCast(@alignCast(obj.data));\n+        return data.source != null;\n+    }\n+\n+    /// Free PyString resources (handles COW)\n+    pub fn deinit(obj: *PyObject, allocator: std.mem.Allocator) void {\n+        std.debug.assert(obj.type_id == .string);\n+        const str_data: *PyString = @ptrCast(@alignCast(obj.data));\n+\n+        if (str_data.source) |source| {\n+            // Borrowed - just decref source, don't free data\n+            runtime.decref(source, allocator);\n+        } else {\n+            // Owned - free data\n+            allocator.free(@constCast(str_data.data));\n+        }\n+        allocator.destroy(str_data);\n+        allocator.destroy(obj);\n+    }\n+\n     /// Create PyString with owned data (takes ownership, no duplication)\n     /// IMPORTANT: Caller must ensure owned_str is allocated with this allocator\n     pub fn createOwned(allocator: std.mem.Allocator, owned_str: []const u8) !*PyObject {\n         const obj = try allocator.create(PyObject);\n         const str_data = try allocator.create(PyString);\n-        str_data.data = owned_str;\n+        str_data.* = .{ .data = owned_str, .source = null };\n+\n+        obj.* = PyObject{\n+            .ref_count = 1,\n+            .type_id = .string,\n+            .data = str_data,\n+        };\n+        return obj;\n+    }\n+\n+    /// Create PyString borrowing from another PyString (COW - zero copy!)\n+    /// The source PyString is kept alive via reference counting\n+    pub fn createBorrowed(allocator: std.mem.Allocator, source_obj: *PyObject, slice: []const u8) !*PyObject {\n+        std.debug.assert(source_obj.type_id == .string);\n+\n+        const obj = try allocator.create(PyObject);\n+        const str_data = try allocator.create(PyString);\n+\n+        // Keep source alive\n+        runtime.incref(source_obj);\n+        str_data.* = .{ .data = slice, .source = source_obj };\n \n         obj.* = PyObject{\n             .ref_count = 1,"
+    },
+    {
+      "sha": "cb5baac86e33f4505421f9fa7c78e79df5c545b3",
+      "filename": "packages/runtime/src/pystring/manipulate.zig",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 2,
+      "changes": 5,
+      "blob_url": "https://github.com/teamchong/metal0/blob/6640f5af0e22bcbab6327c8dd28ddf0aae81c01c/packages%2Fruntime%2Fsrc%2Fpystring%2Fmanipulate.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/6640f5af0e22bcbab6327c8dd28ddf0aae81c01c/packages%2Fruntime%2Fsrc%2Fpystring%2Fmanipulate.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/packages%2Fruntime%2Fsrc%2Fpystring%2Fmanipulate.zig?ref=6640f5af0e22bcbab6327c8dd28ddf0aae81c01c",
+      "patch": "@@ -43,12 +43,13 @@ pub fn sliceWithStep(allocator: std.mem.Allocator, obj: *PyObject, start_opt: ?i\n         end = @max(-1, @min(end, str_len));\n     }\n \n-    // If step is 1, we can use simple substring extraction (optimization)\n+    // If step is 1, use COW (zero-copy slice!)\n     if (step == 1) {\n         const start_idx: usize = @intCast(start);\n         const end_idx: usize = @intCast(end);\n         const substring = data.data[start_idx..end_idx];\n-        return try PyString.create(allocator, substring);\n+        // COW: borrow from source, no copy!\n+        return try PyString.createBorrowed(allocator, obj, substring);\n     }\n \n     // Calculate result size for step != 1"
+    },
+    {
+      "sha": "286b96f14432092240d02cbb6088c1b708c545bc",
+      "filename": "packages/runtime/src/runtime.zig",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 1,
+      "changes": 8,
+      "blob_url": "https://github.com/teamchong/metal0/blob/6640f5af0e22bcbab6327c8dd28ddf0aae81c01c/packages%2Fruntime%2Fsrc%2Fruntime.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/6640f5af0e22bcbab6327c8dd28ddf0aae81c01c/packages%2Fruntime%2Fsrc%2Fruntime.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/packages%2Fruntime%2Fsrc%2Fruntime.zig?ref=6640f5af0e22bcbab6327c8dd28ddf0aae81c01c",
+      "patch": "@@ -123,7 +123,13 @@ pub fn decref(obj: *PyObject, allocator: std.mem.Allocator) void {\n             },\n             .string => {\n                 const data: *PyString = @ptrCast(@alignCast(obj.data));\n-                allocator.free(data.data);\n+                if (data.source) |source| {\n+                    // COW: borrowed from source, just decref source\n+                    decref(source, allocator);\n+                } else {\n+                    // Owned: free the data\n+                    allocator.free(@constCast(data.data));\n+                }\n                 allocator.destroy(data);\n             },\n             .dict => {"
+    }
+  ]
+}

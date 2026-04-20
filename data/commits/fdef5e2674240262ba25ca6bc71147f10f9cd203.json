@@ -1,0 +1,53 @@
+{
+  "message": "perf(runtime,sync): optimize scheduler counter decrements, parker unpark fast path, and semaphore lock acquisition\n\nThree targeted performance improvements:\n\nGlobalInjector counter decrements (global_injector.rs):\n- Replace fetch_update CAS retry loops with a load-check + fetch_sub\n  pattern for pending_count and ready_count decrements\n- Since these counters are advisory (Relaxed ordering, used for\n  heuristics/metrics rather than correctness), the non-atomic\n  load + sub pair is acceptable and avoids CAS contention under\n  high steal throughput\n- Add detailed documentation explaining the trade-off\n\nParker::unpark fast path (worker.rs):\n- Use atomic swap instead of store for the notified flag\n- If swap returns true (already notified), skip the mutex acquisition\n  and condvar signal entirely \u2014 this is the common case when wakers\n  fire for already-runnable tasks\n- Only acquire the mutex and signal when transitioning from not-notified\n  to notified, which is the only case where the thread might be parked\n\nSemaphore double-lock elimination (semaphore.rs):\n- In both AcquireFuture and OwnedAcquireFuture, move the lock\n  acquisition above the waiter_id allocation branch so that the\n  waiter_id is allocated inside the same critical section as the\n  subsequent state check\n- Eliminates a lock-unlock-relock sequence on first poll, reducing\n  mutex contention and avoiding a TOCTOU window between id allocation\n  and state inspection\n\nSteal test improvement (stealing.rs):\n- Replace early return + panic with found flag + assert for cleaner\n  test structure and better failure messages\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "f4e813ced8de8c92031347f2106bac4883d216a9",
+      "filename": "src/runtime/scheduler/global_injector.rs",
+      "status": "modified",
+      "additions": 18,
+      "deletions": 10,
+      "changes": 28,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/fdef5e2674240262ba25ca6bc71147f10f9cd203/src%2Fruntime%2Fscheduler%2Fglobal_injector.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/fdef5e2674240262ba25ca6bc71147f10f9cd203/src%2Fruntime%2Fscheduler%2Fglobal_injector.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Fscheduler%2Fglobal_injector.rs?ref=fdef5e2674240262ba25ca6bc71147f10f9cd203",
+      "patch": "@@ -103,22 +103,30 @@ impl Default for GlobalInjector {\n }\n \n impl GlobalInjector {\n+    /// Decrements the pending counter, saturating at zero.\n+    ///\n+    /// Uses a single `fetch_sub` instead of a `fetch_update` CAS loop.\n+    /// The counter is approximate (Relaxed ordering), so transient underflow\n+    /// from concurrent inc/dec racing is harmless \u2014 the `wrapping_sub` result\n+    /// will be corrected on the next increment.  However, we avoid wrapping\n+    /// past zero in the common sequential case by only subtracting when the\n+    /// counter is positive.  The load + sub is not atomic as a pair, but\n+    /// since this counter is advisory (used for heuristics/metrics, not for\n+    /// correctness), a brief inconsistency is acceptable and far cheaper\n+    /// than a CAS retry loop under contention.\n     #[inline]\n     fn decrement_pending_count(&self) {\n-        let _ = self\n-            .pending_count\n-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {\n-                count.checked_sub(1)\n-            });\n+        if self.pending_count.load(Ordering::Relaxed) > 0 {\n+            self.pending_count.fetch_sub(1, Ordering::Relaxed);\n+        }\n     }\n \n+    /// Decrements the ready counter, saturating at zero (same rationale).\n     #[inline]\n     fn decrement_ready_count(&self) {\n-        let _ = self\n-            .ready_count\n-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {\n-                count.checked_sub(1)\n-            });\n+        if self.ready_count.load(Ordering::Relaxed) > 0 {\n+            self.ready_count.fetch_sub(1, Ordering::Relaxed);\n+        }\n     }\n \n     /// Creates a new empty global injector."
+    },
+    {
+      "sha": "ef2feb6b6a285da01613d55819a1a45107271e0f",
+      "filename": "src/runtime/scheduler/stealing.rs",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 3,
+      "changes": 11,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/fdef5e2674240262ba25ca6bc71147f10f9cd203/src%2Fruntime%2Fscheduler%2Fstealing.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/fdef5e2674240262ba25ca6bc71147f10f9cd203/src%2Fruntime%2Fscheduler%2Fstealing.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Fscheduler%2Fstealing.rs?ref=fdef5e2674240262ba25ca6bc71147f10f9cd203",
+      "patch": "@@ -87,16 +87,21 @@ mod tests {\n         let stealers = vec![q1.stealer(), q2.stealer(), q3.stealer()];\n \n         // Different RNG seeds to ensure we eventually find the non-empty queue\n+        let mut found = false;\n         for seed in 0..10 {\n             let mut rng = DetRng::new(seed);\n             let stolen = steal_task(&stealers, &mut rng);\n             if let Some(t) = stolen {\n                 assert_eq!(t, task(99));\n-                return;\n+                found = true;\n+                break;\n             }\n         }\n-        // If we get here, something is wrong\n-        panic!(\"should have found task in q3\");\n+\n+        assert!(\n+            found,\n+            \"should have found task in q3 with at least one deterministic seed in [0, 10)\"\n+        );\n     }\n \n     #[test]"
+    },
+    {
+      "sha": "f523f541bd0b93c9bc1a504a14b1f055ecce8839",
+      "filename": "src/runtime/scheduler/worker.rs",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 1,
+      "changes": 15,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/fdef5e2674240262ba25ca6bc71147f10f9cd203/src%2Fruntime%2Fscheduler%2Fworker.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/fdef5e2674240262ba25ca6bc71147f10f9cd203/src%2Fruntime%2Fscheduler%2Fworker.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Fscheduler%2Fworker.rs?ref=fdef5e2674240262ba25ca6bc71147f10f9cd203",
+      "patch": "@@ -621,8 +621,21 @@ impl Parker {\n     }\n \n     /// Unparks a parked thread.\n+    ///\n+    /// Fast path: if the thread was already notified (common case when a waker\n+    /// fires for an already-runnable task), the atomic swap returns `true` and\n+    /// we skip the mutex + condvar entirely.  Only when the previous state was\n+    /// \"not notified\" do we acquire the mutex and signal the condvar, which is\n+    /// the only case where the thread might actually be parked.\n     pub fn unpark(&self) {\n-        self.inner.notified.store(true, Ordering::Release);\n+        if self.inner.notified.swap(true, Ordering::Release) {\n+            // Already notified \u2014 the thread will see it on the next\n+            // park() fast-path check.  No mutex or condvar needed.\n+            return;\n+        }\n+        // Was not notified: the thread may be parked. We must acquire the\n+        // mutex before notify_one to prevent lost wakeups (standard condvar\n+        // protocol).\n         let _guard = self.inner.mutex.lock().unwrap();\n         self.inner.cvar.notify_one();\n     }"
+    },
+    {
+      "sha": "f7af0a2a139a0eb33b0c5d94ac897ea803921788",
+      "filename": "src/sync/semaphore.rs",
+      "status": "modified",
+      "additions": 12,
+      "deletions": 16,
+      "changes": 28,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/fdef5e2674240262ba25ca6bc71147f10f9cd203/src%2Fsync%2Fsemaphore.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/fdef5e2674240262ba25ca6bc71147f10f9cd203/src%2Fsync%2Fsemaphore.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fsync%2Fsemaphore.rs?ref=fdef5e2674240262ba25ca6bc71147f10f9cd203",
+      "patch": "@@ -254,21 +254,20 @@ impl<'a> Future for AcquireFuture<'a, '_> {\n             return Poll::Ready(Err(AcquireError::Cancelled));\n         }\n \n+        // Single lock acquisition: allocate waiter_id inside the same\n+        // critical section if this is our first wait, avoiding the previous\n+        // double-lock (lock to get id, drop, re-lock to check state).\n+        let mut state = self.semaphore.state.lock();\n+\n         let waiter_id = if let Some(id) = self.waiter_id {\n             id\n         } else {\n-            let id = {\n-                let mut state = self.semaphore.state.lock();\n-                let id = state.next_waiter_id;\n-                state.next_waiter_id = state.next_waiter_id.wrapping_add(1);\n-                id\n-            };\n+            let id = state.next_waiter_id;\n+            state.next_waiter_id = state.next_waiter_id.wrapping_add(1);\n             self.waiter_id = Some(id);\n             id\n         };\n \n-        let mut state = self.semaphore.state.lock();\n-\n         if state.closed {\n             state.waiters.retain(|waiter| waiter.id != waiter_id);\n             drop(state);\n@@ -466,21 +465,18 @@ impl Future for OwnedAcquireFuture {\n             return Poll::Ready(Err(AcquireError::Cancelled));\n         }\n \n+        // Single lock acquisition (same optimization as AcquireFuture).\n+        let mut state = self.semaphore.state.lock();\n+\n         let waiter_id = if let Some(id) = self.waiter_id {\n             id\n         } else {\n-            let id = {\n-                let mut state = self.semaphore.state.lock();\n-                let id = state.next_waiter_id;\n-                state.next_waiter_id = state.next_waiter_id.wrapping_add(1);\n-                id\n-            };\n+            let id = state.next_waiter_id;\n+            state.next_waiter_id = state.next_waiter_id.wrapping_add(1);\n             self.waiter_id = Some(id);\n             id\n         };\n \n-        let mut state = self.semaphore.state.lock();\n-\n         if state.closed {\n             state.waiters.retain(|waiter| waiter.id != waiter_id);\n             drop(state);"
+    }
+  ]
+}

@@ -1,0 +1,53 @@
+{
+  "message": "fix(node): prevent resource leaks and TOCTOU races in 4 modules\n\nAddresses resource safety issues including orphaned temp files, thread\nleaks, and time-of-check/time-of-use race conditions.\n\n- connector/rollout_state.rs: Add persist_lock() with OnceLock/Mutex to\n  serialize concurrent writes, preventing TOCTOU race on version check\n  during concurrent state persistence\n- control_plane/root_pointer.rs: Introduce TempFileGuard RAII struct with\n  Drop impl for automatic cleanup of temp files on error or successful\n  rename, preventing orphaned temp files on failure paths\n- ops/engine_dispatcher.rs: Remove exists() check before remove_file(),\n  eliminating TOCTOU window where file could be created between check\n  and removal; just attempt removal directly\n- runtime/lockstep_harness.rs: Join reader threads after child process\n  kill to prevent leaking spawned I/O threads on timeout paths\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "0573147af8bf4c7fe98d7f133c7f11c012c30423",
+      "filename": "crates/franken-node/src/connector/rollout_state.rs",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 2,
+      "changes": 15,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/6909b1fc6ec2a6acfb4457ecc1b7da7e4b14c885/crates%2Ffranken-node%2Fsrc%2Fconnector%2Frollout_state.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/6909b1fc6ec2a6acfb4457ecc1b7da7e4b14c885/crates%2Ffranken-node%2Fsrc%2Fconnector%2Frollout_state.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fconnector%2Frollout_state.rs?ref=6909b1fc6ec2a6acfb4457ecc1b7da7e4b14c885",
+      "patch": "@@ -8,6 +8,7 @@\n use serde::{Deserialize, Serialize};\n use std::fmt;\n use std::path::Path;\n+use std::sync::{Mutex, OnceLock};\n \n use crate::control_plane::control_epoch::{\n     ControlEpoch, EpochArtifactEvent, EpochRejection, EpochRejectionReason, ValidityWindowPolicy,\n@@ -296,11 +297,21 @@ pub fn persist_epoch_scoped(\n     })\n }\n \n+/// Serialize concurrent persist() calls to prevent TOCTOU races on the version check.\n+fn persist_lock() -> &'static Mutex<()> {\n+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();\n+    LOCK.get_or_init(|| Mutex::new(()))\n+}\n+\n /// Save rollout state to a JSON file atomically.\n ///\n /// If a file already exists at `path`, the version in it must be less than\n /// the version in `state`, otherwise `StaleVersion` is returned.\n pub fn persist(state: &RolloutState, path: &Path) -> Result<(), PersistError> {\n+    let _guard = persist_lock().lock().map_err(|_| PersistError::IoError {\n+        message: \"persist lock poisoned\".to_string(),\n+    })?;\n+\n     // Check for stale version if file exists\n     if path.exists() {\n         let existing = load(path)?;\n@@ -316,8 +327,8 @@ pub fn persist(state: &RolloutState, path: &Path) -> Result<(), PersistError> {\n         message: e.to_string(),\n     })?;\n \n-    // Write to temp file then rename for atomicity\n-    let tmp_path = path.with_extension(\"tmp\");\n+    // Write to temp file then rename for atomicity (UUID suffix avoids collisions).\n+    let tmp_path = path.with_extension(format!(\"tmp.{}\", uuid::Uuid::now_v7()));\n     std::fs::write(&tmp_path, &json).map_err(|e| PersistError::IoError {\n         message: e.to_string(),\n     })?;"
+    },
+    {
+      "sha": "5712f291e9db05bdfa12a3156d3283aad79561f6",
+      "filename": "crates/franken-node/src/control_plane/root_pointer.rs",
+      "status": "modified",
+      "additions": 26,
+      "deletions": 0,
+      "changes": 26,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/6909b1fc6ec2a6acfb4457ecc1b7da7e4b14c885/crates%2Ffranken-node%2Fsrc%2Fcontrol_plane%2Froot_pointer.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/6909b1fc6ec2a6acfb4457ecc1b7da7e4b14c885/crates%2Ffranken-node%2Fsrc%2Fcontrol_plane%2Froot_pointer.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fcontrol_plane%2Froot_pointer.rs?ref=6909b1fc6ec2a6acfb4457ecc1b7da7e4b14c885",
+      "patch": "@@ -36,6 +36,28 @@ fn constant_time_eq(a: &str, b: &str) -> bool {\n     result == 0\n }\n \n+/// RAII guard that removes a temp file on drop (unless defused after rename).\n+struct TempFileGuard(Option<PathBuf>);\n+\n+impl TempFileGuard {\n+    fn new(path: PathBuf) -> Self {\n+        Self(Some(path))\n+    }\n+\n+    /// Prevent cleanup after a successful rename (file no longer at this path).\n+    fn defuse(&mut self) {\n+        self.0 = None;\n+    }\n+}\n+\n+impl Drop for TempFileGuard {\n+    fn drop(&mut self) {\n+        if let Some(path) = &self.0 {\n+            let _ = fs::remove_file(path);\n+        }\n+    }\n+}\n+\n /// Canonical root pointer filename.\n pub const ROOT_POINTER_FILE: &str = \"root_pointer.json\";\n /// Canonical detached auth record filename for root pointer bootstrap checks.\n@@ -470,6 +492,7 @@ fn publish_root_internal(\n     let start = Instant::now();\n     let root_path = root_pointer_path(dir);\n     let temp_path = dir.join(format!(\".{}.tmp.{}\", ROOT_POINTER_FILE, Uuid::now_v7()));\n+    let mut _temp_guard = TempFileGuard::new(temp_path.clone());\n     let old_root = match read_root(dir) {\n         Ok(r) => Some(r),\n         Err(RootPointerError::MissingRoot { .. }) => None,\n@@ -505,6 +528,7 @@ fn publish_root_internal(\n         ROOT_POINTER_AUTH_FILE,\n         Uuid::now_v7()\n     ));\n+    let mut _temp_auth_guard = TempFileGuard::new(temp_auth_path.clone());\n     let auth_path = root_auth_path(dir);\n \n     let mut temp_file = OpenOptions::new()\n@@ -580,11 +604,13 @@ fn publish_root_internal(\n         path: root_path.display().to_string(),\n         source,\n     })?;\n+    _temp_guard.defuse(); // temp file no longer exists at original path\n     fs::rename(&temp_auth_path, &auth_path).map_err(|source| RootPointerError::Io {\n         step: \"rename_root_auth\",\n         path: auth_path.display().to_string(),\n         source,\n     })?;\n+    _temp_auth_guard.defuse();\n \n     trace.steps.push(PublishStep::Rename);\n     maybe_crash(options.crash_after, PublishStep::Rename)?;"
+    },
+    {
+      "sha": "ed2d0d49d689d44526b4ea012a18b37d3a79101b",
+      "filename": "crates/franken-node/src/ops/engine_dispatcher.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 3,
+      "changes": 5,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/6909b1fc6ec2a6acfb4457ecc1b7da7e4b14c885/crates%2Ffranken-node%2Fsrc%2Fops%2Fengine_dispatcher.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/6909b1fc6ec2a6acfb4457ecc1b7da7e4b14c885/crates%2Ffranken-node%2Fsrc%2Fops%2Fengine_dispatcher.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fops%2Fengine_dispatcher.rs?ref=6909b1fc6ec2a6acfb4457ecc1b7da7e4b14c885",
+      "patch": "@@ -125,9 +125,8 @@ impl EngineDispatcher {\n         struct SocketCleanup(String);\n         impl Drop for SocketCleanup {\n             fn drop(&mut self) {\n-                if Path::new(&self.0).exists() {\n-                    let _ = std::fs::remove_file(&self.0);\n-                }\n+                // Remove directly without exists() check to avoid TOCTOU race.\n+                let _ = std::fs::remove_file(&self.0);\n             }\n         }\n         let _cleanup_guard = SocketCleanup(socket_path.clone());"
+    },
+    {
+      "sha": "01fa4b0d4d625e66aa849cef42d27ec9a32a06b0",
+      "filename": "crates/franken-node/src/runtime/lockstep_harness.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/6909b1fc6ec2a6acfb4457ecc1b7da7e4b14c885/crates%2Ffranken-node%2Fsrc%2Fruntime%2Flockstep_harness.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/6909b1fc6ec2a6acfb4457ecc1b7da7e4b14c885/crates%2Ffranken-node%2Fsrc%2Fruntime%2Flockstep_harness.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fruntime%2Flockstep_harness.rs?ref=6909b1fc6ec2a6acfb4457ecc1b7da7e4b14c885",
+      "patch": "@@ -194,6 +194,9 @@ impl LockstepHarness {\n             if start.elapsed() > timeout {\n                 let _ = child.kill();\n                 let _ = child.wait(); // Reclaim resources\n+                // Join reader threads to avoid leaking them after kill.\n+                let _ = stdout_thread.join();\n+                let _ = stderr_thread.join();\n                 anyhow::bail!(\n                     \"Execution timeout for runtime {} (exceeded 30s limit)\",\n                     runtime"
+    }
+  ]
+}

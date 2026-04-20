@@ -1,0 +1,41 @@
+{
+  "message": "fix: address code quality issues in daemon snapshot integration\n\n- Fix race condition: initialize snapshots inside mutex\n- Fix context usage: store and use service context\n- Clarify error handling rationale with comments\n- Add test for ListTaskSnapshots\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "997d4cdd143910b041698d17317f9f772e1fcd79",
+      "filename": "pkg/daemon/daemon.go",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/prime-radiant-inc/stockyard/blob/5094e3cc270fb762350fcf8a6f4489eba3a68b9e/pkg%2Fdaemon%2Fdaemon.go",
+      "raw_url": "https://github.com/prime-radiant-inc/stockyard/raw/5094e3cc270fb762350fcf8a6f4489eba3a68b9e/pkg%2Fdaemon%2Fdaemon.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/stockyard/contents/pkg%2Fdaemon%2Fdaemon.go?ref=5094e3cc270fb762350fcf8a6f4489eba3a68b9e",
+      "patch": "@@ -56,6 +56,7 @@ func (d *Daemon) Start(ctx context.Context) error {\n \t\treturn fmt.Errorf(\"daemon already running\")\n \t}\n \td.running = true\n+\td.snapshots = NewSnapshotService(d)\n \td.mu.Unlock()\n \n \tsocketDir := filepath.Dir(d.cfg.Daemon.SocketPath)\n@@ -88,7 +89,6 @@ func (d *Daemon) Start(ctx context.Context) error {\n \tfmt.Printf(\"gRPC server started on %s\\n\", d.cfg.Daemon.SocketPath)\n \n \t// Start snapshot service\n-\td.snapshots = NewSnapshotService(d)\n \tgo func() {\n \t\tif err := d.snapshots.Start(ctx); err != nil {\n \t\t\tfmt.Printf(\"Snapshot service error: %v\\n\", err)"
+    },
+    {
+      "sha": "8f3d44b41e324769aab4e4e27e825eb438ec406c",
+      "filename": "pkg/daemon/snapshots.go",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 4,
+      "changes": 12,
+      "blob_url": "https://github.com/prime-radiant-inc/stockyard/blob/5094e3cc270fb762350fcf8a6f4489eba3a68b9e/pkg%2Fdaemon%2Fsnapshots.go",
+      "raw_url": "https://github.com/prime-radiant-inc/stockyard/raw/5094e3cc270fb762350fcf8a6f4489eba3a68b9e/pkg%2Fdaemon%2Fsnapshots.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/stockyard/contents/pkg%2Fdaemon%2Fsnapshots.go?ref=5094e3cc270fb762350fcf8a6f4489eba3a68b9e",
+      "patch": "@@ -14,6 +14,7 @@ import (\n type SnapshotService struct {\n \tdaemon *Daemon\n \tserver *vsock.SnapshotServer\n+\tctx    context.Context\n }\n \n // NewSnapshotService creates a new snapshot service\n@@ -25,6 +26,7 @@ func NewSnapshotService(d *Daemon) *SnapshotService {\n \n // Start starts the snapshot service\n func (ss *SnapshotService) Start(ctx context.Context) error {\n+\tss.ctx = ctx\n \treturn ss.server.Listen(ctx)\n }\n \n@@ -39,17 +41,19 @@ func (ss *SnapshotService) handleSnapshot(vmID, label string) error {\n \tlog.Printf(\"Creating snapshot for task %s: %s\", taskID, label)\n \n \t// Create ZFS snapshot\n-\tsnapName, err := ss.daemon.zfs.CreateSnapshot(context.Background(), taskID, label)\n+\tsnapName, err := ss.daemon.zfs.CreateSnapshot(ss.ctx, taskID, label)\n \tif err != nil {\n \t\treturn fmt.Errorf(\"failed to create snapshot: %w\", err)\n \t}\n \n \tlog.Printf(\"Created snapshot: %s\", snapName)\n \n-\t// Record in database (snapshot name already encodes the label)\n+\t// Record in database. We log but don't fail here because:\n+\t// 1. The ZFS snapshot (the actual data) was successfully created\n+\t// 2. The database is just an index/cache that can be rebuilt\n+\t// 3. Returning an error would tell the VM to retry, but the snapshot already exists\n \tif err := ss.daemon.state.RecordSnapshot(taskID, snapName); err != nil {\n-\t\tlog.Printf(\"Warning: failed to record snapshot in database: %v\", err)\n-\t\t// Don't fail - snapshot was created\n+\t\tlog.Printf(\"Warning: failed to record snapshot in database: %v (ZFS snapshot %s was created)\", err, snapName)\n \t}\n \n \treturn nil"
+    },
+    {
+      "sha": "b33434f3ed9bc2f4e18c9b993782e8aba7567482",
+      "filename": "pkg/daemon/state_test.go",
+      "status": "modified",
+      "additions": 42,
+      "deletions": 0,
+      "changes": 42,
+      "blob_url": "https://github.com/prime-radiant-inc/stockyard/blob/5094e3cc270fb762350fcf8a6f4489eba3a68b9e/pkg%2Fdaemon%2Fstate_test.go",
+      "raw_url": "https://github.com/prime-radiant-inc/stockyard/raw/5094e3cc270fb762350fcf8a6f4489eba3a68b9e/pkg%2Fdaemon%2Fstate_test.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/stockyard/contents/pkg%2Fdaemon%2Fstate_test.go?ref=5094e3cc270fb762350fcf8a6f4489eba3a68b9e",
+      "patch": "@@ -231,6 +231,48 @@ func TestState_UpdateTaskVMID(t *testing.T) {\n \t}\n }\n \n+func TestState_ListTaskSnapshots(t *testing.T) {\n+\tstate, err := NewStateInMemory()\n+\tif err != nil {\n+\t\tt.Fatalf(\"failed to create state: %v\", err)\n+\t}\n+\tdefer state.Close()\n+\n+\t// Create a task first\n+\ttask := &Task{\n+\t\tID:        \"test-task-1\",\n+\t\tName:      \"test\",\n+\t\tStatus:    \"running\",\n+\t\tCreatedAt: time.Now(),\n+\t}\n+\tif err := state.CreateTask(task); err != nil {\n+\t\tt.Fatalf(\"create task: %v\", err)\n+\t}\n+\n+\t// Record some snapshots\n+\tif err := state.RecordSnapshot(\"test-task-1\", \"snap-1\"); err != nil {\n+\t\tt.Fatalf(\"record snapshot 1: %v\", err)\n+\t}\n+\tif err := state.RecordSnapshot(\"test-task-1\", \"snap-2\"); err != nil {\n+\t\tt.Fatalf(\"record snapshot 2: %v\", err)\n+\t}\n+\n+\t// List snapshots\n+\tsnaps, err := state.ListTaskSnapshots(\"test-task-1\")\n+\tif err != nil {\n+\t\tt.Fatalf(\"list snapshots: %v\", err)\n+\t}\n+\n+\tif len(snaps) != 2 {\n+\t\tt.Errorf(\"expected 2 snapshots, got %d\", len(snaps))\n+\t}\n+\n+\t// Should be ordered by created_at DESC\n+\tif len(snaps) >= 2 && snaps[0].Name != \"snap-2\" {\n+\t\tt.Errorf(\"expected snap-2 first (most recent), got %s\", snaps[0].Name)\n+\t}\n+}\n+\n func TestDataDir(t *testing.T) {\n \tdir := DataDir()\n \tif dir == \"\" {"
+    }
+  ]
+}

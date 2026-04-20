@@ -1,0 +1,125 @@
+{
+  "message": "feat(server): add async runtimes to background workers, optimize cleanup and TUI rendering\n\nBackground worker threads (ack_ttl, cleanup, retention, tool_metrics, tui_poller,\nHTTP supervisor) now spawn dedicated single-threaded async runtimes via\nasupersync::RuntimeBuilder. This ensures each worker has a proper async context\navailable, preventing panics when async primitives are used inside these threads.\n\nThe file reservation cleanup module now uses git's native pathspec matching\ninstead of spawning a git process per matched file, significantly reducing\nprocess overhead during stale reservation detection.\n\nThe disk monitor loop now checks for shutdown and sleeps BEFORE doing work on\neach iteration, preventing a wasted monitoring cycle on shutdown and ensuring\nthe first sleep happens before the first check (matching the intended design).\n\nTUI rendering gains a cached composite path (render_cached) that reuses the\npreviously computed ambient effect buffer when the simulation tick has not\nadvanced, avoiding redundant plasma/particle computation on intermediate frames.\n\nAdditional fixes:\n- /mail/api/locks now accepts trailing slash (route parity)\n- reply_message arguments are now normalized alongside send_message\n- \"resource\" added to allowed URL schemes in HTML sanitizer\n- saturating_mul used for TTL microsecond conversions to prevent overflow\n- Removed unused sqlmodel_core::Value import from tui_app\n- .clone() used instead of .to_string() for already-owned recipient strings\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "ba68239db65624d21280535e5d2e9fee6ef4c552",
+      "filename": "crates/mcp-agent-mail-server/src/ack_ttl.rs",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 2,
+      "changes": 12,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/19a7298b685842480665b68ba3240c354f810366/crates%2Fmcp-agent-mail-server%2Fsrc%2Fack_ttl.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/19a7298b685842480665b68ba3240c354f810366/crates%2Fmcp-agent-mail-server%2Fsrc%2Fack_ttl.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-server%2Fsrc%2Fack_ttl.rs?ref=19a7298b685842480665b68ba3240c354f810366",
+      "patch": "@@ -40,7 +40,15 @@ pub fn start(config: &Config) {\n         SHUTDOWN.store(false, Ordering::Release);\n         std::thread::Builder::new()\n             .name(\"ack-ttl-scan\".into())\n-            .spawn(move || ack_ttl_loop(&config))\n+            .spawn(move || {\n+                let rt = asupersync::runtime::RuntimeBuilder::new()\n+                    .worker_threads(1)\n+                    .build()\n+                    .expect(\"build ack-ttl runtime\");\n+                rt.block_on(async move {\n+                    ack_ttl_loop(&config)\n+                });\n+            })\n             .expect(\"failed to spawn ACK TTL scan worker\")\n     });\n }\n@@ -109,7 +117,7 @@ fn ack_ttl_loop(config: &Config) {\n fn run_ack_ttl_cycle(config: &Config, pool: &DbPool) -> Result<(usize, usize), String> {\n     let cx = Cx::for_testing();\n     let now = now_micros();\n-    let ttl_us = i64::try_from(config.ack_ttl_seconds).unwrap_or(1800) * 1_000_000;\n+    let ttl_us = i64::try_from(config.ack_ttl_seconds).unwrap_or(1800).saturating_mul(1_000_000);\n \n     // Get all unacknowledged messages.\n     let rows = match block_on(async { list_unacknowledged_messages(&cx, pool).await }) {"
+    },
+    {
+      "sha": "a99386124fcc8184b66669b98d79ce5601db9983",
+      "filename": "crates/mcp-agent-mail-server/src/cleanup.rs",
+      "status": "modified",
+      "additions": 32,
+      "deletions": 34,
+      "changes": 66,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/19a7298b685842480665b68ba3240c354f810366/crates%2Fmcp-agent-mail-server%2Fsrc%2Fcleanup.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/19a7298b685842480665b68ba3240c354f810366/crates%2Fmcp-agent-mail-server%2Fsrc%2Fcleanup.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-server%2Fsrc%2Fcleanup.rs?ref=19a7298b685842480665b68ba3240c354f810366",
+      "patch": "@@ -45,7 +45,15 @@ pub fn start(config: &Config) {\n         SHUTDOWN.store(false, Ordering::Release);\n         std::thread::Builder::new()\n             .name(\"file-res-cleanup\".into())\n-            .spawn(move || cleanup_loop(&config))\n+            .spawn(move || {\n+                let rt = asupersync::runtime::RuntimeBuilder::new()\n+                    .worker_threads(1)\n+                    .build()\n+                    .expect(\"build cleanup runtime\");\n+                rt.block_on(async move {\n+                    cleanup_loop(&config)\n+                });\n+            })\n             .expect(\"failed to spawn file reservation cleanup worker\")\n     });\n }\n@@ -164,9 +172,9 @@ fn detect_and_release_stale(\n     project_id: i64,\n ) -> Result<Vec<i64>, String> {\n     let inactivity_us =\n-        i64::try_from(config.file_reservation_inactivity_seconds).unwrap_or(1800) * 1_000_000;\n+        i64::try_from(config.file_reservation_inactivity_seconds).unwrap_or(1800).saturating_mul(1_000_000);\n     let grace_us =\n-        i64::try_from(config.file_reservation_activity_grace_seconds).unwrap_or(900) * 1_000_000;\n+        i64::try_from(config.file_reservation_activity_grace_seconds).unwrap_or(900).saturating_mul(1_000_000);\n     let now = now_micros();\n \n     // Get all unreleased reservations for this project.\n@@ -289,39 +297,29 @@ fn check_git_activity(workspace: &Path, path_pattern: &str, now_us: i64, grace_u\n         return false;\n     }\n \n-    let matches = collect_matching_paths(workspace, path_pattern);\n-    if matches.is_empty() {\n+    // Use git log with the path pattern directly (git handles pathspecs including globs).\n+    // This is vastly more efficient than spawning a git process per matched file.\n+    let Ok(output) = std::process::Command::new(\"git\")\n+        .args([\n+            \"-C\",\n+            &workspace.to_string_lossy(),\n+            \"log\",\n+            \"-1\",\n+            \"--format=%ct\",\n+            \"--\",\n+            path_pattern,\n+        ])\n+        .output()\n+    else {\n         return false;\n-    }\n-\n-    // Use git log to find most recent commit touching these paths.\n-    for path in &matches {\n-        let Ok(rel_path) = path.strip_prefix(workspace) else {\n-            continue;\n-        };\n-\n-        let Ok(output) = std::process::Command::new(\"git\")\n-            .args([\n-                \"-C\",\n-                &workspace.to_string_lossy(),\n-                \"log\",\n-                \"-1\",\n-                \"--format=%ct\",\n-                \"--\",\n-                &rel_path.to_string_lossy(),\n-            ])\n-            .output()\n-        else {\n-            continue;\n-        };\n+    };\n \n-        if output.status.success() {\n-            let stdout = String::from_utf8_lossy(&output.stdout);\n-            if let Ok(commit_epoch) = stdout.trim().parse::<i64>() {\n-                let commit_us = commit_epoch * 1_000_000;\n-                if (now_us - commit_us) <= grace_us {\n-                    return true;\n-                }\n+    if output.status.success() {\n+        let stdout = String::from_utf8_lossy(&output.stdout);\n+        if let Ok(commit_epoch) = stdout.trim().parse::<i64>() {\n+            let commit_us = commit_epoch * 1_000_000;\n+            if (now_us - commit_us) <= grace_us {\n+                return true;\n             }\n         }\n     }"
+    },
+    {
+      "sha": "1e00743d2ed812cf4f944ce427f9d9e2bf7c8738",
+      "filename": "crates/mcp-agent-mail-server/src/disk_monitor.rs",
+      "status": "modified",
+      "additions": 12,
+      "deletions": 11,
+      "changes": 23,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/19a7298b685842480665b68ba3240c354f810366/crates%2Fmcp-agent-mail-server%2Fsrc%2Fdisk_monitor.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/19a7298b685842480665b68ba3240c354f810366/crates%2Fmcp-agent-mail-server%2Fsrc%2Fdisk_monitor.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-server%2Fsrc%2Fdisk_monitor.rs?ref=19a7298b685842480665b68ba3240c354f810366",
+      "patch": "@@ -71,6 +71,18 @@ fn monitor_loop(config: &Config) {\n     }\n \n     loop {\n+        // Sleep in small increments to allow quick shutdown.\n+        let mut remaining = interval;\n+        while !remaining.is_zero() {\n+            if SHUTDOWN.load(Ordering::Acquire) {\n+                tracing::info!(\"disk monitor worker shutting down\");\n+                return;\n+            }\n+            let chunk = remaining.min(Duration::from_secs(1));\n+            std::thread::sleep(chunk);\n+            remaining = remaining.saturating_sub(chunk);\n+        }\n+\n         if SHUTDOWN.load(Ordering::Acquire) {\n             tracing::info!(\"disk monitor worker shutting down\");\n             return;\n@@ -90,17 +102,6 @@ fn monitor_loop(config: &Config) {\n             );\n             last_pressure = pressure;\n         }\n-\n-        // Sleep in small increments to allow quick shutdown.\n-        let mut remaining = interval;\n-        while !remaining.is_zero() {\n-            if SHUTDOWN.load(Ordering::Acquire) {\n-                return;\n-            }\n-            let chunk = remaining.min(Duration::from_secs(1));\n-            std::thread::sleep(chunk);\n-            remaining = remaining.saturating_sub(chunk);\n-        }\n     }\n }\n "
+    },
+    {
+      "sha": "27b87dcd5da5d095cede413aa9cb0df467222f3a",
+      "filename": "crates/mcp-agent-mail-server/src/lib.rs",
+      "status": "modified",
+      "additions": 33,
+      "deletions": 6,
+      "changes": 39,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/19a7298b685842480665b68ba3240c354f810366/crates%2Fmcp-agent-mail-server%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/19a7298b685842480665b68ba3240c354f810366/crates%2Fmcp-agent-mail-server%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-server%2Fsrc%2Flib.rs?ref=19a7298b685842480665b68ba3240c354f810366",
+      "patch": "@@ -910,7 +910,12 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul\n     let supervisor_thread = std::thread::Builder::new()\n         .name(\"mcp-http-supervisor\".into())\n         .spawn(move || {\n-            run_http_server_supervisor_thread(server_config, &supervisor_state, &server_ctl_rx)\n+            let rt = asupersync::runtime::RuntimeBuilder::current_thread()\n+                .build()\n+                .expect(\"build supervisor runtime\");\n+            rt.block_on(async move {\n+                run_http_server_supervisor_thread(server_config, &supervisor_state, &server_ctl_rx)\n+            })\n         })\n         .expect(\"spawn HTTP supervisor thread\");\n \n@@ -1218,13 +1223,13 @@ fn dispatch_compose_envelope(\n     // 5. Insert recipients (To, Cc, Bcc).\n     let mut all_recipients = Vec::new();\n     for name in &envelope.to {\n-        all_recipients.push((name.to_string(), \"to\".to_string()));\n+        all_recipients.push((name.clone(), \"to\".to_string()));\n     }\n     for name in &envelope.cc {\n-        all_recipients.push((name.to_string(), \"cc\".to_string()));\n+        all_recipients.push((name.clone(), \"cc\".to_string()));\n     }\n     for name in &envelope.bcc {\n-        all_recipients.push((name.to_string(), \"bcc\".to_string()));\n+        all_recipients.push((name.clone(), \"bcc\".to_string()));\n     }\n \n     match mcp_agent_mail_db::sync::dispatch_root_message(\n@@ -3464,7 +3469,7 @@ impl HttpState {\n             return Some(self.json_response(req, 200, &payload));\n         }\n \n-        if path == \"/mail/api/locks\" {\n+        if path == \"/mail/api/locks\" || path == \"/mail/api/locks/\" {\n             if !matches!(req.method, Http1Method::Get) {\n                 return Some(self.error_response(req, 405, \"Method Not Allowed\"));\n             }\n@@ -4021,7 +4026,7 @@ impl HttpState {\n             \"tools/call\" => {\n                 let mut params: fastmcp_protocol::CallToolParams = parse_params(request.params)?;\n                 let tool_name = params.name.clone();\n-                if tool_name == \"send_message\"\n+                if (tool_name == \"send_message\" || tool_name == \"reply_message\")\n                     && let Some(arguments) = params.arguments.as_mut()\n                 {\n                     mcp_agent_mail_tools::normalize_send_message_arguments(arguments)?;\n@@ -6526,6 +6531,28 @@ mod tests {\n         );\n     }\n \n+    #[test]\n+    fn mail_api_locks_trailing_slash_returns_json() {\n+        let storage_root = std::env::temp_dir().join(format!(\n+            \"mcp-agent-mail-mail-locks-test-trailing-{}\",\n+            std::process::id()\n+        ));\n+        let config = mcp_agent_mail_core::Config {\n+            storage_root,\n+            ..Default::default()\n+        };\n+        let state = build_state(config);\n+        let req = make_request(Http1Method::Get, \"/mail/api/locks/\", &[]);\n+        let resp = block_on(state.handle(req));\n+        assert_eq!(resp.status, 200);\n+        let payload: serde_json::Value =\n+            serde_json::from_slice(&resp.body).expect(\"locks response json\");\n+        assert!(\n+            payload.get(\"locks\").and_then(|v| v.as_array()).is_some(),\n+            \"locks missing or not array: {payload}\"\n+        );\n+    }\n+\n     #[test]\n     fn mail_ws_state_poll_returns_snapshot_json() {\n         let config = mcp_agent_mail_core::Config::default();"
+    },
+    {
+      "sha": "6fd19c300ed9b490f7887be5f43d03c82327fe79",
+      "filename": "crates/mcp-agent-mail-server/src/markdown.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/19a7298b685842480665b68ba3240c354f810366/crates%2Fmcp-agent-mail-server%2Fsrc%2Fmarkdown.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/19a7298b685842480665b68ba3240c354f810366/crates%2Fmcp-agent-mail-server%2Fsrc%2Fmarkdown.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-server%2Fsrc%2Fmarkdown.rs?ref=19a7298b685842480665b68ba3240c354f810366",
+      "patch": "@@ -106,7 +106,7 @@ static HTML_SANITIZER: LazyLock<Builder<'static>> = LazyLock::new(|| {\n \n     // Allowed URL schemes.\n     b.url_schemes(\n-        [\"http\", \"https\", \"mailto\", \"data\"]\n+        [\"http\", \"https\", \"mailto\", \"data\", \"resource\"]\n             .into_iter()\n             .collect::<HashSet<_>>(),\n     );"
+    },
+    {
+      "sha": "10b00d8cec1ebf33d950866557f991d2fb7b1e47",
+      "filename": "crates/mcp-agent-mail-server/src/retention.rs",
+      "status": "modified",
+      "additions": 12,
+      "deletions": 3,
+      "changes": 15,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/19a7298b685842480665b68ba3240c354f810366/crates%2Fmcp-agent-mail-server%2Fsrc%2Fretention.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/19a7298b685842480665b68ba3240c354f810366/crates%2Fmcp-agent-mail-server%2Fsrc%2Fretention.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-server%2Fsrc%2Fretention.rs?ref=19a7298b685842480665b68ba3240c354f810366",
+      "patch": "@@ -36,7 +36,15 @@ pub fn start(config: &Config) {\n         SHUTDOWN.store(false, Ordering::Release);\n         std::thread::Builder::new()\n             .name(\"retention-quota\".into())\n-            .spawn(move || retention_loop(&config))\n+            .spawn(move || {\n+                let rt = asupersync::runtime::RuntimeBuilder::new()\n+                    .worker_threads(1)\n+                    .build()\n+                    .expect(\"build retention runtime\");\n+                rt.block_on(async move {\n+                    retention_loop(&config)\n+                });\n+            })\n             .expect(\"failed to spawn retention/quota worker\")\n     });\n }\n@@ -305,8 +313,9 @@ fn count_old_messages(agents_dir: &Path, max_age_days: u64) -> u64 {\n         return 0;\n     }\n \n-    let cutoff =\n-        std::time::SystemTime::now() - std::time::Duration::from_secs(max_age_days * 86400);\n+    let cutoff = std::time::SystemTime::now()\n+        .checked_sub(std::time::Duration::from_secs(max_age_days.saturating_mul(86400)))\n+        .unwrap_or(std::time::UNIX_EPOCH);\n \n     let mut count = 0u64;\n     if let Ok(agents) = std::fs::read_dir(agents_dir) {"
+    },
+    {
+      "sha": "e1a5519441e21c61c90f380ec59d888f186dcdea",
+      "filename": "crates/mcp-agent-mail-server/src/tool_metrics.rs",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 1,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/19a7298b685842480665b68ba3240c354f810366/crates%2Fmcp-agent-mail-server%2Fsrc%2Ftool_metrics.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/19a7298b685842480665b68ba3240c354f810366/crates%2Fmcp-agent-mail-server%2Fsrc%2Ftool_metrics.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-server%2Fsrc%2Ftool_metrics.rs?ref=19a7298b685842480665b68ba3240c354f810366",
+      "patch": "@@ -61,7 +61,15 @@ pub fn start(config: &Config) {\n         SHUTDOWN.store(false, Ordering::Release);\n         std::thread::Builder::new()\n             .name(\"tool-metrics-emit\".into())\n-            .spawn(move || metrics_loop(&config))\n+            .spawn(move || {\n+                let rt = asupersync::runtime::RuntimeBuilder::new()\n+                    .worker_threads(1)\n+                    .build()\n+                    .expect(\"build tool-metrics runtime\");\n+                rt.block_on(async move {\n+                    metrics_loop(&config)\n+                });\n+            })\n             .expect(\"failed to spawn tool metrics emit worker\")\n     });\n }"
+    },
+    {
+      "sha": "dbddca4940b9773a914bc7e3286c95a1e1657f75",
+      "filename": "crates/mcp-agent-mail-server/src/tui_app.rs",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 6,
+      "changes": 14,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/19a7298b685842480665b68ba3240c354f810366/crates%2Fmcp-agent-mail-server%2Fsrc%2Ftui_app.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/19a7298b685842480665b68ba3240c354f810366/crates%2Fmcp-agent-mail-server%2Fsrc%2Ftui_app.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-server%2Fsrc%2Ftui_app.rs?ref=19a7298b685842480665b68ba3240c354f810366",
+      "patch": "@@ -33,7 +33,6 @@ use ftui_extras::clipboard::{Clipboard, ClipboardSelection};\n use ftui_extras::export::{HtmlExporter, SvgExporter, TextExporter};\n use ftui_extras::theme::ThemeId;\n use ftui_runtime::program::{Cmd, Model};\n-use mcp_agent_mail_db::sqlmodel_core::Value;\n use mcp_agent_mail_db::{DbConn, DbPoolConfig};\n \n use crate::tui_action_menu::{ActionKind, ActionMenuManager, ActionMenuResult};\n@@ -1508,11 +1507,8 @@ impl MailAppModel {\n             return;\n         };\n \n-        match mcp_agent_mail_db::sync::update_message_thread_id(\n-            &conn,\n-            message_id,\n-            target_thread_id,\n-        ) {\n+        match mcp_agent_mail_db::sync::update_message_thread_id(&conn, message_id, target_thread_id)\n+        {\n             Ok(true) => {\n                 self.record_action_outcome(ActionOutcome::Success {\n                     operation: \"rethread_message\".to_string(),\n@@ -3861,6 +3857,12 @@ impl Model for MailAppModel {\n             self.ambient_last_render_tick.set(Some(self.tick_count));\n             self.ambient_render_invocations\n                 .set(self.ambient_render_invocations.get().saturating_add(1));\n+        } else {\n+            self.ambient_renderer.borrow().render_cached(\n+                area,\n+                frame,\n+                self.ambient_mode_for_frame(),\n+            );\n         }\n         let chrome = tui_chrome::chrome_layout(area);\n         let active_screen = self.screen_manager.active_screen();"
+    },
+    {
+      "sha": "d166651f410f012d62da6f937e8008277b7030c4",
+      "filename": "crates/mcp-agent-mail-server/src/tui_poller.rs",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 1,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/19a7298b685842480665b68ba3240c354f810366/crates%2Fmcp-agent-mail-server%2Fsrc%2Ftui_poller.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/19a7298b685842480665b68ba3240c354f810366/crates%2Fmcp-agent-mail-server%2Fsrc%2Ftui_poller.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-server%2Fsrc%2Ftui_poller.rs?ref=19a7298b685842480665b68ba3240c354f810366",
+      "patch": "@@ -212,7 +212,15 @@ impl DbPoller {\n         let stop = Arc::clone(&self.stop);\n         let join = thread::Builder::new()\n             .name(\"tui-db-poller\".into())\n-            .spawn(move || self.run())\n+            .spawn(move || {\n+                let rt = asupersync::runtime::RuntimeBuilder::new()\n+                    .worker_threads(1)\n+                    .build()\n+                    .expect(\"build db poller runtime\");\n+                rt.block_on(async move {\n+                    self.run()\n+                });\n+            })\n             .expect(\"spawn tui-db-poller thread\");\n         DbPollerHandle {\n             join: Some(join),"
+    },
+    {
+      "sha": "d1fde5610eb324f9e7caa33ea71bb4b6597d2e5b",
+      "filename": "crates/mcp-agent-mail-server/src/tui_widgets.rs",
+      "status": "modified",
+      "additions": 21,
+      "deletions": 0,
+      "changes": 21,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/19a7298b685842480665b68ba3240c354f810366/crates%2Fmcp-agent-mail-server%2Fsrc%2Ftui_widgets.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/19a7298b685842480665b68ba3240c354f810366/crates%2Fmcp-agent-mail-server%2Fsrc%2Ftui_widgets.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-server%2Fsrc%2Ftui_widgets.rs?ref=19a7298b685842480665b68ba3240c354f810366",
+      "patch": "@@ -2193,6 +2193,27 @@ impl AmbientEffectRenderer {\n         )\n     }\n \n+    /// Composite the already-rendered background effect onto the frame\n+    /// without re-running the expensive simulation.\n+    pub fn render_cached(\n+        &self,\n+        area: Rect,\n+        frame: &mut Frame,\n+        mode: AmbientMode,\n+    ) {\n+        if area.is_empty() || !mode.is_enabled() {\n+            return;\n+        }\n+        let opacity = mode.effect_opacity();\n+        self.composite_halfblock(\n+            area,\n+            frame,\n+            opacity,\n+            self.last_telemetry.subpixel_width,\n+            self.last_telemetry.subpixel_height,\n+        );\n+    }\n+\n     #[allow(clippy::too_many_arguments)]\n     fn render_plasma(\n         &mut self,"
+    }
+  ]
+}

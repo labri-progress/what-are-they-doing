@@ -1,0 +1,41 @@
+{
+  "message": "fix(raptorq): dynamic symbol pool sizing and bench transport capacity\n\nTwo related fixes that prevent RaptorQ pipeline failures when encoding\nobjects whose source+repair symbol count exceeds the configured pool\nhint, plus release/bench profile optimization.\n\npipeline.rs:\n- SymbolPool max_size is now dynamically computed as the maximum of the\n  configured pool_size hint and the actual number of source + repair\n  symbols needed for the current object. Previously, max_size was set\n  to the static config hint, which caused pool exhaustion and silent\n  failures when encoding large objects with high repair overhead.\n- The computation uses div_ceil for source_count and adds repair_count\n  to get the true needed_symbols.\n\nbenches/phase0_baseline.rs:\n- Transport capacity (sim_channel buffer size) is now computed based on\n  the actual number of source + repair symbols with 25% headroom,\n  instead of using the default capacity. The benchmark sends all symbols\n  before the receiver reads, so the buffer must hold the full burst.\n- Adds a comment explaining why the capacity sizing is necessary.\n\nCargo.toml:\n- Add [profile.release]: opt-level 3, fat LTO, codegen-units 1, strip\n  symbols \u2014 maximizes binary performance and minimizes size for release\n  builds.\n- Add [profile.bench]: opt-level 3, thin LTO, codegen-units 1 \u2014 ensures\n  benchmarks run with representative optimization without the full cost\n  of fat LTO link times.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "278bb3f67fa76fb38b4836a85a8f713f32134596",
+      "filename": "Cargo.toml",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 0,
+      "changes": 11,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/2daba8b960838f1848afc0dc238fc10af461602e/Cargo.toml",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/2daba8b960838f1848afc0dc238fc10af461602e/Cargo.toml",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/Cargo.toml?ref=2daba8b960838f1848afc0dc238fc10af461602e",
+      "patch": "@@ -246,6 +246,17 @@ harness = false\n name = \"methodology_baselines\"\n harness = false\n \n+[profile.release]\n+opt-level = 3\n+lto = \"fat\"\n+codegen-units = 1\n+strip = \"symbols\"\n+\n+[profile.bench]\n+opt-level = 3\n+lto = \"thin\"\n+codegen-units = 1\n+\n [lints.rust]\n # Default to deny for unsafe code - specific modules that require it can use #[allow(unsafe_code)]\n # The epoll reactor requires unsafe for the polling crate's FFI operations"
+    },
+    {
+      "sha": "b4fe188cfb80ca9a2281612d18523de8ada53dba",
+      "filename": "benches/phase0_baseline.rs",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 1,
+      "changes": 12,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/2daba8b960838f1848afc0dc238fc10af461602e/benches%2Fphase0_baseline.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/2daba8b960838f1848afc0dc238fc10af461602e/benches%2Fphase0_baseline.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/benches%2Fphase0_baseline.rs?ref=2daba8b960838f1848afc0dc238fc10af461602e",
+      "patch": "@@ -434,10 +434,20 @@ fn bench_raptorq_pipeline(c: &mut Criterion) {\n             let config = raptorq_config_for_size(size);\n             let params = object_params_for(&config, size);\n             let object_id = params.object_id;\n+            // Transport capacity must hold all source + repair symbols since the\n+            // benchmark sends everything before the receiver starts reading.\n+            let symbol_size = config.encoding.symbol_size as usize;\n+            let source_symbols = size.div_ceil(symbol_size);\n+            #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]\n+            let total_with_overhead =\n+                (source_symbols as f64 * config.encoding.repair_overhead).ceil() as usize;\n+            let transport_capacity = total_with_overhead + total_with_overhead / 4; // 25% headroom\n \n             b.iter_batched(\n                 || {\n-                    let (sink, stream) = sim_channel(SimTransportConfig::reliable());\n+                    let mut transport_config = SimTransportConfig::reliable();\n+                    transport_config.capacity = transport_capacity;\n+                    let (sink, stream) = sim_channel(transport_config);\n                     let sender = RaptorQSenderBuilder::new()\n                         .config(config.clone())\n                         .transport(sink)"
+    },
+    {
+      "sha": "372d0c64e2eea78ec8411de709e7c137880e5590",
+      "filename": "src/raptorq/pipeline.rs",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 1,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/2daba8b960838f1848afc0dc238fc10af461602e/src%2Fraptorq%2Fpipeline.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/2daba8b960838f1848afc0dc238fc10af461602e/src%2Fraptorq%2Fpipeline.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fraptorq%2Fpipeline.rs?ref=2daba8b960838f1848afc0dc238fc10af461602e",
+      "patch": "@@ -98,10 +98,18 @@ impl<T: SymbolSink + Unpin> RaptorQSender<T> {\n             self.config.encoding.symbol_size as usize,\n             self.config.encoding.repair_overhead,\n         );\n+        // Pool max_size must accommodate all source + repair symbols for this\n+        // object. The configured pool_size is a hint for pre-allocation, but\n+        // the actual need depends on the data length.\n+        let source_count = data\n+            .len()\n+            .div_ceil(self.config.encoding.symbol_size as usize);\n+        let needed_symbols = source_count + repair_count;\n+        let pool_max = self.config.resources.symbol_pool_size.max(needed_symbols);\n         let pool = SymbolPool::new(PoolConfig {\n             symbol_size: self.config.encoding.symbol_size,\n             initial_size: self.config.resources.symbol_pool_size,\n-            max_size: self.config.resources.symbol_pool_size,\n+            max_size: pool_max,\n             allow_growth: true,\n             growth_increment: 64,\n         });"
+    }
+  ]
+}

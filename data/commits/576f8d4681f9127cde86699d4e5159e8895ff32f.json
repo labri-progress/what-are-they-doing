@@ -1,0 +1,113 @@
+{
+  "message": "Merge pull request #572 from ngutman/fix/mac-node-bridge-ping\n\nfix(macos): add node bridge ping loop (AI-assisted)",
+  "files": [
+    {
+      "sha": "43aff9bb670488cd5439bb50dbe6d59f5b44234a",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/576f8d4681f9127cde86699d4e5159e8895ff32f/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/576f8d4681f9127cde86699d4e5159e8895ff32f/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=576f8d4681f9127cde86699d4e5159e8895ff32f",
+      "patch": "@@ -2,6 +2,7 @@\n \n ## Unreleased\n \n+- macOS: add node bridge heartbeat pings to detect half-open sockets and reconnect cleanly. (#572) \u2014 thanks @ngutman\n - CLI: add `sandbox list` and `sandbox recreate` commands for managing Docker sandbox containers after image/config updates. (#563) \u2014 thanks @pasogott\n - Providers: add Microsoft Teams provider with polling, attachments, and CLI send support. (#404) \u2014 thanks @onutc\n - Commands: accept /models as an alias for /model."
+    },
+    {
+      "sha": "7c8f5ec7e5b1a62eb19730c3e5027c7fe1e97722",
+      "filename": "apps/macos/Sources/Clawdbot/NodeMode/MacNodeBridgeSession.swift",
+      "status": "modified",
+      "additions": 64,
+      "deletions": 1,
+      "changes": 65,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/576f8d4681f9127cde86699d4e5159e8895ff32f/apps%2Fmacos%2FSources%2FClawdbot%2FNodeMode%2FMacNodeBridgeSession.swift",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/576f8d4681f9127cde86699d4e5159e8895ff32f/apps%2Fmacos%2FSources%2FClawdbot%2FNodeMode%2FMacNodeBridgeSession.swift",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/apps%2Fmacos%2FSources%2FClawdbot%2FNodeMode%2FMacNodeBridgeSession.swift?ref=576f8d4681f9127cde86699d4e5159e8895ff32f",
+      "patch": "@@ -23,6 +23,9 @@ actor MacNodeBridgeSession {\n     private var buffer = Data()\n     private var pendingRPC: [String: CheckedContinuation<BridgeRPCResponse, Error>] = [:]\n     private var serverEventSubscribers: [UUID: AsyncStream<BridgeEventFrame>.Continuation] = [:]\n+    private var pingTask: Task<Void, Never>?\n+    private var lastPongAt: Date?\n+    private var lastPingId: String?\n \n     private(set) var state: State = .idle\n \n@@ -77,6 +80,7 @@ actor MacNodeBridgeSession {\n         if base.type == \"hello-ok\" {\n             let ok = try self.decoder.decode(BridgeHelloOk.self, from: data)\n             self.state = .connected(serverName: ok.serverName)\n+            self.startPingLoop()\n             await onConnected?(ok.serverName)\n         } else if base.type == \"error\" {\n             let err = try self.decoder.decode(BridgeErrorFrame.self, from: data)\n@@ -113,6 +117,10 @@ actor MacNodeBridgeSession {\n                 let ping = try self.decoder.decode(BridgePing.self, from: nextData)\n                 try await self.send(BridgePong(type: \"pong\", id: ping.id))\n \n+            case \"pong\":\n+                let pong = try self.decoder.decode(BridgePong.self, from: nextData)\n+                self.notePong(pong)\n+\n             case \"invoke\":\n                 let req = try self.decoder.decode(BridgeInvokeRequest.self, from: nextData)\n                 let res = await onInvoke(req)\n@@ -182,6 +190,11 @@ actor MacNodeBridgeSession {\n     }\n \n     func disconnect() async {\n+        self.pingTask?.cancel()\n+        self.pingTask = nil\n+        self.lastPongAt = nil\n+        self.lastPingId = nil\n+\n         self.connection?.cancel()\n         self.connection = nil\n         self.queue = nil\n@@ -239,12 +252,17 @@ actor MacNodeBridgeSession {\n     }\n \n     private func send(_ obj: some Encodable) async throws {\n+        guard let connection = self.connection else {\n+            throw NSError(domain: \"Bridge\", code: 15, userInfo: [\n+                NSLocalizedDescriptionKey: \"not connected\",\n+            ])\n+        }\n         let data = try self.encoder.encode(obj)\n         var line = Data()\n         line.append(data)\n         line.append(0x0A)\n         try await withCheckedThrowingContinuation(isolation: self) { (cont: CheckedContinuation<Void, Error>) in\n-            self.connection?.send(content: line, completion: .contentProcessed { err in\n+            connection.send(content: line, completion: .contentProcessed { err in\n                 if let err { cont.resume(throwing: err) } else { cont.resume(returning: ()) }\n             })\n         }\n@@ -280,6 +298,51 @@ actor MacNodeBridgeSession {\n         }\n     }\n \n+    private func startPingLoop() {\n+        self.pingTask?.cancel()\n+        self.lastPongAt = Date()\n+        self.pingTask = Task { [weak self] in\n+            guard let self else { return }\n+            await self.runPingLoop()\n+        }\n+    }\n+\n+    private func runPingLoop() async {\n+        let intervalSeconds = 15.0\n+        let timeoutSeconds = 45.0\n+\n+        while !Task.isCancelled {\n+            do {\n+                try await Task.sleep(nanoseconds: UInt64(intervalSeconds * 1_000_000_000))\n+            } catch {\n+                return\n+            }\n+\n+            guard self.connection != nil else { return }\n+\n+            if let last = self.lastPongAt,\n+               Date().timeIntervalSince(last) > timeoutSeconds\n+            {\n+                await self.disconnect()\n+                return\n+            }\n+\n+            let id = UUID().uuidString\n+            self.lastPingId = id\n+            do {\n+                try await self.send(BridgePing(type: \"ping\", id: id))\n+            } catch {\n+                await self.disconnect()\n+                return\n+            }\n+        }\n+    }\n+\n+    private func notePong(_ pong: BridgePong) {\n+        _ = pong\n+        self.lastPongAt = Date()\n+    }\n+\n     private static func makeStateStream(\n         for connection: NWConnection) -> AsyncStream<NWConnection.State>\n     {"
+    },
+    {
+      "sha": "f7521a66a048518e79365b4f968325d5e71de37b",
+      "filename": "apps/macos/Tests/ClawdbotIPCTests/MacNodeBridgeSessionTests.swift",
+      "status": "added",
+      "additions": 19,
+      "deletions": 0,
+      "changes": 19,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/576f8d4681f9127cde86699d4e5159e8895ff32f/apps%2Fmacos%2FTests%2FClawdbotIPCTests%2FMacNodeBridgeSessionTests.swift",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/576f8d4681f9127cde86699d4e5159e8895ff32f/apps%2Fmacos%2FTests%2FClawdbotIPCTests%2FMacNodeBridgeSessionTests.swift",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/apps%2Fmacos%2FTests%2FClawdbotIPCTests%2FMacNodeBridgeSessionTests.swift?ref=576f8d4681f9127cde86699d4e5159e8895ff32f",
+      "patch": "@@ -0,0 +1,19 @@\n+import Testing\n+@testable import Clawdbot\n+\n+@Suite\n+struct MacNodeBridgeSessionTests {\n+    @Test func sendEventThrowsWhenNotConnected() async {\n+        let session = MacNodeBridgeSession()\n+\n+        do {\n+            try await session.sendEvent(event: \"test\", payloadJSON: \"{}\")\n+            Issue.record(\"Expected sendEvent to throw when disconnected\")\n+        } catch {\n+            let ns = error as NSError\n+            #expect(ns.domain == \"Bridge\")\n+            #expect(ns.code == 15)\n+        }\n+    }\n+}\n+"
+    },
+    {
+      "sha": "8bde6b319a1fbef087563c1cafc0acdf006196e0",
+      "filename": "src/cli/gateway-cli.ts",
+      "status": "modified",
+      "additions": 17,
+      "deletions": 8,
+      "changes": 25,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/576f8d4681f9127cde86699d4e5159e8895ff32f/src%2Fcli%2Fgateway-cli.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/576f8d4681f9127cde86699d4e5159e8895ff32f/src%2Fcli%2Fgateway-cli.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fcli%2Fgateway-cli.ts?ref=576f8d4681f9127cde86699d4e5159e8895ff32f",
+      "patch": "@@ -179,14 +179,23 @@ async function ensureDevGatewayConfig(opts: { reset?: boolean }) {\n       mode: \"local\",\n       bind: \"loopback\",\n     },\n-    agent: {\n-      workspace,\n-      skipBootstrap: true,\n-    },\n-    identity: {\n-      name: DEV_IDENTITY_NAME,\n-      theme: DEV_IDENTITY_THEME,\n-      emoji: DEV_IDENTITY_EMOJI,\n+    agents: {\n+      defaults: {\n+        workspace,\n+        skipBootstrap: true,\n+      },\n+      list: [\n+        {\n+          id: \"dev\",\n+          default: true,\n+          workspace,\n+          identity: {\n+            name: DEV_IDENTITY_NAME,\n+            theme: DEV_IDENTITY_THEME,\n+            emoji: DEV_IDENTITY_EMOJI,\n+          },\n+        },\n+      ],\n     },\n   });\n   await ensureDevWorkspace(workspace);"
+    },
+    {
+      "sha": "25753bb915d5ca33e3b5920aba55d3ef46fd39f8",
+      "filename": "src/commands/doctor.test.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/576f8d4681f9127cde86699d4e5159e8895ff32f/src%2Fcommands%2Fdoctor.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/576f8d4681f9127cde86699d4e5159e8895ff32f/src%2Fcommands%2Fdoctor.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fcommands%2Fdoctor.test.ts?ref=576f8d4681f9127cde86699d4e5159e8895ff32f",
+      "patch": "@@ -278,7 +278,7 @@ describe(\"doctor\", () => {\n       changes: [\"Moved routing.allowFrom \u2192 whatsapp.allowFrom.\"],\n     });\n \n-    await doctorCommand(runtime);\n+    await doctorCommand(runtime, { nonInteractive: true });\n \n     expect(writeConfigFile).toHaveBeenCalledTimes(1);\n     const written = writeConfigFile.mock.calls[0]?.[0] as Record<"
+    },
+    {
+      "sha": "f26bc61bbdbf697303e940752683c17d4574b3dd",
+      "filename": "src/commands/doctor.ts",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 4,
+      "changes": 11,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/576f8d4681f9127cde86699d4e5159e8895ff32f/src%2Fcommands%2Fdoctor.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/576f8d4681f9127cde86699d4e5159e8895ff32f/src%2Fcommands%2Fdoctor.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fcommands%2Fdoctor.ts?ref=576f8d4681f9127cde86699d4e5159e8895ff32f",
+      "patch": "@@ -114,10 +114,13 @@ export async function doctorCommand(\n         .join(\"\\n\"),\n       \"Legacy config keys detected\",\n     );\n-    const migrate = await prompter.confirm({\n-      message: \"Migrate legacy config entries now?\",\n-      initialValue: true,\n-    });\n+    const migrate =\n+      options.nonInteractive === true\n+        ? true\n+        : await prompter.confirm({\n+            message: \"Migrate legacy config entries now?\",\n+            initialValue: true,\n+          });\n     if (migrate) {\n       // Legacy migration (2026-01-02, commit: 16420e5b) \u2014 normalize per-provider allowlists; move WhatsApp gating into whatsapp.allowFrom.\n       const { config: migrated, changes } = migrateLegacyConfig("
+    },
+    {
+      "sha": "37c4ce95cc5d3fe2413fcba6cc9db1c4909a898b",
+      "filename": "src/commands/onboard-auth.ts",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 15,
+      "changes": 30,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/576f8d4681f9127cde86699d4e5159e8895ff32f/src%2Fcommands%2Fonboard-auth.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/576f8d4681f9127cde86699d4e5159e8895ff32f/src%2Fcommands%2Fonboard-auth.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fcommands%2Fonboard-auth.ts?ref=576f8d4681f9127cde86699d4e5159e8895ff32f",
+      "patch": "@@ -170,7 +170,7 @@ export function applyMinimaxHostedProviderConfig(\n   cfg: ClawdbotConfig,\n   params?: { baseUrl?: string },\n ): ClawdbotConfig {\n-  const models = { ...cfg.agent?.models };\n+  const models = { ...cfg.agents?.defaults?.models };\n   models[MINIMAX_HOSTED_MODEL_REF] = {\n     ...models[MINIMAX_HOSTED_MODEL_REF],\n     alias: models[MINIMAX_HOSTED_MODEL_REF]?.alias ?? \"Minimax\",\n@@ -206,9 +206,12 @@ export function applyMinimaxHostedProviderConfig(\n \n   return {\n     ...cfg,\n-    agent: {\n-      ...cfg.agent,\n-      models,\n+    agents: {\n+      ...cfg.agents,\n+      defaults: {\n+        ...cfg.agents?.defaults,\n+        models,\n+      },\n     },\n     models: {\n       mode: cfg.models?.mode ?? \"merge\",\n@@ -248,17 +251,14 @@ export function applyMinimaxHostedConfig(\n   const next = applyMinimaxHostedProviderConfig(cfg, params);\n   return {\n     ...next,\n-    agent: {\n-      ...next.agent,\n-      model: {\n-        ...(next.agent?.model &&\n-        \"fallbacks\" in (next.agent.model as Record<string, unknown>)\n-          ? {\n-              fallbacks: (next.agent.model as { fallbacks?: string[] })\n-                .fallbacks,\n-            }\n-          : undefined),\n-        primary: MINIMAX_HOSTED_MODEL_REF,\n+    agents: {\n+      ...next.agents,\n+      defaults: {\n+        ...next.agents?.defaults,\n+        model: {\n+          ...(next.agents?.defaults?.model ?? {}),\n+          primary: MINIMAX_HOSTED_MODEL_REF,\n+        },\n       },\n     },\n   };"
+    },
+    {
+      "sha": "0b3ab55da296db16a46b0ec6846974beb35c727e",
+      "filename": "src/config/types.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/576f8d4681f9127cde86699d4e5159e8895ff32f/src%2Fconfig%2Ftypes.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/576f8d4681f9127cde86699d4e5159e8895ff32f/src%2Fconfig%2Ftypes.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fconfig%2Ftypes.ts?ref=576f8d4681f9127cde86699d4e5159e8895ff32f",
+      "patch": "@@ -1211,6 +1211,7 @@ export type AgentDefaultsConfig = {\n       | \"slack\"\n       | \"signal\"\n       | \"imessage\"\n+      | \"msteams\"\n       | \"none\";\n     /** Optional delivery override (E.164 for WhatsApp, chat id for Telegram). */\n     to?: string;"
+    },
+    {
+      "sha": "c9bf23bf2397e31373fac91348ce23e85a94d80a",
+      "filename": "src/msteams/monitor.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 2,
+      "changes": 5,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/576f8d4681f9127cde86699d4e5159e8895ff32f/src%2Fmsteams%2Fmonitor.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/576f8d4681f9127cde86699d4e5159e8895ff32f/src%2Fmsteams%2Fmonitor.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fmsteams%2Fmonitor.ts?ref=576f8d4681f9127cde86699d4e5159e8895ff32f",
+      "patch": "@@ -56,8 +56,9 @@ export async function monitorMSTeamsProvider(\n   const textLimit = resolveTextChunkLimit(cfg, \"msteams\");\n   const MB = 1024 * 1024;\n   const mediaMaxBytes =\n-    typeof cfg.agent?.mediaMaxMb === \"number\" && cfg.agent.mediaMaxMb > 0\n-      ? Math.floor(cfg.agent.mediaMaxMb * MB)\n+    typeof cfg.agents?.defaults?.mediaMaxMb === \"number\" &&\n+    cfg.agents.defaults.mediaMaxMb > 0\n+      ? Math.floor(cfg.agents.defaults.mediaMaxMb * MB)\n       : 8 * MB;\n   const conversationStore =\n     opts.conversationStore ?? createMSTeamsConversationStoreFs();"
+    }
+  ]
+}

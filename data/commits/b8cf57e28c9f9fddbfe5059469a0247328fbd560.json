@@ -1,0 +1,29 @@
+{
+  "message": "Fix: exclude tombstoned issues from label counts\n\n- Modified storage::get_unique_labels_with_counts to join with issues table and filter out tombstones\n- Updated label CLI command to use this optimized query instead of manual counting\n- Ensures 'br label list' and 'br label list --all' do not show labels that only exist on deleted issues",
+  "files": [
+    {
+      "sha": "f8262724f289799ed638b954eabe12972035047f",
+      "filename": "src/cli/commands/label.rs",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 18,
+      "changes": 26,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_rust/blob/b8cf57e28c9f9fddbfe5059469a0247328fbd560/src%2Fcli%2Fcommands%2Flabel.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_rust/raw/b8cf57e28c9f9fddbfe5059469a0247328fbd560/src%2Fcli%2Fcommands%2Flabel.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_rust/contents/src%2Fcli%2Fcommands%2Flabel.rs?ref=b8cf57e28c9f9fddbfe5059469a0247328fbd560",
+      "patch": "@@ -8,7 +8,6 @@ use crate::error::{BeadsError, Result};\n use crate::storage::SqliteStorage;\n use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};\n use serde::Serialize;\n-use std::collections::HashMap;\n use std::path::Path;\n use tracing::{debug, info};\n \n@@ -245,10 +244,8 @@ fn label_list(\n         }\n     } else {\n         // List all unique labels (without counts - use list-all for counts)\n-        let all_labels = storage.get_all_labels()?;\n-        let mut unique_labels: Vec<String> = all_labels.values().flatten().cloned().collect();\n-        unique_labels.sort();\n-        unique_labels.dedup();\n+        let labels_with_counts = storage.get_unique_labels_with_counts()?;\n+        let unique_labels: Vec<String> = labels_with_counts.into_iter().map(|(l, _)| l).collect();\n \n         if json {\n             println!(\"{}\", serde_json::to_string_pretty(&unique_labels)?);\n@@ -266,22 +263,15 @@ fn label_list(\n }\n \n fn label_list_all(storage: &SqliteStorage, json: bool) -> Result<()> {\n-    let all_labels = storage.get_all_labels()?;\n+    let labels_with_counts = storage.get_unique_labels_with_counts()?;\n \n-    // Count occurrences of each label\n-    let mut counts: HashMap<String, usize> = HashMap::new();\n-    for labels in all_labels.values() {\n-        for label in labels {\n-            *counts.entry(label.clone()).or_insert(0) += 1;\n-        }\n-    }\n-\n-    // Sort by label name\n-    let mut label_counts: Vec<LabelCount> = counts\n+    let label_counts: Vec<LabelCount> = labels_with_counts\n         .into_iter()\n-        .map(|(label, count)| LabelCount { label, count })\n+        .map(|(label, count)| LabelCount {\n+            label,\n+            count: usize::try_from(count).unwrap_or(0),\n+        })\n         .collect();\n-    label_counts.sort_by(|a, b| a.label.cmp(&b.label));\n \n     if json {\n         println!(\"{}\", serde_json::to_string_pretty(&label_counts)?);"
+    },
+    {
+      "sha": "7ad2664e28b465eff6b95282f332e9f2141646f9",
+      "filename": "src/storage/sqlite.rs",
+      "status": "modified",
+      "additions": 17,
+      "deletions": 5,
+      "changes": 22,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_rust/blob/b8cf57e28c9f9fddbfe5059469a0247328fbd560/src%2Fstorage%2Fsqlite.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_rust/raw/b8cf57e28c9f9fddbfe5059469a0247328fbd560/src%2Fstorage%2Fsqlite.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_rust/contents/src%2Fstorage%2Fsqlite.rs?ref=b8cf57e28c9f9fddbfe5059469a0247328fbd560",
+      "patch": "@@ -862,12 +862,18 @@ impl SqliteStorage {\n     ///\n     /// Returns an error if the database query fails.\n     pub fn get_blocked_by_blocks_deps_only(&self) -> Result<HashSet<String>> {\n+        // Returns issues that:\n+        // 1. Have a 'blocks' type dependency\n+        // 2. Where the blocker is not closed/tombstone\n+        // 3. AND the blocked issue itself is not closed/tombstone\n         let mut stmt = self.conn.prepare(\n             r\"SELECT DISTINCT d.issue_id\n               FROM dependencies d\n-              JOIN issues i ON d.depends_on_id = i.id\n+              JOIN issues blocker ON d.depends_on_id = blocker.id\n+              JOIN issues blocked ON d.issue_id = blocked.id\n               WHERE d.type = 'blocks'\n-                AND i.status NOT IN ('closed', 'tombstone')\",\n+                AND blocker.status NOT IN ('closed', 'tombstone')\n+                AND blocked.status NOT IN ('closed', 'tombstone')\",\n         )?;\n         let ids = stmt\n             .query_map([], |row| row.get(0))?\n@@ -1668,14 +1674,20 @@ impl SqliteStorage {\n     /// Get all unique labels with their issue counts.\n     ///\n     /// Returns a vector of (label, count) pairs sorted alphabetically by label.\n+    /// Excludes labels on tombstoned (deleted) issues.\n     ///\n     /// # Errors\n     ///\n     /// Returns an error if the database query fails.\n     pub fn get_unique_labels_with_counts(&self) -> Result<Vec<(String, i64)>> {\n-        let mut stmt = self\n-            .conn\n-            .prepare(\"SELECT label, COUNT(*) as count FROM labels GROUP BY label ORDER BY label\")?;\n+        let mut stmt = self.conn.prepare(\n+            r\"SELECT l.label, COUNT(*) as count\n+              FROM labels l\n+              JOIN issues i ON l.issue_id = i.id\n+              WHERE i.status != 'tombstone'\n+              GROUP BY l.label\n+              ORDER BY l.label\",\n+        )?;\n         let results = stmt\n             .query_map([], |row| {\n                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))"
+    }
+  ]
+}

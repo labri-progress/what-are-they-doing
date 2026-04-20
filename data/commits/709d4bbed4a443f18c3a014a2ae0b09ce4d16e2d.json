@@ -1,0 +1,29 @@
+{
+  "message": "fix(bulkhead): cap release_permit at max_concurrent via CAS loop\n\nrelease_permit() previously used a simple fetch_add which could inflate\navailable_permits above max_concurrent when permits were released after\na reset(). Changed to a CAS loop that caps at policy.max_concurrent.\n\nAlso added cancel-safety documentation to bracket_move warning that it\nlacks a Drop handler (unlike Bracket) so release work is abandoned on\ndrop.\n\nIncludes regression test release_after_reset_does_not_exceed_max_concurrent.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "ffda624385cb36576789ce7f759d0104d186c28f",
+      "filename": "src/combinator/bracket.rs",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 1,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/709d4bbed4a443f18c3a014a2ae0b09ce4d16e2d/src%2Fcombinator%2Fbracket.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/709d4bbed4a443f18c3a014a2ae0b09ce4d16e2d/src%2Fcombinator%2Fbracket.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fcombinator%2Fbracket.rs?ref=709d4bbed4a443f18c3a014a2ae0b09ce4d16e2d",
+      "patch": "@@ -308,7 +308,14 @@ where\n /// A simpler bracket that doesn't require Clone on the resource.\n ///\n /// The release function receives an `Option<Res>` which is `Some` if the\n-/// use function consumed the resource, `None` otherwise.\n+/// use function returned it, `None` if the use function consumed it or panicked.\n+///\n+/// # Cancel Safety \u2014 WEAKER than `Bracket`\n+///\n+/// Unlike [`Bracket`], this function is a plain `async fn` with no `Drop`\n+/// handler. If the returned future is dropped during `release().await`,\n+/// the release work is abandoned. Use [`bracket`] (which requires `Res: Clone`)\n+/// for full cancel-safe resource cleanup.\n pub async fn bracket_move<Res, T, E, A, U, R, RF>(acquire: A, use_fn: U, release: R) -> Result<T, E>\n where\n     A: Future<Output = Result<Res, E>>,"
+    },
+    {
+      "sha": "c98d94c87f1f0484df3fe5901e1d30f7fc2f4d5a",
+      "filename": "src/combinator/bulkhead.rs",
+      "status": "modified",
+      "additions": 64,
+      "deletions": 1,
+      "changes": 65,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/709d4bbed4a443f18c3a014a2ae0b09ce4d16e2d/src%2Fcombinator%2Fbulkhead.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/709d4bbed4a443f18c3a014a2ae0b09ce4d16e2d/src%2Fcombinator%2Fbulkhead.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fcombinator%2Fbulkhead.rs?ref=709d4bbed4a443f18c3a014a2ae0b09ce4d16e2d",
+      "patch": "@@ -448,8 +448,25 @@ impl Bulkhead {\n     }\n \n     /// Release permit (internal use - prefer RAII via permit).\n+    ///\n+    /// Uses a CAS loop to cap `available_permits` at `max_concurrent`,\n+    /// preventing overflow if permits are released after a `reset()`.\n     fn release_permit(&self, weight: u32) {\n-        self.available_permits.fetch_add(weight, Ordering::SeqCst);\n+        let max = self.policy.max_concurrent;\n+        loop {\n+            let current = self.available_permits.load(Ordering::SeqCst);\n+            let new = current.saturating_add(weight).min(max);\n+            if new == current {\n+                break;\n+            }\n+            if self\n+                .available_permits\n+                .compare_exchange(current, new, Ordering::SeqCst, Ordering::SeqCst)\n+                .is_ok()\n+            {\n+                break;\n+            }\n+        }\n     }\n \n     /// Execute an operation with bulkhead protection (synchronous, immediate).\n@@ -1332,4 +1349,50 @@ mod tests {\n \n         assert_eq!(bh.available(), 10);\n     }\n+\n+    #[test]\n+    fn release_after_reset_does_not_exceed_max_concurrent() {\n+        let bh = Bulkhead::new(BulkheadPolicy {\n+            max_concurrent: 10,\n+            ..Default::default()\n+        });\n+\n+        // Acquire permits\n+        let p1 = bh.try_acquire(5).unwrap();\n+        let p2 = bh.try_acquire(3).unwrap();\n+        assert_eq!(bh.available(), 2);\n+\n+        // Reset while permits outstanding\n+        bh.reset();\n+        assert_eq!(bh.available(), 10);\n+\n+        // Release pre-reset permits \u2014 must NOT exceed max_concurrent\n+        p1.release_to(&bh);\n+        assert_eq!(\n+            bh.available(),\n+            10,\n+            \"available_permits must be capped at max_concurrent after reset + release\"\n+        );\n+\n+        p2.release_to(&bh);\n+        assert_eq!(\n+            bh.available(),\n+            10,\n+            \"available_permits must still be capped after second release\"\n+        );\n+\n+        // Core invariant: must not grant more than max_concurrent permits\n+        let mut permits: Vec<BulkheadPermit> = Vec::new();\n+        for _ in 0..10 {\n+            permits.push(bh.try_acquire(1).unwrap());\n+        }\n+        assert!(\n+            bh.try_acquire(1).is_none(),\n+            \"must reject 11th permit even after reset + release\"\n+        );\n+\n+        for p in permits {\n+            p.release_to(&bh);\n+        }\n+    }\n }"
+    }
+  ]
+}

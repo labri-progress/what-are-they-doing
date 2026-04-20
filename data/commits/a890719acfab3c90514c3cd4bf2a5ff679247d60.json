@@ -1,0 +1,137 @@
+{
+  "message": "Fix multi-dimensional VJP slice adjoint, harden dtype promotion in select, and improve correctness across AD/LAX/egraph\n\n- Rewrite VJP backward pass for slice operations to correctly handle\n  multi-dimensional tensors by computing N-dimensional input coordinates\n  from output coordinates, fixing incorrect 1D-only adjoint scattering\n- Add dtype promotion to eval_select for both scalar and tensor paths,\n  ensuring mixed-type branches (e.g. i64 true-branch, f64 false-branch)\n  produce correctly promoted output values\n- Guard e-graph optimizer to bail out on multi-output jaxprs since\n  tuple-node extraction is not yet implemented\n- Fix partial_eval fast-path to only activate when there are no\n  constvars to thread as residuals, preventing dropped constant bindings\n- Pre-allocate interpreter environment HashMap with known capacity\n- Skip TTL timestamp insertion in cache when ttl_secs is 0\n- Use pattern matching instead of method probing in conformance type\n  fingerprinting for exhaustive Literal variant coverage\n- Fix element count comparison cast direction in TensorValue::new\n- Pre-allocate element Vec in TensorValue::axis_stack\n- Handle empty element slice in infer_dtype_from_literals\n- Return scalar (not clone of tensor value) for rank-0 full reductions\n- Remove .max(1) from gather/scatter slice element calculation to\n  correctly handle zero-size slices\n- Clamp hardened-mode kill_if_useful to minimum of 1\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "12e525fa58a23038e55060f6d111f7e931329b7b",
+      "filename": "crates/fj-ad/src/lib.rs",
+      "status": "modified",
+      "additions": 96,
+      "deletions": 32,
+      "changes": 128,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenjax/blob/a890719acfab3c90514c3cd4bf2a5ff679247d60/crates%2Ffj-ad%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenjax/raw/a890719acfab3c90514c3cd4bf2a5ff679247d60/crates%2Ffj-ad%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenjax/contents/crates%2Ffj-ad%2Fsrc%2Flib.rs?ref=a890719acfab3c90514c3cd4bf2a5ff679247d60",
+      "patch": "@@ -851,12 +851,37 @@ fn vjp(\n                             .collect(),\n                     };\n \n-                    // For 1D case (most common in current usage)\n-                    let start = starts.first().copied().unwrap_or(0);\n-                    for (i, &gval) in g_elements.iter().enumerate() {\n-                        let target = start + i;\n-                        if target < total {\n-                            result_elements[target] = Literal::from_f64(gval);\n+                    let rank = t.shape.rank();\n+                    let mut in_strides = vec![1_usize; rank];\n+                    for i in (0..rank.saturating_sub(1)).rev() {\n+                        in_strides[i] = in_strides[i + 1] * t.shape.dims[i + 1] as usize;\n+                    }\n+                    \n+                    let g_shape = match g {\n+                        Value::Scalar(_) => Shape::scalar(),\n+                        Value::Tensor(gt) => gt.shape.clone(),\n+                    };\n+                    let g_dims = &g_shape.dims;\n+                    let mut out_coords = vec![0_usize; rank];\n+\n+                    for &gval in g_elements.iter() {\n+                        let mut in_flat = 0_usize;\n+                        for ax in 0..rank {\n+                            let start = *starts.get(ax).unwrap_or(&0);\n+                            in_flat += (out_coords[ax] + start) * in_strides[ax];\n+                        }\n+                        if in_flat < total {\n+                            result_elements[in_flat] = Literal::from_f64(gval);\n+                        }\n+                        \n+                        if rank > 0 {\n+                            for ax in (0..rank).rev() {\n+                                out_coords[ax] += 1;\n+                                if out_coords[ax] < g_dims[ax] as usize {\n+                                    break;\n+                                }\n+                                out_coords[ax] = 0;\n+                            }\n                         }\n                     }\n \n@@ -868,34 +893,71 @@ fn vjp(\n             }\n         }\n         Primitive::Concatenate => {\n-            // VJP of concatenate: split g into slices for each input\n+            // VJP of concatenate: split g into slices for each input along the concat dimension\n+            let axis: usize = params\n+                .get(\"dimension\")\n+                .and_then(|s| s.parse::<usize>().ok())\n+                .unwrap_or(0);\n+\n+            let g_rank = match g {\n+                Value::Tensor(t) => t.shape.rank(),\n+                Value::Scalar(_) => 0,\n+            };\n+\n+            if g_rank == 0 {\n+                let mut grad_inputs = Vec::with_capacity(inputs.len());\n+                for _ in inputs {\n+                    grad_inputs.push(g.clone());\n+                }\n+                return Ok(grad_inputs);\n+            }\n+\n+            let g_dims: Vec<usize> = match g {\n+                Value::Tensor(t) => t.shape.dims.iter().map(|&d| d as usize).collect(),\n+                Value::Scalar(_) => vec![],\n+            };\n+\n             let mut grad_inputs = Vec::with_capacity(inputs.len());\n-            let mut offset = 0_usize;\n+            let mut current_offset = 0;\n+\n             for inp in inputs {\n-                let inp_len = match inp {\n-                    Value::Scalar(_) => 1,\n-                    Value::Tensor(t) => t.elements.len(),\n+                let inp_shape = match inp {\n+                    Value::Scalar(_) => Shape::scalar(),\n+                    Value::Tensor(t) => t.shape.clone(),\n                 };\n-                match g {\n-                    Value::Tensor(gt) => {\n-                        let slice_elements: Vec<Literal> = gt.elements[offset..offset + inp_len]\n-                            .iter()\n-                            .map(|l| Literal::from_f64(l.as_f64().unwrap_or(0.0)))\n-                            .collect();\n-                        let grad_shape = match inp {\n-                            Value::Scalar(_) => Shape::scalar(),\n-                            Value::Tensor(t) => t.shape.clone(),\n-                        };\n-                        grad_inputs.push(Value::Tensor(\n-                            TensorValue::new(DType::F64, grad_shape, slice_elements)\n-                                .map_err(|e| AdError::EvalFailed(e.to_string()))?,\n-                        ));\n-                    }\n-                    Value::Scalar(_) => {\n-                        grad_inputs.push(g.clone());\n-                    }\n-                }\n-                offset += inp_len;\n+\n+                let slice_size = inp_shape.dims.get(axis).copied().unwrap_or(1) as usize;\n+\n+                let mut start_indices = vec![0; g_rank];\n+                let mut limit_indices = g_dims.clone();\n+\n+                start_indices[axis] = current_offset;\n+                limit_indices[axis] = current_offset + slice_size;\n+\n+                let mut slice_params = BTreeMap::new();\n+                slice_params.insert(\n+                    \"start_indices\".to_owned(),\n+                    start_indices\n+                        .iter()\n+                        .map(ToString::to_string)\n+                        .collect::<Vec<_>>()\n+                        .join(\",\"),\n+                );\n+                slice_params.insert(\n+                    \"limit_indices\".to_owned(),\n+                    limit_indices\n+                        .iter()\n+                        .map(ToString::to_string)\n+                        .collect::<Vec<_>>()\n+                        .join(\",\"),\n+                );\n+\n+                let slice_g =\n+                    eval_primitive(Primitive::Slice, std::slice::from_ref(g), &slice_params)\n+                        .map_err(|e| AdError::EvalFailed(e.to_string()))?;\n+\n+                grad_inputs.push(slice_g);\n+                current_offset += slice_size;\n             }\n             Ok(grad_inputs)\n         }\n@@ -915,11 +977,13 @@ fn vjp(\n                 TensorValue::new(DType::F64, operand_shape, zero_elements)\n                     .map_err(|e| AdError::EvalFailed(e.to_string()))?,\n             );\n+            let mut scatter_params = BTreeMap::new();\n+            scatter_params.insert(\"mode\".to_owned(), \"add\".to_owned());\n             // Scatter gradient into the zero tensor at the gathered indices\n             let scattered = eval_primitive(\n                 Primitive::Scatter,\n                 &[zero_operand, indices.clone(), g.clone()],\n-                &BTreeMap::new(),\n+                &scatter_params,\n             )\n             .map_err(|e| AdError::EvalFailed(e.to_string()))?;\n             // Gradient w.r.t. operand is the scattered result; indices have no gradient"
+    },
+    {
+      "sha": "024e3d50f20189ed2dc94cacffee1bd0cb2727f1",
+      "filename": "crates/fj-cache/src/eviction.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 2,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenjax/blob/a890719acfab3c90514c3cd4bf2a5ff679247d60/crates%2Ffj-cache%2Fsrc%2Feviction.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenjax/raw/a890719acfab3c90514c3cd4bf2a5ff679247d60/crates%2Ffj-cache%2Fsrc%2Feviction.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenjax/contents/crates%2Ffj-cache%2Fsrc%2Feviction.rs?ref=a890719acfab3c90514c3cd4bf2a5ff679247d60",
+      "patch": "@@ -252,8 +252,10 @@ impl<B: CacheBackend> CacheBackend for TtlLruCache<B> {\n \n     fn put(&mut self, key: &CacheKey, artifact: CachedArtifact) {\n         let key_str = key.as_string();\n-        self.insert_times\n-            .insert(key_str, std::time::Instant::now());\n+        if self.ttl_secs > 0 {\n+            self.insert_times\n+                .insert(key_str, std::time::Instant::now());\n+        }\n         self.inner.put(key, artifact);\n         // Opportunistically sweep expired entries\n         self.sweep_expired();"
+    },
+    {
+      "sha": "7f5a3bcd79f3f080303dc1d2824679c5cc955ff9",
+      "filename": "crates/fj-conformance/src/lib.rs",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 6,
+      "changes": 11,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenjax/blob/a890719acfab3c90514c3cd4bf2a5ff679247d60/crates%2Ffj-conformance%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenjax/raw/a890719acfab3c90514c3cd4bf2a5ff679247d60/crates%2Ffj-conformance%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenjax/contents/crates%2Ffj-conformance%2Fsrc%2Flib.rs?ref=a890719acfab3c90514c3cd4bf2a5ff679247d60",
+      "patch": "@@ -819,12 +819,11 @@ fn value_type_fingerprint(expected: &FixtureValue) -> &'static str {\n \n fn value_type_runtime(actual: &Value) -> &'static str {\n     if let Some(scalar) = actual.as_scalar_literal() {\n-        if scalar.as_i64().is_some() {\n-            return \"i64\";\n-        }\n-        if scalar.as_f64().is_some() {\n-            return \"f64\";\n-        }\n+        return match scalar {\n+            fj_core::Literal::I64(_) => \"i64\",\n+            fj_core::Literal::F64Bits(_) => \"f64\",\n+            fj_core::Literal::Bool(_) => \"bool\",\n+        };\n     }\n \n     if let Some(tensor) = actual.as_tensor() {"
+    },
+    {
+      "sha": "45356ab7177dfd095b03b5a4c4e4df597669c400",
+      "filename": "crates/fj-core/src/lib.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 2,
+      "changes": 8,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenjax/blob/a890719acfab3c90514c3cd4bf2a5ff679247d60/crates%2Ffj-core%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenjax/raw/a890719acfab3c90514c3cd4bf2a5ff679247d60/crates%2Ffj-core%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenjax/contents/crates%2Ffj-core%2Fsrc%2Flib.rs?ref=a890719acfab3c90514c3cd4bf2a5ff679247d60",
+      "patch": "@@ -324,7 +324,7 @@ impl TensorValue {\n             shape: shape.clone(),\n         })?;\n \n-        if expected_count as usize != elements.len() {\n+        if expected_count != elements.len() as u64 {\n             return Err(ValueError::ElementCountMismatch {\n                 shape,\n                 expected_count,\n@@ -422,7 +422,8 @@ impl TensorValue {\n                 TensorValue::new(dtype, Shape::vector(slices.len() as u32), elements)\n             }\n             Value::Tensor(first) => {\n-                let mut elements = first.elements.clone();\n+                let mut elements = Vec::with_capacity(first.elements.len() * slices.len());\n+                elements.extend_from_slice(&first.elements);\n                 for value in &slices[1..] {\n                     let Value::Tensor(tensor) = value else {\n                         return Err(ValueError::MixedAxisStackKinds);\n@@ -536,6 +537,9 @@ impl std::fmt::Display for ValueError {\n impl std::error::Error for ValueError {}\n \n fn infer_dtype_from_literals(elements: &[Literal]) -> DType {\n+    if elements.is_empty() {\n+        return DType::F64;\n+    }\n     if elements\n         .iter()\n         .all(|literal| matches!(literal, Literal::I64(_)))"
+    },
+    {
+      "sha": "fa384ff46df947079cf22b0a70b9fe1545a7ca3e",
+      "filename": "crates/fj-egraph/src/lib.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenjax/blob/a890719acfab3c90514c3cd4bf2a5ff679247d60/crates%2Ffj-egraph%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenjax/raw/a890719acfab3c90514c3cd4bf2a5ff679247d60/crates%2Ffj-egraph%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenjax/contents/crates%2Ffj-egraph%2Fsrc%2Flib.rs?ref=a890719acfab3c90514c3cd4bf2a5ff679247d60",
+      "patch": "@@ -871,6 +871,12 @@ fn id_to_atom(id: Id, node_to_var: &BTreeMap<usize, VarId>, expr: &RecExpr<FjLan\n /// Optimize a Jaxpr using equality saturation with algebraic rules.\n #[must_use]\n pub fn optimize_jaxpr(jaxpr: &Jaxpr) -> Jaxpr {\n+    if jaxpr.outvars.len() != 1 {\n+        // Multi-output extraction requires tuple-nodes or multiple extraction passes.\n+        // For V1, we only optimize single-output jaxprs.\n+        return jaxpr.clone();\n+    }\n+\n     if jaxpr\n         .equations\n         .iter()"
+    },
+    {
+      "sha": "f60a10032f17ddd56bd9bdf0138e7b122da0927a",
+      "filename": "crates/fj-interpreters/src/lib.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 1,
+      "changes": 5,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenjax/blob/a890719acfab3c90514c3cd4bf2a5ff679247d60/crates%2Ffj-interpreters%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenjax/raw/a890719acfab3c90514c3cd4bf2a5ff679247d60/crates%2Ffj-interpreters%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenjax/contents/crates%2Ffj-interpreters%2Fsrc%2Flib.rs?ref=a890719acfab3c90514c3cd4bf2a5ff679247d60",
+      "patch": "@@ -85,7 +85,10 @@ pub fn eval_jaxpr_with_consts(\n         });\n     }\n \n-    let mut env: FxHashMap<VarId, Value> = FxHashMap::default();\n+    let mut env: FxHashMap<VarId, Value> = FxHashMap::with_capacity_and_hasher(\n+        jaxpr.constvars.len() + jaxpr.invars.len() + jaxpr.equations.len(),\n+        Default::default(),\n+    );\n     for (idx, var) in jaxpr.constvars.iter().enumerate() {\n         env.insert(*var, const_values[idx].clone());\n     }"
+    },
+    {
+      "sha": "bd73e2f3a490980e76e7804a2c82d7d0733dae81",
+      "filename": "crates/fj-interpreters/src/partial_eval.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenjax/blob/a890719acfab3c90514c3cd4bf2a5ff679247d60/crates%2Ffj-interpreters%2Fsrc%2Fpartial_eval.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenjax/raw/a890719acfab3c90514c3cd4bf2a5ff679247d60/crates%2Ffj-interpreters%2Fsrc%2Fpartial_eval.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenjax/contents/crates%2Ffj-interpreters%2Fsrc%2Fpartial_eval.rs?ref=a890719acfab3c90514c3cd4bf2a5ff679247d60",
+      "patch": "@@ -139,9 +139,9 @@ pub fn partial_eval_jaxpr(\n         });\n     }\n \n-    // Fast path: all-unknown \u2014 everything goes to unknown jaxpr, no residuals.\n+    // Fast path: all-unknown (only safe if there are no constvars to thread as residuals)\n     let all_unknown = unknowns.iter().all(|u| *u);\n-    if all_unknown {\n+    if all_unknown && jaxpr.constvars.is_empty() {\n         let out_unknowns = vec![true; jaxpr.outvars.len()];\n         return Ok(PartialEvalResult {\n             jaxpr_known: Jaxpr::new(vec![], jaxpr.constvars.clone(), vec![], vec![]),"
+    },
+    {
+      "sha": "e22b559c14c7ba5d364947b5afa9f2c167b71e3c",
+      "filename": "crates/fj-lax/src/arithmetic.rs",
+      "status": "modified",
+      "additions": 51,
+      "deletions": 5,
+      "changes": 56,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenjax/blob/a890719acfab3c90514c3cd4bf2a5ff679247d60/crates%2Ffj-lax%2Fsrc%2Farithmetic.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenjax/raw/a890719acfab3c90514c3cd4bf2a5ff679247d60/crates%2Ffj-lax%2Fsrc%2Farithmetic.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenjax/contents/crates%2Ffj-lax%2Fsrc%2Farithmetic.rs?ref=a890719acfab3c90514c3cd4bf2a5ff679247d60",
+      "patch": "@@ -321,7 +321,36 @@ pub(crate) fn eval_select(primitive: Primitive, inputs: &[Value]) -> Result<Valu\n                 Literal::I64(v) => *v != 0,\n                 Literal::F64Bits(bits) => f64::from_bits(*bits) != 0.0,\n             };\n-            Ok(Value::Scalar(if c { *on_true } else { *on_false }))\n+            let val = if c { *on_true } else { *on_false };\n+            let lhs_dtype = match on_true {\n+                Literal::I64(_) => DType::I64,\n+                Literal::F64Bits(_) => DType::F64,\n+                Literal::Bool(_) => DType::Bool,\n+            };\n+            let rhs_dtype = match on_false {\n+                Literal::I64(_) => DType::I64,\n+                Literal::F64Bits(_) => DType::F64,\n+                Literal::Bool(_) => DType::Bool,\n+            };\n+            let dtype = promote_dtype(lhs_dtype, rhs_dtype);\n+            let promoted_val = match dtype {\n+                DType::F64 | DType::F32 => {\n+                    let f_val = val.as_f64().ok_or(EvalError::TypeMismatch {\n+                        primitive,\n+                        detail: \"expected numeric scalar for select\",\n+                    })?;\n+                    Literal::from_f64(f_val)\n+                }\n+                DType::I64 | DType::I32 => {\n+                    let i_val = val.as_i64().ok_or(EvalError::TypeMismatch {\n+                        primitive,\n+                        detail: \"expected integer scalar for select\",\n+                    })?;\n+                    Literal::I64(i_val)\n+                }\n+                DType::Bool => val,\n+            };\n+            Ok(Value::Scalar(promoted_val))\n         }\n         (Value::Tensor(cond), Value::Tensor(on_true), Value::Tensor(on_false)) => {\n             if cond.shape != on_true.shape || cond.shape != on_false.shape {\n@@ -330,7 +359,8 @@ pub(crate) fn eval_select(primitive: Primitive, inputs: &[Value]) -> Result<Valu\n                     detail: \"select requires all inputs to have the same shape\".to_owned(),\n                 });\n             }\n-            let elements: Vec<Literal> = cond\n+            let dtype = promote_dtype(on_true.dtype, on_false.dtype);\n+            let elements: Result<Vec<Literal>, EvalError> = cond\n                 .elements\n                 .iter()\n                 .zip(on_true.elements.iter())\n@@ -341,14 +371,30 @@ pub(crate) fn eval_select(primitive: Primitive, inputs: &[Value]) -> Result<Valu\n                         Literal::I64(v) => *v != 0,\n                         Literal::F64Bits(bits) => f64::from_bits(*bits) != 0.0,\n                     };\n-                    if flag { *t } else { *f }\n+                    let val = if flag { *t } else { *f };\n+                    match dtype {\n+                        DType::F64 | DType::F32 => {\n+                            let f_val = val.as_f64().ok_or(EvalError::TypeMismatch {\n+                                primitive,\n+                                detail: \"expected numeric tensor elements for select\",\n+                            })?;\n+                            Ok(Literal::from_f64(f_val))\n+                        }\n+                        DType::I64 | DType::I32 => {\n+                            let i_val = val.as_i64().ok_or(EvalError::TypeMismatch {\n+                                primitive,\n+                                detail: \"expected integer tensor elements for select\",\n+                            })?;\n+                            Ok(Literal::I64(i_val))\n+                        }\n+                        DType::Bool => Ok(val),\n+                    }\n                 })\n                 .collect();\n-            let dtype = promote_dtype(on_true.dtype, on_false.dtype);\n             Ok(Value::Tensor(TensorValue::new(\n                 dtype,\n                 cond.shape.clone(),\n-                elements,\n+                elements?,\n             )?))\n         }\n         _ => Err(EvalError::Unsupported {"
+    },
+    {
+      "sha": "d9a5ffe7b578290238d4c3504dfbbbb0b88c4c46",
+      "filename": "crates/fj-lax/src/reduction.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenjax/blob/a890719acfab3c90514c3cd4bf2a5ff679247d60/crates%2Ffj-lax%2Fsrc%2Freduction.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenjax/raw/a890719acfab3c90514c3cd4bf2a5ff679247d60/crates%2Ffj-lax%2Fsrc%2Freduction.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenjax/contents/crates%2Ffj-lax%2Fsrc%2Freduction.rs?ref=a890719acfab3c90514c3cd4bf2a5ff679247d60",
+      "patch": "@@ -30,7 +30,7 @@ pub(crate) fn eval_reduce(\n \n             // Full reduction (all elements to scalar)\n             if rank == 0 {\n-                return Ok(inputs[0].clone());\n+                return Ok(Value::Scalar(tensor.elements[0]));\n             }\n \n             let is_integral = tensor.dtype == DType::I64 || tensor.dtype == DType::I32;"
+    },
+    {
+      "sha": "56c85398419a18ef5f6df6786d8b70e5343148f8",
+      "filename": "crates/fj-lax/src/tensor_ops.rs",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 3,
+      "changes": 16,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenjax/blob/a890719acfab3c90514c3cd4bf2a5ff679247d60/crates%2Ffj-lax%2Fsrc%2Ftensor_ops.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenjax/raw/a890719acfab3c90514c3cd4bf2a5ff679247d60/crates%2Ffj-lax%2Fsrc%2Ftensor_ops.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenjax/contents/crates%2Ffj-lax%2Fsrc%2Ftensor_ops.rs?ref=a890719acfab3c90514c3cd4bf2a5ff679247d60",
+      "patch": "@@ -677,7 +677,7 @@ pub(crate) fn eval_gather(\n     }\n \n     // Number of elements per gathered slice (product of slice_sizes[1..])\n-    let slice_elems: usize = slice_sizes[1..].iter().product::<usize>().max(1);\n+    let slice_elems: usize = slice_sizes[1..].iter().product::<usize>();\n \n     let total = num_indices * slice_elems;\n     let mut elements = Vec::with_capacity(total);\n@@ -794,11 +794,13 @@ pub(crate) fn eval_scatter(\n     }\n \n     // Number of elements per slice (product of dims[1..])\n-    let slice_elems: usize = op_dims[1..].iter().map(|d| *d as usize).product::<usize>().max(1);\n+    let slice_elems: usize = op_dims[1..].iter().map(|d| *d as usize).product::<usize>();\n \n     // Clone operand elements to create output\n     let mut result_elements = operand.elements.clone();\n \n+    let mode = params.get(\"mode\").map(|s| s.as_str()).unwrap_or(\"overwrite\");\n+\n     for (i, &idx) in index_vals.iter().enumerate() {\n         if idx >= op_dims[0] as usize {\n             return Err(EvalError::Unsupported {\n@@ -815,7 +817,15 @@ pub(crate) fn eval_scatter(\n \n         for j in 0..slice_elems {\n             if update_offset + j < updates.elements.len() {\n-                result_elements[base_offset + j] = updates.elements[update_offset + j];\n+                let current = &result_elements[base_offset + j];\n+                let update = &updates.elements[update_offset + j];\n+                if mode == \"add\" {\n+                    let c_val = current.as_f64().unwrap_or(0.0);\n+                    let u_val = update.as_f64().unwrap_or(0.0);\n+                    result_elements[base_offset + j] = Literal::from_f64(c_val + u_val);\n+                } else {\n+                    result_elements[base_offset + j] = *update;\n+                }\n             }\n         }\n     }"
+    },
+    {
+      "sha": "7d759d318cea85906c48466401e08b07a239e8f7",
+      "filename": "crates/fj-runtime/src/lib.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenjax/blob/a890719acfab3c90514c3cd4bf2a5ff679247d60/crates%2Ffj-runtime%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenjax/raw/a890719acfab3c90514c3cd4bf2a5ff679247d60/crates%2Ffj-runtime%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenjax/contents/crates%2Ffj-runtime%2Fsrc%2Flib.rs?ref=a890719acfab3c90514c3cd4bf2a5ff679247d60",
+      "patch": "@@ -38,7 +38,7 @@ impl RuntimeAdmissionModel {\n             CompatibilityMode::Strict => self.loss_matrix.clone(),\n             CompatibilityMode::Hardened => LossMatrix {\n                 keep_if_useful: self.loss_matrix.keep_if_useful,\n-                kill_if_useful: self.loss_matrix.kill_if_useful / 2,\n+                kill_if_useful: (self.loss_matrix.kill_if_useful / 2).max(1),\n                 keep_if_abandoned: self.loss_matrix.keep_if_abandoned.saturating_mul(2).min(100),\n                 kill_if_abandoned: self.loss_matrix.kill_if_abandoned,\n             },"
+    }
+  ]
+}

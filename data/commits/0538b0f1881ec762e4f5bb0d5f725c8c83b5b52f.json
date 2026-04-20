@@ -1,0 +1,65 @@
+{
+  "message": "fix: add watchdog for Claude probes",
+  "files": [
+    {
+      "sha": "2dad95da9e0723dc4267ced2f03434faf8e2cc31",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/steipete/CodexBar/blob/0538b0f1881ec762e4f5bb0d5f725c8c83b5b52f/CHANGELOG.md",
+      "raw_url": "https://github.com/steipete/CodexBar/raw/0538b0f1881ec762e4f5bb0d5f725c8c83b5b52f/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/steipete/CodexBar/contents/CHANGELOG.md?ref=0538b0f1881ec762e4f5bb0d5f725c8c83b5b52f",
+      "patch": "@@ -4,6 +4,7 @@\n - New local cost usage tracking (Codex + Claude) via a lightweight scanner inspired by ccusage (MIT) \u2014 computes cost from local JSONL logs without Node CLIs. Thanks @ryoppippi!\n - Expand model normalization/pricing so newer Codex and Claude variants keep showing accurate costs.\n - Add weekly pace indicators with ahead/behind copy and runout projections when reset data is available. Thanks @Remedy92!\n+- Claude: run PTY probes via a bundled watchdog helper so `claude /usage` and `/status` are terminated when CodexBar quits or crashes (prevents runaway Claude processes).\n \n ## 0.11.2 \u2014 2025-12-21\n - ccusage-codex cost fetch is faster and more reliable by limiting the session scan window."
+    },
+    {
+      "sha": "42b1564734ffdfbe4bd3a264b66002031c109ee7",
+      "filename": "Package.swift",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 0,
+      "changes": 7,
+      "blob_url": "https://github.com/steipete/CodexBar/blob/0538b0f1881ec762e4f5bb0d5f725c8c83b5b52f/Package.swift",
+      "raw_url": "https://github.com/steipete/CodexBar/raw/0538b0f1881ec762e4f5bb0d5f725c8c83b5b52f/Package.swift",
+      "contents_url": "https://api.github.com/repos/steipete/CodexBar/contents/Package.swift?ref=0538b0f1881ec762e4f5bb0d5f725c8c83b5b52f",
+      "patch": "@@ -17,6 +17,13 @@ let package = Package(\n             swiftSettings: [\n                 .enableUpcomingFeature(\"StrictConcurrency\"),\n             ]),\n+        .executableTarget(\n+            name: \"CodexBarClaudeWatchdog\",\n+            dependencies: [],\n+            path: \"Sources/CodexBarClaudeWatchdog\",\n+            swiftSettings: [\n+                .enableUpcomingFeature(\"StrictConcurrency\"),\n+            ]),\n         .executableTarget(\n             name: \"CodexBar\",\n             dependencies: ["
+    },
+    {
+      "sha": "51bc3069c274f3eac0358107255866ebf040b303",
+      "filename": "Scripts/package_app.sh",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/steipete/CodexBar/blob/0538b0f1881ec762e4f5bb0d5f725c8c83b5b52f/Scripts%2Fpackage_app.sh",
+      "raw_url": "https://github.com/steipete/CodexBar/raw/0538b0f1881ec762e4f5bb0d5f725c8c83b5b52f/Scripts%2Fpackage_app.sh",
+      "contents_url": "https://api.github.com/repos/steipete/CodexBar/contents/Scripts%2Fpackage_app.sh?ref=0538b0f1881ec762e4f5bb0d5f725c8c83b5b52f",
+      "patch": "@@ -69,6 +69,11 @@ if [[ -f \".build/$CONF/CodexBarCLI\" ]]; then\n   cp \".build/$CONF/CodexBarCLI\" \"$APP/Contents/Helpers/CodexBarCLI\"\n   chmod +x \"$APP/Contents/Helpers/CodexBarCLI\"\n fi\n+# Watchdog helper: ensures `claude` probes die when CodexBar crashes/gets killed.\n+if [[ -f \".build/$CONF/CodexBarClaudeWatchdog\" ]]; then\n+  cp \".build/$CONF/CodexBarClaudeWatchdog\" \"$APP/Contents/Helpers/CodexBarClaudeWatchdog\"\n+  chmod +x \"$APP/Contents/Helpers/CodexBarClaudeWatchdog\"\n+fi\n # Embed Sparkle.framework\n if [[ -d \".build/$CONF/Sparkle.framework\" ]]; then\n   cp -R \".build/$CONF/Sparkle.framework\" \"$APP/Contents/Frameworks/\""
+    },
+    {
+      "sha": "e363e936a23b0e1a94751ed65a7316a9bc29b045",
+      "filename": "Sources/CodexBarClaudeWatchdog/main.swift",
+      "status": "added",
+      "additions": 122,
+      "deletions": 0,
+      "changes": 122,
+      "blob_url": "https://github.com/steipete/CodexBar/blob/0538b0f1881ec762e4f5bb0d5f725c8c83b5b52f/Sources%2FCodexBarClaudeWatchdog%2Fmain.swift",
+      "raw_url": "https://github.com/steipete/CodexBar/raw/0538b0f1881ec762e4f5bb0d5f725c8c83b5b52f/Sources%2FCodexBarClaudeWatchdog%2Fmain.swift",
+      "contents_url": "https://api.github.com/repos/steipete/CodexBar/contents/Sources%2FCodexBarClaudeWatchdog%2Fmain.swift?ref=0538b0f1881ec762e4f5bb0d5f725c8c83b5b52f",
+      "patch": "@@ -0,0 +1,122 @@\n+import Darwin\n+import Foundation\n+\n+private enum WatchdogExitCode {\n+    static let usage: Int32 = 64\n+    static let spawnFailed: Int32 = 70\n+}\n+\n+private nonisolated(unsafe) var globalChildPID: pid_t = 0\n+private nonisolated(unsafe) var globalShouldTerminate: Int32 = 0\n+\n+private func usageAndExit() -> Never {\n+    fputs(\"Usage: CodexBarClaudeWatchdog -- <binary> [args...]\\n\", stderr)\n+    Darwin.exit(WatchdogExitCode.usage)\n+}\n+\n+private func killProcessTree(childPID: pid_t, graceSeconds: TimeInterval = 0.5) {\n+    let pgid = getpgid(childPID)\n+    if pgid > 0 {\n+        kill(-pgid, SIGTERM)\n+    } else {\n+        kill(childPID, SIGTERM)\n+    }\n+\n+    let deadline = Date().addingTimeInterval(graceSeconds)\n+    var status: Int32 = 0\n+    while Date() < deadline {\n+        let rc = waitpid(childPID, &status, WNOHANG)\n+        if rc == childPID { return }\n+        usleep(50000)\n+    }\n+\n+    if pgid > 0 {\n+        kill(-pgid, SIGKILL)\n+    } else {\n+        kill(childPID, SIGKILL)\n+    }\n+}\n+\n+private func exitCode(fromWaitStatus status: Int32) -> Int32 {\n+    // Swift can't import wait(2) macros (function-like macros). Use the classic encoding:\n+    // - low 7 bits: signal number (0 means exited)\n+    // - high byte: exit status (when exited)\n+    let low = status & 0x7F\n+    if low == 0 {\n+        return (status >> 8) & 0xFF\n+    }\n+    if low != 0x7F {\n+        return 128 + low\n+    }\n+    return 1\n+}\n+\n+let argv = CommandLine.arguments\n+guard let sep = argv.firstIndex(of: \"--\") else { usageAndExit() }\n+let childArgs = Array(argv[(sep + 1)...])\n+guard !childArgs.isEmpty else { usageAndExit() }\n+\n+let childBinary = childArgs[0]\n+let childArgv = childArgs\n+\n+let spawnResult: Int32 = childArgv.withUnsafeBufferPointer { buffer in\n+    var cStrings: [UnsafeMutablePointer<CChar>?] = buffer\n+        .map { strdup($0) }\n+    cStrings.append(nil)\n+    defer { cStrings.forEach { if let p = $0 { free(p) } } }\n+\n+    return cStrings.withUnsafeMutableBufferPointer { cBuffer in\n+        var pid: pid_t = 0\n+        let rc: Int32 = childBinary.withCString { childPath in\n+            posix_spawnp(&pid, childPath, nil, nil, cBuffer.baseAddress, environ)\n+        }\n+        if rc == 0, pid > 0 {\n+            globalChildPID = pid\n+        }\n+        return rc\n+    }\n+}\n+\n+guard spawnResult == 0, globalChildPID > 0 else {\n+    fputs(\"CodexBarClaudeWatchdog: failed to spawn child: \\(childBinary) (rc=\\(spawnResult))\\n\", stderr)\n+    Darwin.exit(WatchdogExitCode.spawnFailed)\n+}\n+\n+_ = setpgid(globalChildPID, globalChildPID)\n+\n+private func terminateChild() {\n+    if globalChildPID > 0 {\n+        killProcessTree(childPID: globalChildPID)\n+    }\n+}\n+\n+private func handleTerminationSignal(_ sig: Int32) {\n+    globalShouldTerminate = sig\n+}\n+\n+signal(SIGTERM, handleTerminationSignal)\n+signal(SIGINT, handleTerminationSignal)\n+signal(SIGHUP, handleTerminationSignal)\n+\n+var status: Int32 = 0\n+while true {\n+    let rc = waitpid(globalChildPID, &status, WNOHANG)\n+    if rc == globalChildPID {\n+        Darwin.exit(exitCode(fromWaitStatus: status))\n+    }\n+\n+    if globalShouldTerminate != 0 {\n+        let sig = globalShouldTerminate\n+        terminateChild()\n+        _ = waitpid(globalChildPID, &status, 0)\n+        Darwin.exit(128 + sig)\n+    }\n+\n+    if getppid() == 1 {\n+        terminateChild()\n+        _ = waitpid(globalChildPID, &status, 0)\n+        Darwin.exit(exitCode(fromWaitStatus: status))\n+    }\n+\n+    usleep(200_000)\n+}"
+    },
+    {
+      "sha": "aa51d23527f88c5ea188d456696a4e34f147968a",
+      "filename": "Sources/CodexBarCore/TTYCommandRunner.swift",
+      "status": "modified",
+      "additions": 52,
+      "deletions": 2,
+      "changes": 54,
+      "blob_url": "https://github.com/steipete/CodexBar/blob/0538b0f1881ec762e4f5bb0d5f725c8c83b5b52f/Sources%2FCodexBarCore%2FTTYCommandRunner.swift",
+      "raw_url": "https://github.com/steipete/CodexBar/raw/0538b0f1881ec762e4f5bb0d5f725c8c83b5b52f/Sources%2FCodexBarCore%2FTTYCommandRunner.swift",
+      "contents_url": "https://api.github.com/repos/steipete/CodexBar/contents/Sources%2FCodexBarCore%2FTTYCommandRunner.swift?ref=0538b0f1881ec762e4f5bb0d5f725c8c83b5b52f",
+      "patch": "@@ -70,6 +70,48 @@ public struct TTYCommandRunner {\n \n     public init() {}\n \n+    private static func locateBundledHelper(_ name: String) -> String? {\n+        let fm = FileManager.default\n+\n+        func isExecutable(_ path: String) -> Bool {\n+            fm.isExecutableFile(atPath: path)\n+        }\n+\n+        if let override = ProcessInfo.processInfo.environment[\"CODEXBAR_HELPER_\\(name.uppercased())\"],\n+           isExecutable(override)\n+        {\n+            return override\n+        }\n+\n+        func candidate(inAppBundleURL appURL: URL) -> String? {\n+            let path = appURL\n+                .appendingPathComponent(\"Contents\", isDirectory: true)\n+                .appendingPathComponent(\"Helpers\", isDirectory: true)\n+                .appendingPathComponent(name, isDirectory: false)\n+                .path\n+            return isExecutable(path) ? path : nil\n+        }\n+\n+        let mainURL = Bundle.main.bundleURL\n+        if mainURL.pathExtension == \"app\", let found = candidate(inAppBundleURL: mainURL) { return found }\n+\n+        if let argv0 = CommandLine.arguments.first {\n+            var url = URL(fileURLWithPath: argv0)\n+            if !argv0.hasPrefix(\"/\") {\n+                url = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(argv0)\n+            }\n+            var probe = url\n+            for _ in 0..<6 {\n+                let parent = probe.deletingLastPathComponent()\n+                if parent.pathExtension == \"app\", let found = candidate(inAppBundleURL: parent) { return found }\n+                if parent.path == probe.path { break }\n+                probe = parent\n+            }\n+        }\n+\n+        return nil\n+    }\n+\n     // swiftlint:disable function_body_length\n     // swiftlint:disable:next cyclomatic_complexity\n     public func run(\n@@ -100,8 +142,16 @@ public struct TTYCommandRunner {\n         let secondaryHandle = FileHandle(fileDescriptor: secondaryFD, closeOnDealloc: true)\n \n         let proc = Process()\n-        proc.executableURL = URL(fileURLWithPath: resolved)\n-        proc.arguments = options.extraArgs\n+        let resolvedURL = URL(fileURLWithPath: resolved)\n+        if resolvedURL.lastPathComponent == \"claude\",\n+           let watchdog = Self.locateBundledHelper(\"CodexBarClaudeWatchdog\")\n+        {\n+            proc.executableURL = URL(fileURLWithPath: watchdog)\n+            proc.arguments = [\"--\", resolved] + options.extraArgs\n+        } else {\n+            proc.executableURL = resolvedURL\n+            proc.arguments = options.extraArgs\n+        }\n         proc.standardInput = secondaryHandle\n         proc.standardOutput = secondaryHandle\n         proc.standardError = secondaryHandle"
+    }
+  ]
+}

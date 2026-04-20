@@ -1,0 +1,65 @@
+{
+  "message": "fix(security,perf): address critical vulnerabilities and optimize hot paths\n\nSecurity fixes:\n- extract.rs: Fix unquote_param panic on single-char input (bd-30c0)\n- extract.rs: Add boundary length validation per RFC 2046 (bd-22da)\n- extract.rs: Document serde_json recursion limit protection (bd-276d)\n\nPerformance optimizations:\n- trie.rs: Rewrite is_uuid with zero-allocation byte validation (bd-21c2)\n- response.rs: Use io::Write for hex formatting to avoid alloc (bd-25hi)\n\nClippy fixes:\n- middleware.rs: Use Ipv4Addr::LOCALHOST constant\n- validate.rs: Use RangeInclusive::contains for phone validation\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "e4b8362780ca66ea472de45b40667f1b15686311",
+      "filename": "crates/fastapi-core/src/extract.rs",
+      "status": "modified",
+      "additions": 92,
+      "deletions": 1,
+      "changes": 93,
+      "blob_url": "https://github.com/Dicklesworthstone/fastapi_rust/blob/94467b6757aac60ab301975a79e95602a7ea5104/crates%2Ffastapi-core%2Fsrc%2Fextract.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/fastapi_rust/raw/94467b6757aac60ab301975a79e95602a7ea5104/crates%2Ffastapi-core%2Fsrc%2Fextract.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/fastapi_rust/contents/crates%2Ffastapi-core%2Fsrc%2Fextract.rs?ref=94467b6757aac60ab301975a79e95602a7ea5104",
+      "patch": "@@ -367,6 +367,8 @@ impl<T: DeserializeOwned> FromRequest for Json<T> {\n         let _ = ctx.checkpoint();\n \n         // Deserialize JSON\n+        // NOTE: serde_json 1.0.114+ has a default recursion limit of 128,\n+        // protecting against stack overflow from deeply nested JSON.\n         let value =\n             serde_json::from_slice(&bytes).map_err(|e| JsonExtractError::DeserializeError {\n                 message: e.to_string(),\n@@ -1769,6 +1771,12 @@ impl FromRequest for File {\n     }\n }\n \n+/// Maximum boundary length per RFC 2046.\n+///\n+/// Boundaries can be 1-70 characters. We add a safety margin and reject\n+/// anything longer to prevent memory amplification attacks.\n+const MAX_MULTIPART_BOUNDARY_LEN: usize = 70;\n+\n /// Parse boundary from Content-Type header.\n fn parse_multipart_boundary(content_type: &str) -> Result<String, MultipartExtractError> {\n     for part in content_type.split(';') {\n@@ -1781,6 +1789,16 @@ fn parse_multipart_boundary(content_type: &str) -> Result<String, MultipartExtra\n             if boundary.is_empty() {\n                 return Err(MultipartExtractError::MissingBoundary);\n             }\n+            // RFC 2046: boundary must be 1-70 characters\n+            if boundary.len() > MAX_MULTIPART_BOUNDARY_LEN {\n+                return Err(MultipartExtractError::InvalidFormat {\n+                    detail: format!(\n+                        \"boundary too long: {} chars (max {})\",\n+                        boundary.len(),\n+                        MAX_MULTIPART_BOUNDARY_LEN\n+                    ),\n+                });\n+            }\n             return Ok(boundary.to_string());\n         }\n     }\n@@ -1998,9 +2016,16 @@ fn parse_content_disposition_header(value: &str) -> (Option<String>, Option<Stri\n }\n \n /// Remove quotes from a parameter value.\n+///\n+/// Returns the string with surrounding quotes removed, or the original\n+/// string if it's not quoted. Handles both single and double quotes.\n fn unquote_param(s: &str) -> String {\n     let s = s.trim();\n-    if (s.starts_with('\"') && s.ends_with('\"')) || (s.starts_with('\\'') && s.ends_with('\\'')) {\n+    // Need at least 2 chars for valid quotes (e.g., \"\")\n+    if s.len() >= 2\n+        && ((s.starts_with('\"') && s.ends_with('\"'))\n+            || (s.starts_with('\\'') && s.ends_with('\\'')))\n+    {\n         s[1..s.len() - 1].to_string()\n     } else {\n         s.to_string()\n@@ -2042,6 +2067,28 @@ mod multipart_tests {\n         ));\n     }\n \n+    #[test]\n+    fn test_parse_boundary_too_long() {\n+        // RFC 2046 limits boundary to 70 chars\n+        let long_boundary = \"x\".repeat(100);\n+        let ct = format!(\"multipart/form-data; boundary={long_boundary}\");\n+        let result = parse_multipart_boundary(&ct);\n+        assert!(\n+            matches!(result, Err(MultipartExtractError::InvalidFormat { .. })),\n+            \"Expected InvalidFormat for boundary > 70 chars\"\n+        );\n+    }\n+\n+    #[test]\n+    fn test_parse_boundary_max_length() {\n+        // 70 chars should be OK\n+        let boundary = \"x\".repeat(70);\n+        let ct = format!(\"multipart/form-data; boundary={boundary}\");\n+        let result = parse_multipart_boundary(&ct);\n+        assert!(result.is_ok(), \"70-char boundary should be accepted\");\n+        assert_eq!(result.unwrap(), boundary);\n+    }\n+\n     #[test]\n     fn test_parse_simple_form() {\n         let boundary = \"----boundary\";\n@@ -2269,6 +2316,50 @@ mod multipart_tests {\n         assert_eq!(files[0].filename(), \"a.txt\");\n         assert_eq!(files[1].filename(), \"b.txt\");\n     }\n+\n+    // =========================================================================\n+    // unquote_param edge case tests\n+    // =========================================================================\n+\n+    #[test]\n+    fn test_unquote_param_normal_quoted() {\n+        assert_eq!(unquote_param(\"\\\"hello\\\"\"), \"hello\");\n+        assert_eq!(unquote_param(\"'hello'\"), \"hello\");\n+    }\n+\n+    #[test]\n+    fn test_unquote_param_empty_quotes() {\n+        // Empty quoted string \"\"\n+        assert_eq!(unquote_param(\"\\\"\\\"\"), \"\");\n+        assert_eq!(unquote_param(\"''\"), \"\");\n+    }\n+\n+    #[test]\n+    fn test_unquote_param_single_char_no_panic() {\n+        // Single quote char should not panic, just return as-is\n+        assert_eq!(unquote_param(\"\\\"\"), \"\\\"\");\n+        assert_eq!(unquote_param(\"'\"), \"'\");\n+    }\n+\n+    #[test]\n+    fn test_unquote_param_unquoted() {\n+        assert_eq!(unquote_param(\"hello\"), \"hello\");\n+        assert_eq!(unquote_param(\"\"), \"\");\n+    }\n+\n+    #[test]\n+    fn test_unquote_param_mismatched_quotes() {\n+        // Mismatched quotes should not be unquoted\n+        assert_eq!(unquote_param(\"\\\"hello'\"), \"\\\"hello'\");\n+        assert_eq!(unquote_param(\"'hello\\\"\"), \"'hello\\\"\");\n+    }\n+\n+    #[test]\n+    fn test_unquote_param_whitespace() {\n+        // Whitespace is trimmed before quote check\n+        assert_eq!(unquote_param(\"  \\\"hello\\\"  \"), \"hello\");\n+        assert_eq!(unquote_param(\"  'hello'  \"), \"hello\");\n+    }\n }\n \n // ============================================================================"
+    },
+    {
+      "sha": "660700e3d108d366ea4bdc6b5c008c2d82e000cf",
+      "filename": "crates/fastapi-core/src/middleware.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/fastapi_rust/blob/94467b6757aac60ab301975a79e95602a7ea5104/crates%2Ffastapi-core%2Fsrc%2Fmiddleware.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/fastapi_rust/raw/94467b6757aac60ab301975a79e95602a7ea5104/crates%2Ffastapi-core%2Fsrc%2Fmiddleware.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/fastapi_rust/contents/crates%2Ffastapi-core%2Fsrc%2Fmiddleware.rs?ref=94467b6757aac60ab301975a79e95602a7ea5104",
+      "patch": "@@ -12733,7 +12733,7 @@ mod rate_limit_tests {\n         let extractor = TrustedProxyIpKeyExtractor::new().trust_loopback();\n \n         let mut req = Request::new(Method::Get, \"/\");\n-        req.insert_extension(RemoteAddr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));\n+        req.insert_extension(RemoteAddr(IpAddr::V4(Ipv4Addr::LOCALHOST)));\n         req.headers_mut()\n             .insert(\"x-forwarded-for\", b\"8.8.8.8\".to_vec());\n "
+    },
+    {
+      "sha": "63b143b1c1073a37712db2dafb6dbd1e44bfbc0b",
+      "filename": "crates/fastapi-http/src/response.rs",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 4,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/fastapi_rust/blob/94467b6757aac60ab301975a79e95602a7ea5104/crates%2Ffastapi-http%2Fsrc%2Fresponse.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/fastapi_rust/raw/94467b6757aac60ab301975a79e95602a7ea5104/crates%2Ffastapi-http%2Fsrc%2Fresponse.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/fastapi_rust/contents/crates%2Ffastapi-http%2Fsrc%2Fresponse.rs?ref=94467b6757aac60ab301975a79e95602a7ea5104",
+      "patch": "@@ -105,10 +105,11 @@ impl ChunkedEncoder {\n     }\n \n     fn encode_chunk(chunk: &[u8]) -> Vec<u8> {\n-        let size = format!(\"{:x}\", chunk.len());\n-        let mut out = Vec::with_capacity(size.len() + 2 + chunk.len() + 2);\n-        out.extend_from_slice(size.as_bytes());\n-        out.extend_from_slice(b\"\\r\\n\");\n+        // Use std::io::Write to format hex directly into buffer without allocation.\n+        // Max hex digits for usize is 16 (64-bit), so we pre-allocate conservatively.\n+        use std::io::Write as _;\n+        let mut out = Vec::with_capacity(20 + chunk.len() + 4);\n+        write!(out, \"{:x}\\r\\n\", chunk.len()).expect(\"write to Vec cannot fail\");\n         out.extend_from_slice(chunk);\n         out.extend_from_slice(b\"\\r\\n\");\n         out"
+    },
+    {
+      "sha": "d884bfeb3f6680e5c35814c41e3b180242692f11",
+      "filename": "crates/fastapi-macros/src/validate.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/fastapi_rust/blob/94467b6757aac60ab301975a79e95602a7ea5104/crates%2Ffastapi-macros%2Fsrc%2Fvalidate.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/fastapi_rust/raw/94467b6757aac60ab301975a79e95602a7ea5104/crates%2Ffastapi-macros%2Fsrc%2Fvalidate.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/fastapi_rust/contents/crates%2Ffastapi-macros%2Fsrc%2Fvalidate.rs?ref=94467b6757aac60ab301975a79e95602a7ea5104",
+      "patch": "@@ -607,8 +607,8 @@ fn generate_field_validation(field: &Field, validators: &FieldValidators) -> Tok\n                         }\n                     }\n \n-                    // Must have balanced parens and 7-15 digits\n-                    paren_depth == 0 && digit_count >= 7 && digit_count <= 15\n+                    // Must have balanced parens and 7-15 digits (E.164 standard)\n+                    paren_depth == 0 && (7..=15).contains(&digit_count)\n                 }\n \n                 if !is_valid_phone(phone) {"
+    },
+    {
+      "sha": "fd4528afa56a8a0cb42375702a23adbae4e0843c",
+      "filename": "crates/fastapi-router/src/trie.rs",
+      "status": "modified",
+      "additions": 18,
+      "deletions": 11,
+      "changes": 29,
+      "blob_url": "https://github.com/Dicklesworthstone/fastapi_rust/blob/94467b6757aac60ab301975a79e95602a7ea5104/crates%2Ffastapi-router%2Fsrc%2Ftrie.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/fastapi_rust/raw/94467b6757aac60ab301975a79e95602a7ea5104/crates%2Ffastapi-router%2Fsrc%2Ftrie.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/fastapi_rust/contents/crates%2Ffastapi-router%2Fsrc%2Ftrie.rs?ref=94467b6757aac60ab301975a79e95602a7ea5104",
+      "patch": "@@ -237,23 +237,30 @@ impl Converter {\n     }\n }\n \n+/// Check if a string is a valid UUID (8-4-4-4-12 format).\n+///\n+/// This implementation avoids allocations by using byte-based validation.\n fn is_uuid(s: &str) -> bool {\n-    // Simple UUID check: 8-4-4-4-12 hex digits\n+    // UUID must be exactly 36 chars: 8-4-4-4-12 = 32 hex + 4 dashes\n     if s.len() != 36 {\n         return false;\n     }\n-    let parts: Vec<_> = s.split('-').collect();\n-    if parts.len() != 5 {\n+\n+    let bytes = s.as_bytes();\n+\n+    // Check dashes at positions 8, 13, 18, 23\n+    if bytes[8] != b'-' || bytes[13] != b'-' || bytes[18] != b'-' || bytes[23] != b'-' {\n         return false;\n     }\n-    parts[0].len() == 8\n-        && parts[1].len() == 4\n-        && parts[2].len() == 4\n-        && parts[3].len() == 4\n-        && parts[4].len() == 12\n-        && parts\n-            .iter()\n-            .all(|p| p.chars().all(|c| c.is_ascii_hexdigit()))\n+\n+    // Check all hex digits (skip dash positions)\n+    bytes.iter().enumerate().all(|(i, &b)| {\n+        if i == 8 || i == 13 || i == 18 || i == 23 {\n+            true // Already verified dashes\n+        } else {\n+            b.is_ascii_hexdigit()\n+        }\n+    })\n }\n \n /// Path parameter information with optional OpenAPI metadata."
+    }
+  ]
+}

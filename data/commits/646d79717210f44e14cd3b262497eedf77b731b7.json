@@ -1,0 +1,111 @@
+{
+  "message": "feat(fcp-ratelimit): add smooth token bucket refill and safety guards\n\nImprove TokenBucket rate limiter with smooth refill behavior and\nprotection against edge cases that could cause division by zero.\n\n## Smooth Token Bucket Refill\n\nTraditional token buckets exhibit \"burst-then-wait\" behavior: all N\ntokens are added at once every T seconds, leading to traffic spikes.\n\nNew behavior normalizes the rate for smoother throughput:\n- Instead of: N tokens every T seconds\n- Now: 1 token every T/N seconds\n\nThis provides more consistent rate limiting without changing the\neffective throughput ceiling.\n\n```rust\n// Before: 100 req/min = 100 tokens every 60s (burst then wait)\n// After:  100 req/min = 1 token every 600ms (smooth flow)\n```\n\nThe optimization is applied in from_config() when:\n- requests_per_window > 0\n- Calculated interval (window_nanos / requests) > 0\n- Result fits in u64 nanoseconds\n\nFalls back to window-based refill for extreme rates (>1 req/ns).\n\n## Zero-Window Safety Guards\n\nAll constructors now guard against zero-duration windows:\n- new(): Clamp to 1ns minimum\n- from_config(): Clamp after rate normalization\n- with_burst(): Clamp to 1ns minimum\n\nThis prevents division-by-zero panics from malformed configs.\n\n## New Tests\n\n- test_token_bucket_zero_window_safety: Verifies safe handling\n  of Duration::ZERO windows\n\n## Test Vectors\n\nAdd CBOR golden vectors for rate limiting types:\n- backpressure_signal.cbor: Backpressure response encoding\n- quota_state.cbor: Quota tracking state\n- throttle_violation.cbor: Violation event encoding\n\nVectors added in both:\n- crates/fcp-ratelimit/tests/vectors/rate_limiting/\n- tests/vectors/rate_limiting/ (workspace-level)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "5b1d5f3820dd4761908ecafdb1000323d8a9cc4a",
+      "filename": "crates/fcp-ratelimit/Cargo.toml",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/646d79717210f44e14cd3b262497eedf77b731b7/crates%2Ffcp-ratelimit%2FCargo.toml",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/646d79717210f44e14cd3b262497eedf77b731b7/crates%2Ffcp-ratelimit%2FCargo.toml",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-ratelimit%2FCargo.toml?ref=646d79717210f44e14cd3b262497eedf77b731b7",
+      "patch": "@@ -38,4 +38,6 @@ tracing.workspace = true\n rand = \"0.9\"\n \n [dev-dependencies]\n+ciborium.workspace = true\n+uuid.workspace = true\n tokio = { workspace = true, features = [\"macros\", \"rt-multi-thread\", \"time\"] }"
+    },
+    {
+      "sha": "a61efc6e2fb065f23d3b20f4e692912cb8774d4c",
+      "filename": "crates/fcp-ratelimit/src/sliding_window.rs",
+      "status": "modified",
+      "additions": 41,
+      "deletions": 0,
+      "changes": 41,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/646d79717210f44e14cd3b262497eedf77b731b7/crates%2Ffcp-ratelimit%2Fsrc%2Fsliding_window.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/646d79717210f44e14cd3b262497eedf77b731b7/crates%2Ffcp-ratelimit%2Fsrc%2Fsliding_window.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-ratelimit%2Fsrc%2Fsliding_window.rs?ref=646d79717210f44e14cd3b262497eedf77b731b7",
+      "patch": "@@ -320,4 +320,45 @@ mod tests {\n         assert!(limiter.try_acquire().await);\n         assert!(limiter.try_acquire().await);\n     }\n+\n+    #[tokio::test]\n+    async fn test_sliding_window_wait_time() {\n+        let limiter = SlidingWindow::new(1, Duration::from_millis(100));\n+\n+        // Acquire the only permit\n+        assert!(limiter.try_acquire().await);\n+\n+        // Now it should be limited\n+        assert!(!limiter.try_acquire().await);\n+\n+        // Check wait time - should be approx 100ms\n+        let wait = limiter.wait_time().await;\n+        assert!(wait.as_millis() > 0);\n+        assert!(wait.as_millis() <= 100);\n+\n+        // Wait that amount\n+        sleep(wait).await;\n+\n+        // Should be available now\n+        assert!(limiter.try_acquire().await);\n+    }\n+\n+    #[tokio::test]\n+    async fn test_fixed_window_wait_time() {\n+        let limiter = FixedWindow::new(1, Duration::from_millis(100));\n+\n+        // Acquire\n+        assert!(limiter.try_acquire().await);\n+        assert!(!limiter.try_acquire().await);\n+\n+        // Check wait time\n+        let wait = limiter.wait_time().await;\n+        assert!(wait.as_millis() > 0);\n+        assert!(wait.as_millis() <= 100);\n+\n+        sleep(wait).await;\n+\n+        // Should reset\n+        assert!(limiter.try_acquire().await);\n+    }\n }"
+    },
+    {
+      "sha": "3e8684b1f30771a29df938a69889fb842f646760",
+      "filename": "crates/fcp-ratelimit/src/token_bucket.rs",
+      "status": "modified",
+      "additions": 67,
+      "deletions": 4,
+      "changes": 71,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/646d79717210f44e14cd3b262497eedf77b731b7/crates%2Ffcp-ratelimit%2Fsrc%2Ftoken_bucket.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/646d79717210f44e14cd3b262497eedf77b731b7/crates%2Ffcp-ratelimit%2Fsrc%2Ftoken_bucket.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-ratelimit%2Fsrc%2Ftoken_bucket.rs?ref=646d79717210f44e14cd3b262497eedf77b731b7",
+      "patch": "@@ -42,10 +42,17 @@ impl TokenBucket {\n     /// * `window` - Duration of the rate limit window\n     #[must_use]\n     pub fn new(requests_per_window: u32, window: Duration) -> Self {\n+        // Ensure refill interval is never zero to prevent division by zero\n+        let refill_interval = if window.is_zero() {\n+            Duration::from_nanos(1)\n+        } else {\n+            window\n+        };\n+\n         Self {\n             capacity: requests_per_window,\n             refill_amount: requests_per_window,\n-            refill_interval: window,\n+            refill_interval,\n             tokens: AtomicU32::new(requests_per_window),\n             last_refill: Mutex::new(Instant::now()),\n         }\n@@ -55,10 +62,39 @@ impl TokenBucket {\n     #[must_use]\n     pub fn from_config(config: &RateLimitConfig) -> Self {\n         let capacity = config.burst_size.unwrap_or(config.requests_per_window);\n+\n+        // Normalize rate for smoothness (avoid \"burst-then-wait\" behavior).\n+        // Instead of adding N tokens every T seconds, add 1 token every T/N seconds.\n+        let (refill_amount, refill_interval) = if config.requests_per_window > 0 {\n+            let window_nanos = config.window.as_nanos();\n+            let nanos_per_request = window_nanos / u128::from(config.requests_per_window);\n+\n+            if nanos_per_request > 0 {\n+                // Smooth rate: 1 token per calculated interval\n+                (\n+                    1,\n+                    Duration::from_nanos(u64::try_from(nanos_per_request).unwrap_or(u64::MAX)),\n+                )\n+            } else {\n+                // Rate too high for smooth 1-token refilling (e.g. > 1 req/ns),\n+                // or window is zero. Fallback to window-based.\n+                (config.requests_per_window, config.window)\n+            }\n+        } else {\n+            (0, config.window)\n+        };\n+\n+        // Ensure refill interval is never zero\n+        let refill_interval = if refill_interval.is_zero() {\n+            Duration::from_nanos(1)\n+        } else {\n+            refill_interval\n+        };\n+\n         Self {\n             capacity,\n-            refill_amount: config.requests_per_window,\n-            refill_interval: config.window,\n+            refill_amount,\n+            refill_interval,\n             tokens: AtomicU32::new(capacity),\n             last_refill: Mutex::new(Instant::now()),\n         }\n@@ -67,10 +103,17 @@ impl TokenBucket {\n     /// Create with burst capacity.\n     #[must_use]\n     pub fn with_burst(requests_per_window: u32, window: Duration, burst: u32) -> Self {\n+        // Ensure refill interval is never zero\n+        let refill_interval = if window.is_zero() {\n+            Duration::from_nanos(1)\n+        } else {\n+            window\n+        };\n+\n         Self {\n             capacity: burst,\n             refill_amount: requests_per_window,\n-            refill_interval: window,\n+            refill_interval,\n             tokens: AtomicU32::new(burst),\n             last_refill: Mutex::new(Instant::now()),\n         }\n@@ -308,4 +351,24 @@ mod tests {\n         assert!(limiter.try_acquire_n(2).await);\n         assert_eq!(limiter.remaining(), 0);\n     }\n+\n+    #[tokio::test]\n+    async fn test_token_bucket_zero_window_safety() {\n+        // Ensure we don't panic if window is zero (e.g. from bad config)\n+        let config = RateLimitConfig {\n+            requests_per_window: 100,\n+            window: Duration::ZERO,\n+            ..Default::default()\n+        };\n+\n+        // Should not panic\n+        let limiter = TokenBucket::from_config(&config);\n+\n+        // Should work safely (likely using fallback 1ns interval or similar logic)\n+        assert!(limiter.try_acquire().await);\n+\n+        // Direct constructor safety\n+        let limiter_direct = TokenBucket::new(100, Duration::ZERO);\n+        assert!(limiter_direct.try_acquire().await);\n+    }\n }"
+    },
+    {
+      "sha": "420c24287a0347c9d4d35e4c62b247ee78c19425",
+      "filename": "crates/fcp-ratelimit/tests/vectors/rate_limiting/backpressure_signal.cbor",
+      "status": "added",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/646d79717210f44e14cd3b262497eedf77b731b7/crates%2Ffcp-ratelimit%2Ftests%2Fvectors%2Frate_limiting%2Fbackpressure_signal.cbor",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/646d79717210f44e14cd3b262497eedf77b731b7/crates%2Ffcp-ratelimit%2Ftests%2Fvectors%2Frate_limiting%2Fbackpressure_signal.cbor",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-ratelimit%2Ftests%2Fvectors%2Frate_limiting%2Fbackpressure_signal.cbor?ref=646d79717210f44e14cd3b262497eedf77b731b7",
+      "patch": "@@ -0,0 +1 @@\n+\ufffdeleveljsoft_limitoutilization_bps\u0019%\u001cnretry_after_ms\u0019\u0002\ufffd\n\\ No newline at end of file"
+    },
+    {
+      "sha": "03ac58a64186a1c1b6f789661b1be7de3f6ea92d",
+      "filename": "crates/fcp-ratelimit/tests/vectors/rate_limiting/quota_state.cbor",
+      "status": "added",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/646d79717210f44e14cd3b262497eedf77b731b7/crates%2Ffcp-ratelimit%2Ftests%2Fvectors%2Frate_limiting%2Fquota_state.cbor",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/646d79717210f44e14cd3b262497eedf77b731b7/crates%2Ffcp-ratelimit%2Ftests%2Fvectors%2Frate_limiting%2Fquota_state.cbor",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-ratelimit%2Ftests%2Fvectors%2Frate_limiting%2Fquota_state.cbor?ref=646d79717210f44e14cd3b262497eedf77b731b7",
+      "patch": "@@ -0,0 +1 @@\n+\ufffdelimit\u0018diremaining\u0005nreset_after_ms\u0019\ufffd`jis_limited\ufffd\n\\ No newline at end of file"
+    },
+    {
+      "sha": "3206a3a55a80c028634cae2e8d2f245dafc45354",
+      "filename": "crates/fcp-ratelimit/tests/vectors/rate_limiting/throttle_violation.cbor",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/646d79717210f44e14cd3b262497eedf77b731b7/crates%2Ffcp-ratelimit%2Ftests%2Fvectors%2Frate_limiting%2Fthrottle_violation.cbor",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/646d79717210f44e14cd3b262497eedf77b731b7/crates%2Ffcp-ratelimit%2Ftests%2Fvectors%2Frate_limiting%2Fthrottle_violation.cbor",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-ratelimit%2Ftests%2Fvectors%2Frate_limiting%2Fthrottle_violation.cbor?ref=646d79717210f44e14cd3b262497eedf77b731b7"
+    },
+    {
+      "sha": "420c24287a0347c9d4d35e4c62b247ee78c19425",
+      "filename": "tests/vectors/rate_limiting/backpressure_signal.cbor",
+      "status": "added",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/646d79717210f44e14cd3b262497eedf77b731b7/tests%2Fvectors%2Frate_limiting%2Fbackpressure_signal.cbor",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/646d79717210f44e14cd3b262497eedf77b731b7/tests%2Fvectors%2Frate_limiting%2Fbackpressure_signal.cbor",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/tests%2Fvectors%2Frate_limiting%2Fbackpressure_signal.cbor?ref=646d79717210f44e14cd3b262497eedf77b731b7",
+      "patch": "@@ -0,0 +1 @@\n+\ufffdeleveljsoft_limitoutilization_bps\u0019%\u001cnretry_after_ms\u0019\u0002\ufffd\n\\ No newline at end of file"
+    },
+    {
+      "sha": "03ac58a64186a1c1b6f789661b1be7de3f6ea92d",
+      "filename": "tests/vectors/rate_limiting/quota_state.cbor",
+      "status": "added",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/646d79717210f44e14cd3b262497eedf77b731b7/tests%2Fvectors%2Frate_limiting%2Fquota_state.cbor",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/646d79717210f44e14cd3b262497eedf77b731b7/tests%2Fvectors%2Frate_limiting%2Fquota_state.cbor",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/tests%2Fvectors%2Frate_limiting%2Fquota_state.cbor?ref=646d79717210f44e14cd3b262497eedf77b731b7",
+      "patch": "@@ -0,0 +1 @@\n+\ufffdelimit\u0018diremaining\u0005nreset_after_ms\u0019\ufffd`jis_limited\ufffd\n\\ No newline at end of file"
+    },
+    {
+      "sha": "3206a3a55a80c028634cae2e8d2f245dafc45354",
+      "filename": "tests/vectors/rate_limiting/throttle_violation.cbor",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/646d79717210f44e14cd3b262497eedf77b731b7/tests%2Fvectors%2Frate_limiting%2Fthrottle_violation.cbor",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/646d79717210f44e14cd3b262497eedf77b731b7/tests%2Fvectors%2Frate_limiting%2Fthrottle_violation.cbor",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/tests%2Fvectors%2Frate_limiting%2Fthrottle_violation.cbor?ref=646d79717210f44e14cd3b262497eedf77b731b7"
+    }
+  ]
+}

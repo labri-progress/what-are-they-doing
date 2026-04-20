@@ -1,0 +1,101 @@
+{
+  "message": "feat: add logger and twilio poll backoff",
+  "files": [
+    {
+      "sha": "a25d317e8fbfc2fa747c6d911ffc569072f42b9d",
+      "filename": "docs/refactor/plan.md",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 3,
+      "changes": 7,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/7fa071267c0b62c592243cf00902bc8b64a8ba0a/docs%2Frefactor%2Fplan.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/7fa071267c0b62c592243cf00902bc8b64a8ba0a/docs%2Frefactor%2Fplan.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/docs%2Frefactor%2Fplan.md?ref=7fa071267c0b62c592243cf00902bc8b64a8ba0a",
+      "patch": "@@ -14,11 +14,12 @@ This is a living note capturing the cleanups underway to keep `warelay` small an\n - Added prompt/wait helpers (`src/cli/{prompt,wait}.ts`) and Twilio sender discovery module (`src/twilio/senders.ts`).\n - Slimmed `src/index.ts` to ~130 LOC.\n - README updated to document direct WhatsApp Web support and Claude output handling.\n+- Added zod validation for `~/.warelay/warelay.json` and a `--dry-run` flag for `send`.\n+- Introduced a tiny logger (`src/logger.ts`) and backoff retry in Twilio polling.\n \n ## In this pass\n-- Added config validation for inbound reply settings (claude output format, command/text shape).\n-- Added `--dry-run` for `send` to print the outbound payload without contacting providers.\n-- Documented roadmap (this file).\n+- Wire more modules to the logger; keep colors/verbosity consistent.\n+- Add minimal retries/backoff for webhook bring-up and port/Tailscale helpers.\n \n ## Next candidates (not yet done)\n - Centralize logging/verbosity (runtime-aware logger wrapper)."
+    },
+    {
+      "sha": "8ac25aa3a70a801ff4b01670037ee9727d9295e2",
+      "filename": "src/auto-reply/claude.test.ts",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 2,
+      "changes": 16,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/7fa071267c0b62c592243cf00902bc8b64a8ba0a/src%2Fauto-reply%2Fclaude.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/7fa071267c0b62c592243cf00902bc8b64a8ba0a/src%2Fauto-reply%2Fclaude.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fauto-reply%2Fclaude.test.ts?ref=7fa071267c0b62c592243cf00902bc8b64a8ba0a",
+      "patch": "@@ -1,6 +1,6 @@\n import { describe, expect, it } from \"vitest\";\n \n-import { parseClaudeJsonText } from \"./claude.js\";\n+import { parseClaudeJson, parseClaudeJsonText } from \"./claude.js\";\n \n describe(\"claude JSON parsing\", () => {\n \tit(\"extracts text from single JSON object\", () => {\n@@ -16,5 +16,17 @@ describe(\"claude JSON parsing\", () => {\n \tit(\"returns undefined on invalid JSON\", () => {\n \t\texpect(parseClaudeJsonText(\"not json\")).toBeUndefined();\n \t});\n-});\n \n+\tit(\"extracts text from Claude CLI result field and preserves metadata\", () => {\n+\t\tconst sample = {\n+\t\t\ttype: \"result\",\n+\t\t\tsubtype: \"success\",\n+\t\t\tresult: \"hello from result field\",\n+\t\t\tduration_ms: 1234,\n+\t\t\tusage: { server_tool_use: { tool_a: 2 } },\n+\t\t};\n+\t\tconst parsed = parseClaudeJson(JSON.stringify(sample));\n+\t\texpect(parsed?.text).toBe(\"hello from result field\");\n+\t\texpect(parsed?.parsed).toMatchObject({ duration_ms: 1234 });\n+\t});\n+});"
+    },
+    {
+      "sha": "d3ba790a4d9c8c4af9a664a0469d01e485aa110d",
+      "filename": "src/auto-reply/claude.ts",
+      "status": "modified",
+      "additions": 19,
+      "deletions": 3,
+      "changes": 22,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/7fa071267c0b62c592243cf00902bc8b64a8ba0a/src%2Fauto-reply%2Fclaude.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/7fa071267c0b62c592243cf00902bc8b64a8ba0a/src%2Fauto-reply%2Fclaude.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fauto-reply%2Fclaude.ts?ref=7fa071267c0b62c592243cf00902bc8b64a8ba0a",
+      "patch": "@@ -16,6 +16,7 @@ function extractClaudeText(payload: unknown): string | undefined {\n \t}\n \tif (typeof payload === \"object\") {\n \t\tconst obj = payload as Record<string, unknown>;\n+\t\tif (typeof obj.result === \"string\") return obj.result;\n \t\tif (typeof obj.text === \"string\") return obj.text;\n \t\tif (typeof obj.completion === \"string\") return obj.completion;\n \t\tif (typeof obj.output === \"string\") return obj.output;\n@@ -45,17 +46,32 @@ function extractClaudeText(payload: unknown): string | undefined {\n \treturn undefined;\n }\n \n-export function parseClaudeJsonText(raw: string): string | undefined {\n-    // Handle a single JSON blob or newline-delimited JSON; return the first extracted text.\n+export type ClaudeJsonParseResult = {\n+\ttext?: string;\n+\tparsed: unknown;\n+};\n+\n+export function parseClaudeJson(raw: string): ClaudeJsonParseResult | undefined {\n+\t// Handle a single JSON blob or newline-delimited JSON; return the first parsed payload.\n+\tlet firstParsed: unknown;\n \tconst candidates = [raw, ...raw.split(/\\n+/).map((s) => s.trim()).filter(Boolean)];\n \tfor (const candidate of candidates) {\n \t\ttry {\n \t\t\tconst parsed = JSON.parse(candidate);\n+\t\t\tif (firstParsed === undefined) firstParsed = parsed;\n \t\t\tconst text = extractClaudeText(parsed);\n-\t\t\tif (text) return text;\n+\t\t\tif (text) return { parsed, text };\n \t\t} catch {\n \t\t\t// ignore parse errors; try next candidate\n \t\t}\n \t}\n+\tif (firstParsed !== undefined) {\n+\t\treturn { parsed: firstParsed, text: extractClaudeText(firstParsed) };\n+\t}\n \treturn undefined;\n }\n+\n+export function parseClaudeJsonText(raw: string): string | undefined {\n+\tconst parsed = parseClaudeJson(raw);\n+\treturn parsed?.text;\n+}"
+    },
+    {
+      "sha": "a8955c9d1f11c0ba20dad01264df92454db58e3f",
+      "filename": "src/auto-reply/reply.ts",
+      "status": "modified",
+      "additions": 61,
+      "deletions": 7,
+      "changes": 68,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/7fa071267c0b62c592243cf00902bc8b64a8ba0a/src%2Fauto-reply%2Freply.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/7fa071267c0b62c592243cf00902bc8b64a8ba0a/src%2Fauto-reply%2Freply.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fauto-reply%2Freply.ts?ref=7fa071267c0b62c592243cf00902bc8b64a8ba0a",
+      "patch": "@@ -1,7 +1,7 @@\n import crypto from \"node:crypto\";\n import path from \"node:path\";\n \n-import { CLAUDE_BIN, parseClaudeJsonText } from \"./claude.js\";\n+import { CLAUDE_BIN, parseClaudeJson } from \"./claude.js\";\n import {\n \tapplyTemplate,\n \ttype MsgContext,\n@@ -39,6 +39,52 @@ type GetReplyOptions = {\n \tonReplyStart?: () => Promise<void> | void;\n };\n \n+function summarizeClaudeMetadata(payload: unknown): string | undefined {\n+\tif (!payload || typeof payload !== \"object\") return undefined;\n+\tconst obj = payload as Record<string, unknown>;\n+\tconst parts: string[] = [];\n+\n+\tif (typeof obj.duration_ms === \"number\") {\n+\t\tparts.push(`duration=${obj.duration_ms}ms`);\n+\t}\n+\tif (typeof obj.duration_api_ms === \"number\") {\n+\t\tparts.push(`api=${obj.duration_api_ms}ms`);\n+\t}\n+\tif (typeof obj.num_turns === \"number\") {\n+\t\tparts.push(`turns=${obj.num_turns}`);\n+\t}\n+\tif (typeof obj.total_cost_usd === \"number\") {\n+\t\tparts.push(`cost=$${obj.total_cost_usd.toFixed(4)}`);\n+\t}\n+\n+\tconst usage = obj.usage;\n+\tif (usage && typeof usage === \"object\") {\n+\t\tconst serverToolUse = (usage as { server_tool_use?: Record<string, unknown> })\n+\t\t\t.server_tool_use;\n+\t\tif (serverToolUse && typeof serverToolUse === \"object\") {\n+\t\t\tconst toolCalls = Object.values(serverToolUse).reduce((sum, val) => {\n+\t\t\t\tif (typeof val === \"number\") return sum + val;\n+\t\t\t\treturn sum;\n+\t\t\t}, 0);\n+\t\t\tif (toolCalls > 0) parts.push(`tool_calls=${toolCalls}`);\n+\t\t}\n+\t}\n+\n+\tconst modelUsage = obj.modelUsage;\n+\tif (modelUsage && typeof modelUsage === \"object\") {\n+\t\tconst models = Object.keys(modelUsage as Record<string, unknown>);\n+\t\tif (models.length) {\n+\t\t\tconst display =\n+\t\t\t\tmodels.length > 2\n+\t\t\t\t\t? `${models.slice(0, 2).join(\",\")}+${models.length - 2}`\n+\t\t\t\t\t: models.join(\",\");\n+\t\t\tparts.push(`models=${display}`);\n+\t\t}\n+\t}\n+\n+\treturn parts.length ? parts.join(\", \") : undefined;\n+}\n+\n export async function getReplyFromConfig(\n \tctx: MsgContext,\n \topts?: GetReplyOptions,\n@@ -216,18 +262,26 @@ export async function getReplyFromConfig(\n \t\t\t\tfinalArgv,\n \t\t\t\ttimeoutMs,\n \t\t\t);\n-\t\t\tlet trimmed = stdout.trim();\n+\t\t\tconst rawStdout = stdout.trim();\n+\t\t\tlet trimmed = rawStdout;\n \t\t\tif (stderr?.trim()) {\n \t\t\t\tlogVerbose(`Command auto-reply stderr: ${stderr.trim()}`);\n \t\t\t}\n \t\t\tif (reply.claudeOutputFormat === \"json\" && trimmed) {\n-\t\t\t\t// Claude JSON mode: extract the human text for both logging and reply.\n-\t\t\t\tconst extracted = parseClaudeJsonText(trimmed);\n-\t\t\t\tif (extracted) {\n+\t\t\t\t// Claude JSON mode: extract the human text for both logging and reply while keeping metadata.\n+\t\t\t\tconst parsed = parseClaudeJson(trimmed);\n+\t\t\t\tif (parsed?.parsed && isVerbose()) {\n+\t\t\t\t\tconst summary = summarizeClaudeMetadata(parsed.parsed);\n+\t\t\t\t\tif (summary) logVerbose(`Claude JSON meta: ${summary}`);\n+\t\t\t\t\tlogVerbose(\n+\t\t\t\t\t\t`Claude JSON raw: ${JSON.stringify(parsed.parsed, null, 2)}`,\n+\t\t\t\t\t);\n+\t\t\t\t}\n+\t\t\t\tif (parsed?.text) {\n \t\t\t\t\tlogVerbose(\n-\t\t\t\t\t\t`Claude JSON parsed -> ${extracted.slice(0, 120)}${extracted.length > 120 ? \"\u2026\" : \"\"}`,\n+\t\t\t\t\t\t`Claude JSON parsed -> ${parsed.text.slice(0, 120)}${parsed.text.length > 120 ? \"\u2026\" : \"\"}`,\n \t\t\t\t\t);\n-\t\t\t\t\ttrimmed = extracted.trim();\n+\t\t\t\t\ttrimmed = parsed.text.trim();\n \t\t\t\t} else {\n \t\t\t\t\tlogVerbose(\"Claude JSON parse failed; returning raw stdout\");\n \t\t\t\t}"
+    },
+    {
+      "sha": "7379eea8ed69c29ca7e89ad58fd94aaf9b539cae",
+      "filename": "src/index.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/7fa071267c0b62c592243cf00902bc8b64a8ba0a/src%2Findex.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/7fa071267c0b62c592243cf00902bc8b64a8ba0a/src%2Findex.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Findex.ts?ref=7fa071267c0b62c592243cf00902bc8b64a8ba0a",
+      "patch": "@@ -20,7 +20,7 @@ import {\n \tsetMessagingServiceWebhook as setMessagingServiceWebhookImpl,\n } from \"./twilio/update-webhook.js\";\n import { listRecentMessages, formatMessageLine, uniqueBySid, sortByDateDesc } from \"./twilio/messages.js\";\n-import { CLAUDE_BIN, parseClaudeJsonText } from \"./auto-reply/claude.js\";\n+import { CLAUDE_BIN } from \"./auto-reply/claude.js\";\n import { applyTemplate, type MsgContext, type TemplateContext } from \"./auto-reply/templating.js\";\n import {\n \tCONFIG_PATH,"
+    },
+    {
+      "sha": "a7e03c8faa208a9e27b7a24f8fbe0292cd0fff6b",
+      "filename": "src/logger.ts",
+      "status": "added",
+      "additions": 26,
+      "deletions": 0,
+      "changes": 26,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/7fa071267c0b62c592243cf00902bc8b64a8ba0a/src%2Flogger.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/7fa071267c0b62c592243cf00902bc8b64a8ba0a/src%2Flogger.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Flogger.ts?ref=7fa071267c0b62c592243cf00902bc8b64a8ba0a",
+      "patch": "@@ -0,0 +1,26 @@\n+import { danger, info, success, warn, logVerbose, isVerbose } from \"./globals.js\";\n+import { defaultRuntime, type RuntimeEnv } from \"./runtime.js\";\n+\n+export function logInfo(message: string, runtime: RuntimeEnv = defaultRuntime) {\n+\truntime.log(info(message));\n+}\n+\n+export function logWarn(message: string, runtime: RuntimeEnv = defaultRuntime) {\n+\truntime.log(warn(message));\n+}\n+\n+export function logSuccess(\n+\tmessage: string,\n+\truntime: RuntimeEnv = defaultRuntime,\n+) {\n+\truntime.log(success(message));\n+}\n+\n+export function logError(message: string, runtime: RuntimeEnv = defaultRuntime) {\n+\truntime.error(danger(message));\n+}\n+\n+export function logDebug(message: string) {\n+\t// Verbose helper that respects global verbosity flag.\n+\tif (isVerbose()) logVerbose(message);\n+}"
+    },
+    {
+      "sha": "d7bfa49cb6abd8cd6d9b31347785865fa0fed652",
+      "filename": "src/provider-web.ts",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 6,
+      "changes": 12,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/7fa071267c0b62c592243cf00902bc8b64a8ba0a/src%2Fprovider-web.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/7fa071267c0b62c592243cf00902bc8b64a8ba0a/src%2Fprovider-web.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fprovider-web.ts?ref=7fa071267c0b62c592243cf00902bc8b64a8ba0a",
+      "patch": "@@ -12,12 +12,13 @@ import {\n } from \"@whiskeysockets/baileys\";\n import pino from \"pino\";\n import qrcode from \"qrcode-terminal\";\n-import { danger, info, isVerbose, logVerbose, success, warn } from \"./globals.js\";\n+import { danger, isVerbose, logVerbose, success, warn } from \"./globals.js\";\n import { ensureDir, jidToE164, toWhatsappJid } from \"./utils.js\";\n import type { Provider } from \"./utils.js\";\n import { waitForever } from \"./cli/wait.js\";\n import { getReplyFromConfig } from \"./auto-reply/reply.js\";\n import { defaultRuntime, type RuntimeEnv } from \"./runtime.js\";\n+import { logInfo, logWarn } from \"./logger.js\";\n \n const WA_WEB_AUTH_DIR = path.join(os.homedir(), \".warelay\", \"credentials\");\n \n@@ -319,14 +320,13 @@ export async function monitorWebProvider(\n \t\t},\n \t});\n \n-\tconsole.log(\n-\t\tinfo(\n-\t\t\t\"\ud83d\udce1 Listening for personal WhatsApp Web inbound messages. Leave this running; Ctrl+C to stop.\",\n-\t\t),\n+\tlogInfo(\n+\t\t\"\ud83d\udce1 Listening for personal WhatsApp Web inbound messages. Leave this running; Ctrl+C to stop.\",\n+\t\truntime,\n \t);\n \tprocess.on(\"SIGINT\", () => {\n \t\tvoid listener.close().finally(() => {\n-\t\t\tconsole.log(\"\\n\ud83d\udc4b Web monitor stopped\");\n+\t\t\tlogInfo(\"\ud83d\udc4b Web monitor stopped\", runtime);\n \t\t\truntime.exit(0);\n \t\t});\n \t});"
+    },
+    {
+      "sha": "50919ea8a54aa016ee565b591012f3cd3da8797c",
+      "filename": "src/twilio/monitor.ts",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 6,
+      "changes": 26,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/7fa071267c0b62c592243cf00902bc8b64a8ba0a/src%2Ftwilio%2Fmonitor.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/7fa071267c0b62c592243cf00902bc8b64a8ba0a/src%2Ftwilio%2Fmonitor.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Ftwilio%2Fmonitor.ts?ref=7fa071267c0b62c592243cf00902bc8b64a8ba0a",
+      "patch": "@@ -1,12 +1,12 @@\n-import chalk from \"chalk\";\n import type { MessageInstance } from \"twilio/lib/rest/api/v2010/account/message.js\";\n \n-import { danger, info, logVerbose, warn } from \"../globals.js\";\n+import { danger, warn } from \"../globals.js\";\n import { sleep, withWhatsAppPrefix } from \"../utils.js\";\n import { defaultRuntime, type RuntimeEnv } from \"../runtime.js\";\n import { autoReplyIfConfigured } from \"../auto-reply/reply.js\";\n import { createClient } from \"./client.js\";\n import { readEnv } from \"../env.js\";\n+import { logDebug, logInfo, logWarn } from \"../logger.js\";\n \n type MonitorDeps = {\n \tautoReplyIfConfigured: typeof autoReplyIfConfigured;\n@@ -58,19 +58,33 @@ export async function monitorTwilio(\n \tconst deps = opts?.deps ?? defaultDeps;\n \tconst runtime = opts?.runtime ?? defaultRuntime;\n \tconst maxIterations = opts?.maxIterations ?? Infinity;\n+\tlet backoffMs = 1_000;\n \n \tconst env = deps.readEnv(runtime);\n \tconst from = withWhatsAppPrefix(env.whatsappFrom);\n \tconst client = opts?.client ?? deps.createClient(env);\n-\tconsole.log(\n+\tlogInfo(\n \t\t`\ud83d\udce1 Monitoring inbound messages to ${from} (poll ${pollSeconds}s, lookback ${lookbackMinutes}m)`,\n+\t\truntime,\n \t);\n \n \tlet lastSeenSid: string | undefined;\n \tlet iterations = 0;\n \twhile (iterations < maxIterations) {\n-\t\tconst messages =\n-\t\t\t(await deps.listRecentMessages(lookbackMinutes, 50, client)) ?? [];\n+\t\tlet messages: ListedMessage[] = [];\n+\t\ttry {\n+\t\t\tmessages =\n+\t\t\t\t(await deps.listRecentMessages(lookbackMinutes, 50, client)) ?? [];\n+\t\t\tbackoffMs = 1_000; // reset after success\n+\t\t} catch (err) {\n+\t\t\tlogWarn(\n+\t\t\t\t`Twilio polling failed (will retry in ${backoffMs}ms): ${String(err)}`,\n+\t\t\t\truntime,\n+\t\t\t);\n+\t\t\tawait deps.sleep(backoffMs);\n+\t\t\tbackoffMs = Math.min(backoffMs * 2, 10_000);\n+\t\t\tcontinue;\n+\t\t}\n \t\tconst inboundOnly = messages.filter((m) => m.direction === \"inbound\");\n \t\t// Sort newest -> oldest without relying on external helpers (avoids test mocks clobbering imports).\n \t\tconst newestFirst = [...inboundOnly].sort(\n@@ -95,7 +109,7 @@ async function handleMessages(\n \tfor (const m of messages) {\n \t\tif (!m.sid) continue;\n \t\tif (lastSeenSid && m.sid === lastSeenSid) break; // stop at previously seen\n-\t\tlogVerbose(`[${m.sid}] ${m.from ?? \"?\"} -> ${m.to ?? \"?\"}: ${m.body ?? \"\"}`);\n+\t\tlogDebug(`[${m.sid}] ${m.from ?? \"?\"} -> ${m.to ?? \"?\"}: ${m.body ?? \"\"}`);\n \t\tif (m.direction !== \"inbound\") continue;\n \t\tif (!m.from || !m.to) continue;\n \t\ttry {"
+    }
+  ]
+}

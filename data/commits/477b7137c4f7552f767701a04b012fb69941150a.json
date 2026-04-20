@@ -1,0 +1,41 @@
+{
+  "message": "fix(fsfs,fusion,embed): fsync all production metadata writes\n\nReplace fs::write() with write_all + sync_all in 8 production code\npaths across three crates to prevent silent data loss on power failure:\n\n  fsfs/runtime.rs (6 sites):\n  - write_index_artifacts: vector & lexical manifest JSON\n  - write_index_sentinel: index sentinel JSON\n  - write_version_cache: version check cache JSON\n  - write_rollback_manifest: rollback manifest JSON\n  - save_explain_session: explain session JSON\n\n  fusion/cache.rs (1 site):\n  - IndexSentinel::write_to: staleness-detection sentinel\n\n  embed/model_manifest.rs (1 site):\n  - write_verification_marker: model verification cache\n\nWithout fsync these writes could appear successful but lose data if\nthe kernel hasn't flushed pages to disk before a crash.\n\nBead: bd-1l6x\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "ef09a869998ba55434f6eb0e5d3d748d420fea29",
+      "filename": "crates/frankensearch-embed/src/model_manifest.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 1,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensearch/blob/477b7137c4f7552f767701a04b012fb69941150a/crates%2Ffrankensearch-embed%2Fsrc%2Fmodel_manifest.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensearch/raw/477b7137c4f7552f767701a04b012fb69941150a/crates%2Ffrankensearch-embed%2Fsrc%2Fmodel_manifest.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensearch/contents/crates%2Ffrankensearch-embed%2Fsrc%2Fmodel_manifest.rs?ref=477b7137c4f7552f767701a04b012fb69941150a",
+      "patch": "@@ -1159,7 +1159,12 @@ pub fn write_verification_marker(manifest: &ModelManifest, model_dir: &Path) {\n     let Ok(json) = serde_json::to_string_pretty(&marker) else {\n         return;\n     };\n-    let _ = fs::write(model_dir.join(VERIFIED_MARKER_FILE), json);\n+    let _ = (|| -> std::io::Result<()> {\n+        let mut file = File::create(model_dir.join(VERIFIED_MARKER_FILE))?;\n+        std::io::Write::write_all(&mut file, json.as_bytes())?;\n+        file.sync_all()?;\n+        Ok(())\n+    })();\n }\n \n /// Check whether a valid verification marker exists for the given manifest and directory."
+    },
+    {
+      "sha": "df9e11722c42c7d39b680c2984610e09691d12d5",
+      "filename": "crates/frankensearch-fsfs/src/runtime.rs",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 6,
+      "changes": 22,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensearch/blob/477b7137c4f7552f767701a04b012fb69941150a/crates%2Ffrankensearch-fsfs%2Fsrc%2Fruntime.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensearch/raw/477b7137c4f7552f767701a04b012fb69941150a/crates%2Ffrankensearch-fsfs%2Fsrc%2Fruntime.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensearch/contents/crates%2Ffrankensearch-fsfs%2Fsrc%2Fruntime.rs?ref=477b7137c4f7552f767701a04b012fb69941150a",
+      "patch": "@@ -988,7 +988,7 @@ pub fn write_version_cache(cache: &VersionCheckCache) -> SearchResult<()> {\n         subsystem: \"fsfs.version_cache.json\",\n         source: Box::new(e),\n     })?;\n-    fs::write(&path, json).map_err(|e| SearchError::SubsystemError {\n+    write_durable(&path, json).map_err(|e| SearchError::SubsystemError {\n         subsystem: \"fsfs.version_cache.write\",\n         source: Box::new(e),\n     })?;\n@@ -1135,7 +1135,7 @@ pub fn write_rollback_manifest(manifest: &RollbackManifest) -> SearchResult<()>\n         subsystem: \"fsfs.backup.json\",\n         source: Box::new(e),\n     })?;\n-    fs::write(&path, json).map_err(|e| SearchError::SubsystemError {\n+    write_durable(&path, json).map_err(|e| SearchError::SubsystemError {\n         subsystem: \"fsfs.backup.write\",\n         source: Box::new(e),\n     })?;\n@@ -3017,7 +3017,7 @@ impl FsfsRuntime {\n                 source: Box::new(source),\n             }\n         })?;\n-        fs::write(path, json)?;\n+        write_durable(path, json)?;\n         Ok(())\n     }\n \n@@ -4503,15 +4503,15 @@ impl FsfsRuntime {\n                 source: Box::new(error),\n             }\n         })?;\n-        fs::write(index_root.join(FSFS_VECTOR_MANIFEST_FILE), vector_manifest)?;\n+        write_durable(index_root.join(FSFS_VECTOR_MANIFEST_FILE), vector_manifest)?;\n \n         let lexical_manifest = serde_json::to_string_pretty(manifests).map_err(|error| {\n             SearchError::SubsystemError {\n                 subsystem: \"index.lexical_manifest\",\n                 source: Box::new(error),\n             }\n         })?;\n-        fs::write(\n+        write_durable(\n             index_root.join(FSFS_LEXICAL_MANIFEST_FILE),\n             lexical_manifest,\n         )?;\n@@ -4531,7 +4531,7 @@ impl FsfsRuntime {\n                 source: Box::new(error),\n             }\n         })?;\n-        fs::write(index_root.join(FSFS_SENTINEL_FILE), json)?;\n+        write_durable(index_root.join(FSFS_SENTINEL_FILE), json)?;\n         Ok(())\n     }\n \n@@ -5536,6 +5536,16 @@ const fn degradation_controller_config_for_profile(\n     }\n }\n \n+/// Write `data` to `path` with fsync so the content is durable even under\n+/// sudden power loss.  Used for manifest, sentinel, and other metadata files\n+/// whose silent loss would leave the index in an inconsistent state.\n+fn write_durable(path: impl AsRef<Path>, data: impl AsRef<[u8]>) -> std::io::Result<()> {\n+    let mut file = fs::File::create(path)?;\n+    file.write_all(data.as_ref())?;\n+    file.sync_all()?;\n+    Ok(())\n+}\n+\n #[cfg(test)]\n mod tests {\n     use std::fs;"
+    },
+    {
+      "sha": "c6794c9d8d09fadb3dd10469e24887d4fdb32741",
+      "filename": "crates/frankensearch-fusion/src/cache.rs",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 1,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensearch/blob/477b7137c4f7552f767701a04b012fb69941150a/crates%2Ffrankensearch-fusion%2Fsrc%2Fcache.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensearch/raw/477b7137c4f7552f767701a04b012fb69941150a/crates%2Ffrankensearch-fusion%2Fsrc%2Fcache.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensearch/contents/crates%2Ffrankensearch-fusion%2Fsrc%2Fcache.rs?ref=477b7137c4f7552f767701a04b012fb69941150a",
+      "patch": "@@ -110,7 +110,11 @@ impl IndexSentinel {\n             value: \"<serialization>\".to_owned(),\n             reason: e.to_string(),\n         })?;\n-        std::fs::write(&path, json)?;\n+        {\n+            let mut file = std::fs::File::create(&path)?;\n+            std::io::Write::write_all(&mut file, json.as_bytes())?;\n+            file.sync_all()?;\n+        }\n         debug!(\n             target: \"frankensearch.cache\",\n             path = %path.display(),"
+    }
+  ]
+}

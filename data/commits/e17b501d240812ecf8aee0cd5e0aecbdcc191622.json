@@ -1,0 +1,41 @@
+{
+  "message": "fix(buffers): add 64KB limits to stream observers + optimize detector locking\n\n- Add maxBufferSize (64KB) limit to ObservingWriter, teeWriter, captureWriter,\n  and URLDetector to prevent OOM on long lines without newlines (caam-g0cq)\n- Optimize Detector.Check to use read lock for fast path and release lock\n  during expensive regex matching operations (caam-rfa0)\n- Closes caam-d4g7 (already fixed in commit b074887)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "466a91202979ce2a3ceeea7c232627233b51e8e3",
+      "filename": "internal/browser/urldetect.go",
+      "status": "modified",
+      "additions": 37,
+      "deletions": 0,
+      "changes": 37,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_account_manager/blob/e17b501d240812ecf8aee0cd5e0aecbdcc191622/internal%2Fbrowser%2Furldetect.go",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_account_manager/raw/e17b501d240812ecf8aee0cd5e0aecbdcc191622/internal%2Fbrowser%2Furldetect.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_account_manager/contents/internal%2Fbrowser%2Furldetect.go?ref=e17b501d240812ecf8aee0cd5e0aecbdcc191622",
+      "patch": "@@ -15,6 +15,10 @@ import (\n // Matches: http://localhost:PORT/path?query or http://127.0.0.1:PORT/path?query\n var URLPattern = regexp.MustCompile(`https?://(?:localhost|127\\.0\\.0\\.1):[0-9]+[^\\s\"']*`)\n \n+// maxBufferSize is the maximum buffer size before forcing a flush (64KB).\n+// This prevents unbounded memory growth when output contains no newlines.\n+const maxBufferSize = 64 * 1024\n+\n // URLCallback is called when a URL is detected in the output.\n // Note: The return value is currently unused; all output is passed through.\n type URLCallback func(url string) bool\n@@ -79,6 +83,19 @@ func (d *URLDetector) Write(p []byte) (n int, err error) {\n \t\td.buffer = d.buffer[idx+1:]\n \t}\n \n+\t// Enforce buffer limit to prevent OOM on long lines without newlines\n+\tif len(d.buffer) > maxBufferSize {\n+\t\t// Process oversized buffer before clearing\n+\t\tif d.callback != nil {\n+\t\t\tlineStr := string(d.buffer)\n+\t\t\turls := URLPattern.FindAllString(lineStr, -1)\n+\t\t\tfor _, url := range urls {\n+\t\t\t\td.callback(cleanURL(url))\n+\t\t\t}\n+\t\t}\n+\t\td.buffer = nil\n+\t}\n+\n \t// Always pass through to output\n \treturn d.output.Write(p)\n }\n@@ -267,6 +284,26 @@ func (w *captureWriter) Write(p []byte) (n int, err error) {\n \n \t\t\tw.buffer = w.buffer[idx+1:]\n \t\t}\n+\n+\t\t// Enforce buffer limit to prevent OOM on long lines without newlines\n+\t\tif len(w.buffer) > maxBufferSize {\n+\t\t\t// Process oversized buffer before clearing\n+\t\t\tlineStr := string(w.buffer)\n+\t\t\turls := URLPattern.FindAllString(lineStr, -1)\n+\t\t\tfor _, url := range urls {\n+\t\t\t\tcleaned := cleanURL(url)\n+\t\t\t\tw.capture.mu.Lock()\n+\t\t\t\tw.capture.DetectedURLs = append(w.capture.DetectedURLs, DetectedURL{\n+\t\t\t\t\tURL:    cleaned,\n+\t\t\t\t\tSource: w.source,\n+\t\t\t\t})\n+\t\t\t\tif w.capture.OnURL != nil {\n+\t\t\t\t\tw.capture.OnURL(cleaned, w.source)\n+\t\t\t\t}\n+\t\t\t\tw.capture.mu.Unlock()\n+\t\t\t}\n+\t\t\tw.buffer = nil\n+\t\t}\n \t\tw.mu.Unlock()\n \t}\n "
+    },
+    {
+      "sha": "095ed0c312cfa4cfd6398e8d3c3be1a1ed74ec60",
+      "filename": "internal/ratelimit/detector.go",
+      "status": "modified",
+      "additions": 41,
+      "deletions": 8,
+      "changes": 49,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_account_manager/blob/e17b501d240812ecf8aee0cd5e0aecbdcc191622/internal%2Fratelimit%2Fdetector.go",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_account_manager/raw/e17b501d240812ecf8aee0cd5e0aecbdcc191622/internal%2Fratelimit%2Fdetector.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_account_manager/contents/internal%2Fratelimit%2Fdetector.go?ref=e17b501d240812ecf8aee0cd5e0aecbdcc191622",
+      "patch": "@@ -124,19 +124,29 @@ func NewDetector(provider Provider, customPatterns []string) (*Detector, error)\n // Returns true if a rate limit pattern is detected.\n // The detection is sticky - once detected, it remains true.\n func (d *Detector) Check(text string) bool {\n-\td.mu.Lock()\n-\tdefer d.mu.Unlock()\n-\n+\t// Fast path: check if already detected using read lock\n+\td.mu.RLock()\n \tif d.detected {\n+\t\td.mu.RUnlock()\n \t\treturn true\n \t}\n+\t// Capture patterns while holding read lock (patterns slice is immutable after creation)\n+\tpatterns := d.patterns\n+\td.mu.RUnlock()\n \n-\tfor _, re := range d.patterns {\n+\t// Perform expensive regex matching outside the lock\n+\tfor _, re := range patterns {\n \t\tif re.MatchString(text) {\n-\t\t\td.detected = true\n-\t\t\t// Extract the matching portion for the reason\n-\t\t\tmatch := re.FindString(text)\n-\t\t\td.reason = strings.TrimSpace(match)\n+\t\t\t// Only acquire write lock when updating state\n+\t\t\td.mu.Lock()\n+\t\t\t// Double-check in case another goroutine set it while we were matching\n+\t\t\tif !d.detected {\n+\t\t\t\td.detected = true\n+\t\t\t\t// Extract the matching portion for the reason\n+\t\t\t\tmatch := re.FindString(text)\n+\t\t\t\td.reason = strings.TrimSpace(match)\n+\t\t\t}\n+\t\t\td.mu.Unlock()\n \t\t\treturn true\n \t\t}\n \t}\n@@ -173,6 +183,10 @@ func (d *Detector) Provider() Provider {\n \treturn d.provider\n }\n \n+// maxBufferSize is the maximum buffer size before forcing a flush (64KB).\n+// This prevents unbounded memory growth when output contains no newlines.\n+const maxBufferSize = 64 * 1024\n+\n // ObservingWriter wraps a writer and checks each write for rate limit patterns.\n type ObservingWriter struct {\n \tmu       sync.Mutex\n@@ -218,6 +232,25 @@ func (w *ObservingWriter) Write(p []byte) (n int, err error) {\n \t\t}\n \t}\n \n+\t// Enforce buffer limit to prevent OOM on long lines without newlines\n+\tif len(w.buffer) > maxBufferSize {\n+\t\t// Process oversized buffer as a partial line\n+\t\tline := string(w.buffer)\n+\t\tw.detector.Check(line)\n+\t\tif w.callback != nil {\n+\t\t\tw.callback(line)\n+\t\t}\n+\t\tw.buffer = nil\n+\t}\n+\n+\t// Compact buffer if it has grown large but contains little data\n+\t// (capacity > 4KB and usage < 25%)\n+\tif cap(w.buffer) > 4096 && len(w.buffer) < cap(w.buffer)/4 {\n+\t\tnewBuf := make([]byte, len(w.buffer))\n+\t\tcopy(newBuf, w.buffer)\n+\t\tw.buffer = newBuf\n+\t}\n+\n \treturn n, nil\n }\n "
+    },
+    {
+      "sha": "016a88006260bf94283aac375dc6e0378b850f2d",
+      "filename": "internal/wrap/wrap.go",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 0,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_account_manager/blob/e17b501d240812ecf8aee0cd5e0aecbdcc191622/internal%2Fwrap%2Fwrap.go",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_account_manager/raw/e17b501d240812ecf8aee0cd5e0aecbdcc191622/internal%2Fwrap%2Fwrap.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_account_manager/contents/internal%2Fwrap%2Fwrap.go?ref=e17b501d240812ecf8aee0cd5e0aecbdcc191622",
+      "patch": "@@ -410,6 +410,10 @@ func (w *Wrapper) runOnce(ctx context.Context, profile string) (int, bool, error\n \treturn exitCode, rateLimitHit, nil\n }\n \n+// maxBufferSize is the maximum buffer size before forcing a flush (64KB).\n+// This prevents unbounded memory growth when output contains no newlines.\n+const maxBufferSize = 64 * 1024\n+\n // teeWriter writes to a destination while also checking for rate limits.\n // It buffers data to ensure rate limit patterns aren't missed when split\n // across multiple Write calls (e.g., \"rate li\" then \"mit exceeded\").\n@@ -446,6 +450,11 @@ func (t *teeWriter) Write(p []byte) (n int, err error) {\n \t\tt.detector.Check(string(t.buffer))\n \t}\n \n+\t// Enforce buffer limit to prevent OOM on long lines without newlines\n+\tif len(t.buffer) > maxBufferSize {\n+\t\tt.buffer = nil\n+\t}\n+\n \t// Forward to destination\n \treturn t.dest.Write(p)\n }"
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "message": "fix: emit SESSION_END exactly once, not twice (GAP-2.10)\n\nSESSION_END was emitted both after ProcessInput (input_complete) and in\nClose() (session_closed). Add sessionEndEmitted flag to ensure it fires\nexactly once regardless of call ordering.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "a2536ac999e58234deafbbeb7ba914744bd0af31",
+      "filename": "internal/agent/session.go",
+      "status": "modified",
+      "additions": 26,
+      "deletions": 9,
+      "changes": 35,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/56b460f0f53bdcf8fd030131876c1efb4862c464/internal%2Fagent%2Fsession.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/56b460f0f53bdcf8fd030131876c1efb4862c464/internal%2Fagent%2Fsession.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/internal%2Fagent%2Fsession.go?ref=56b460f0f53bdcf8fd030131876c1efb4862c464",
+      "patch": "@@ -138,6 +138,9 @@ type Session struct {\n \t// read-before-write guardrail\n \treadFiles map[string]bool\n \n+\t// SESSION_END deduplication: emitted exactly once across ProcessInput and Close.\n+\tsessionEndEmitted bool\n+\n \t// task list (lazy-init)\n \ttaskStore     *TaskStore\n \ttaskStoreOnce sync.Once\n@@ -432,6 +435,8 @@ func (s *Session) Close() {\n \t\tdelete(s.subagents, id)\n \t}\n \tturns := s.turns\n+\temitEnd := !s.sessionEndEmitted\n+\ts.sessionEndEmitted = true\n \ts.mu.Unlock()\n \n \tfor _, sub := range subs {\n@@ -444,11 +449,13 @@ func (s *Session) Close() {\n \n \ts.env.Cleanup()\n \n-\ts.emit(EventSessionEnd, map[string]any{\n-\t\t\"reason\": \"session_closed\",\n-\t\t\"state\":  string(SessionClosed),\n-\t\t\"turns\":  turns,\n-\t})\n+\tif emitEnd {\n+\t\ts.emit(EventSessionEnd, map[string]any{\n+\t\t\t\"reason\": \"session_closed\",\n+\t\t\t\"state\":  string(SessionClosed),\n+\t\t\t\"turns\":  turns,\n+\t\t})\n+\t}\n \tclose(s.events)\n }\n \n@@ -469,10 +476,20 @@ func (s *Session) ProcessInput(ctx context.Context, input string) (string, error\n \t\t}\n \t\tfu := s.popFollowUp()\n \t\tif strings.TrimSpace(fu) == \"\" {\n-\t\t\ts.emit(EventSessionEnd, map[string]any{\n-\t\t\t\t\"reason\": \"input_complete\",\n-\t\t\t\t\"state\":  string(s.State()),\n-\t\t\t})\n+\t\t\ts.mu.Lock()\n+\t\t\tif !s.sessionEndEmitted {\n+\t\t\t\ts.sessionEndEmitted = true\n+\t\t\t\tturns := s.turns\n+\t\t\t\tstate := s.state\n+\t\t\t\ts.mu.Unlock()\n+\t\t\t\ts.emit(EventSessionEnd, map[string]any{\n+\t\t\t\t\t\"reason\": \"input_complete\",\n+\t\t\t\t\t\"state\":  string(state),\n+\t\t\t\t\t\"turns\":  turns,\n+\t\t\t\t})\n+\t\t\t} else {\n+\t\t\t\ts.mu.Unlock()\n+\t\t\t}\n \t\t\treturn strings.Join(outputs, \"\\n\"), nil\n \t\t}\n \t\tnext = fu"
+    },
+    {
+      "sha": "73081c760a120cc9649c255fc3ef1431e85cb8f0",
+      "filename": "internal/agent/session_dod_test.go",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 8,
+      "changes": 19,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/56b460f0f53bdcf8fd030131876c1efb4862c464/internal%2Fagent%2Fsession_dod_test.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/56b460f0f53bdcf8fd030131876c1efb4862c464/internal%2Fagent%2Fsession_dod_test.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/internal%2Fagent%2Fsession_dod_test.go?ref=56b460f0f53bdcf8fd030131876c1efb4862c464",
+      "patch": "@@ -2014,7 +2014,10 @@ func TestSession_GracefulShutdown_SessionEndIncludesStateAndTurns(t *testing.T)\n \tif endData == nil {\n \t\tt.Fatal(\"expected SESSION_END event\")\n \t}\n-\tif state, ok := endData[\"state\"].(string); !ok || state != string(SessionClosed) {\n+\t// SESSION_END is emitted exactly once (dedup). When ProcessInput completes\n+\t// successfully, it emits with the current state (IDLE); when only Close()\n+\t// fires it, the state is CLOSED. Either is valid.\n+\tif state, ok := endData[\"state\"].(string); !ok || state == \"\" {\n \t\tt.Fatalf(\"SESSION_END state: got %v\", endData[\"state\"])\n \t}\n \tif turns, ok := endData[\"turns\"].(int); !ok || turns < 1 {\n@@ -2397,26 +2400,26 @@ func TestSession_SessionEnd_AfterProcessInput(t *testing.T) {\n \t\tt.Fatalf(\"ProcessInput: %v\", err)\n \t}\n \n-\t// After ProcessInput returns, a SESSION_END with reason \"input_complete\" should be emitted.\n+\t// After ProcessInput returns, exactly one SESSION_END with reason \"input_complete\" should be emitted.\n+\t// Close() must not emit a second SESSION_END (dedup via sessionEndEmitted flag).\n \tsess.Close()\n \t<-done\n \n-\tvar inputCompleteEnd, sessionClosedEnd bool\n+\tendCount := 0\n+\tvar inputCompleteEnd bool\n \tfor _, ev := range events {\n \t\tif ev.Kind == EventSessionEnd {\n+\t\t\tendCount++\n \t\t\tif r, _ := ev.Data[\"reason\"].(string); r == \"input_complete\" {\n \t\t\t\tinputCompleteEnd = true\n \t\t\t}\n-\t\t\tif r, _ := ev.Data[\"reason\"].(string); r == \"session_closed\" {\n-\t\t\t\tsessionClosedEnd = true\n-\t\t\t}\n \t\t}\n \t}\n \tif !inputCompleteEnd {\n \t\tt.Fatalf(\"expected SESSION_END with reason=input_complete\")\n \t}\n-\tif !sessionClosedEnd {\n-\t\tt.Fatalf(\"expected SESSION_END with reason=session_closed\")\n+\tif endCount != 1 {\n+\t\tt.Fatalf(\"expected exactly 1 SESSION_END event, got %d\", endCount)\n \t}\n }\n "
+    },
+    {
+      "sha": "5e6c23e877c1d6fd66bd961d13cc37fa5365d6f6",
+      "filename": "internal/agent/session_test.go",
+      "status": "modified",
+      "additions": 34,
+      "deletions": 0,
+      "changes": 34,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/56b460f0f53bdcf8fd030131876c1efb4862c464/internal%2Fagent%2Fsession_test.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/56b460f0f53bdcf8fd030131876c1efb4862c464/internal%2Fagent%2Fsession_test.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/internal%2Fagent%2Fsession_test.go?ref=56b460f0f53bdcf8fd030131876c1efb4862c464",
+      "patch": "@@ -1046,3 +1046,37 @@ func TestSessionState_Transitions(t *testing.T) {\n \t\tt.Fatal(\"SessionClosed wrong\")\n \t}\n }\n+\n+func TestSession_SessionEnd_EmittedExactlyOnce(t *testing.T) {\n+\tc := llm.NewClient()\n+\tf := &fakeAdapter{name: \"openai\", steps: []func(llm.Request) llm.Response{\n+\t\tfunc(req llm.Request) llm.Response {\n+\t\t\treturn llm.Response{Message: llm.Assistant(\"done\")}\n+\t\t},\n+\t}}\n+\tc.Register(f)\n+\tdir := t.TempDir()\n+\tsess, err := NewSession(c, NewOpenAIProfile(\"test-model\"), NewLocalExecutionEnvironment(dir), SessionConfig{})\n+\tif err != nil {\n+\t\tt.Fatal(err)\n+\t}\n+\teventsPtr, mu, doneCh := collectEvents(sess)\n+\n+\tctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)\n+\tdefer cancel()\n+\tsess.ProcessInput(ctx, \"hello\")\n+\tsess.Close()\n+\t<-doneCh\n+\n+\tmu.Lock()\n+\tdefer mu.Unlock()\n+\tcount := 0\n+\tfor _, ev := range *eventsPtr {\n+\t\tif ev.Kind == EventSessionEnd {\n+\t\t\tcount++\n+\t\t}\n+\t}\n+\tif count != 1 {\n+\t\tt.Fatalf(\"expected exactly 1 SESSION_END event, got %d\", count)\n+\t}\n+}"
+    }
+  ]
+}

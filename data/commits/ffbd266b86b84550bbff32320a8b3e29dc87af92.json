@@ -1,0 +1,29 @@
+{
+  "message": "fix(tls): remove unused session_memory_limit field from TlsAcceptorBuilder\n\nThe session_memory_limit field was defined and had a setter but was never\napplied to the ServerConfig when building the TlsAcceptor. This was dead\ncode that could confuse users expecting it to work. Removed the field\nsince rustls uses a built-in session cache by default.\n\nAlso includes test_race_empty_is_never and test_race_identity_law_violation\ntests from concurrent agent work documenting race([]) behavior.\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "ac6204d00d99d601323d916915b77ef74a05044a",
+      "filename": "src/tls/acceptor.rs",
+      "status": "modified",
+      "additions": 0,
+      "deletions": 10,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/ffbd266b86b84550bbff32320a8b3e29dc87af92/src%2Ftls%2Facceptor.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/ffbd266b86b84550bbff32320a8b3e29dc87af92/src%2Ftls%2Facceptor.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Ftls%2Facceptor.rs?ref=ffbd266b86b84550bbff32320a8b3e29dc87af92",
+      "patch": "@@ -102,7 +102,6 @@ pub struct TlsAcceptorBuilder {\n     key: PrivateKey,\n     client_auth: ClientAuth,\n     alpn_protocols: Vec<Vec<u8>>,\n-    session_memory_limit: usize,\n     max_fragment_size: Option<usize>,\n }\n \n@@ -114,7 +113,6 @@ impl TlsAcceptorBuilder {\n             key,\n             client_auth: ClientAuth::None,\n             alpn_protocols: Vec::new(),\n-            session_memory_limit: 256 * 1024 * 1024, // 256 MB default\n             max_fragment_size: None,\n         }\n     }\n@@ -165,14 +163,6 @@ impl TlsAcceptorBuilder {\n         self.alpn_protocols(vec![b\"h2\".to_vec(), b\"http/1.1\".to_vec()])\n     }\n \n-    /// Set session memory limit (for session resumption cache).\n-    ///\n-    /// Default is 256 MB.\n-    pub fn session_memory_limit(mut self, bytes: usize) -> Self {\n-        self.session_memory_limit = bytes;\n-        self\n-    }\n-\n     /// Set maximum TLS fragment size.\n     ///\n     /// This limits the size of TLS records. Smaller values may help with"
+    },
+    {
+      "sha": "7f2ea68defaa44ce792840793a4b7b06a10ee155",
+      "filename": "tests/repro_race_empty.rs",
+      "status": "added",
+      "additions": 62,
+      "deletions": 0,
+      "changes": 62,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/ffbd266b86b84550bbff32320a8b3e29dc87af92/tests%2Frepro_race_empty.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/ffbd266b86b84550bbff32320a8b3e29dc87af92/tests%2Frepro_race_empty.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/tests%2Frepro_race_empty.rs?ref=ffbd266b86b84550bbff32320a8b3e29dc87af92",
+      "patch": "@@ -0,0 +1,62 @@\n+use asupersync::cx::Cx;\n+use asupersync::runtime::task_handle::JoinError;\n+use asupersync::test_utils::init_test_logging;\n+use std::future::Future;\n+use std::pin::Pin;\n+use std::time::Duration;\n+\n+#[tokio::test]\n+async fn test_race_empty_is_never() {\n+    init_test_logging();\n+    \n+    let cx = Cx::for_testing();\n+    \n+    // An empty race should be \"never\" (pending forever).\n+    // Currently, it returns Err(Cancelled).\n+    let futures: Vec<Pin<Box<dyn Future<Output = i32> + Send>>> = vec![];\n+    let result = cx.race(futures).await;\n+    \n+    // If this assertion fails, it confirms the bug (it returned Err instead of hanging or behaving like never)\n+    // Note: In a real test we can't easily test \"hangs forever\" without a timeout.\n+    // But here we just check that it DOES NOT return the error immediately.\n+    \n+    // We expect it to NOT return Err(Cancelled).\n+    // Ideally it should timeout if we wrapped it in a timeout, but since we didn't,\n+    // if it returns ready immediately, that's wrong.\n+    \n+    assert!(result.is_err(), \"Current implementation returns Err(Cancelled)\");\n+    \n+    if let Err(JoinError::Cancelled(reason)) = &result {\n+        assert_eq!(reason.kind, asupersync::types::CancelKind::RaceLost);\n+        println!(\"Confirmed: race([]) returns Cancelled(RaceLost)\");\n+    } else {\n+        panic!(\"Expected Cancelled error, got {:?}\", result);\n+    }\n+}\n+\n+#[tokio::test]\n+async fn test_race_identity_law_violation() {\n+    init_test_logging();\n+    let cx = Cx::for_testing();\n+\n+    // Law: race(a, never) \u2243 a\n+    // If race([]) is never, then race(async { 42 }, race([])) should be 42.\n+    \n+    let f1 = Box::pin(async { \n+        tokio::time::sleep(Duration::from_millis(10)).await;\n+        42 \n+    }) as Pin<Box<dyn Future<Output = i32> + Send>>;\n+    \n+    let f2 = Box::pin(async {\n+        // race([]) currently returns Err immediately\n+        let empty: Vec<Pin<Box<dyn Future<Output = i32> + Send>>> = vec![];\n+        cx.race(empty).await.unwrap_or(-1)\n+    }) as Pin<Box<dyn Future<Output = i32> + Send>>;\n+    \n+    let combined = cx.race(vec![f1, f2]).await;\n+    \n+    // If bug exists, f2 wins immediately with -1 (or Err if we didn't unwrap).\n+    // If fixed, f2 hangs, so f1 wins with 42.\n+    \n+    assert_eq!(combined.unwrap(), -1, \"Confirmed: race(a, race([])) fails because race([]) is not never\");\n+}"
+    }
+  ]
+}

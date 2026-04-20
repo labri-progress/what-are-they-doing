@@ -1,0 +1,53 @@
+{
+  "message": "Add auto-recovery from stuck WhatsApp sessions\n\nFixes issue where unauthorized messages from +212652169245 (5elements spa)\ntriggered Bad MAC errors and silently killed the event emitter, preventing\nall future message processing.\n\nChanges:\n1. Early allowFrom filtering in inbound.ts - blocks unauthorized senders\n   before they trigger encryption errors\n2. Message timeout watchdog - auto-restarts connection if no messages\n   received for 10 minutes\n3. Health monitoring in heartbeat - warns if >30 min without messages\n4. Mock loadConfig in tests to handle new dependency\n\nRoot cause: Event emitter stopped firing after Bad MAC errors from\ndecryption attempts on messages from unauthorized senders. Connection\nstayed alive but all subsequent messages.upsert events silently failed.",
+  "files": [
+    {
+      "sha": "040ca31f6c4cf2f8640fb2bb6077eebe1583d3a8",
+      "filename": "src/web/auto-reply.ts",
+      "status": "modified",
+      "additions": 51,
+      "deletions": 11,
+      "changes": 62,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/69319a05690106ac76027e0802cfafc7bcf20d12/src%2Fweb%2Fauto-reply.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/69319a05690106ac76027e0802cfafc7bcf20d12/src%2Fweb%2Fauto-reply.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fweb%2Fauto-reply.ts?ref=69319a05690106ac76027e0802cfafc7bcf20d12",
+      "patch": "@@ -512,10 +512,15 @@ export async function monitorWebProvider(\n     const startedAt = Date.now();\n     let heartbeat: NodeJS.Timeout | null = null;\n     let replyHeartbeatTimer: NodeJS.Timeout | null = null;\n+    let watchdogTimer: NodeJS.Timeout | null = null;\n     let lastMessageAt: number | null = null;\n     let handledMessages = 0;\n     let lastInboundMsg: WebInboundMsg | null = null;\n \n+    // Watchdog to detect stuck message processing (e.g., event emitter died)\n+    const MESSAGE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes without any messages\n+    const WATCHDOG_CHECK_MS = 60 * 1000; // Check every minute\n+\n     const listener = await (listenerFactory ?? monitorWebInbox)({\n       verbose,\n       onMessage: async (msg) => {\n@@ -673,6 +678,7 @@ export async function monitorWebProvider(\n     const closeListener = async () => {\n       if (heartbeat) clearInterval(heartbeat);\n       if (replyHeartbeatTimer) clearInterval(replyHeartbeatTimer);\n+      if (watchdogTimer) clearInterval(watchdogTimer);\n       try {\n         await listener.close();\n       } catch (err) {\n@@ -683,18 +689,52 @@ export async function monitorWebProvider(\n     if (keepAlive) {\n       heartbeat = setInterval(() => {\n         const authAgeMs = getWebAuthAgeMs();\n-        heartbeatLogger.info(\n-          {\n-            connectionId,\n-            reconnectAttempts,\n-            messagesHandled: handledMessages,\n-            lastMessageAt,\n-            authAgeMs,\n-            uptimeMs: Date.now() - startedAt,\n-          },\n-          \"web relay heartbeat\",\n-        );\n+        const minutesSinceLastMessage = lastMessageAt\n+          ? Math.floor((Date.now() - lastMessageAt) / 60000)\n+          : null;\n+\n+        const logData = {\n+          connectionId,\n+          reconnectAttempts,\n+          messagesHandled: handledMessages,\n+          lastMessageAt,\n+          authAgeMs,\n+          uptimeMs: Date.now() - startedAt,\n+          ...(minutesSinceLastMessage !== null && minutesSinceLastMessage > 30\n+            ? { minutesSinceLastMessage }\n+            : {}),\n+        };\n+\n+        // Warn if no messages in 30+ minutes\n+        if (minutesSinceLastMessage && minutesSinceLastMessage > 30) {\n+          heartbeatLogger.warn(logData, \"\u26a0\ufe0f web relay heartbeat - no messages in 30+ minutes\");\n+        } else {\n+          heartbeatLogger.info(logData, \"web relay heartbeat\");\n+        }\n       }, heartbeatSeconds * 1000);\n+\n+      // Watchdog: Auto-restart if no messages received for MESSAGE_TIMEOUT_MS\n+      watchdogTimer = setInterval(() => {\n+        if (lastMessageAt) {\n+          const timeSinceLastMessage = Date.now() - lastMessageAt;\n+          if (timeSinceLastMessage > MESSAGE_TIMEOUT_MS) {\n+            const minutesSinceLastMessage = Math.floor(timeSinceLastMessage / 60000);\n+            heartbeatLogger.warn(\n+              {\n+                connectionId,\n+                minutesSinceLastMessage,\n+                lastMessageAt: new Date(lastMessageAt),\n+                messagesHandled: handledMessages,\n+              },\n+              \"Message timeout detected - forcing reconnect\",\n+            );\n+            console.error(\n+              `\u26a0\ufe0f  No messages received in ${minutesSinceLastMessage}m - restarting connection`,\n+            );\n+            closeListener(); // Trigger reconnect\n+          }\n+        }\n+      }, WATCHDOG_CHECK_MS);\n     }\n \n     const runReplyHeartbeat = async () => {"
+    },
+    {
+      "sha": "fe234953f2be6fdd4ebb73d223a5323500ef63bc",
+      "filename": "src/web/inbound.media.test.ts",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 0,
+      "changes": 8,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/69319a05690106ac76027e0802cfafc7bcf20d12/src%2Fweb%2Finbound.media.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/69319a05690106ac76027e0802cfafc7bcf20d12/src%2Fweb%2Finbound.media.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fweb%2Finbound.media.test.ts?ref=69319a05690106ac76027e0802cfafc7bcf20d12",
+      "patch": "@@ -5,6 +5,14 @@ import path from \"node:path\";\n \n import { afterAll, beforeAll, describe, expect, it, vi } from \"vitest\";\n \n+vi.mock(\"../config/config.js\", () => ({\n+  loadConfig: vi.fn().mockReturnValue({\n+    inbound: {\n+      allowFrom: [\"*\"], // Allow all in tests\n+    },\n+  }),\n+}));\n+\n const HOME = path.join(\n   os.tmpdir(),\n   `warelay-inbound-media-${crypto.randomUUID()}`,"
+    },
+    {
+      "sha": "2098242294450b2a45cc7bdb8699036939d60e55",
+      "filename": "src/web/inbound.ts",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 1,
+      "changes": 17,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/69319a05690106ac76027e0802cfafc7bcf20d12/src%2Fweb%2Finbound.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/69319a05690106ac76027e0802cfafc7bcf20d12/src%2Fweb%2Finbound.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fweb%2Finbound.ts?ref=69319a05690106ac76027e0802cfafc7bcf20d12",
+      "patch": "@@ -8,10 +8,11 @@ import {\n   downloadMediaMessage,\n } from \"@whiskeysockets/baileys\";\n \n+import { loadConfig } from \"../config/config.js\";\n import { isVerbose, logVerbose } from \"../globals.js\";\n import { getChildLogger } from \"../logging.js\";\n import { saveMediaBuffer } from \"../media/store.js\";\n-import { jidToE164 } from \"../utils.js\";\n+import { jidToE164, normalizeE164 } from \"../utils.js\";\n import {\n   createWaSocket,\n   getStatusCode,\n@@ -94,6 +95,20 @@ export async function monitorWebInbox(options: {\n       }\n       const from = jidToE164(remoteJid);\n       if (!from) continue;\n+\n+      // Filter unauthorized senders early to prevent wasted processing\n+      // and potential session corruption from Bad MAC errors\n+      const cfg = loadConfig();\n+      const allowFrom = cfg.inbound?.allowFrom;\n+      const isSamePhone = from === selfE164;\n+\n+      if (!isSamePhone && Array.isArray(allowFrom) && allowFrom.length > 0) {\n+        if (!allowFrom.includes(\"*\") && !allowFrom.map(normalizeE164).includes(from)) {\n+          logVerbose(`Blocked unauthorized sender ${from} (not in allowFrom list)`);\n+          continue; // Skip processing entirely\n+        }\n+      }\n+\n       let body = extractText(msg.message ?? undefined);\n       if (!body) {\n         body = extractMediaPlaceholder(msg.message ?? undefined);"
+    },
+    {
+      "sha": "b37398d92c8922c9acbc3741163e2e7cfdf95be7",
+      "filename": "src/web/monitor-inbox.test.ts",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 0,
+      "changes": 8,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/69319a05690106ac76027e0802cfafc7bcf20d12/src%2Fweb%2Fmonitor-inbox.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/69319a05690106ac76027e0802cfafc7bcf20d12/src%2Fweb%2Fmonitor-inbox.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fweb%2Fmonitor-inbox.test.ts?ref=69319a05690106ac76027e0802cfafc7bcf20d12",
+      "patch": "@@ -9,6 +9,14 @@ vi.mock(\"../media/store.js\", () => ({\n   }),\n }));\n \n+vi.mock(\"../config/config.js\", () => ({\n+  loadConfig: vi.fn().mockReturnValue({\n+    inbound: {\n+      allowFrom: [\"*\"], // Allow all in tests\n+    },\n+  }),\n+}));\n+\n vi.mock(\"./session.js\", () => {\n   const { EventEmitter } = require(\"node:events\");\n   const ev = new EventEmitter();"
+    }
+  ]
+}

@@ -1,0 +1,77 @@
+{
+  "message": "fix: dedupe download metrics hourly by user-or-ip identity (#278)",
+  "files": [
+    {
+      "sha": "12cd08fc86afdc6613272d7dc664edfa28588781",
+      "filename": "convex/downloads.test.ts",
+      "status": "modified",
+      "additions": 38,
+      "deletions": 7,
+      "changes": 45,
+      "blob_url": "https://github.com/openclaw/clawhub/blob/03cd710abc7754f613b975df594f1a69c2222fb4/convex%2Fdownloads.test.ts",
+      "raw_url": "https://github.com/openclaw/clawhub/raw/03cd710abc7754f613b975df594f1a69c2222fb4/convex%2Fdownloads.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/clawhub/contents/convex%2Fdownloads.test.ts?ref=03cd710abc7754f613b975df594f1a69c2222fb4",
+      "patch": "@@ -1,12 +1,43 @@\n-import { describe, expect, it } from 'vitest'\n+import { afterEach, describe, expect, it, vi } from 'vitest'\n import { __test } from './downloads'\n \n describe('downloads helpers', () => {\n-  it('calculates day start boundaries', () => {\n-    const day = 86_400_000\n-    expect(__test.getDayStart(0)).toBe(0)\n-    expect(__test.getDayStart(day - 1)).toBe(0)\n-    expect(__test.getDayStart(day)).toBe(day)\n-    expect(__test.getDayStart(day + 1)).toBe(day)\n+  afterEach(() => {\n+    vi.unstubAllEnvs()\n+  })\n+\n+  it('calculates hour start boundaries', () => {\n+    const hour = 3_600_000\n+    expect(__test.getHourStart(0)).toBe(0)\n+    expect(__test.getHourStart(hour - 1)).toBe(0)\n+    expect(__test.getHourStart(hour)).toBe(hour)\n+    expect(__test.getHourStart(hour + 1)).toBe(hour)\n+  })\n+\n+  it('prefers user identity when token user exists', () => {\n+    const request = new Request('https://example.com', {\n+      headers: { 'cf-connecting-ip': '1.2.3.4' },\n+    })\n+    expect(__test.getDownloadIdentityValue(request, 'users_123')).toBe('user:users_123')\n+  })\n+\n+  it('uses cf-connecting-ip for anonymous identity', () => {\n+    const request = new Request('https://example.com', {\n+      headers: { 'cf-connecting-ip': '1.2.3.4' },\n+    })\n+    expect(__test.getDownloadIdentityValue(request, null)).toBe('ip:1.2.3.4')\n+  })\n+\n+  it('falls back to forwarded ip when explicitly enabled', () => {\n+    vi.stubEnv('TRUST_FORWARDED_IPS', 'true')\n+    const request = new Request('https://example.com', {\n+      headers: { 'x-forwarded-for': '10.0.0.1, 10.0.0.2' },\n+    })\n+    expect(__test.getDownloadIdentityValue(request, null)).toBe('ip:10.0.0.1')\n+  })\n+\n+  it('returns null when user and ip are missing', () => {\n+    const request = new Request('https://example.com')\n+    expect(__test.getDownloadIdentityValue(request, null)).toBeNull()\n   })\n })"
+    },
+    {
+      "sha": "bea39645403bfc1ab5186900e55c054eddc52a3b",
+      "filename": "convex/downloads.ts",
+      "status": "modified",
+      "additions": 34,
+      "deletions": 21,
+      "changes": 55,
+      "blob_url": "https://github.com/openclaw/clawhub/blob/03cd710abc7754f613b975df594f1a69c2222fb4/convex%2Fdownloads.ts",
+      "raw_url": "https://github.com/openclaw/clawhub/raw/03cd710abc7754f613b975df594f1a69c2222fb4/convex%2Fdownloads.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/clawhub/contents/convex%2Fdownloads.ts?ref=03cd710abc7754f613b975df594f1a69c2222fb4",
+      "patch": "@@ -1,13 +1,14 @@\n import { v } from 'convex/values'\n import { api, internal } from './_generated/api'\n import { httpAction, internalMutation, mutation } from './_generated/server'\n+import { getOptionalApiTokenUserId } from './lib/apiTokenAuth'\n import { applyRateLimit, getClientIp } from './lib/httpRateLimit'\n import { buildDeterministicZip } from './lib/skillZip'\n import { hashToken } from './lib/tokens'\n import { insertStatEvent } from './skillStatEvents'\n \n-const DAY_MS = 86_400_000\n-const DEDUPE_RETENTION_DAYS = 14\n+const HOUR_MS = 3_600_000\n+const DEDUPE_RETENTION_MS = 7 * 24 * HOUR_MS\n const PRUNE_BATCH_SIZE = 200\n const PRUNE_MAX_BATCHES = 50\n \n@@ -87,15 +88,16 @@ export const downloadZip = httpAction(async (ctx, request) => {\n   })\n   const zipBlob = new Blob([zipArray], { type: 'application/zip' })\n \n-  const ip = getClientIp(request) ?? 'unknown'\n-  const ipHash = await hashToken(ip)\n-  const dayStart = getDayStart(Date.now())\n   try {\n-    await ctx.runMutation(internal.downloads.recordDownloadInternal, {\n-      skillId: skill._id,\n-      ipHash,\n-      dayStart,\n-    })\n+    const userId = await getOptionalApiTokenUserId(ctx, request)\n+    const identity = getDownloadIdentityValue(request, userId ? String(userId) : null)\n+    if (identity) {\n+      await ctx.runMutation(internal.downloads.recordDownloadInternal, {\n+        skillId: skill._id,\n+        identityHash: await hashToken(identity),\n+        hourStart: getHourStart(Date.now()),\n+      })\n+    }\n   } catch {\n     // Best-effort metric path; do not fail downloads.\n   }\n@@ -126,22 +128,25 @@ export const increment = mutation({\n export const recordDownloadInternal = internalMutation({\n   args: {\n     skillId: v.id('skills'),\n-    ipHash: v.string(),\n-    dayStart: v.number(),\n+    identityHash: v.string(),\n+    hourStart: v.number(),\n   },\n   handler: async (ctx, args) => {\n     const existing = await ctx.db\n       .query('downloadDedupes')\n-      .withIndex('by_skill_ip_day', (q) =>\n-        q.eq('skillId', args.skillId).eq('ipHash', args.ipHash).eq('dayStart', args.dayStart),\n+      .withIndex('by_skill_identity_hour', (q) =>\n+        q\n+          .eq('skillId', args.skillId)\n+          .eq('identityHash', args.identityHash)\n+          .eq('hourStart', args.hourStart),\n       )\n       .unique()\n     if (existing) return\n \n     await ctx.db.insert('downloadDedupes', {\n       skillId: args.skillId,\n-      ipHash: args.ipHash,\n-      dayStart: args.dayStart,\n+      identityHash: args.identityHash,\n+      hourStart: args.hourStart,\n       createdAt: Date.now(),\n     })\n \n@@ -155,12 +160,12 @@ export const recordDownloadInternal = internalMutation({\n export const pruneDownloadDedupesInternal = internalMutation({\n   args: {},\n   handler: async (ctx) => {\n-    const cutoff = Date.now() - DEDUPE_RETENTION_DAYS * DAY_MS\n+    const cutoff = Date.now() - DEDUPE_RETENTION_MS\n \n     for (let batches = 0; batches < PRUNE_MAX_BATCHES; batches += 1) {\n       const stale = await ctx.db\n         .query('downloadDedupes')\n-        .withIndex('by_day', (q) => q.lt('dayStart', cutoff))\n+        .withIndex('by_hour', (q) => q.lt('hourStart', cutoff))\n         .take(PRUNE_BATCH_SIZE)\n \n       if (stale.length === 0) break\n@@ -174,12 +179,20 @@ export const pruneDownloadDedupesInternal = internalMutation({\n   },\n })\n \n-export function getDayStart(timestamp: number) {\n-  return Math.floor(timestamp / DAY_MS) * DAY_MS\n+export function getHourStart(timestamp: number) {\n+  return Math.floor(timestamp / HOUR_MS) * HOUR_MS\n+}\n+\n+export function getDownloadIdentityValue(request: Request, userId: string | null) {\n+  if (userId) return `user:${userId}`\n+  const ip = getClientIp(request)\n+  if (!ip) return null\n+  return `ip:${ip}`\n }\n \n export const __test = {\n-  getDayStart,\n+  getHourStart,\n+  getDownloadIdentityValue,\n }\n \n function mergeHeaders(base: HeadersInit, extra: HeadersInit) {"
+    },
+    {
+      "sha": "630b89daf1d598fb89f836d59e6887ba09cb2102",
+      "filename": "convex/lib/apiTokenAuth.test.ts",
+      "status": "added",
+      "additions": 85,
+      "deletions": 0,
+      "changes": 85,
+      "blob_url": "https://github.com/openclaw/clawhub/blob/03cd710abc7754f613b975df594f1a69c2222fb4/convex%2Flib%2FapiTokenAuth.test.ts",
+      "raw_url": "https://github.com/openclaw/clawhub/raw/03cd710abc7754f613b975df594f1a69c2222fb4/convex%2Flib%2FapiTokenAuth.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/clawhub/contents/convex%2Flib%2FapiTokenAuth.test.ts?ref=03cd710abc7754f613b975df594f1a69c2222fb4",
+      "patch": "@@ -0,0 +1,85 @@\n+import { describe, expect, it, vi } from 'vitest'\n+import { getOptionalApiTokenUserId } from './apiTokenAuth'\n+import { hashToken } from './tokens'\n+\n+describe('getOptionalApiTokenUserId', () => {\n+  it('returns null when auth header is missing', async () => {\n+    const ctx = {\n+      runQuery: vi.fn(),\n+    }\n+    const request = new Request('https://example.com')\n+\n+    const userId = await getOptionalApiTokenUserId(ctx as never, request)\n+\n+    expect(userId).toBeNull()\n+    expect(ctx.runQuery).not.toHaveBeenCalled()\n+  })\n+\n+  it('returns null for unknown token', async () => {\n+    const ctx = {\n+      runQuery: vi.fn().mockResolvedValue(null),\n+    }\n+    const request = new Request('https://example.com', {\n+      headers: { authorization: 'Bearer token-1' },\n+    })\n+\n+    const userId = await getOptionalApiTokenUserId(ctx as never, request)\n+\n+    expect(userId).toBeNull()\n+    expect(ctx.runQuery).toHaveBeenCalledTimes(1)\n+    expect(ctx.runQuery.mock.calls[0]?.[1]).toEqual({\n+      tokenHash: await hashToken('token-1'),\n+    })\n+  })\n+\n+  it('returns user id when token and user are valid', async () => {\n+    const tokenId = 'apiTokens_1'\n+    const expectedUserId = 'users_1'\n+    const ctx = {\n+      runQuery: vi\n+        .fn()\n+        .mockImplementation(async (_fn, args: { tokenHash?: string; tokenId?: string }) => {\n+          if (args.tokenHash) {\n+            return { _id: tokenId, revokedAt: undefined }\n+          }\n+          if (args.tokenId) {\n+            return { _id: expectedUserId, deletedAt: undefined }\n+          }\n+          return null\n+        }),\n+    }\n+    const request = new Request('https://example.com', {\n+      headers: { authorization: 'Bearer token-2' },\n+    })\n+\n+    const userId = await getOptionalApiTokenUserId(ctx as never, request)\n+\n+    expect(userId).toBe(expectedUserId)\n+    expect(ctx.runQuery).toHaveBeenCalledTimes(2)\n+  })\n+\n+  it('returns null when user is deleted', async () => {\n+    const tokenId = 'apiTokens_2'\n+    const ctx = {\n+      runQuery: vi\n+        .fn()\n+        .mockImplementation(async (_fn, args: { tokenHash?: string; tokenId?: string }) => {\n+          if (args.tokenHash) {\n+            return { _id: tokenId, revokedAt: undefined }\n+          }\n+          if (args.tokenId) {\n+            return { _id: 'users_deleted', deletedAt: Date.now() }\n+          }\n+          return null\n+        }),\n+    }\n+    const request = new Request('https://example.com', {\n+      headers: { authorization: 'Bearer token-3' },\n+    })\n+\n+    const userId = await getOptionalApiTokenUserId(ctx as never, request)\n+\n+    expect(userId).toBeNull()\n+    expect(ctx.runQuery).toHaveBeenCalledTimes(2)\n+  })\n+})"
+    },
+    {
+      "sha": "c94b8de789471f377fce9009dd905418eb99cc57",
+      "filename": "convex/lib/apiTokenAuth.ts",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 0,
+      "changes": 20,
+      "blob_url": "https://github.com/openclaw/clawhub/blob/03cd710abc7754f613b975df594f1a69c2222fb4/convex%2Flib%2FapiTokenAuth.ts",
+      "raw_url": "https://github.com/openclaw/clawhub/raw/03cd710abc7754f613b975df594f1a69c2222fb4/convex%2Flib%2FapiTokenAuth.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/clawhub/contents/convex%2Flib%2FapiTokenAuth.ts?ref=03cd710abc7754f613b975df594f1a69c2222fb4",
+      "patch": "@@ -27,6 +27,26 @@ export async function requireApiTokenUser(\n   return { user, userId: user._id }\n }\n \n+export async function getOptionalApiTokenUserId(\n+  ctx: ActionCtx,\n+  request: Request,\n+): Promise<Doc<'users'>['_id'] | null> {\n+  const header = request.headers.get('authorization') ?? request.headers.get('Authorization')\n+  const token = parseBearerToken(header)\n+  if (!token) return null\n+\n+  const tokenHash = await hashToken(token)\n+  const apiToken = await ctx.runQuery(internal.tokens.getByHashInternal, { tokenHash })\n+  if (!apiToken || apiToken.revokedAt) return null\n+\n+  const user = await ctx.runQuery(internal.tokens.getUserForTokenInternal, {\n+    tokenId: apiToken._id,\n+  })\n+  if (!user || user.deletedAt) return null\n+\n+  return user._id\n+}\n+\n function parseBearerToken(header: string | null) {\n   if (!header) return null\n   const trimmed = header.trim()"
+    },
+    {
+      "sha": "085cef138854cbde0364e8e3b2b497e4a6ce2c62",
+      "filename": "convex/schema.ts",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 4,
+      "changes": 8,
+      "blob_url": "https://github.com/openclaw/clawhub/blob/03cd710abc7754f613b975df594f1a69c2222fb4/convex%2Fschema.ts",
+      "raw_url": "https://github.com/openclaw/clawhub/raw/03cd710abc7754f613b975df594f1a69c2222fb4/convex%2Fschema.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/clawhub/contents/convex%2Fschema.ts?ref=03cd710abc7754f613b975df594f1a69c2222fb4",
+      "patch": "@@ -492,12 +492,12 @@ const rateLimits = defineTable({\n \n const downloadDedupes = defineTable({\n   skillId: v.id('skills'),\n-  ipHash: v.string(),\n-  dayStart: v.number(),\n+  identityHash: v.string(),\n+  hourStart: v.number(),\n   createdAt: v.number(),\n })\n-  .index('by_skill_ip_day', ['skillId', 'ipHash', 'dayStart'])\n-  .index('by_day', ['dayStart'])\n+  .index('by_skill_identity_hour', ['skillId', 'identityHash', 'hourStart'])\n+  .index('by_hour', ['hourStart'])\n \n const githubBackupSyncState = defineTable({\n   key: v.string(),"
+    },
+    {
+      "sha": "803bea673524071eb67c466a2d1d431dd3a48adb",
+      "filename": "docs/http-api.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/clawhub/blob/03cd710abc7754f613b975df594f1a69c2222fb4/docs%2Fhttp-api.md",
+      "raw_url": "https://github.com/openclaw/clawhub/raw/03cd710abc7754f613b975df594f1a69c2222fb4/docs%2Fhttp-api.md",
+      "contents_url": "https://api.github.com/repos/openclaw/clawhub/contents/docs%2Fhttp-api.md?ref=03cd710abc7754f613b975df594f1a69c2222fb4",
+      "patch": "@@ -131,6 +131,7 @@ Notes:\n \n - If neither `version` nor `tag` is provided, the latest version is used.\n - Soft-deleted versions return `410`.\n+- Download stats are counted as unique identities per hour (`userId` when API token is valid, otherwise IP).\n \n ## Auth endpoints (Bearer token)\n "
+    }
+  ]
+}

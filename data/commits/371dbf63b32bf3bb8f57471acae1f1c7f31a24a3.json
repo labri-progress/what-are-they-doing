@@ -1,0 +1,53 @@
+{
+  "message": "Preserve outer row captures in sort cmp lambdas",
+  "files": [
+    {
+      "sha": "9f7076674c1c46dd9a728613e34ed103072ba3ec",
+      "filename": "libtenzir/builtins/operators/sort.cpp",
+      "status": "modified",
+      "additions": 32,
+      "deletions": 22,
+      "changes": 54,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/371dbf63b32bf3bb8f57471acae1f1c7f31a24a3/libtenzir%2Fbuiltins%2Foperators%2Fsort.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/371dbf63b32bf3bb8f57471acae1f1c7f31a24a3/libtenzir%2Fbuiltins%2Foperators%2Fsort.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Fbuiltins%2Foperators%2Fsort.cpp?ref=371dbf63b32bf3bb8f57471acae1f1c7f31a24a3",
+      "patch": "@@ -19,6 +19,7 @@\n #include <tenzir/table_slice.hpp>\n #include <tenzir/tql2/eval.hpp>\n #include <tenzir/tql2/plugin.hpp>\n+#include <tenzir/tql2/set.hpp>\n #include <tenzir/type.hpp>\n \n #include <arrow/compute/api_vector.h>\n@@ -39,28 +40,28 @@ struct comparator_warning_state {\n   bool non_boolean_result = false;\n };\n \n+auto empty_scope_slice() -> table_slice {\n+  auto schema = type{\"cmp\", record_type{}};\n+  return table_slice{\n+    arrow::RecordBatch::Make(schema.to_arrow_schema(), int64_t{1},\n+                             arrow::ArrayVector{}),\n+    std::move(schema),\n+  };\n+}\n+\n auto eval_sort_predicate(const ast::lambda_expr& cmp, const data& left,\n-                         const data& right,\n+                         const data& right, const table_slice& scope,\n                          comparator_warning_state& warning_state, session ctx)\n   -> bool {\n   TENZIR_ASSERT(cmp.is_binary());\n   auto left_series = data_to_series(left, int64_t{1});\n   auto right_series = data_to_series(right, int64_t{1});\n-  auto schema = type{\n-    \"cmp\",\n-    record_type{\n-      {cmp.param(0).name, left_series.type},\n-      {cmp.param(1).name, right_series.type},\n-    },\n-  };\n-  auto slice = table_slice{\n-    arrow::RecordBatch::Make(schema.to_arrow_schema(), int64_t{1},\n-                             arrow::ArrayVector{\n-                               left_series.array,\n-                               right_series.array,\n-                             }),\n-    schema,\n-  };\n+  auto lhs_path\n+    = check(ast::field_path::try_from(ast::root_field{cmp.param(0), false}));\n+  auto rhs_path\n+    = check(ast::field_path::try_from(ast::root_field{cmp.param(1), false}));\n+  auto slice = assign(lhs_path, std::move(left_series), scope, ctx.dh());\n+  slice = assign(rhs_path, std::move(right_series), slice, ctx.dh());\n   auto result = eval(cmp.right, slice, ctx.dh());\n   if (result.length() != 1) {\n     if (not warning_state.invalid_result_length) {\n@@ -93,13 +94,19 @@ auto eval_sort_predicate(const ast::lambda_expr& cmp, const data& left,\n   return false;\n }\n \n-auto sort_list(const series& input, bool descending,\n-               const std::optional<ast::lambda_expr>& cmp, session ctx)\n-  -> series {\n+auto sort_list(const series& input, const std::optional<table_slice>& scope,\n+               bool descending, const std::optional<ast::lambda_expr>& cmp,\n+               session ctx) -> series {\n   auto builder = series_builder{input.type};\n+  TENZIR_ASSERT(\n+    not scope or scope->rows() == detail::narrow_cast<size_t>(input.length()));\n   auto warning_state = comparator_warning_state{};\n+  auto fallback_scope = empty_scope_slice();\n+  auto row = int64_t{0};\n   for (const auto& value :\n        values(as<list_type>(input.type), as<arrow::ListArray>(*input.array))) {\n+    auto row_scope = scope ? subslice(*scope, row, row + 1) : fallback_scope;\n+    ++row;\n     if (not value) {\n       builder.null();\n       continue;\n@@ -110,8 +117,8 @@ auto sort_list(const series& input, bool descending,\n                        [&](const data& lhs, const data& rhs) {\n                          const auto& left = descending ? rhs : lhs;\n                          const auto& right = descending ? lhs : rhs;\n-                         return eval_sort_predicate(*cmp, left, right,\n-                                                    warning_state, ctx);\n+                         return eval_sort_predicate(\n+                           *cmp, left, right, row_scope, warning_state, ctx);\n                        });\n     } else if (descending) {\n       std::stable_sort(materialized.begin(), materialized.end(),\n@@ -770,13 +777,16 @@ class plugin2 final : public virtual operator_plugin2<sort_operator2>,\n     return function_use::make([call = inv.call, expr = std::move(expr),\n                                descending,\n                                cmp = std::move(cmp)](auto eval, session ctx) {\n+      auto offset = int64_t{0};\n       return map_series(eval(expr), [&](series arg) {\n+        auto scope = eval.slice(offset, offset + arg.length());\n+        offset += arg.length();\n         auto f = detail::overload{\n           [&](const arrow::NullArray&) {\n             return arg;\n           },\n           [&](const arrow::ListArray&) {\n-            return sort_list(arg, descending, cmp, ctx);\n+            return sort_list(arg, scope, descending, cmp, ctx);\n           },\n           [&](const arrow::StructArray&) {\n             if (descending or cmp) {"
+    },
+    {
+      "sha": "c39043209dad40988d5bd0e1309bd9226ee9f286",
+      "filename": "libtenzir/include/tenzir/tql2/plugin.hpp",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/371dbf63b32bf3bb8f57471acae1f1c7f31a24a3/libtenzir%2Finclude%2Ftenzir%2Ftql2%2Fplugin.hpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/371dbf63b32bf3bb8f57471acae1f1c7f31a24a3/libtenzir%2Finclude%2Ftenzir%2Ftql2%2Fplugin.hpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Finclude%2Ftenzir%2Ftql2%2Fplugin.hpp?ref=371dbf63b32bf3bb8f57471acae1f1c7f31a24a3",
+      "patch": "@@ -11,8 +11,11 @@\n #include \"tenzir/detail/string_literal.hpp\"\n #include \"tenzir/multi_series.hpp\"\n #include \"tenzir/plugin.hpp\"\n+#include \"tenzir/table_slice.hpp\"\n #include \"tenzir/tql2/ast.hpp\"\n \n+#include <optional>\n+\n namespace tenzir {\n \n class operator_factory_plugin : public virtual plugin {\n@@ -133,6 +136,8 @@ class function_use {\n \n     auto length() const -> int64_t;\n \n+    auto slice(int64_t begin, int64_t end) const -> std::optional<table_slice>;\n+\n   private:\n     void* self_;\n   };"
+    },
+    {
+      "sha": "465711b7fabdb4c87e60199085d506239a9954b5",
+      "filename": "libtenzir/src/tql2/plugin.cpp",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 0,
+      "changes": 10,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/371dbf63b32bf3bb8f57471acae1f1c7f31a24a3/libtenzir%2Fsrc%2Ftql2%2Fplugin.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/371dbf63b32bf3bb8f57471acae1f1c7f31a24a3/libtenzir%2Fsrc%2Ftql2%2Fplugin.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Fsrc%2Ftql2%2Fplugin.cpp?ref=371dbf63b32bf3bb8f57471acae1f1c7f31a24a3",
+      "patch": "@@ -19,6 +19,16 @@ auto function_use::evaluator::length() const -> int64_t {\n   return static_cast<tenzir::evaluator*>(self_)->length();\n }\n \n+auto function_use::evaluator::slice(int64_t begin, int64_t end) const\n+  -> std::optional<table_slice> {\n+  auto* evaluator = static_cast<tenzir::evaluator*>(self_);\n+  const auto* input = evaluator->get_input();\n+  if (not input) {\n+    return std::nullopt;\n+  }\n+  return subslice(*input, begin, end);\n+}\n+\n auto function_use::evaluator::operator()(const ast::expression& expr) const\n   -> multi_series {\n   return static_cast<tenzir::evaluator*>(self_)->eval(expr);"
+    },
+    {
+      "sha": "03dd24e6abd2d58609b56c3a47168919bd8443bf",
+      "filename": "libtenzir/test/sort_function.cpp",
+      "status": "added",
+      "additions": 59,
+      "deletions": 0,
+      "changes": 59,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/371dbf63b32bf3bb8f57471acae1f1c7f31a24a3/libtenzir%2Ftest%2Fsort_function.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/371dbf63b32bf3bb8f57471acae1f1c7f31a24a3/libtenzir%2Ftest%2Fsort_function.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Ftest%2Fsort_function.cpp?ref=371dbf63b32bf3bb8f57471acae1f1c7f31a24a3",
+      "patch": "@@ -0,0 +1,59 @@\n+//    _   _____   __________\n+//   | | / / _ | / __/_  __/     Visibility\n+//   | |/ / __ |_\\ \\  / /          Across\n+//   |___/_/ |_/___/ /_/       Space and Time\n+//\n+// SPDX-FileCopyrightText: (c) 2026 The Tenzir Contributors\n+// SPDX-License-Identifier: BSD-3-Clause\n+\n+#include \"tenzir/arrow_utils.hpp\"\n+#include \"tenzir/data.hpp\"\n+#include \"tenzir/table_slice.hpp\"\n+#include \"tenzir/test/test.hpp\"\n+#include \"tenzir/tql2/eval.hpp\"\n+#include \"tenzir/tql2/parser.hpp\"\n+#include \"tenzir/tql2/resolve.hpp\"\n+\n+#include <arrow/record_batch.h>\n+\n+using namespace tenzir;\n+\n+namespace {\n+\n+auto make_input_slice() -> table_slice {\n+  auto row = data{record{\n+    {\"pivot\", int64_t{10}},\n+    {\"xs\", list{int64_t{17}, int64_t{8}, int64_t{12}, int64_t{3}}},\n+  }};\n+  auto row_series = data_to_series(row, int64_t{1});\n+  auto schema = type{\"input\", as<record_type>(row_series.type)};\n+  const auto& row_array = as<arrow::StructArray>(*row_series.array);\n+  return table_slice{\n+    arrow::RecordBatch::Make(schema.to_arrow_schema(), int64_t{1},\n+                             row_array.fields()),\n+    std::move(schema),\n+  };\n+}\n+\n+} // namespace\n+\n+TEST(\"sort cmp keeps captures from surrounding row context\") {\n+  auto dh = collecting_diagnostic_handler{};\n+  auto provider = session_provider::make(dh);\n+  auto ctx = provider.as_session();\n+  auto expr = parse_expression_with_bad_diagnostics(\n+    \"sort(xs, cmp=(l, r) => (l - pivot) * (l - pivot) < (r - pivot) * (r - \"\n+    \"pivot))\",\n+    ctx);\n+  REQUIRE(expr);\n+  auto resolved = resolve_entities(*expr, ctx);\n+  REQUIRE(resolved);\n+  auto result = eval(*expr, make_input_slice(), dh);\n+  REQUIRE_EQUAL(result.length(), int64_t{1});\n+  auto value = materialize(result.value_at(0));\n+  auto* sorted = try_as<list>(&value);\n+  REQUIRE(sorted);\n+  CHECK_EQUAL(*sorted,\n+              (list{int64_t{8}, int64_t{12}, int64_t{17}, int64_t{3}}));\n+  CHECK_EQUAL(std::move(dh).collect().size(), size_t{0});\n+}"
+    }
+  ]
+}

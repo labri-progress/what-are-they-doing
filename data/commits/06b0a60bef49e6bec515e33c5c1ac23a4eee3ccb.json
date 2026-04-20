@@ -1,0 +1,149 @@
+{
+  "message": "refactor(daemon): share runtime and service probe helpers",
+  "files": [
+    {
+      "sha": "0e1f8793899d896a12072edae0247ac02f6d6e64",
+      "filename": "src/daemon/inspect.test.ts",
+      "status": "added",
+      "additions": 87,
+      "deletions": 0,
+      "changes": 87,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb/src%2Fdaemon%2Finspect.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb/src%2Fdaemon%2Finspect.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fdaemon%2Finspect.test.ts?ref=06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb",
+      "patch": "@@ -0,0 +1,87 @@\n+import { afterEach, beforeEach, describe, expect, it, vi } from \"vitest\";\n+import { findExtraGatewayServices } from \"./inspect.js\";\n+\n+const { execSchtasksMock } = vi.hoisted(() => ({\n+  execSchtasksMock: vi.fn(),\n+}));\n+\n+vi.mock(\"./schtasks-exec.js\", () => ({\n+  execSchtasks: (...args: unknown[]) => execSchtasksMock(...args),\n+}));\n+\n+describe(\"findExtraGatewayServices (win32)\", () => {\n+  const originalPlatform = process.platform;\n+\n+  beforeEach(() => {\n+    Object.defineProperty(process, \"platform\", {\n+      configurable: true,\n+      value: \"win32\",\n+    });\n+    execSchtasksMock.mockReset();\n+  });\n+\n+  afterEach(() => {\n+    Object.defineProperty(process, \"platform\", {\n+      configurable: true,\n+      value: originalPlatform,\n+    });\n+  });\n+\n+  it(\"skips schtasks queries unless deep mode is enabled\", async () => {\n+    const result = await findExtraGatewayServices({});\n+    expect(result).toEqual([]);\n+    expect(execSchtasksMock).not.toHaveBeenCalled();\n+  });\n+\n+  it(\"returns empty results when schtasks query fails\", async () => {\n+    execSchtasksMock.mockResolvedValueOnce({\n+      code: 1,\n+      stdout: \"\",\n+      stderr: \"error\",\n+    });\n+\n+    const result = await findExtraGatewayServices({}, { deep: true });\n+    expect(result).toEqual([]);\n+  });\n+\n+  it(\"collects only non-openclaw marker tasks from schtasks output\", async () => {\n+    execSchtasksMock.mockResolvedValueOnce({\n+      code: 0,\n+      stdout: [\n+        \"TaskName: OpenClaw Gateway\",\n+        \"Task To Run: C:\\\\Program Files\\\\OpenClaw\\\\openclaw.exe gateway run\",\n+        \"\",\n+        \"TaskName: Clawdbot Legacy\",\n+        \"Task To Run: C:\\\\clawdbot\\\\clawdbot.exe run\",\n+        \"\",\n+        \"TaskName: Other Task\",\n+        \"Task To Run: C:\\\\tools\\\\helper.exe\",\n+        \"\",\n+        \"TaskName: MoltBot Legacy\",\n+        \"Task To Run: C:\\\\moltbot\\\\moltbot.exe run\",\n+        \"\",\n+      ].join(\"\\n\"),\n+      stderr: \"\",\n+    });\n+\n+    const result = await findExtraGatewayServices({}, { deep: true });\n+    expect(result).toEqual([\n+      {\n+        platform: \"win32\",\n+        label: \"Clawdbot Legacy\",\n+        detail: \"task: Clawdbot Legacy, run: C:\\\\clawdbot\\\\clawdbot.exe run\",\n+        scope: \"system\",\n+        marker: \"clawdbot\",\n+        legacy: true,\n+      },\n+      {\n+        platform: \"win32\",\n+        label: \"MoltBot Legacy\",\n+        detail: \"task: MoltBot Legacy, run: C:\\\\moltbot\\\\moltbot.exe run\",\n+        scope: \"system\",\n+        marker: \"moltbot\",\n+        legacy: true,\n+      },\n+    ]);\n+  });\n+});"
+    },
+    {
+      "sha": "29ac8094ceb3c4a2bc5e7d9d5b0f65327797aecc",
+      "filename": "src/daemon/inspect.ts",
+      "status": "modified",
+      "additions": 38,
+      "deletions": 22,
+      "changes": 60,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb/src%2Fdaemon%2Finspect.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb/src%2Fdaemon%2Finspect.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fdaemon%2Finspect.ts?ref=06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb",
+      "patch": "@@ -152,26 +152,50 @@ async function readUtf8File(filePath: string): Promise<string | null> {\n   }\n }\n \n-async function scanLaunchdDir(params: {\n+type ServiceFileEntry = {\n+  entry: string;\n+  name: string;\n+  fullPath: string;\n+  contents: string;\n+};\n+\n+async function collectServiceFiles(params: {\n   dir: string;\n-  scope: \"user\" | \"system\";\n-}): Promise<ExtraGatewayService[]> {\n-  const results: ExtraGatewayService[] = [];\n+  extension: string;\n+  isIgnoredName: (name: string) => boolean;\n+}): Promise<ServiceFileEntry[]> {\n+  const out: ServiceFileEntry[] = [];\n   const entries = await readDirEntries(params.dir);\n-\n   for (const entry of entries) {\n-    if (!entry.endsWith(\".plist\")) {\n+    if (!entry.endsWith(params.extension)) {\n       continue;\n     }\n-    const labelFromName = entry.replace(/\\.plist$/, \"\");\n-    if (isIgnoredLaunchdLabel(labelFromName)) {\n+    const name = entry.slice(0, -params.extension.length);\n+    if (params.isIgnoredName(name)) {\n       continue;\n     }\n     const fullPath = path.join(params.dir, entry);\n     const contents = await readUtf8File(fullPath);\n     if (contents === null) {\n       continue;\n     }\n+    out.push({ entry, name, fullPath, contents });\n+  }\n+  return out;\n+}\n+\n+async function scanLaunchdDir(params: {\n+  dir: string;\n+  scope: \"user\" | \"system\";\n+}): Promise<ExtraGatewayService[]> {\n+  const results: ExtraGatewayService[] = [];\n+  const candidates = await collectServiceFiles({\n+    dir: params.dir,\n+    extension: \".plist\",\n+    isIgnoredName: isIgnoredLaunchdLabel,\n+  });\n+\n+  for (const { name: labelFromName, fullPath, contents } of candidates) {\n     const marker = detectMarker(contents);\n     const label = tryExtractPlistLabel(contents) ?? labelFromName;\n     if (!marker) {\n@@ -213,21 +237,13 @@ async function scanSystemdDir(params: {\n   scope: \"user\" | \"system\";\n }): Promise<ExtraGatewayService[]> {\n   const results: ExtraGatewayService[] = [];\n-  const entries = await readDirEntries(params.dir);\n+  const candidates = await collectServiceFiles({\n+    dir: params.dir,\n+    extension: \".service\",\n+    isIgnoredName: isIgnoredSystemdName,\n+  });\n \n-  for (const entry of entries) {\n-    if (!entry.endsWith(\".service\")) {\n-      continue;\n-    }\n-    const name = entry.replace(/\\.service$/, \"\");\n-    if (isIgnoredSystemdName(name)) {\n-      continue;\n-    }\n-    const fullPath = path.join(params.dir, entry);\n-    const contents = await readUtf8File(fullPath);\n-    if (contents === null) {\n-      continue;\n-    }\n+  for (const { entry, name, fullPath, contents } of candidates) {\n     const marker = detectMarker(contents);\n     if (!marker) {\n       continue;"
+    },
+    {
+      "sha": "c92065b584eb173e27b9ba9884e6fc160145eb9e",
+      "filename": "src/daemon/program-args.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 10,
+      "changes": 11,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb/src%2Fdaemon%2Fprogram-args.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb/src%2Fdaemon%2Fprogram-args.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fdaemon%2Fprogram-args.ts?ref=06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb",
+      "patch": "@@ -1,5 +1,6 @@\n import fs from \"node:fs/promises\";\n import path from \"node:path\";\n+import { isBunRuntime, isNodeRuntime } from \"./runtime-binary.js\";\n \n type GatewayProgramArgs = {\n   programArguments: string[];\n@@ -8,16 +9,6 @@ type GatewayProgramArgs = {\n \n type GatewayRuntimePreference = \"auto\" | \"node\" | \"bun\";\n \n-function isNodeRuntime(execPath: string): boolean {\n-  const base = path.basename(execPath).toLowerCase();\n-  return base === \"node\" || base === \"node.exe\";\n-}\n-\n-function isBunRuntime(execPath: string): boolean {\n-  const base = path.basename(execPath).toLowerCase();\n-  return base === \"bun\" || base === \"bun.exe\";\n-}\n-\n async function resolveCliEntrypointPathForService(): Promise<string> {\n   const argv1 = process.argv[1];\n   if (!argv1) {"
+    },
+    {
+      "sha": "95f7ea1072e774495c589aaf0aacfabc2b9c9ac1",
+      "filename": "src/daemon/runtime-binary.ts",
+      "status": "added",
+      "additions": 11,
+      "deletions": 0,
+      "changes": 11,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb/src%2Fdaemon%2Fruntime-binary.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb/src%2Fdaemon%2Fruntime-binary.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fdaemon%2Fruntime-binary.ts?ref=06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb",
+      "patch": "@@ -0,0 +1,11 @@\n+import path from \"node:path\";\n+\n+export function isNodeRuntime(execPath: string): boolean {\n+  const base = path.basename(execPath).toLowerCase();\n+  return base === \"node\" || base === \"node.exe\";\n+}\n+\n+export function isBunRuntime(execPath: string): boolean {\n+  const base = path.basename(execPath).toLowerCase();\n+  return base === \"bun\" || base === \"bun.exe\";\n+}"
+    },
+    {
+      "sha": "09e766065ecfa8510300f7c5f9d22b0ec9f82850",
+      "filename": "src/daemon/service-audit.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 10,
+      "changes": 11,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb/src%2Fdaemon%2Fservice-audit.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb/src%2Fdaemon%2Fservice-audit.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fdaemon%2Fservice-audit.ts?ref=06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb",
+      "patch": "@@ -1,6 +1,7 @@\n import fs from \"node:fs/promises\";\n import path from \"node:path\";\n import { resolveLaunchAgentPlistPath } from \"./launchd.js\";\n+import { isBunRuntime, isNodeRuntime } from \"./runtime-binary.js\";\n import {\n   isSystemNodePath,\n   isVersionManagedNodePath,\n@@ -224,16 +225,6 @@ function auditGatewayToken(\n   });\n }\n \n-function isNodeRuntime(execPath: string): boolean {\n-  const base = path.basename(execPath).toLowerCase();\n-  return base === \"node\" || base === \"node.exe\";\n-}\n-\n-function isBunRuntime(execPath: string): boolean {\n-  const base = path.basename(execPath).toLowerCase();\n-  return base === \"bun\" || base === \"bun.exe\";\n-}\n-\n function getPathModule(platform: NodeJS.Platform) {\n   return platform === \"win32\" ? path.win32 : path.posix;\n }"
+    },
+    {
+      "sha": "53d362397b6959840625a0d7c3a3cf318e9f0062",
+      "filename": "src/infra/device-pairing.ts",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 8,
+      "changes": 16,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb/src%2Finfra%2Fdevice-pairing.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb/src%2Finfra%2Fdevice-pairing.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Fdevice-pairing.ts?ref=06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb",
+      "patch": "@@ -8,6 +8,7 @@ import {\n   resolvePairingPaths,\n   writeJsonAtomic,\n } from \"./pairing-files.js\";\n+import { rejectPendingPairingRequest } from \"./pairing-pending.js\";\n import { generatePairingToken, verifyPairingToken } from \"./pairing-token.js\";\n \n export type DevicePairingPendingRequest = {\n@@ -382,14 +383,13 @@ export async function rejectDevicePairing(\n   baseDir?: string,\n ): Promise<{ requestId: string; deviceId: string } | null> {\n   return await withLock(async () => {\n-    const state = await loadState(baseDir);\n-    const pending = state.pendingById[requestId];\n-    if (!pending) {\n-      return null;\n-    }\n-    delete state.pendingById[requestId];\n-    await persistState(state, baseDir);\n-    return { requestId, deviceId: pending.deviceId };\n+    return await rejectPendingPairingRequest({\n+      requestId,\n+      idKey: \"deviceId\",\n+      loadState: () => loadState(baseDir),\n+      persistState: (state) => persistState(state, baseDir),\n+      getId: (pending) => pending.deviceId,\n+    });\n   });\n }\n "
+    },
+    {
+      "sha": "4990a28b43563f2dfefa7ce2adbddddd59a6f2dd",
+      "filename": "src/infra/node-pairing.ts",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 8,
+      "changes": 16,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb/src%2Finfra%2Fnode-pairing.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb/src%2Finfra%2Fnode-pairing.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Fnode-pairing.ts?ref=06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb",
+      "patch": "@@ -7,6 +7,7 @@ import {\n   upsertPendingPairingRequest,\n   writeJsonAtomic,\n } from \"./pairing-files.js\";\n+import { rejectPendingPairingRequest } from \"./pairing-pending.js\";\n import { generatePairingToken, verifyPairingToken } from \"./pairing-token.js\";\n \n export type NodePairingPendingRequest = {\n@@ -194,14 +195,13 @@ export async function rejectNodePairing(\n   baseDir?: string,\n ): Promise<{ requestId: string; nodeId: string } | null> {\n   return await withLock(async () => {\n-    const state = await loadState(baseDir);\n-    const pending = state.pendingById[requestId];\n-    if (!pending) {\n-      return null;\n-    }\n-    delete state.pendingById[requestId];\n-    await persistState(state, baseDir);\n-    return { requestId, nodeId: pending.nodeId };\n+    return await rejectPendingPairingRequest({\n+      requestId,\n+      idKey: \"nodeId\",\n+      loadState: () => loadState(baseDir),\n+      persistState: (state) => persistState(state, baseDir),\n+      getId: (pending) => pending.nodeId,\n+    });\n   });\n }\n "
+    },
+    {
+      "sha": "a6b40b773386b958a60bcf0815e2f21afe65cce9",
+      "filename": "src/infra/pairing-pending.ts",
+      "status": "added",
+      "additions": 27,
+      "deletions": 0,
+      "changes": 27,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb/src%2Finfra%2Fpairing-pending.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb/src%2Finfra%2Fpairing-pending.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Fpairing-pending.ts?ref=06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb",
+      "patch": "@@ -0,0 +1,27 @@\n+type PendingState<TPending> = {\n+  pendingById: Record<string, TPending>;\n+};\n+\n+export async function rejectPendingPairingRequest<\n+  TPending,\n+  TState extends PendingState<TPending>,\n+  TIdKey extends string,\n+>(params: {\n+  requestId: string;\n+  idKey: TIdKey;\n+  loadState: () => Promise<TState>;\n+  persistState: (state: TState) => Promise<void>;\n+  getId: (pending: TPending) => string;\n+}): Promise<({ requestId: string } & Record<TIdKey, string>) | null> {\n+  const state = await params.loadState();\n+  const pending = state.pendingById[params.requestId];\n+  if (!pending) {\n+    return null;\n+  }\n+  delete state.pendingById[params.requestId];\n+  await params.persistState(state);\n+  return {\n+    requestId: params.requestId,\n+    [params.idKey]: params.getId(pending),\n+  } as { requestId: string } & Record<TIdKey, string>;\n+}"
+    },
+    {
+      "sha": "d6c172a7bd9600ef21bbc5a8df82555dd244cfea",
+      "filename": "src/infra/ports-inspect.ts",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 10,
+      "changes": 12,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb/src%2Finfra%2Fports-inspect.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb/src%2Finfra%2Fports-inspect.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Fports-inspect.ts?ref=06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb",
+      "patch": "@@ -1,8 +1,8 @@\n-import net from \"node:net\";\n import { runCommandWithTimeout } from \"../process/exec.js\";\n import { isErrno } from \"./errors.js\";\n import { buildPortHints } from \"./ports-format.js\";\n import { resolveLsofCommand } from \"./ports-lsof.js\";\n+import { tryListenOnPort } from \"./ports-probe.js\";\n import type { PortListener, PortUsage, PortUsageStatus } from \"./ports-types.js\";\n \n type CommandResult = {\n@@ -227,15 +227,7 @@ async function readWindowsListeners(\n \n async function tryListenOnHost(port: number, host: string): Promise<PortUsageStatus | \"skip\"> {\n   try {\n-    await new Promise<void>((resolve, reject) => {\n-      const tester = net\n-        .createServer()\n-        .once(\"error\", (err) => reject(err))\n-        .once(\"listening\", () => {\n-          tester.close(() => resolve());\n-        })\n-        .listen({ port, host, exclusive: true });\n-    });\n+    await tryListenOnPort({ port, host, exclusive: true });\n     return \"free\";\n   } catch (err) {\n     if (isErrno(err) && err.code === \"EADDRINUSE\") {"
+    },
+    {
+      "sha": "9d971ea949354800fe15f1b5e9f853c210e6dc75",
+      "filename": "src/infra/ports-probe.ts",
+      "status": "added",
+      "additions": 24,
+      "deletions": 0,
+      "changes": 24,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb/src%2Finfra%2Fports-probe.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb/src%2Finfra%2Fports-probe.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Fports-probe.ts?ref=06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb",
+      "patch": "@@ -0,0 +1,24 @@\n+import net from \"node:net\";\n+\n+export async function tryListenOnPort(params: {\n+  port: number;\n+  host?: string;\n+  exclusive?: boolean;\n+}): Promise<void> {\n+  const listenOptions: net.ListenOptions = { port: params.port };\n+  if (params.host) {\n+    listenOptions.host = params.host;\n+  }\n+  if (typeof params.exclusive === \"boolean\") {\n+    listenOptions.exclusive = params.exclusive;\n+  }\n+  await new Promise<void>((resolve, reject) => {\n+    const tester = net\n+      .createServer()\n+      .once(\"error\", (err) => reject(err))\n+      .once(\"listening\", () => {\n+        tester.close(() => resolve());\n+      })\n+      .listen(listenOptions);\n+  });\n+}"
+    },
+    {
+      "sha": "58f0cf7d7c831280e26b69d7b68333af677ad98f",
+      "filename": "src/infra/ports.ts",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 10,
+      "changes": 12,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb/src%2Finfra%2Fports.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb/src%2Finfra%2Fports.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Fports.ts?ref=06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb",
+      "patch": "@@ -1,11 +1,11 @@\n-import net from \"node:net\";\n import { danger, info, shouldLogVerbose, warn } from \"../globals.js\";\n import { logDebug } from \"../logger.js\";\n import type { RuntimeEnv } from \"../runtime.js\";\n import { defaultRuntime } from \"../runtime.js\";\n import { isErrno } from \"./errors.js\";\n import { formatPortDiagnostics } from \"./ports-format.js\";\n import { inspectPortUsage } from \"./ports-inspect.js\";\n+import { tryListenOnPort } from \"./ports-probe.js\";\n import type { PortListener, PortListenerKind, PortUsage, PortUsageStatus } from \"./ports-types.js\";\n \n class PortInUseError extends Error {\n@@ -31,15 +31,7 @@ export async function describePortOwner(port: number): Promise<string | undefine\n export async function ensurePortAvailable(port: number): Promise<void> {\n   // Detect EADDRINUSE early with a friendly message.\n   try {\n-    await new Promise<void>((resolve, reject) => {\n-      const tester = net\n-        .createServer()\n-        .once(\"error\", (err) => reject(err))\n-        .once(\"listening\", () => {\n-          tester.close(() => resolve());\n-        })\n-        .listen(port);\n-    });\n+    await tryListenOnPort({ port });\n   } catch (err) {\n     if (isErrno(err) && err.code === \"EADDRINUSE\") {\n       throw new PortInUseError(port);"
+    },
+    {
+      "sha": "eb0b52b308bf91319b88ab0f8adc6a7405ec3b8c",
+      "filename": "src/pairing/pairing-store.ts",
+      "status": "modified",
+      "additions": 31,
+      "deletions": 28,
+      "changes": 59,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb/src%2Fpairing%2Fpairing-store.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb/src%2Fpairing%2Fpairing-store.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fpairing%2Fpairing-store.ts?ref=06b0a60bef49e6bec515e33c5c1ac23a4eee3ccb",
+      "patch": "@@ -376,9 +376,14 @@ type AllowFromStoreEntryUpdateParams = {\n   env?: NodeJS.ProcessEnv;\n };\n \n+type ChannelAllowFromStoreEntryMutation = (\n+  current: string[],\n+  normalized: string,\n+) => string[] | null;\n+\n async function updateChannelAllowFromStore(\n   params: {\n-    apply: (current: string[], normalized: string) => string[] | null;\n+    apply: ChannelAllowFromStoreEntryMutation;\n   } & AllowFromStoreEntryUpdateParams,\n ): Promise<{ changed: boolean; allowFrom: string[] }> {\n   return await updateAllowFromStoreEntry({\n@@ -390,38 +395,36 @@ async function updateChannelAllowFromStore(\n   });\n }\n \n-export async function addChannelAllowFromStoreEntry(params: {\n-  channel: PairingChannel;\n-  entry: string | number;\n-  accountId?: string;\n-  env?: NodeJS.ProcessEnv;\n-}): Promise<{ changed: boolean; allowFrom: string[] }> {\n+async function mutateChannelAllowFromStoreEntry(\n+  params: AllowFromStoreEntryUpdateParams,\n+  apply: ChannelAllowFromStoreEntryMutation,\n+): Promise<{ changed: boolean; allowFrom: string[] }> {\n   return await updateChannelAllowFromStore({\n     ...params,\n-    apply: (current, normalized) => {\n-      if (current.includes(normalized)) {\n-        return null;\n-      }\n-      return [...current, normalized];\n-    },\n+    apply,\n   });\n }\n \n-export async function removeChannelAllowFromStoreEntry(params: {\n-  channel: PairingChannel;\n-  entry: string | number;\n-  accountId?: string;\n-  env?: NodeJS.ProcessEnv;\n-}): Promise<{ changed: boolean; allowFrom: string[] }> {\n-  return await updateChannelAllowFromStore({\n-    ...params,\n-    apply: (current, normalized) => {\n-      const next = current.filter((entry) => entry !== normalized);\n-      if (next.length === current.length) {\n-        return null;\n-      }\n-      return next;\n-    },\n+export async function addChannelAllowFromStoreEntry(\n+  params: AllowFromStoreEntryUpdateParams,\n+): Promise<{ changed: boolean; allowFrom: string[] }> {\n+  return await mutateChannelAllowFromStoreEntry(params, (current, normalized) => {\n+    if (current.includes(normalized)) {\n+      return null;\n+    }\n+    return [...current, normalized];\n+  });\n+}\n+\n+export async function removeChannelAllowFromStoreEntry(\n+  params: AllowFromStoreEntryUpdateParams,\n+): Promise<{ changed: boolean; allowFrom: string[] }> {\n+  return await mutateChannelAllowFromStoreEntry(params, (current, normalized) => {\n+    const next = current.filter((entry) => entry !== normalized);\n+    if (next.length === current.length) {\n+      return null;\n+    }\n+    return next;\n   });\n }\n "
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "message": "feat: stream markdown via hybrid block streamer",
+  "files": [
+    {
+      "sha": "b0ccbf54ad539c1f2c39221acdc7c86eb61da876",
+      "filename": "src/run/markdown.ts",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/steipete/summarize/blob/c16db093c26b230d3c04c39ffc6e71372e762615/src%2Frun%2Fmarkdown.ts",
+      "raw_url": "https://github.com/steipete/summarize/raw/c16db093c26b230d3c04c39ffc6e71372e762615/src%2Frun%2Fmarkdown.ts",
+      "contents_url": "https://api.github.com/repos/steipete/summarize/contents/src%2Frun%2Fmarkdown.ts?ref=c16db093c26b230d3c04c39ffc6e71372e762615",
+      "patch": "@@ -37,6 +37,12 @@ export function prepareMarkdownLineForTerminal(line: string): string {\n   })\n }\n \n+export function prepareMarkdownForTerminalStreaming(markdown: string): string {\n+  // Streaming is append-only; never rewrite earlier content (e.g. reference-style links).\n+  // Only apply local, fence-aware transformations.\n+  return materializeInlineMarkdownLinks(markdown)\n+}\n+\n function inlineReferenceStyleLinks(markdown: string): string {\n   // Some models like emitting reference-style links:\n   //   [Label][1]"
+    },
+    {
+      "sha": "34c8ca2f2e6c88f446eee68dd80e1560071daaf3",
+      "filename": "src/run/summary-engine.ts",
+      "status": "modified",
+      "additions": 26,
+      "deletions": 53,
+      "changes": 79,
+      "blob_url": "https://github.com/steipete/summarize/blob/c16db093c26b230d3c04c39ffc6e71372e762615/src%2Frun%2Fsummary-engine.ts",
+      "raw_url": "https://github.com/steipete/summarize/raw/c16db093c26b230d3c04c39ffc6e71372e762615/src%2Frun%2Fsummary-engine.ts",
+      "contents_url": "https://api.github.com/repos/steipete/summarize/contents/src%2Frun%2Fsummary-engine.ts?ref=c16db093c26b230d3c04c39ffc6e71372e762615",
+      "patch": "@@ -1,13 +1,13 @@\n import type { ModelMessage } from 'ai'\n import { countTokens } from 'gpt-tokenizer'\n-import { render as renderMarkdownAnsi } from 'markdansi'\n+import { createMarkdownStreamer, render as renderMarkdownAnsi } from 'markdansi'\n import type { CliProvider } from '../config.js'\n import { isCliDisabled, runCliModel } from '../llm/cli.js'\n import { streamTextWithModelId } from '../llm/generate-text.js'\n import { parseGatewayStyleModelId } from '../llm/model-id.js'\n import { formatCompactCount } from '../tty/format.js'\n import { createRetryLogger, writeVerbose } from './logging.js'\n-import { prepareMarkdownLineForTerminal } from './markdown.js'\n+import { prepareMarkdownForTerminalStreaming } from './markdown.js'\n import {\n   isGoogleStreamingUnsupportedError,\n   isStreamingTimeoutError,\n@@ -374,55 +374,18 @@ export function createSummaryEngine(deps: SummaryEngineDeps) {\n \t      let streamedRaw = ''\n \t      const liveWidth = markdownRenderWidth(deps.stdout, deps.env)\n \n-      let markdownFlushedLen = 0\n-      let markdownFence = false\n-      let renderedStarted = false\n-\n-      const renderLine = (line: string): string => {\n-        const trimmed = line.trimStart()\n-        const isFence = trimmed.startsWith('```')\n-        if (isFence) {\n-          markdownFence = !markdownFence\n-          return `${line}\\n`\n-        }\n-        if (markdownFence) return `${line}\\n`\n-\n-        // Keep reference definitions stable in streaming mode; they can affect earlier lines.\n-        if (/^\\s*\\[[^\\]]+\\]:\\s*\\S+/.test(line)) return `${line}\\n`\n-\n-        if (!line) return '\\n'\n-\n-        const rendered = renderMarkdownAnsi(prepareMarkdownLineForTerminal(line), {\n-          width: liveWidth,\n-          wrap: true,\n-          color: supportsColor(deps.stdout, deps.envForRun),\n-          hyperlinks: true,\n-        })\n-        const normalized = rendered.replace(/^\\n+/, '')\n-        return normalized.endsWith('\\n') ? normalized : `${normalized}\\n`\n-      }\n-\n-      const flushRenderedLines = (markdown: string, { final }: { final: boolean }) => {\n-        const lastNl = markdown.lastIndexOf('\\n')\n-        const upto = final ? markdown.length : lastNl >= 0 ? lastNl + 1 : 0\n-        if (upto <= markdownFlushedLen) return\n-        const chunk = markdown.slice(markdownFlushedLen, upto)\n-        markdownFlushedLen = upto\n-        if (!chunk) return\n-\n-        deps.clearProgressForStdout()\n-        const lines = chunk.split('\\n')\n-        const trailing = lines.pop() ?? ''\n-        for (const line of lines) {\n-          if (!renderedStarted && line.length === 0) continue\n-          renderedStarted = true\n-          deps.stdout.write(renderLine(line))\n-        }\n-        if (final && trailing.length > 0) {\n-          renderedStarted = true\n-          deps.stdout.write(renderLine(trailing))\n-        }\n-      }\n+      const streamer = shouldStreamRenderedMarkdownToStdout\n+        ? createMarkdownStreamer({\n+            render: (markdown) =>\n+              renderMarkdownAnsi(prepareMarkdownForTerminalStreaming(markdown), {\n+                width: liveWidth,\n+                wrap: true,\n+                color: supportsColor(deps.stdout, deps.envForRun),\n+                hyperlinks: true,\n+              }),\n+            spacing: 'single',\n+          })\n+        : null\n \n \t      try {\n \t        let cleared = false\n@@ -446,15 +409,25 @@ export function createSummaryEngine(deps: SummaryEngineDeps) {\n \t            continue\n \t          }\n \n-          if (shouldStreamRenderedMarkdownToStdout) flushRenderedLines(streamed, { final: false })\n+          if (shouldStreamRenderedMarkdownToStdout && streamer) {\n+            const out = streamer.push(merged.appended)\n+            if (out) {\n+              deps.clearProgressForStdout()\n+              deps.stdout.write(out)\n+            }\n+          }\n \t        }\n \n \t        streamedRaw = streamed\n \t        const trimmed = streamed.trim()\n \t        streamed = trimmed\n \t      } finally {\n \t        if (shouldStreamRenderedMarkdownToStdout) {\n-\t          flushRenderedLines(streamedRaw || streamed, { final: true })\n+            const out = streamer?.finish()\n+            if (out) {\n+              deps.clearProgressForStdout()\n+              deps.stdout.write(out)\n+            }\n           summaryAlreadyPrinted = true\n         }\n       }"
+    },
+    {
+      "sha": "edb2c3b8b315dac0ba03ccd6bbfa66fae84e4ffb",
+      "filename": "tests/cli.render.md-live.options.test.ts",
+      "status": "modified",
+      "additions": 0,
+      "deletions": 9,
+      "changes": 9,
+      "blob_url": "https://github.com/steipete/summarize/blob/c16db093c26b230d3c04c39ffc6e71372e762615/tests%2Fcli.render.md-live.options.test.ts",
+      "raw_url": "https://github.com/steipete/summarize/raw/c16db093c26b230d3c04c39ffc6e71372e762615/tests%2Fcli.render.md-live.options.test.ts",
+      "contents_url": "https://api.github.com/repos/steipete/summarize/contents/tests%2Fcli.render.md-live.options.test.ts?ref=c16db093c26b230d3c04c39ffc6e71372e762615",
+      "patch": "@@ -6,14 +6,6 @@ import { describe, expect, it, vi } from 'vitest'\n \n import { runCli } from '../src/run.js'\n \n-const { renderMock } = vi.hoisted(() => ({\n-  renderMock: vi.fn((markdown: string) => markdown),\n-}))\n-\n-vi.mock('markdansi', () => ({\n-  render: renderMock,\n-}))\n-\n function createTextStream(chunks: string[]): AsyncIterable<string> {\n   return {\n     async *[Symbol.asyncIterator]() {\n@@ -64,7 +56,6 @@ function collectChunks() {\n \n describe('cli streamed markdown write semantics', () => {\n   it('buffers until newline and writes complete lines only', async () => {\n-    renderMock.mockClear()\n     streamTextMock.mockClear()\n     createOpenAIMock.mockClear()\n "
+    }
+  ]
+}

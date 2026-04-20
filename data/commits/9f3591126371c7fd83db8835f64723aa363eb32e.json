@@ -1,0 +1,101 @@
+{
+  "message": "feat(tui): prefetch full-res gifs",
+  "files": [
+    {
+      "sha": "c9f97c9ff2987e9bf9df9fe57e819af65a037b56",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/steipete/gifgrep/blob/9f3591126371c7fd83db8835f64723aa363eb32e/CHANGELOG.md",
+      "raw_url": "https://github.com/steipete/gifgrep/raw/9f3591126371c7fd83db8835f64723aa363eb32e/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/steipete/gifgrep/contents/CHANGELOG.md?ref=9f3591126371c7fd83db8835f64723aa363eb32e",
+      "patch": "@@ -3,6 +3,7 @@\n ## 0.2.3 \u2014 Unreleased\n ### Fixes\n - TUI: after download, preview reloads from the saved full-res GIF.\n+- TUI: prefetch full-res GIFs in the background (<=10MB) so selection swaps to high-res.\n \n ## 0.2.2 - 2026-01-22\n "
+    },
+    {
+      "sha": "df7731b664e4018d5a745391af4d29ccbeb84c6a",
+      "filename": "internal/tui/prefetch.go",
+      "status": "added",
+      "additions": 205,
+      "deletions": 0,
+      "changes": 205,
+      "blob_url": "https://github.com/steipete/gifgrep/blob/9f3591126371c7fd83db8835f64723aa363eb32e/internal%2Ftui%2Fprefetch.go",
+      "raw_url": "https://github.com/steipete/gifgrep/raw/9f3591126371c7fd83db8835f64723aa363eb32e/internal%2Ftui%2Fprefetch.go",
+      "contents_url": "https://api.github.com/repos/steipete/gifgrep/contents/internal%2Ftui%2Fprefetch.go?ref=9f3591126371c7fd83db8835f64723aa363eb32e",
+      "patch": "@@ -0,0 +1,205 @@\n+package tui\n+\n+import (\n+\t\"fmt\"\n+\t\"io\"\n+\t\"net/http\"\n+\t\"os\"\n+\t\"strconv\"\n+\t\"strings\"\n+\t\"time\"\n+\n+\t\"github.com/steipete/gifgrep/internal/model\"\n+)\n+\n+type prefetchResult struct {\n+\tkey  string\n+\tgen  int\n+\tpath string\n+\terr  error\n+}\n+\n+func prefetchMaxBytes() int64 {\n+\tconst fallback = int64(10 * 1024 * 1024)\n+\traw := strings.TrimSpace(os.Getenv(\"GIFGREP_TUI_PREFETCH_MAX_BYTES\"))\n+\tif raw == \"\" {\n+\t\treturn fallback\n+\t}\n+\tv, err := strconv.ParseInt(raw, 10, 64)\n+\tif err != nil || v < 0 {\n+\t\treturn fallback\n+\t}\n+\treturn v\n+}\n+\n+func ensureTempDir(state *appState) (string, error) {\n+\tif state.tempDir != \"\" {\n+\t\treturn state.tempDir, nil\n+\t}\n+\tdir, err := os.MkdirTemp(\"\", \"gifgrep-tui-\")\n+\tif err != nil {\n+\t\treturn \"\", err\n+\t}\n+\tstate.tempDir = dir\n+\treturn dir, nil\n+}\n+\n+func startPrefetch(state *appState, results []model.Result, notify chan<- prefetchResult) {\n+\tif notify == nil {\n+\t\treturn\n+\t}\n+\tif state.prefetching == nil {\n+\t\tstate.prefetching = map[string]bool{}\n+\t}\n+\tif state.tempPaths == nil {\n+\t\tstate.tempPaths = map[string]string{}\n+\t}\n+\tmaxBytes := prefetchMaxBytes()\n+\tif maxBytes == 0 {\n+\t\treturn\n+\t}\n+\tdir, err := ensureTempDir(state)\n+\tif err != nil {\n+\t\treturn\n+\t}\n+\tgen := state.prefetchGen\n+\tfor _, item := range results {\n+\t\tif item.URL == \"\" {\n+\t\t\tcontinue\n+\t\t}\n+\t\tkey := resultKey(item)\n+\t\tif key == \"\" || key == \"unknown\" || state.prefetching[key] {\n+\t\t\tcontinue\n+\t\t}\n+\t\tif _, ok := savedPathForResult(state, item); ok {\n+\t\t\tcontinue\n+\t\t}\n+\t\tif _, ok := tempPathForResult(state, item); ok {\n+\t\t\tcontinue\n+\t\t}\n+\t\tstate.prefetching[key] = true\n+\t\turl := item.URL\n+\t\tgo func() {\n+\t\t\tpath, err := prefetchGIFToTemp(url, dir, maxBytes)\n+\t\t\tnotify <- prefetchResult{key: key, gen: gen, path: path, err: err}\n+\t\t}()\n+\t}\n+}\n+\n+func resetPrefetch(state *appState) {\n+\tif state == nil {\n+\t\treturn\n+\t}\n+\tstate.prefetchGen++\n+\tfor _, path := range state.tempPaths {\n+\t\tif path != \"\" {\n+\t\t\t_ = os.Remove(path)\n+\t\t}\n+\t}\n+\tstate.prefetching = map[string]bool{}\n+\tstate.tempPaths = map[string]string{}\n+}\n+\n+func prefetchGIFToTemp(gifURL, dir string, maxBytes int64) (string, error) {\n+\tif dir == \"\" {\n+\t\treturn \"\", fmt.Errorf(\"missing temp dir\")\n+\t}\n+\tclient := &http.Client{Timeout: 20 * time.Second}\n+\treq, err := http.NewRequest(http.MethodGet, gifURL, nil)\n+\tif err != nil {\n+\t\treturn \"\", err\n+\t}\n+\treq.Header.Set(\"User-Agent\", \"gifgrep\")\n+\tresp, err := client.Do(req)\n+\tif err != nil {\n+\t\treturn \"\", err\n+\t}\n+\tdefer func() {\n+\t\t_ = resp.Body.Close()\n+\t}()\n+\tif resp.StatusCode < 200 || resp.StatusCode >= 300 {\n+\t\treturn \"\", fmt.Errorf(\"http %d\", resp.StatusCode)\n+\t}\n+\tif maxBytes > 0 && resp.ContentLength > 0 && resp.ContentLength > maxBytes {\n+\t\treturn \"\", fmt.Errorf(\"too large\")\n+\t}\n+\n+\ttmp, err := os.CreateTemp(dir, \"gifgrep-*.gif\")\n+\tif err != nil {\n+\t\treturn \"\", err\n+\t}\n+\tpath := tmp.Name()\n+\tcleanup := func() {\n+\t\t_ = tmp.Close()\n+\t\t_ = os.Remove(path)\n+\t}\n+\n+\tlimit := maxBytes\n+\tif limit <= 0 {\n+\t\tlimit = 1<<63 - 1\n+\t}\n+\tn, err := io.Copy(tmp, io.LimitReader(resp.Body, limit+1))\n+\tif err != nil {\n+\t\tcleanup()\n+\t\treturn \"\", err\n+\t}\n+\tif n > limit {\n+\t\tcleanup()\n+\t\treturn \"\", fmt.Errorf(\"too large\")\n+\t}\n+\tif err := tmp.Close(); err != nil {\n+\t\tcleanup()\n+\t\treturn \"\", err\n+\t}\n+\treturn path, nil\n+}\n+\n+func cleanupTempDir(state *appState) {\n+\tif state == nil || state.tempDir == \"\" {\n+\t\treturn\n+\t}\n+\t_ = os.RemoveAll(state.tempDir)\n+\tstate.tempDir = \"\"\n+\tstate.tempPaths = nil\n+\tstate.prefetching = nil\n+}\n+\n+func tempPathForResult(state *appState, item model.Result) (string, bool) {\n+\tif state == nil || state.tempPaths == nil {\n+\t\treturn \"\", false\n+\t}\n+\tkey := resultKey(item)\n+\tif key == \"\" {\n+\t\treturn \"\", false\n+\t}\n+\tif p, ok := state.tempPaths[key]; ok && p != \"\" {\n+\t\tif _, err := os.Stat(p); err == nil {\n+\t\t\treturn p, true\n+\t\t}\n+\t}\n+\treturn \"\", false\n+}\n+\n+func acceptPrefetchResult(state *appState, res prefetchResult) bool {\n+\tif state == nil {\n+\t\treturn false\n+\t}\n+\tdelete(state.prefetching, res.key)\n+\tif res.err != nil {\n+\t\treturn false\n+\t}\n+\tif res.gen != state.prefetchGen {\n+\t\tif res.path != \"\" {\n+\t\t\t_ = os.Remove(res.path)\n+\t\t}\n+\t\treturn false\n+\t}\n+\tif state.tempPaths == nil {\n+\t\tstate.tempPaths = map[string]string{}\n+\t}\n+\tif res.path == \"\" {\n+\t\treturn false\n+\t}\n+\tstate.tempPaths[res.key] = res.path\n+\treturn true\n+}"
+    },
+    {
+      "sha": "021dc394d10fdb52e95bcbe84b25d7c440b6cd42",
+      "filename": "internal/tui/prefetch_test.go",
+      "status": "added",
+      "additions": 27,
+      "deletions": 0,
+      "changes": 27,
+      "blob_url": "https://github.com/steipete/gifgrep/blob/9f3591126371c7fd83db8835f64723aa363eb32e/internal%2Ftui%2Fprefetch_test.go",
+      "raw_url": "https://github.com/steipete/gifgrep/raw/9f3591126371c7fd83db8835f64723aa363eb32e/internal%2Ftui%2Fprefetch_test.go",
+      "contents_url": "https://api.github.com/repos/steipete/gifgrep/contents/internal%2Ftui%2Fprefetch_test.go?ref=9f3591126371c7fd83db8835f64723aa363eb32e",
+      "patch": "@@ -0,0 +1,27 @@\n+package tui\n+\n+import (\n+\t\"os\"\n+\t\"testing\"\n+\n+\t\"github.com/steipete/gifgrep/internal/testutil\"\n+)\n+\n+func TestPrefetchGIFToTempRespectsSize(t *testing.T) {\n+\tdata := testutil.MakeTestGIF()\n+\trt := &testutil.FakeTransport{GIFData: data}\n+\ttestutil.WithTransport(t, rt, func() {\n+\t\tdir := t.TempDir()\n+\t\tpath, err := prefetchGIFToTemp(\"https://example.test/full.gif\", dir, int64(len(data)+1))\n+\t\tif err != nil {\n+\t\t\tt.Fatalf(\"prefetch failed: %v\", err)\n+\t\t}\n+\t\tif _, err := os.Stat(path); err != nil {\n+\t\t\tt.Fatalf(\"missing temp file: %v\", err)\n+\t\t}\n+\n+\t\tif _, err := prefetchGIFToTemp(\"https://example.test/full.gif\", dir, int64(len(data)-1)); err == nil {\n+\t\t\tt.Fatalf(\"expected size cap error\")\n+\t\t}\n+\t})\n+}"
+    },
+    {
+      "sha": "db80144b33a962fe764e97c289aff6c3187600b8",
+      "filename": "internal/tui/preview.go",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/steipete/gifgrep/blob/9f3591126371c7fd83db8835f64723aa363eb32e/internal%2Ftui%2Fpreview.go",
+      "raw_url": "https://github.com/steipete/gifgrep/raw/9f3591126371c7fd83db8835f64723aa363eb32e/internal%2Ftui%2Fpreview.go",
+      "contents_url": "https://api.github.com/repos/steipete/gifgrep/contents/internal%2Ftui%2Fpreview.go?ref=9f3591126371c7fd83db8835f64723aa363eb32e",
+      "patch": "@@ -36,6 +36,10 @@ func loadSelectedImage(state *appState) {\n \tlocalPath, localOK := savedPathForResult(state, item)\n \tif localOK {\n \t\tsource = localPath\n+\t} else if tempPath, ok := tempPathForResult(state, item); ok {\n+\t\tsource = tempPath\n+\t\tlocalPath = tempPath\n+\t\tlocalOK = true\n \t}\n \tif source == \"\" {\n \t\tstate.currentAnim = nil"
+    },
+    {
+      "sha": "9b02deb25e12c1f240fdea3b38d58f1e3b6103ba",
+      "filename": "internal/tui/preview_test.go",
+      "status": "modified",
+      "additions": 34,
+      "deletions": 0,
+      "changes": 34,
+      "blob_url": "https://github.com/steipete/gifgrep/blob/9f3591126371c7fd83db8835f64723aa363eb32e/internal%2Ftui%2Fpreview_test.go",
+      "raw_url": "https://github.com/steipete/gifgrep/raw/9f3591126371c7fd83db8835f64723aa363eb32e/internal%2Ftui%2Fpreview_test.go",
+      "contents_url": "https://api.github.com/repos/steipete/gifgrep/contents/internal%2Ftui%2Fpreview_test.go?ref=9f3591126371c7fd83db8835f64723aa363eb32e",
+      "patch": "@@ -105,3 +105,37 @@ func TestLoadSelectedImageUsesDownloadedFile(t *testing.T) {\n \t\tt.Fatalf(\"expected animation from downloaded file\")\n \t}\n }\n+\n+func TestLoadSelectedImageUsesTempFile(t *testing.T) {\n+\tdata := testutil.MakeTestGIF()\n+\ttmp, err := os.CreateTemp(t.TempDir(), \"gifgrep-*.gif\")\n+\tif err != nil {\n+\t\tt.Fatalf(\"temp file: %v\", err)\n+\t}\n+\tif _, err := tmp.Write(data); err != nil {\n+\t\tt.Fatalf(\"write temp gif: %v\", err)\n+\t}\n+\tif err := tmp.Close(); err != nil {\n+\t\tt.Fatalf(\"close temp gif: %v\", err)\n+\t}\n+\n+\tstate := &appState{\n+\t\tresults: []model.Result{{\n+\t\t\tID:         \"id1\",\n+\t\t\tTitle:      \"cached\",\n+\t\t\tURL:        \"https://example.test/full.gif\",\n+\t\t\tPreviewURL: \"https://example.test/preview.gif\",\n+\t\t}},\n+\t\tselected:   0,\n+\t\tinline:     termcaps.InlineKitty,\n+\t\tcache:      map[string]*gifCacheEntry{},\n+\t\ttempPaths:  map[string]string{\"id:id1\": tmp.Name()},\n+\t\tsavedPaths: map[string]string{},\n+\t}\n+\ttestutil.WithTransport(t, &errTransport{}, func() {\n+\t\tloadSelectedImage(state)\n+\t})\n+\tif state.currentAnim == nil || len(state.currentAnim.RawGIF) == 0 {\n+\t\tt.Fatalf(\"expected animation from temp file\")\n+\t}\n+}"
+    },
+    {
+      "sha": "c7d68aca4544f9a95b4ee8106ec4e9ddaf1a91bc",
+      "filename": "internal/tui/tui.go",
+      "status": "modified",
+      "additions": 21,
+      "deletions": 4,
+      "changes": 25,
+      "blob_url": "https://github.com/steipete/gifgrep/blob/9f3591126371c7fd83db8835f64723aa363eb32e/internal%2Ftui%2Ftui.go",
+      "raw_url": "https://github.com/steipete/gifgrep/raw/9f3591126371c7fd83db8835f64723aa363eb32e/internal%2Ftui%2Ftui.go",
+      "contents_url": "https://api.github.com/repos/steipete/gifgrep/contents/internal%2Ftui%2Ftui.go?ref=9f3591126371c7fd83db8835f64723aa363eb32e",
+      "patch": "@@ -119,6 +119,7 @@ func runWith(env Env, opts model.Options, query string) error {\n \t}\n \n \tinputCh := make(chan inputEvent, 16)\n+\tprefetchCh := make(chan prefetchResult, 64)\n \tstopCh := make(chan struct{})\n \tgo readInput(env.In, inputCh, stopCh)\n \n@@ -128,13 +129,16 @@ func runWith(env Env, opts model.Options, query string) error {\n \t\ttagline:         pickTagline(time.Now(), os.Getenv, nil),\n \t\tcache:           map[string]*gifCacheEntry{},\n \t\tsavedPaths:      map[string]string{},\n+\t\ttempPaths:       map[string]string{},\n+\t\tprefetching:     map[string]bool{},\n \t\trenderDirty:     true,\n \t\tnextImageID:     1,\n \t\tinline:          inline,\n \t\tuseSoftwareAnim: inline == termcaps.InlineKitty && useSoftwareAnimation(),\n \t\tuseColor:        opts.Color != \"never\",\n \t\topts:            opts,\n \t}\n+\tdefer cleanupTempDir(state)\n \tif cols, rows, err := env.GetSize(env.FD); err == nil {\n \t\tstate.lastRows = rows\n \t\tstate.lastCols = cols\n@@ -161,9 +165,12 @@ func runWith(env Env, opts model.Options, query string) error {\n \t\t\t\tstate.status = \"No results\"\n \t\t\t\tstate.currentAnim = nil\n \t\t\t\tstate.previewDirty = true\n+\t\t\t\tresetPrefetch(state)\n \t\t\t} else {\n \t\t\t\tstate.status = fmt.Sprintf(\"%d results\", len(results))\n \t\t\t\tloadSelectedImage(state)\n+\t\t\t\tresetPrefetch(state)\n+\t\t\t\tstartPrefetch(state, results, prefetchCh)\n \t\t\t}\n \t\t}\n \t\tstate.renderDirty = true\n@@ -175,10 +182,17 @@ func runWith(env Env, opts model.Options, query string) error {\n \t\t\tclose(stopCh)\n \t\t\treturn nil\n \t\tcase ev := <-inputCh:\n-\t\t\tif handleInput(state, ev, out) {\n+\t\t\tif handleInput(state, ev, out, prefetchCh) {\n \t\t\t\tclose(stopCh)\n \t\t\t\treturn nil\n \t\t\t}\n+\t\tcase res := <-prefetchCh:\n+\t\t\tif acceptPrefetchResult(state, res) {\n+\t\t\t\tif state.selected >= 0 && state.selected < len(state.results) && resultKey(state.results[state.selected]) == res.key {\n+\t\t\t\t\tloadSelectedImage(state)\n+\t\t\t\t\tstate.renderDirty = true\n+\t\t\t\t}\n+\t\t\t}\n \t\tcase <-ticker.C:\n \t\t}\n \n@@ -250,7 +264,7 @@ func readInput(r io.Reader, ch chan<- inputEvent, stop <-chan struct{}) {\n \t}\n }\n \n-func handleInput(state *appState, ev inputEvent, out *bufio.Writer) bool {\n+func handleInput(state *appState, ev inputEvent, out *bufio.Writer, prefetchCh chan<- prefetchResult) bool {\n \tif ev.kind == keyCtrlC {\n \t\treturn true\n \t}\n@@ -260,15 +274,15 @@ func handleInput(state *appState, ev inputEvent, out *bufio.Writer) bool {\n \n \tswitch state.mode {\n \tcase modeQuery:\n-\t\treturn handleQueryInput(state, ev, out)\n+\t\treturn handleQueryInput(state, ev, out, prefetchCh)\n \tcase modeBrowse:\n \t\treturn handleBrowseInput(state, ev, out)\n \t}\n \n \treturn false\n }\n \n-func handleQueryInput(state *appState, ev inputEvent, out *bufio.Writer) bool {\n+func handleQueryInput(state *appState, ev inputEvent, out *bufio.Writer, prefetchCh chan<- prefetchResult) bool {\n \tswitch ev.kind {\n \tcase keyRune:\n \t\tstate.query += string(ev.ch)\n@@ -299,9 +313,12 @@ func handleQueryInput(state *appState, ev inputEvent, out *bufio.Writer) bool {\n \t\t\t\tstate.status = \"No results\"\n \t\t\t\tstate.currentAnim = nil\n \t\t\t\tstate.previewDirty = true\n+\t\t\t\tresetPrefetch(state)\n \t\t\t} else {\n \t\t\t\tstate.status = fmt.Sprintf(\"%d results\", len(results))\n \t\t\t\tloadSelectedImage(state)\n+\t\t\t\tresetPrefetch(state)\n+\t\t\t\tstartPrefetch(state, results, prefetchCh)\n \t\t\t}\n \t\t}\n \t\tstate.mode = modeBrowse"
+    },
+    {
+      "sha": "64b4e2d4a63be61c4ec9d88a97d8b953ea96332e",
+      "filename": "internal/tui/tui_test.go",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 11,
+      "changes": 22,
+      "blob_url": "https://github.com/steipete/gifgrep/blob/9f3591126371c7fd83db8835f64723aa363eb32e/internal%2Ftui%2Ftui_test.go",
+      "raw_url": "https://github.com/steipete/gifgrep/raw/9f3591126371c7fd83db8835f64723aa363eb32e/internal%2Ftui%2Ftui_test.go",
+      "contents_url": "https://api.github.com/repos/steipete/gifgrep/contents/internal%2Ftui%2Ftui_test.go?ref=9f3591126371c7fd83db8835f64723aa363eb32e",
+      "patch": "@@ -60,7 +60,7 @@ func TestHandleInputAndLoad(t *testing.T) {\n \t\tvar buf bytes.Buffer\n \t\tout := bufio.NewWriter(&buf)\n \n-\t\thandleInput(state, inputEvent{kind: keyEnter}, out)\n+\t\thandleInput(state, inputEvent{kind: keyEnter}, out, nil)\n \n \t\tif state.mode != modeBrowse {\n \t\t\tt.Fatalf(\"expected browse mode\")\n@@ -74,62 +74,62 @@ func TestHandleInputAndLoad(t *testing.T) {\n \n \t\tstate.results = append(state.results, model.Result{Title: \"Second\", PreviewURL: state.results[0].PreviewURL})\n \t\tstate.selected = 0\n-\t\thandleInput(state, inputEvent{kind: keyDown}, out)\n+\t\thandleInput(state, inputEvent{kind: keyDown}, out, nil)\n \t\tif state.selected != 1 {\n \t\t\tt.Fatalf(\"expected selection to move down\")\n \t\t}\n \n \t\tstate.mode = modeBrowse\n-\t\thandleInput(state, inputEvent{kind: keyUp}, out)\n+\t\thandleInput(state, inputEvent{kind: keyUp}, out, nil)\n \t\tif state.selected != 0 {\n \t\t\tt.Fatalf(\"expected selection to move up\")\n \t\t}\n \n \t\tstate.mode = modeBrowse\n-\t\thandleInput(state, inputEvent{kind: keyEnter}, out)\n+\t\thandleInput(state, inputEvent{kind: keyEnter}, out, nil)\n \t\tif state.mode != modeQuery {\n \t\t\tt.Fatalf(\"expected query mode on enter\")\n \t\t}\n \n-\t\thandleInput(state, inputEvent{kind: keyRune, ch: '/'}, out)\n+\t\thandleInput(state, inputEvent{kind: keyRune, ch: '/'}, out, nil)\n \t\tif state.mode != modeQuery {\n \t\t\tt.Fatalf(\"expected query mode\")\n \t\t}\n \n \t\tstate.results = []model.Result{{Title: \"A\"}}\n-\t\thandleInput(state, inputEvent{kind: keyEsc}, out)\n+\t\thandleInput(state, inputEvent{kind: keyEsc}, out, nil)\n \t\tif state.mode != modeBrowse {\n \t\t\tt.Fatalf(\"expected browse mode on esc\")\n \t\t}\n \n \t\tstate.mode = modeBrowse\n-\t\thandleInput(state, inputEvent{kind: keyEsc}, out)\n+\t\thandleInput(state, inputEvent{kind: keyEsc}, out, nil)\n \t\tif state.mode != modeQuery {\n \t\t\tt.Fatalf(\"expected query mode on esc\")\n \t\t}\n \n \t\tstate.mode = modeQuery\n \t\tstate.query = \"c\"\n-\t\thandleInput(state, inputEvent{kind: keyBackspace}, out)\n+\t\thandleInput(state, inputEvent{kind: keyBackspace}, out, nil)\n \t\tif state.query != \"\" {\n \t\t\tt.Fatalf(\"expected backspace to remove query\")\n \t\t}\n \n \t\tstate.mode = modeQuery\n-\t\tif !handleInput(state, inputEvent{kind: keyRune, ch: 'q'}, out) {\n+\t\tif !handleInput(state, inputEvent{kind: keyRune, ch: 'q'}, out, nil) {\n \t\t\tt.Fatalf(\"expected quit on q\")\n \t\t}\n \n \t\tstate.mode = modeQuery\n \t\tstate.results = []model.Result{{Title: \"A\"}}\n-\t\thandleInput(state, inputEvent{kind: keyEsc}, out)\n+\t\thandleInput(state, inputEvent{kind: keyEsc}, out, nil)\n \t\tif state.mode != modeBrowse {\n \t\t\tt.Fatalf(\"expected browse mode on esc with results\")\n \t\t}\n \n \t\tstate.mode = modeBrowse\n \t\tstate.selected = len(state.results) - 1\n-\t\thandleInput(state, inputEvent{kind: keyDown}, out)\n+\t\thandleInput(state, inputEvent{kind: keyDown}, out, nil)\n \t\tif state.selected != len(state.results)-1 {\n \t\t\tt.Fatalf(\"expected selection to stay at end\")\n \t\t}"
+    },
+    {
+      "sha": "c67ca29c038a55fe0f7ec6018c1876b7cd95c0f4",
+      "filename": "internal/tui/types.go",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/steipete/gifgrep/blob/9f3591126371c7fd83db8835f64723aa363eb32e/internal%2Ftui%2Ftypes.go",
+      "raw_url": "https://github.com/steipete/gifgrep/raw/9f3591126371c7fd83db8835f64723aa363eb32e/internal%2Ftui%2Ftypes.go",
+      "contents_url": "https://api.github.com/repos/steipete/gifgrep/contents/internal%2Ftui%2Ftypes.go?ref=9f3591126371c7fd83db8835f64723aa363eb32e",
+      "patch": "@@ -44,6 +44,10 @@ type appState struct {\n \tinline        termcaps.InlineProtocol\n \tcache         map[string]*gifCacheEntry\n \tsavedPaths    map[string]string\n+\ttempPaths     map[string]string\n+\ttempDir       string\n+\tprefetchGen   int\n+\tprefetching   map[string]bool\n \trenderDirty   bool\n \tlastShowRight bool\n \tlastRows      int"
+    }
+  ]
+}

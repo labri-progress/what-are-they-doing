@@ -1,0 +1,149 @@
+{
+  "message": "Fix AD edge cases, add constvar support to e-graph, overhaul dtype promotion, and harden LAX ops\n\nAutomatic Differentiation (fj-ad):\n- Fix zeros_like() to use correct output dtype (F64 for Bool/Float inputs,\n  I64 for integer inputs) instead of reusing the input tensor's dtype with\n  mismatched literal types\n- Guard Pow JVP rule against NaN: skip da term when tangent[0]==0 (avoids\n  0^(-1) from b*a.powf(b-1)), skip db term when tangent[1]==0 (avoids ln(0)\n  from a.powf(b)*a.ln())\n\nCache Backend (fj-cache):\n- Use unique temp filenames (pid + atomic counter) for atomic cache writes to\n  prevent concurrent put() calls from racing on the same .tmp file\n- Clean up temp file on write failure\n\nConformance (fj-conformance):\n- Handle NaN==NaN and same-sign infinity comparisons in approx_equal() to\n  prevent false failures in conformance tests\n\nDispatch (fj-dispatch):\n- Fix effect token ordering: always remove-then-push-back instead of\n  in-place update, ensuring correct ordering for order-sensitive transforms\n\nE-Graph (fj-egraph):\n- Add constvars as symbols in jaxpr_to_egraph(), fixing missing-variable errors\n- Encode booleans as \"bool:0\"/\"bool:1\" symbols instead of FjLang::Num to\n  prevent bool/integer confusion during optimization\n- Thread constvars through egraph_to_jaxpr() and optimize_jaxpr()\n- Decode \"bool:\" prefix back to Literal::Bool in id_to_atom()\n\nPartial Evaluation (fj-interpreters):\n- Mark unknown constvars as residuals in partial_eval_jaxpr()\n- Prune output variable list in dce_jaxpr() to only retain used outputs\n\nLAX Operations (fj-lax):\n- Add promote_dtype(lhs, rhs) with proper lattice: F64>F32>I64>I32>Bool\n- Replace element-scanning infer_dtype() with promote_dtype() in all binary\n  elementwise, broadcast, select, and scalar-tensor operations\n- Preserve input tensor dtype through unary operations\n- Determine integral reduction status from tensor.dtype, not element scanning\n- Short-circuit erf_approx(0.0) to preserve signed zero\n- Preserve zero in signum() for float inputs (-0.0/+0.0)\n- Validate input rank <= output rank in broadcast_in_dim\n- Error on rank-0 tensors in gather and scatter operations\n- Use modulo instead of is_multiple_of for reshape inferred-axis validation\n\nLedger (fj-ledger):\n- Use saturating_sub(1) in conformal predictor quantile index to prevent\n  underflow panic with small datasets\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "c7a31e8d83f2cb1d5485e4aa5c1aa83dfdecd4bf",
+      "filename": "crates/fj-ad/src/lib.rs",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 6,
+      "changes": 14,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenjax/blob/9495a6339845cdcc982b027aa77d5a05f8c15c3c/crates%2Ffj-ad%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenjax/raw/9495a6339845cdcc982b027aa77d5a05f8c15c3c/crates%2Ffj-ad%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenjax/contents/crates%2Ffj-ad%2Fsrc%2Flib.rs?ref=9495a6339845cdcc982b027aa77d5a05f8c15c3c",
+      "patch": "@@ -125,14 +125,14 @@ fn zeros_like(v: &Value) -> Value {\n             Literal::F64Bits(_) => Value::scalar_f64(0.0),\n         },\n         Value::Tensor(t) => {\n-            let zero_lit = match t.dtype {\n-                DType::I64 | DType::I32 => Literal::I64(0),\n-                DType::Bool => Literal::from_f64(0.0),\n-                DType::F64 | DType::F32 => Literal::from_f64(0.0),\n+            let (zero_lit, out_dtype) = match t.dtype {\n+                DType::I64 | DType::I32 => (Literal::I64(0), DType::I64),\n+                DType::Bool => (Literal::from_f64(0.0), DType::F64),\n+                DType::F64 | DType::F32 => (Literal::from_f64(0.0), DType::F64),\n             };\n             let elements = vec![zero_lit; t.elements.len()];\n             Value::Tensor(\n-                TensorValue::new(t.dtype, t.shape.clone(), elements)\n+                TensorValue::new(out_dtype, t.shape.clone(), elements)\n                     .expect(\"zeros_like should never fail for valid tensor shape\"),\n             )\n         }\n@@ -1160,7 +1160,9 @@ fn jvp_rule(primitive: Primitive, primals: &[Value], tangents: &[f64]) -> Result\n         Primitive::Pow => {\n             let a = to_f64(&primals[0])?;\n             let b = to_f64(&primals[1])?;\n-            Ok(b * a.powf(b - 1.0) * tangents[0] + a.powf(b) * a.ln() * tangents[1])\n+            let da = if tangents[0] == 0.0 { 0.0 } else { b * a.powf(b - 1.0) * tangents[0] };\n+            let db = if tangents[1] == 0.0 { 0.0 } else { a.powf(b) * a.ln() * tangents[1] };\n+            Ok(da + db)\n         }\n         Primitive::Exp => {\n             let x = to_f64(&primals[0])?;"
+    },
+    {
+      "sha": "13900aabd82cd9126e22ff8812f215d848d78353",
+      "filename": "crates/fj-cache/src/backend.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 1,
+      "changes": 8,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenjax/blob/9495a6339845cdcc982b027aa77d5a05f8c15c3c/crates%2Ffj-cache%2Fsrc%2Fbackend.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenjax/raw/9495a6339845cdcc982b027aa77d5a05f8c15c3c/crates%2Ffj-cache%2Fsrc%2Fbackend.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenjax/contents/crates%2Ffj-cache%2Fsrc%2Fbackend.rs?ref=9495a6339845cdcc982b027aa77d5a05f8c15c3c",
+      "patch": "@@ -149,9 +149,15 @@ impl CacheBackend for FileCache {\n     fn put(&mut self, key: &CacheKey, artifact: CachedArtifact) {\n         let path = self.path_for(key);\n         // Atomic write: write to temp file, then rename.\n-        let tmp_path = path.with_extension(\"tmp\");\n+        // Use a unique temp file to avoid concurrent write races.\n+        use std::sync::atomic::{AtomicUsize, Ordering};\n+        static COUNTER: AtomicUsize = AtomicUsize::new(0);\n+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);\n+        let tmp_path = path.with_extension(format!(\"tmp.{}.{}\", std::process::id(), id));\n         if std::fs::write(&tmp_path, &artifact.data).is_ok() {\n             let _ = std::fs::rename(&tmp_path, &path);\n+        } else {\n+            let _ = std::fs::remove_file(&tmp_path);\n         }\n     }\n "
+    },
+    {
+      "sha": "c909a9a3307675583ff4675a2245a0e6454e5032",
+      "filename": "crates/fj-conformance/src/lib.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenjax/blob/9495a6339845cdcc982b027aa77d5a05f8c15c3c/crates%2Ffj-conformance%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenjax/raw/9495a6339845cdcc982b027aa77d5a05f8c15c3c/crates%2Ffj-conformance%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenjax/contents/crates%2Ffj-conformance%2Fsrc%2Flib.rs?ref=9495a6339845cdcc982b027aa77d5a05f8c15c3c",
+      "patch": "@@ -737,6 +737,12 @@ fn run_transform_fixture_case(case: &TransformFixtureCase) -> TransformCaseRepor\n }\n \n fn approx_equal(expected: f64, actual: f64, atol: f64, rtol: f64) -> bool {\n+    if expected.is_nan() && actual.is_nan() {\n+        return true;\n+    }\n+    if expected.is_infinite() && actual.is_infinite() && expected.signum() == actual.signum() {\n+        return true;\n+    }\n     let tolerance = atol + rtol * expected.abs();\n     (expected - actual).abs() <= tolerance\n }"
+    },
+    {
+      "sha": "c5de3304e3b3ff255e9ca6a56a82c7b716735ffc",
+      "filename": "crates/fj-dispatch/src/lib.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 3,
+      "changes": 5,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenjax/blob/9495a6339845cdcc982b027aa77d5a05f8c15c3c/crates%2Ffj-dispatch%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenjax/raw/9495a6339845cdcc982b027aa77d5a05f8c15c3c/crates%2Ffj-dispatch%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenjax/contents/crates%2Ffj-dispatch%2Fsrc%2Flib.rs?ref=9495a6339845cdcc982b027aa77d5a05f8c15c3c",
+      "patch": "@@ -59,10 +59,9 @@ impl EffectContext {\n             .iter()\n             .position(|t| t.effect_name == token.effect_name)\n         {\n-            self.tokens[pos] = token.clone();\n-        } else {\n-            self.tokens.push(token.clone());\n+            self.tokens.remove(pos);\n         }\n+        self.tokens.push(token.clone());\n         token\n     }\n "
+    },
+    {
+      "sha": "bf828d7bfcedbec2f92191fd8b4a0059b795dd08",
+      "filename": "crates/fj-egraph/src/lib.rs",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 7,
+      "changes": 22,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenjax/blob/9495a6339845cdcc982b027aa77d5a05f8c15c3c/crates%2Ffj-egraph%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenjax/raw/9495a6339845cdcc982b027aa77d5a05f8c15c3c/crates%2Ffj-egraph%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenjax/contents/crates%2Ffj-egraph%2Fsrc%2Flib.rs?ref=9495a6339845cdcc982b027aa77d5a05f8c15c3c",
+      "patch": "@@ -170,8 +170,8 @@ pub fn jaxpr_to_egraph(jaxpr: &Jaxpr) -> (RecExpr<FjLang>, BTreeMap<VarId, Id>)\n     let mut expr = RecExpr::default();\n     let mut var_map: BTreeMap<VarId, Id> = BTreeMap::new();\n \n-    // Add input variables as symbols\n-    for var in &jaxpr.invars {\n+    // Add input variables and constant variables as symbols\n+    for var in jaxpr.invars.iter().chain(jaxpr.constvars.iter()) {\n         let sym = egg::Symbol::from(format!(\"v{}\", var.0));\n         let id = expr.add(FjLang::Symbol(sym));\n         var_map.insert(*var, id);\n@@ -190,7 +190,10 @@ pub fn jaxpr_to_egraph(jaxpr: &Jaxpr) -> (RecExpr<FjLang>, BTreeMap<VarId, Id>)\n                     let sym = egg::Symbol::from(format!(\"f64:{bits}\"));\n                     expr.add(FjLang::Symbol(sym))\n                 }\n-                Atom::Lit(Literal::Bool(b)) => expr.add(FjLang::Num(if *b { 1 } else { 0 })),\n+                Atom::Lit(Literal::Bool(b)) => {\n+                    let sym = egg::Symbol::from(format!(\"bool:{}\", if *b { 1 } else { 0 }));\n+                    expr.add(FjLang::Symbol(sym))\n+                }\n             })\n             .collect();\n \n@@ -273,9 +276,11 @@ pub fn jaxpr_to_egraph(jaxpr: &Jaxpr) -> (RecExpr<FjLang>, BTreeMap<VarId, Id>)\n pub fn egraph_to_jaxpr(\n     expr: &RecExpr<FjLang>,\n     invars: &[VarId],\n+    constvars: &[VarId],\n     original_outvars: &[VarId],\n ) -> Jaxpr {\n-    let mut next_var = invars.iter().map(|v| v.0).max().unwrap_or(0) + 1;\n+    let max_in_const = invars.iter().chain(constvars.iter()).map(|v| v.0).max().unwrap_or(0);\n+    let mut next_var = max_in_const + 1;\n     let mut equations = Vec::new();\n     let mut node_to_var: BTreeMap<usize, VarId> = BTreeMap::new();\n \n@@ -288,7 +293,7 @@ pub fn egraph_to_jaxpr(\n             && let Ok(var_num) = rest.parse::<u32>()\n         {\n             let var_id = VarId(var_num);\n-            if invars.contains(&var_id) {\n+            if invars.contains(&var_id) || constvars.contains(&var_id) {\n                 node_to_var.insert(idx, var_id);\n             }\n         }\n@@ -753,7 +758,7 @@ pub fn egraph_to_jaxpr(\n         original_outvars.to_vec()\n     };\n \n-    Jaxpr::new(invars.to_vec(), vec![], outvars, equations)\n+    Jaxpr::new(invars.to_vec(), constvars.to_vec(), outvars, equations)\n }\n \n fn resolve_or_create(\n@@ -847,6 +852,9 @@ fn id_to_atom(id: Id, node_to_var: &BTreeMap<usize, VarId>, expr: &RecExpr<FjLan\n             {\n                 return Atom::Lit(Literal::F64Bits(bits));\n             }\n+            if let Some(bool_str) = sym.as_str().strip_prefix(\"bool:\") {\n+                return Atom::Lit(Literal::Bool(bool_str == \"1\"));\n+            }\n             // Otherwise it's a variable reference\n             node_to_var\n                 .get(&idx)\n@@ -887,7 +895,7 @@ pub fn optimize_jaxpr(jaxpr: &Jaxpr) -> Jaxpr {\n     let extractor = egg::Extractor::new(&runner.egraph, OpCount);\n     let (_, best_expr) = extractor.find_best(root_id);\n \n-    egraph_to_jaxpr(&best_expr, &jaxpr.invars, &jaxpr.outvars)\n+    egraph_to_jaxpr(&best_expr, &jaxpr.invars, &jaxpr.constvars, &jaxpr.outvars)\n }\n \n fn is_egraph_supported_primitive(primitive: Primitive) -> bool {"
+    },
+    {
+      "sha": "6ac11f2fa6c17e01c9d8e2eb0328bd1fdcf138ff",
+      "filename": "crates/fj-interpreters/src/partial_eval.rs",
+      "status": "modified",
+      "additions": 17,
+      "deletions": 1,
+      "changes": 18,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenjax/blob/9495a6339845cdcc982b027aa77d5a05f8c15c3c/crates%2Ffj-interpreters%2Fsrc%2Fpartial_eval.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenjax/raw/9495a6339845cdcc982b027aa77d5a05f8c15c3c/crates%2Ffj-interpreters%2Fsrc%2Fpartial_eval.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenjax/contents/crates%2Ffj-interpreters%2Fsrc%2Fpartial_eval.rs?ref=9495a6339845cdcc982b027aa77d5a05f8c15c3c",
+      "patch": "@@ -229,6 +229,14 @@ pub fn partial_eval_jaxpr(\n         }\n     }\n \n+    for var in &jaxpr.constvars {\n+        let idx = var.0 as usize;\n+        if is_unknown_input[idx] && !is_residual[idx] {\n+            residual_vars.push(*var);\n+            is_residual[idx] = true;\n+        }\n+    }\n+\n     // Build known Jaxpr.\n     let known_invars: Vec<VarId> = jaxpr\n         .invars\n@@ -351,10 +359,18 @@ pub fn dce_jaxpr(jaxpr: &Jaxpr, used_outputs: &[bool]) -> (Jaxpr, Vec<bool>) {\n \n     let used_inputs: Vec<bool> = jaxpr.invars.iter().map(|v| needed[v.0 as usize]).collect();\n \n+    let retained_outvars: Vec<VarId> = jaxpr\n+        .outvars\n+        .iter()\n+        .zip(used_outputs.iter())\n+        .filter(|(_, &used)| used)\n+        .map(|(v, _)| *v)\n+        .collect();\n+\n     let new_jaxpr = Jaxpr::new(\n         jaxpr.invars.clone(),\n         jaxpr.constvars.clone(),\n-        jaxpr.outvars.clone(),\n+        retained_outvars,\n         retained_eqns,\n     );\n "
+    },
+    {
+      "sha": "10fbbc07d751a99ca6adfa83ca738eb05d8aa102",
+      "filename": "crates/fj-lax/src/arithmetic.rs",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 7,
+      "changes": 27,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenjax/blob/9495a6339845cdcc982b027aa77d5a05f8c15c3c/crates%2Ffj-lax%2Fsrc%2Farithmetic.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenjax/raw/9495a6339845cdcc982b027aa77d5a05f8c15c3c/crates%2Ffj-lax%2Fsrc%2Farithmetic.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenjax/contents/crates%2Ffj-lax%2Fsrc%2Farithmetic.rs?ref=9495a6339845cdcc982b027aa77d5a05f8c15c3c",
+      "patch": "@@ -3,7 +3,7 @@\n use fj_core::{DType, Literal, Primitive, Shape, TensorValue, Value};\n \n use crate::EvalError;\n-use crate::type_promotion::{binary_literal_op, infer_dtype};\n+use crate::type_promotion::{binary_literal_op, infer_dtype, promote_dtype};\n \n /// Binary elementwise operation dispatching on int/float paths.\n /// Supports full NumPy broadcasting: scalar-scalar, tensor-tensor (same shape),\n@@ -40,7 +40,7 @@ pub(crate) fn eval_binary_elementwise(\n                     })\n                     .collect::<Result<Vec<_>, _>>()?;\n \n-                let dtype = infer_dtype(&elements);\n+                let dtype = promote_dtype(lhs.dtype, rhs.dtype);\n                 Ok(Value::Tensor(TensorValue::new(\n                     dtype,\n                     lhs.shape.clone(),\n@@ -59,7 +59,12 @@ pub(crate) fn eval_binary_elementwise(\n                 .map(|right| binary_literal_op(*lhs, right, primitive, &int_op, &float_op))\n                 .collect::<Result<Vec<_>, _>>()?;\n \n-            let dtype = infer_dtype(&elements);\n+            let lhs_dtype = match lhs {\n+                Literal::I64(_) => DType::I64,\n+                Literal::F64Bits(_) => DType::F64,\n+                Literal::Bool(_) => DType::Bool,\n+            };\n+            let dtype = promote_dtype(lhs_dtype, rhs.dtype);\n             Ok(Value::Tensor(TensorValue::new(\n                 dtype,\n                 rhs.shape.clone(),\n@@ -74,7 +79,12 @@ pub(crate) fn eval_binary_elementwise(\n                 .map(|left| binary_literal_op(left, *rhs, primitive, &int_op, &float_op))\n                 .collect::<Result<Vec<_>, _>>()?;\n \n-            let dtype = infer_dtype(&elements);\n+            let rhs_dtype = match rhs {\n+                Literal::I64(_) => DType::I64,\n+                Literal::F64Bits(_) => DType::F64,\n+                Literal::Bool(_) => DType::Bool,\n+            };\n+            let dtype = promote_dtype(lhs.dtype, rhs_dtype);\n             Ok(Value::Tensor(TensorValue::new(\n                 dtype,\n                 lhs.shape.clone(),\n@@ -118,7 +128,7 @@ fn broadcast_binary_tensors(\n         elements.push(binary_literal_op(l, r, primitive, int_op, float_op)?);\n     }\n \n-    let dtype = infer_dtype(&elements);\n+    let dtype = promote_dtype(lhs.dtype, rhs.dtype);\n     Ok(Value::Tensor(TensorValue::new(dtype, out_shape, elements)?))\n }\n \n@@ -284,7 +294,7 @@ pub(crate) fn eval_unary_int_or_float(\n                 })\n                 .collect::<Result<Vec<_>, _>>()?;\n \n-            let dtype = infer_dtype(&elements);\n+            let dtype = tensor.dtype;\n             Ok(Value::Tensor(TensorValue::new(\n                 dtype,\n                 tensor.shape.clone(),\n@@ -334,7 +344,7 @@ pub(crate) fn eval_select(primitive: Primitive, inputs: &[Value]) -> Result<Valu\n                     if flag { *t } else { *f }\n                 })\n                 .collect();\n-            let dtype = infer_dtype(&elements);\n+            let dtype = promote_dtype(on_true.dtype, on_false.dtype);\n             Ok(Value::Tensor(TensorValue::new(\n                 dtype,\n                 cond.shape.clone(),\n@@ -350,6 +360,9 @@ pub(crate) fn eval_select(primitive: Primitive, inputs: &[Value]) -> Result<Valu\n \n /// Approximate erf using Abramowitz & Stegun formula (max error ~1.5e-7).\n pub(crate) fn erf_approx(x: f64) -> f64 {\n+    if x == 0.0 {\n+        return x;\n+    }\n     let sign = x.signum();\n     let x = x.abs();\n     let t = 1.0 / (1.0 + 0.3275911 * x);"
+    },
+    {
+      "sha": "e93da7b427ecc6a6e98e10f0aa8b2a24c6047423",
+      "filename": "crates/fj-lax/src/lib.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenjax/blob/9495a6339845cdcc982b027aa77d5a05f8c15c3c/crates%2Ffj-lax%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenjax/raw/9495a6339845cdcc982b027aa77d5a05f8c15c3c/crates%2Ffj-lax%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenjax/contents/crates%2Ffj-lax%2Fsrc%2Flib.rs?ref=9495a6339845cdcc982b027aa77d5a05f8c15c3c",
+      "patch": "@@ -139,7 +139,7 @@ pub fn eval_primitive(\n             inputs,\n             |x| x.signum(),\n             |x| {\n-                if x.is_nan() { f64::NAN } else { x.signum() }\n+                if x.is_nan() { f64::NAN } else if x == 0.0 { x } else { x.signum() }\n             },\n         ),\n         Primitive::Square => eval_unary_int_or_float(primitive, inputs, |x| x * x, |x| x * x),"
+    },
+    {
+      "sha": "52489fb449dfc7c94485e9be50bc1273581a2f40",
+      "filename": "crates/fj-lax/src/reduction.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenjax/blob/9495a6339845cdcc982b027aa77d5a05f8c15c3c/crates%2Ffj-lax%2Fsrc%2Freduction.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenjax/raw/9495a6339845cdcc982b027aa77d5a05f8c15c3c/crates%2Ffj-lax%2Fsrc%2Freduction.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenjax/contents/crates%2Ffj-lax%2Fsrc%2Freduction.rs?ref=9495a6339845cdcc982b027aa77d5a05f8c15c3c",
+      "patch": "@@ -33,7 +33,7 @@ pub(crate) fn eval_reduce(\n                 return Ok(inputs[0].clone());\n             }\n \n-            let is_integral = tensor.elements.iter().all(|literal| literal.is_integral());\n+            let is_integral = tensor.dtype == DType::I64 || tensor.dtype == DType::I32;\n \n             // Full reduction: flatten to scalar\n             if is_integral {\n@@ -130,7 +130,7 @@ pub(crate) fn eval_reduce_axes(\n                 .map(|(_, d)| *d)\n                 .collect();\n \n-            let is_integral = tensor.elements.iter().all(|literal| literal.is_integral());\n+            let is_integral = tensor.dtype == DType::I64 || tensor.dtype == DType::I32;\n \n             // Compute strides for the input tensor (row-major)\n             let strides = compute_strides(&tensor.shape.dims);"
+    },
+    {
+      "sha": "fdccb7bb1f6ff8972161eb99aa8cbd5dae59b569",
+      "filename": "crates/fj-lax/src/tensor_ops.rs",
+      "status": "modified",
+      "additions": 21,
+      "deletions": 1,
+      "changes": 22,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenjax/blob/9495a6339845cdcc982b027aa77d5a05f8c15c3c/crates%2Ffj-lax%2Fsrc%2Ftensor_ops.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenjax/raw/9495a6339845cdcc982b027aa77d5a05f8c15c3c/crates%2Ffj-lax%2Fsrc%2Ftensor_ops.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenjax/contents/crates%2Ffj-lax%2Fsrc%2Ftensor_ops.rs?ref=9495a6339845cdcc982b027aa77d5a05f8c15c3c",
+      "patch": "@@ -127,7 +127,7 @@ pub(crate) fn eval_reshape(\n             }\n \n             if let Some(axis) = inferred_axis {\n-                if known_product == 0 || !elem_count.is_multiple_of(known_product) {\n+                if known_product == 0 || elem_count % known_product != 0 {\n                     return Err(EvalError::Unsupported {\n                         primitive,\n                         detail: format!(\n@@ -304,6 +304,12 @@ pub(crate) fn eval_broadcast_in_dim(\n                 // Default: map input axes to trailing output axes.\n                 let out_rank = target_dims.len();\n                 let in_rank = tensor.shape.rank();\n+                if in_rank > out_rank {\n+                    return Err(EvalError::Unsupported {\n+                        primitive,\n+                        detail: format!(\"input rank {} exceeds output rank {}\", in_rank, out_rank),\n+                    });\n+                }\n                 (out_rank - in_rank..out_rank).collect()\n             };\n \n@@ -623,6 +629,13 @@ pub(crate) fn eval_gather(\n         }\n     };\n \n+    if operand.shape.rank() == 0 {\n+        return Err(EvalError::Unsupported {\n+            primitive,\n+            detail: \"cannot gather from a rank-0 tensor\".into(),\n+        });\n+    }\n+\n     let slice_sizes = parse_usize_param(primitive, \"slice_sizes\", params)?;\n     if slice_sizes.len() != operand.shape.rank() {\n         return Err(EvalError::Unsupported {\n@@ -745,6 +758,13 @@ pub(crate) fn eval_scatter(\n         }\n     };\n \n+    if operand.shape.rank() == 0 {\n+        return Err(EvalError::Unsupported {\n+            primitive,\n+            detail: \"cannot scatter into a rank-0 tensor\".into(),\n+        });\n+    }\n+\n     let index_vals: Vec<usize> = match &inputs[1] {\n         Value::Scalar(lit) => vec![lit_to_usize(lit, primitive)?],\n         Value::Tensor(t) => t"
+    },
+    {
+      "sha": "9dfd46c7598f866fa358508d24a8d3d366eddc78",
+      "filename": "crates/fj-lax/src/type_promotion.rs",
+      "status": "modified",
+      "additions": 17,
+      "deletions": 0,
+      "changes": 17,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenjax/blob/9495a6339845cdcc982b027aa77d5a05f8c15c3c/crates%2Ffj-lax%2Fsrc%2Ftype_promotion.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenjax/raw/9495a6339845cdcc982b027aa77d5a05f8c15c3c/crates%2Ffj-lax%2Fsrc%2Ftype_promotion.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenjax/contents/crates%2Ffj-lax%2Fsrc%2Ftype_promotion.rs?ref=9495a6339845cdcc982b027aa77d5a05f8c15c3c",
+      "patch": "@@ -4,10 +4,27 @@ use fj_core::{DType, Literal, Primitive};\n \n use crate::EvalError;\n \n+/// Infer the DType from a slice of Literal elements.\n+/// Returns I64 if all are I64, Bool if all are Bool, otherwise F64.\n+#[inline]\n+pub(crate) fn promote_dtype(lhs: DType, rhs: DType) -> DType {\n+    use DType::{Bool, F32, F64, I32, I64};\n+    match (lhs, rhs) {\n+        (F64, _) | (_, F64) => F64,\n+        (F32, _) | (_, F32) => F32,\n+        (I64, _) | (_, I64) => I64,\n+        (I32, _) | (_, I32) => I32,\n+        (Bool, Bool) => Bool,\n+    }\n+}\n+\n /// Infer the DType from a slice of Literal elements.\n /// Returns I64 if all are I64, Bool if all are Bool, otherwise F64.\n #[inline]\n pub(crate) fn infer_dtype(elements: &[Literal]) -> DType {\n+    if elements.is_empty() {\n+        return DType::F64;\n+    }\n     if elements\n         .iter()\n         .all(|literal| matches!(literal, Literal::I64(_)))"
+    },
+    {
+      "sha": "825b47e294cc71bf8eec94828005b0ae977dcff3",
+      "filename": "crates/fj-ledger/src/lib.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenjax/blob/9495a6339845cdcc982b027aa77d5a05f8c15c3c/crates%2Ffj-ledger%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenjax/raw/9495a6339845cdcc982b027aa77d5a05f8c15c3c/crates%2Ffj-ledger%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenjax/contents/crates%2Ffj-ledger%2Fsrc%2Flib.rs?ref=9495a6339845cdcc982b027aa77d5a05f8c15c3c",
+      "patch": "@@ -193,7 +193,7 @@ impl ConformalPredictor {\n         let n = sorted.len();\n         // Finite-sample correction: ceil((n+1) * coverage) / n\n         let idx = ((n as f64 + 1.0) * self.target_coverage).ceil() as usize;\n-        let idx = idx.min(n) - 1;\n+        let idx = idx.min(n).saturating_sub(1);\n         Some(sorted[idx])\n     }\n "
+    }
+  ]
+}

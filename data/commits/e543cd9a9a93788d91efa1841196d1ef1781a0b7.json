@@ -1,0 +1,113 @@
+{
+  "message": "feat: add build retries and force attach guidance",
+  "files": [
+    {
+      "sha": "26723dc8f4f7db64cc02f777967e90ecf8b25d95",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/steipete/poltergeist/blob/e543cd9a9a93788d91efa1841196d1ef1781a0b7/CHANGELOG.md",
+      "raw_url": "https://github.com/steipete/poltergeist/raw/e543cd9a9a93788d91efa1841196d1ef1781a0b7/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/steipete/poltergeist/contents/CHANGELOG.md?ref=e543cd9a9a93788d91efa1841196d1ef1781a0b7",
+      "patch": "@@ -6,6 +6,8 @@ All notable changes to Poltergeist will be documented in this file.\n \n - Fixed the daemon skipping post-start builds by feeding an explicit initial-build marker into the intelligent queue, so every enabled target compiles immediately after `poltergeist haunt` and exposes up-to-date `lastBuild` metadata for `poltergeist status`.\n - `polter` now performs strict TTY capability checks (screen size, color depth, TERM, CI flags) before enabling the ora spinner/log stream so scripted runs stay quiet while real terminals keep the rich UI (still override with `POLTER_FORCE_TTY=1` or `POLTER_DISABLE_TTY=1`).\n+- Automatic build retries now respect each target\u2019s `maxRetries`/`backoffMultiplier`, using capped exponential backoff and clear logging whenever the daemon decides to try again after a failure.\n+- `poltergeist build <target>` prints attach/wait/force instructions when another build already holds the lock, and the new `--force` flag clears stale locks so manual builds can take over immediately.\n \n ## [2.1.0] - 2025-11-08\n "
+    },
+    {
+      "sha": "81fdadc3c3c87d6ee8bf66868f08df915113d4e4",
+      "filename": "src/build-queue.ts",
+      "status": "modified",
+      "additions": 52,
+      "deletions": 3,
+      "changes": 55,
+      "blob_url": "https://github.com/steipete/poltergeist/blob/e543cd9a9a93788d91efa1841196d1ef1781a0b7/src%2Fbuild-queue.ts",
+      "raw_url": "https://github.com/steipete/poltergeist/raw/e543cd9a9a93788d91efa1841196d1ef1781a0b7/src%2Fbuild-queue.ts",
+      "contents_url": "https://api.github.com/repos/steipete/poltergeist/contents/src%2Fbuild-queue.ts?ref=e543cd9a9a93788d91efa1841196d1ef1781a0b7",
+      "patch": "@@ -197,7 +197,7 @@ export class IntelligentBuildQueue {\n       const result = await buildPromise;\n \n       // Handle completion\n-      await this.handleBuildCompletion(targetName, result, startTime);\n+      await this.handleBuildCompletion(targetName, result, startTime, request);\n     } catch (error) {\n       this.logger.error(`Build failed for ${targetName}: ${error}`);\n \n@@ -210,7 +210,7 @@ export class IntelligentBuildQueue {\n         duration: Date.now() - startTime,\n       };\n \n-      await this.handleBuildCompletion(targetName, failureResult, startTime);\n+      await this.handleBuildCompletion(targetName, failureResult, startTime, request);\n \n       // Send exception notification if notifier is available\n       if (this.notifier) {\n@@ -246,7 +246,8 @@ export class IntelligentBuildQueue {\n   private async handleBuildCompletion(\n     targetName: string,\n     result: BuildStatus,\n-    startTime: number\n+    startTime: number,\n+    request: QueuedBuild\n   ): Promise<void> {\n     // Remove from running builds\n     this.runningBuilds.delete(targetName);\n@@ -287,6 +288,11 @@ export class IntelligentBuildQueue {\n       }\n     }\n \n+    // Schedule automatic retry if configured and build failed\n+    if (BuildStatusManager.isFailure(result)) {\n+      this.tryScheduleRetry(request, result);\n+    }\n+\n     this.logger.info(`Build completed for ${targetName}: ${result.status} (${result.duration}ms)`);\n \n     // Continue processing queue\n@@ -398,4 +404,47 @@ export class IntelligentBuildQueue {\n         this.queueStats.avgBuildTime * (1 - alpha) + result.duration * alpha;\n     }\n   }\n+\n+  private tryScheduleRetry(request: QueuedBuild, result: BuildStatus): void {\n+    const target = request.target;\n+    const maxRetries = target.maxRetries ?? 0;\n+    if (maxRetries <= 0) {\n+      return;\n+    }\n+\n+    if (request.retryCount >= maxRetries) {\n+      this.logger.warn(\n+        `Max retries reached for ${target.name} (${request.retryCount}/${maxRetries}), not retrying`\n+      );\n+      return;\n+    }\n+\n+    const attemptNumber = request.retryCount + 1;\n+    const backoffMultiplier = target.backoffMultiplier ?? 2;\n+    const baseDelay = 1000; // 1 second base\n+    const delay = Math.min(\n+      30000,\n+      Math.round(baseDelay * Math.pow(backoffMultiplier, attemptNumber - 1))\n+    );\n+    const errorMessage = BuildStatusManager.getErrorMessage(result);\n+\n+    this.logger.warn(\n+      `Retrying ${target.name} (attempt ${attemptNumber}/${maxRetries}) in ${delay}ms due to failure${errorMessage ? `: ${errorMessage}` : ''}`\n+    );\n+\n+    setTimeout(() => {\n+      const retryRequest: QueuedBuild = {\n+        ...request,\n+        id: this.generateRequestId(),\n+        timestamp: Date.now(),\n+        retryCount: attemptNumber,\n+      };\n+      this.pendingQueue.push(retryRequest);\n+      this.sortQueue();\n+      this.logger.info(\n+        `Queued retry for ${target.name} (attempt ${attemptNumber}/${maxRetries})`\n+      );\n+      this.processQueue();\n+    }, delay);\n+  }\n }"
+    },
+    {
+      "sha": "bd38cbd487a993c93fb247b4fab0024a16b026ba",
+      "filename": "src/builders/base-builder.ts",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 1,
+      "changes": 12,
+      "blob_url": "https://github.com/steipete/poltergeist/blob/e543cd9a9a93788d91efa1841196d1ef1781a0b7/src%2Fbuilders%2Fbase-builder.ts",
+      "raw_url": "https://github.com/steipete/poltergeist/raw/e543cd9a9a93788d91efa1841196d1ef1781a0b7/src%2Fbuilders%2Fbase-builder.ts",
+      "contents_url": "https://api.github.com/repos/steipete/poltergeist/contents/src%2Fbuilders%2Fbase-builder.ts?ref=e543cd9a9a93788d91efa1841196d1ef1781a0b7",
+      "patch": "@@ -10,6 +10,8 @@ import { BuildStatusManager } from '../utils/build-status-manager.js';\n export interface BuildOptions {\n   captureLogs?: boolean;\n   logFile?: string;\n+  force?: boolean;\n+  onLock?: () => void;\n }\n \n export abstract class BaseBuilder<T extends Target = Target> {\n@@ -37,9 +39,17 @@ export abstract class BaseBuilder<T extends Target = Target> {\n       `[${this.target.name}] Building with ${changedFiles.length} changed file(s)${fileListText}`\n     );\n \n+    if (options.force) {\n+      const unlocked = await this.stateManager.forceUnlock(this.target.name);\n+      if (unlocked) {\n+        this.logger.warn(`[${this.target.name}] Force option enabled - cleared existing lock`);\n+      }\n+    }\n+\n     // Check if already building using state manager\n-    if (await this.stateManager.isLocked(this.target.name)) {\n+    if (!options.force && (await this.stateManager.isLocked(this.target.name))) {\n       this.logger.warn(`[${this.target.name}] Build already in progress, skipping`);\n+      options.onLock?.();\n       return BuildStatusManager.createBuildingStatus(this.target.name, {\n         gitHash: this.getGitHash(),\n         builder: this.getBuilderName(),"
+    },
+    {
+      "sha": "fa42a5f8f2f9d3f08e77e8addd2f1a5fa2bbd06f",
+      "filename": "src/cli.ts",
+      "status": "modified",
+      "additions": 21,
+      "deletions": 0,
+      "changes": 21,
+      "blob_url": "https://github.com/steipete/poltergeist/blob/e543cd9a9a93788d91efa1841196d1ef1781a0b7/src%2Fcli.ts",
+      "raw_url": "https://github.com/steipete/poltergeist/raw/e543cd9a9a93788d91efa1841196d1ef1781a0b7/src%2Fcli.ts",
+      "contents_url": "https://api.github.com/repos/steipete/poltergeist/contents/src%2Fcli.ts?ref=e543cd9a9a93788d91efa1841196d1ef1781a0b7",
+      "patch": "@@ -401,6 +401,7 @@ program\n   .description('Manually trigger a build for a target')\n   .option('-c, --config <path>', 'Path to config file')\n   .option('--verbose', 'Show build output in real-time')\n+  .option('-f, --force', 'Force rebuild even if another build is running')\n   .option('--json', 'Output result as JSON')\n   .action(async (targetName, options) => {\n     const { config, projectRoot } = await loadConfiguration(options.config);\n@@ -448,9 +449,17 @@ program\n \n       // Execute build with real-time output\n       const startTime = Date.now();\n+      let lockHintShown = false;\n+      const showLockHints = (): void => {\n+        if (lockHintShown || options.json) return;\n+        lockHintShown = true;\n+        printBuildLockHints(targetToBuild.name);\n+      };\n       const buildStatus = await builder.build([], {\n         captureLogs: true,\n         logFile: `.poltergeist-build-${targetToBuild.name}.log`,\n+        force: options.force ?? false,\n+        onLock: showLockHints,\n       });\n \n       const duration = Date.now() - startTime;\n@@ -474,6 +483,10 @@ program\n           console.log(\n             chalk.green(`\u2705 Build completed successfully in ${Math.round(duration / 1000)}s`)\n           );\n+        } else if (buildStatus.status === 'building') {\n+          showLockHints();\n+          console.error(chalk.yellow('Build skipped because another build is already running.'));\n+          process.exit(1);\n         } else {\n           console.error(chalk.red(`\u274c Build failed after ${Math.round(duration / 1000)}s`));\n           if (buildStatus.errorSummary) {\n@@ -754,6 +767,14 @@ function formatStatus(status: string): string {\n   }\n }\n \n+function printBuildLockHints(targetName: string): void {\n+  const writer = process.stdout.isTTY ? console.error : console.log;\n+  writer(chalk.yellow(`\u26a0\ufe0f  Build already running for '${targetName}'.`));\n+  writer(`   Attach logs: poltergeist logs ${targetName} -f`);\n+  writer(`   Wait for result: poltergeist wait ${targetName}`);\n+  writer(`   Force rebuild: poltergeist build ${targetName} --force`);\n+}\n+\n // Log entry interface\n interface LogEntry {\n   timestamp: string;"
+    },
+    {
+      "sha": "cfbb771c8710d86fc6684b832326660c51cb4dd0",
+      "filename": "src/interfaces.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/steipete/poltergeist/blob/e543cd9a9a93788d91efa1841196d1ef1781a0b7/src%2Finterfaces.ts",
+      "raw_url": "https://github.com/steipete/poltergeist/raw/e543cd9a9a93788d91efa1841196d1ef1781a0b7/src%2Finterfaces.ts",
+      "contents_url": "https://api.github.com/repos/steipete/poltergeist/contents/src%2Finterfaces.ts?ref=e543cd9a9a93788d91efa1841196d1ef1781a0b7",
+      "patch": "@@ -39,6 +39,7 @@ export interface IStateManager {\n   readState(targetName: string): Promise<PoltergeistState | null>;\n   updateState(targetName: string, updates: Partial<PoltergeistState>): Promise<void>;\n   updateBuildStatus(targetName: string, buildStatus: BuildStatus): Promise<void>;\n+  forceUnlock(targetName: string): Promise<boolean>;\n   removeState(targetName: string): Promise<void>;\n   isLocked(targetName: string): Promise<boolean>;\n   discoverStates(): Promise<Record<string, Partial<PoltergeistState>>>;"
+    },
+    {
+      "sha": "cda4a986336f859597d6700f6b27ecee540b4c3b",
+      "filename": "src/state.ts",
+      "status": "modified",
+      "additions": 31,
+      "deletions": 0,
+      "changes": 31,
+      "blob_url": "https://github.com/steipete/poltergeist/blob/e543cd9a9a93788d91efa1841196d1ef1781a0b7/src%2Fstate.ts",
+      "raw_url": "https://github.com/steipete/poltergeist/raw/e543cd9a9a93788d91efa1841196d1ef1781a0b7/src%2Fstate.ts",
+      "contents_url": "https://api.github.com/repos/steipete/poltergeist/contents/src%2Fstate.ts?ref=e543cd9a9a93788d91efa1841196d1ef1781a0b7",
+      "patch": "@@ -202,6 +202,37 @@ export class StateManager implements IStateManager {\n     await this.writeState(targetName);\n   }\n \n+  /**\n+   * Forcefully clear locks and mark processes inactive for a target.\n+   * Used by manual --force builds to take over from stuck processes.\n+   */\n+  public async forceUnlock(targetName: string): Promise<boolean> {\n+    const stateFile = this.getStateFilePath(targetName);\n+    const lockFile = stateFile.replace('.state', '.lock');\n+    let unlocked = false;\n+\n+    if (existsSync(lockFile)) {\n+      try {\n+        unlinkSync(lockFile);\n+        unlocked = true;\n+        this.logger.warn(`Force unlocked lock file for ${targetName}`);\n+      } catch (error) {\n+        this.logger.error(`Failed to remove lock file for ${targetName}: ${error}`);\n+      }\n+    }\n+\n+    const state = await this.readState(targetName);\n+    if (state) {\n+      state.process.isActive = false;\n+      this.states.set(targetName, state);\n+      await this.writeState(targetName, false);\n+      unlocked = true;\n+      this.logger.warn(`Marked process inactive for ${targetName} due to force unlock`);\n+    }\n+\n+    return unlocked;\n+  }\n+\n   /**\n    * Writes state to file using write-file-atomic for robust cross-platform atomic writes.\n    * This prevents corruption during concurrent writes and handles Windows race conditions."
+    },
+    {
+      "sha": "d7386f8cf383cb3915318ef16c4b886e0e7dc5e5",
+      "filename": "test/build-queue.test.ts",
+      "status": "modified",
+      "additions": 31,
+      "deletions": 0,
+      "changes": 31,
+      "blob_url": "https://github.com/steipete/poltergeist/blob/e543cd9a9a93788d91efa1841196d1ef1781a0b7/test%2Fbuild-queue.test.ts",
+      "raw_url": "https://github.com/steipete/poltergeist/raw/e543cd9a9a93788d91efa1841196d1ef1781a0b7/test%2Fbuild-queue.test.ts",
+      "contents_url": "https://api.github.com/repos/steipete/poltergeist/contents/test%2Fbuild-queue.test.ts?ref=e543cd9a9a93788d91efa1841196d1ef1781a0b7",
+      "patch": "@@ -280,6 +280,37 @@ describe('IntelligentBuildQueue', () => {\n     });\n   });\n \n+  describe('Retry Handling', () => {\n+    it('should retry failed builds up to target maxRetries', async () => {\n+      const controllable = createControllableMockBuilder('frontend');\n+      const retryTarget = {\n+        ...targets[0],\n+        maxRetries: 2,\n+        backoffMultiplier: 1,\n+      };\n+\n+      buildQueue.registerTarget(retryTarget, controllable.builder);\n+      await buildQueue.onFileChanged(['frontend/src/app.ts'], [retryTarget]);\n+\n+      // Fail first attempt\n+      controllable.fail('First failure');\n+      await waitForAsync();\n+      expect(controllable.builder.build).toHaveBeenCalledTimes(1);\n+\n+      // Fast-forward retry delay (1s base, multiplier 1)\n+      await waitForAsync(1000);\n+      expect(controllable.builder.build).toHaveBeenCalledTimes(2);\n+\n+      // Fail second attempt\n+      controllable.fail('Second failure');\n+      await waitForAsync();\n+\n+      // Advance timers again; no third attempt (maxRetries reached)\n+      await waitForAsync(1000);\n+      expect(controllable.builder.build).toHaveBeenCalledTimes(2);\n+    });\n+  });\n+\n   describe('Pending Rebuild Handling', () => {\n     it('should mark builds for rebuild when already running', async () => {\n       const mockBuilder = createMockBuilder('frontend');"
+    },
+    {
+      "sha": "b157d869de1f6c9f377f087a8a977f85228d40a7",
+      "filename": "test/builders.test.ts",
+      "status": "modified",
+      "additions": 40,
+      "deletions": 0,
+      "changes": 40,
+      "blob_url": "https://github.com/steipete/poltergeist/blob/e543cd9a9a93788d91efa1841196d1ef1781a0b7/test%2Fbuilders.test.ts",
+      "raw_url": "https://github.com/steipete/poltergeist/raw/e543cd9a9a93788d91efa1841196d1ef1781a0b7/test%2Fbuilders.test.ts",
+      "contents_url": "https://api.github.com/repos/steipete/poltergeist/contents/test%2Fbuilders.test.ts?ref=e543cd9a9a93788d91efa1841196d1ef1781a0b7",
+      "patch": "@@ -46,6 +46,7 @@ const mockStateManager = {\n   updateAppInfo: vi.fn(),\n   readState: vi.fn(),\n   isLocked: vi.fn(),\n+  forceUnlock: vi.fn(),\n   initializeState: vi.fn(),\n   updateState: vi.fn(),\n   removeState: vi.fn(),\n@@ -322,6 +323,45 @@ describe('ExecutableBuilder', () => {\n       );\n       expect(spawn).not.toHaveBeenCalled();\n     });\n+\n+    it('should force unlock when force option is provided', async () => {\n+      const mockProcess = new MockChildProcess();\n+      vi.mocked(spawn).mockReturnValue(mockProcess as ReturnType<typeof spawn>);\n+\n+      vi.mocked(mockStateManager.forceUnlock).mockResolvedValue(true);\n+      vi.mocked(mockStateManager.initializeState).mockResolvedValue({\n+        target: target.name,\n+        projectName: 'test-project',\n+        projectRoot: '/test/project',\n+        process: {\n+          pid: process.pid,\n+          hostname: 'test-host',\n+          isActive: true,\n+          lastHeartbeat: new Date().toISOString(),\n+        },\n+        lastBuild: null,\n+        buildHistory: [],\n+      });\n+      vi.mocked(mockStateManager.updateBuildStatus).mockResolvedValue(undefined);\n+\n+      const buildPromise = builder.build([], { force: true });\n+      setTimeout(() => mockProcess.emit('close', 0), 10);\n+      await buildPromise;\n+\n+      expect(mockStateManager.forceUnlock).toHaveBeenCalledWith('cli');\n+      expect(mockStateManager.isLocked).not.toHaveBeenCalled();\n+    });\n+\n+    it('should invoke onLock callback when build is already running', async () => {\n+      vi.mocked(mockStateManager.isLocked).mockResolvedValue(true);\n+      const onLock = vi.fn();\n+\n+      const result = await builder.build([], { onLock });\n+\n+      expect(onLock).toHaveBeenCalled();\n+      expect(result.status).toBe('building');\n+      expect(mockStateManager.initializeState).not.toHaveBeenCalled();\n+    });\n   });\n \n   describe('validation', () => {"
+    },
+    {
+      "sha": "39b832f33df945dc91a9b56241930897da91a80c",
+      "filename": "test/helpers.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/steipete/poltergeist/blob/e543cd9a9a93788d91efa1841196d1ef1781a0b7/test%2Fhelpers.ts",
+      "raw_url": "https://github.com/steipete/poltergeist/raw/e543cd9a9a93788d91efa1841196d1ef1781a0b7/test%2Fhelpers.ts",
+      "contents_url": "https://api.github.com/repos/steipete/poltergeist/contents/test%2Fhelpers.ts?ref=e543cd9a9a93788d91efa1841196d1ef1781a0b7",
+      "patch": "@@ -77,6 +77,7 @@ export function createMockStateManager(): IStateManager {\n     readState: vi.fn().mockResolvedValue(null),\n     updateState: vi.fn().mockResolvedValue(undefined),\n     updateBuildStatus: vi.fn().mockResolvedValue(undefined),\n+    forceUnlock: vi.fn().mockResolvedValue(false),\n     removeState: vi.fn().mockResolvedValue(undefined),\n     isLocked: vi.fn().mockResolvedValue(false),\n     discoverStates: vi.fn().mockResolvedValue({}),"
+    }
+  ]
+}

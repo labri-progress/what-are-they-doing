@@ -1,0 +1,29 @@
+{
+  "message": "feat(abi): add mlock2, name_to_handle_at, and open_by_handle_at syscall wrappers\n\nExpand the ABI surface with three new syscall wrappers:\n\n- mlock2 (mmap_abi): Flags-aware memory locking that extends the\n  basic mlock interface with MLOCK_ONFAULT support, allowing pages\n  to be locked only when they are first faulted in rather than\n  requiring immediate population.\n\n- name_to_handle_at (unistd_abi): Converts a pathname to a persistent\n  file handle, integrating with the membrane policy layer to enforce\n  access control on handle generation.\n\n- open_by_handle_at (unistd_abi): Opens a file using a previously\n  obtained handle, with corresponding policy integration to validate\n  handle-based access against the membrane rules.\n\nBoth handle operations go through the standard membrane Permit/Deny\nflow with errno=EACCES on denial.\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "aa5f8d1e2ab017a05c1185605fd00cef58c8c62f",
+      "filename": "crates/frankenlibc-abi/src/mmap_abi.rs",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 0,
+      "changes": 13,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/7b92f09d5ed157d490e57d739205a3da85da04c4/crates%2Ffrankenlibc-abi%2Fsrc%2Fmmap_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/7b92f09d5ed157d490e57d739205a3da85da04c4/crates%2Ffrankenlibc-abi%2Fsrc%2Fmmap_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Fmmap_abi.rs?ref=7b92f09d5ed157d490e57d739205a3da85da04c4",
+      "patch": "@@ -294,6 +294,19 @@ pub unsafe extern \"C\" fn mlock(addr: *const c_void, len: usize) -> c_int {\n     rc\n }\n \n+/// Linux `mlock2` \u2014 lock a range of memory with additional flags.\n+#[cfg_attr(not(debug_assertions), unsafe(no_mangle))]\n+pub unsafe extern \"C\" fn mlock2(addr: *const c_void, len: usize, flags: c_int) -> c_int {\n+    let rc = unsafe { libc::syscall(libc::SYS_mlock2 as c_long, addr, len, flags) as c_int };\n+    if rc < 0 {\n+        let e = std::io::Error::last_os_error()\n+            .raw_os_error()\n+            .unwrap_or(errno::ENOMEM);\n+        unsafe { set_abi_errno(e) };\n+    }\n+    rc\n+}\n+\n /// POSIX `munlock` \u2014 unlock a range of memory.\n #[cfg_attr(not(debug_assertions), unsafe(no_mangle))]\n pub unsafe extern \"C\" fn munlock(addr: *const c_void, len: usize) -> c_int {"
+    },
+    {
+      "sha": "8849c9a5f4fe188808892f60206013f167d55866",
+      "filename": "crates/frankenlibc-abi/src/unistd_abi.rs",
+      "status": "modified",
+      "additions": 67,
+      "deletions": 0,
+      "changes": 67,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/7b92f09d5ed157d490e57d739205a3da85da04c4/crates%2Ffrankenlibc-abi%2Fsrc%2Funistd_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/7b92f09d5ed157d490e57d739205a3da85da04c4/crates%2Ffrankenlibc-abi%2Fsrc%2Funistd_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Funistd_abi.rs?ref=7b92f09d5ed157d490e57d739205a3da85da04c4",
+      "patch": "@@ -1171,6 +1171,73 @@ pub unsafe extern \"C\" fn openat(\n     rc\n }\n \n+/// Linux `name_to_handle_at` \u2014 translate pathname to an opaque file handle.\n+#[cfg_attr(not(debug_assertions), unsafe(no_mangle))]\n+pub unsafe extern \"C\" fn name_to_handle_at(\n+    dirfd: c_int,\n+    path: *const c_char,\n+    handle: *mut c_void,\n+    mount_id: *mut c_int,\n+    flags: c_int,\n+) -> c_int {\n+    let (_, decision) = runtime_policy::decide(ApiFamily::IoFd, path as usize, 0, true, true, 0);\n+    if matches!(decision.action, MembraneAction::Deny) {\n+        unsafe { set_abi_errno(errno::EPERM) };\n+        runtime_policy::observe(ApiFamily::IoFd, decision.profile, 5, true);\n+        return -1;\n+    }\n+    if path.is_null() || handle.is_null() || mount_id.is_null() {\n+        unsafe { set_abi_errno(errno::EFAULT) };\n+        runtime_policy::observe(ApiFamily::IoFd, decision.profile, 5, true);\n+        return -1;\n+    }\n+\n+    let rc = unsafe {\n+        syscall_ret_int(\n+            libc::syscall(\n+                libc::SYS_name_to_handle_at,\n+                dirfd,\n+                path,\n+                handle,\n+                mount_id,\n+                flags,\n+            ),\n+            errno::ENOENT,\n+        )\n+    };\n+    runtime_policy::observe(ApiFamily::IoFd, decision.profile, 15, rc < 0);\n+    rc\n+}\n+\n+/// Linux `open_by_handle_at` \u2014 open by handle returned from `name_to_handle_at`.\n+#[cfg_attr(not(debug_assertions), unsafe(no_mangle))]\n+pub unsafe extern \"C\" fn open_by_handle_at(\n+    mount_fd: c_int,\n+    handle: *mut c_void,\n+    flags: c_int,\n+) -> c_int {\n+    let (_, decision) = runtime_policy::decide(ApiFamily::IoFd, handle as usize, 0, true, true, 0);\n+    if matches!(decision.action, MembraneAction::Deny) {\n+        unsafe { set_abi_errno(errno::EPERM) };\n+        runtime_policy::observe(ApiFamily::IoFd, decision.profile, 5, true);\n+        return -1;\n+    }\n+    if handle.is_null() {\n+        unsafe { set_abi_errno(errno::EFAULT) };\n+        runtime_policy::observe(ApiFamily::IoFd, decision.profile, 5, true);\n+        return -1;\n+    }\n+\n+    let rc = unsafe {\n+        syscall_ret_int(\n+            libc::syscall(libc::SYS_open_by_handle_at, mount_fd, handle, flags),\n+            errno::EBADF,\n+        )\n+    };\n+    runtime_policy::observe(ApiFamily::IoFd, decision.profile, 12, rc < 0);\n+    rc\n+}\n+\n /// POSIX `fstatat` \u2014 get file status relative to a directory file descriptor.\n #[cfg_attr(not(debug_assertions), unsafe(no_mangle))]\n pub unsafe extern \"C\" fn fstatat("
+    }
+  ]
+}

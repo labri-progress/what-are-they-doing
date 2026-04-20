@@ -1,0 +1,89 @@
+{
+  "message": "Make from_kafka batching first-class",
+  "files": [
+    {
+      "sha": "7edd28238bcb182d1a9e0a759b77733c9de681d3",
+      "filename": "plugins/kafka/builtins/from_kafka.cpp",
+      "status": "modified",
+      "additions": 34,
+      "deletions": 17,
+      "changes": 51,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/579bf8cf4c73db17bf0d9aa0532e075c360052b1/plugins%2Fkafka%2Fbuiltins%2Ffrom_kafka.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/579bf8cf4c73db17bf0d9aa0532e075c360052b1/plugins%2Fkafka%2Fbuiltins%2Ffrom_kafka.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/plugins%2Fkafka%2Fbuiltins%2Ffrom_kafka.cpp?ref=579bf8cf4c73db17bf0d9aa0532e075c360052b1",
+      "patch": "@@ -32,26 +32,29 @@ namespace tenzir::plugins::kafka {\n \n namespace {\n \n-/// Maximum delay before flushing a partial commit batch.\n-constexpr auto commit_timeout = 10s;\n+/// Default delay before flushing a partial batch.\n+constexpr auto default_batch_timeout = 10s;\n \n /// Stores process-wide `from_kafka` defaults from `kafka.yaml`.\n auto source_global_defaults() -> record& {\n   static auto defaults = record{};\n   return defaults;\n }\n \n+/// Parsed arguments for `from_kafka`.\n struct FromKafkaArgs {\n   std::string topic;\n   std::optional<located<uint64_t>> count;\n   std::optional<location> exit;\n   std::optional<located<data>> offset;\n-  uint64_t commit_batch_size = 1000;\n+  uint64_t batch_size = 1000;\n+  duration batch_timeout = default_batch_timeout;\n   located<record> options;\n   std::optional<located<std::string>> aws_region;\n   std::optional<located<record>> aws_iam;\n };\n \n+/// Parses `offset=` values, including symbolic names and tail offsets.\n auto parse_offset_value(const located<data>& input, int64_t& offset) -> bool {\n   return match(\n     input.inner,\n@@ -85,6 +88,7 @@ struct FromKafkaTaskResult {\n   bool idle_timeout = false;\n };\n \n+/// Streaming source operator that consumes Kafka records asynchronously.\n class FromKafkaOperator final : public Operator<void, table_slice> {\n public:\n   explicit FromKafkaOperator(FromKafkaArgs args) : args_{std::move(args)} {\n@@ -227,9 +231,9 @@ class FromKafkaOperator final : public Operator<void, table_slice> {\n       auto timeout = std::optional<std::chrono::milliseconds>{};\n       // Invariant: idle timeouts are only relevant while we hold unflushed\n       // records, otherwise we can sleep until a real queue event arrives.\n-      if (messages_since_batch_commit_ > 0) {\n+      if (messages_since_batch_flush_ > 0) {\n         timeout = std::chrono::duration_cast<std::chrono::milliseconds>(\n-          commit_timeout);\n+          args_.batch_timeout);\n       }\n       auto result = co_await (*queue_)->next(timeout);\n       co_return FromKafkaTaskResult{\n@@ -247,7 +251,7 @@ class FromKafkaOperator final : public Operator<void, table_slice> {\n     auto task_result = std::move(result).as<FromKafkaTaskResult>();\n     if (task_result.idle_timeout) {\n       co_await flush_pending(push);\n-      messages_since_batch_commit_ = 0;\n+      messages_since_batch_flush_ = 0;\n       last_batch_time_ = time::clock::now();\n       co_return;\n     }\n@@ -257,20 +261,19 @@ class FromKafkaOperator final : public Operator<void, table_slice> {\n       co_return;\n     }\n     const auto now = time::clock::now();\n-    const auto timed_out = now - last_batch_time_ >= commit_timeout;\n+    const auto timed_out = now - last_batch_time_ >= args_.batch_timeout;\n     switch (message->err()) {\n       case RdKafka::ERR_NO_ERROR: {\n         builder_.append(*message);\n         current_uncommitted_offsets_[message->partition()] = message->offset();\n         ++emitted_messages_;\n-        ++messages_since_batch_commit_;\n+        ++messages_since_batch_flush_;\n         const auto reached_count\n           = args_.count and args_.count->inner == emitted_messages_;\n-        const auto full_batch\n-          = messages_since_batch_commit_ >= args_.commit_batch_size;\n+        const auto full_batch = messages_since_batch_flush_ >= args_.batch_size;\n         if (full_batch or timed_out or reached_count) {\n           co_await flush_pending(push);\n-          messages_since_batch_commit_ = 0;\n+          messages_since_batch_flush_ = 0;\n           last_batch_time_ = now;\n           if (reached_count) {\n             done_ = true;\n@@ -392,18 +395,21 @@ class FromKafkaOperator final : public Operator<void, table_slice> {\n   // Number of records emitted so far; used for `count=` resumption.\n   size_t emitted_messages_ = 0;\n   // Invariant: this counts unflushed records in `builder_` only.\n-  size_t messages_since_batch_commit_ = 0;\n+  size_t messages_since_batch_flush_ = 0;\n   // Invariant: tracks the last successful flush decision point.\n   time last_batch_time_ = time::clock::now();\n   // Invariant: highest consumed offset per partition since last flush.\n   std::unordered_map<int32_t, int64_t> current_uncommitted_offsets_;\n   // Invariant: committed offsets are stored as \"next offset to consume\".\n   std::unordered_map<int32_t, int64_t> checkpoint_pending_offsets_;\n+  // Invariant: when set, this is the latest assignment for `args_.topic`.\n   std::optional<std::unordered_set<int32_t>> assigned_partitions_;\n+  // Invariant: contains only partitions from `assigned_partitions_`.\n   std::unordered_set<int32_t> eof_partitions_;\n   bool done_ = false;\n };\n \n+/// Plugin entrypoint that parses `from_kafka` arguments and builds operators.\n class FromKafkaPlugin final : public virtual OperatorPlugin {\n public:\n   auto initialize(const record& unused_plugin_config,\n@@ -458,18 +464,29 @@ class FromKafkaPlugin final : public virtual OperatorPlugin {\n     auto options_arg = d.named_optional(\"options\", &FromKafkaArgs::options);\n     auto aws_region_arg = d.named(\"aws_region\", &FromKafkaArgs::aws_region);\n     auto aws_iam_arg = d.named(\"aws_iam\", &FromKafkaArgs::aws_iam);\n-    auto batch_size_arg = d.named_optional(\"commit_batch_size\",\n-                                           &FromKafkaArgs::commit_batch_size);\n+    auto batch_size_arg\n+      = d.named_optional(\"batch_size\", &FromKafkaArgs::batch_size);\n+    auto batch_timeout_arg\n+      = d.named_optional(\"batch_timeout\", &FromKafkaArgs::batch_timeout);\n     d.validate([=](ValidateCtx& ctx) -> Empty {\n-      if (auto commit_batch_size = ctx.get(batch_size_arg); commit_batch_size) {\n-        if (*commit_batch_size == 0) {\n-          diagnostic::error(\"`commit_batch_size` must be greater than zero\")\n+      if (auto batch_size = ctx.get(batch_size_arg); batch_size) {\n+        if (*batch_size == 0) {\n+          diagnostic::error(\"`batch_size` must be greater than zero\")\n             .primary(\n               ctx.get_location(batch_size_arg).value_or(location::unknown))\n             .emit(ctx);\n           return {};\n         }\n       }\n+      if (auto batch_timeout = ctx.get(batch_timeout_arg); batch_timeout) {\n+        if (*batch_timeout <= duration::zero()) {\n+          diagnostic::error(\"`batch_timeout` must be a positive duration\")\n+            .primary(\n+              ctx.get_location(batch_timeout_arg).value_or(location::unknown))\n+            .emit(ctx);\n+          return {};\n+        }\n+      }\n       if (auto options = ctx.get(options_arg); options) {\n         if (not validate_options(*options, ctx)) {\n           return {};"
+    },
+    {
+      "sha": "bca998a53225fe10d1a45f557105b050bddb8197",
+      "filename": "test/tests/operators/from_kafka/batch_size_count_flush.tql",
+      "status": "added",
+      "additions": 10,
+      "deletions": 0,
+      "changes": 10,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/579bf8cf4c73db17bf0d9aa0532e075c360052b1/test%2Ftests%2Foperators%2Ffrom_kafka%2Fbatch_size_count_flush.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/579bf8cf4c73db17bf0d9aa0532e075c360052b1/test%2Ftests%2Foperators%2Ffrom_kafka%2Fbatch_size_count_flush.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Ffrom_kafka%2Fbatch_size_count_flush.tql?ref=579bf8cf4c73db17bf0d9aa0532e075c360052b1",
+      "patch": "@@ -0,0 +1,10 @@\n+// Consume all seeded records while forcing intermediate flushes.\n+from_kafka env(\"KAFKA_TOPIC\"),\n+           count=3,\n+           offset=\"beginning\",\n+           batch_size=2,\n+           batch_timeout=1s,\n+           options={\n+             \"bootstrap.servers\": env(\"KAFKA_BOOTSTRAP_SERVERS\"),\n+             \"group.id\": \"tenzir-test-from-kafka-batch-size\"\n+           }"
+    },
+    {
+      "sha": "d8f6ecc29590244c03f394d98edfc14f5a49ae6a",
+      "filename": "test/tests/operators/from_kafka/batch_size_count_flush.txt",
+      "status": "added",
+      "additions": 9,
+      "deletions": 0,
+      "changes": 9,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/579bf8cf4c73db17bf0d9aa0532e075c360052b1/test%2Ftests%2Foperators%2Ffrom_kafka%2Fbatch_size_count_flush.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/579bf8cf4c73db17bf0d9aa0532e075c360052b1/test%2Ftests%2Foperators%2Ffrom_kafka%2Fbatch_size_count_flush.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Ffrom_kafka%2Fbatch_size_count_flush.txt?ref=579bf8cf4c73db17bf0d9aa0532e075c360052b1",
+      "patch": "@@ -0,0 +1,9 @@\n+{\n+  message: \"message-0001\",\n+}\n+{\n+  message: \"message-0002\",\n+}\n+{\n+  message: \"message-0003\",\n+}"
+    },
+    {
+      "sha": "6d760b28aa15e2f8d0f1a5689712dbd969355f36",
+      "filename": "test/tests/operators/from_kafka/error_batch_size_zero.tql",
+      "status": "added",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/579bf8cf4c73db17bf0d9aa0532e075c360052b1/test%2Ftests%2Foperators%2Ffrom_kafka%2Ferror_batch_size_zero.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/579bf8cf4c73db17bf0d9aa0532e075c360052b1/test%2Ftests%2Foperators%2Ffrom_kafka%2Ferror_batch_size_zero.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Ffrom_kafka%2Ferror_batch_size_zero.tql?ref=579bf8cf4c73db17bf0d9aa0532e075c360052b1",
+      "patch": "@@ -0,0 +1,6 @@\n+---\n+error: true\n+---\n+\n+from_kafka \"unused\",\n+           batch_size=0"
+    },
+    {
+      "sha": "ac21ea379952a500280920e479831510b78f190c",
+      "filename": "test/tests/operators/from_kafka/error_batch_size_zero.txt",
+      "status": "added",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/579bf8cf4c73db17bf0d9aa0532e075c360052b1/test%2Ftests%2Foperators%2Ffrom_kafka%2Ferror_batch_size_zero.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/579bf8cf4c73db17bf0d9aa0532e075c360052b1/test%2Ftests%2Foperators%2Ffrom_kafka%2Ferror_batch_size_zero.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Ffrom_kafka%2Ferror_batch_size_zero.txt?ref=579bf8cf4c73db17bf0d9aa0532e075c360052b1",
+      "patch": "@@ -0,0 +1,6 @@\n+error: `batch_size` must be greater than zero\n+ --> tests/operators/from_kafka/error_batch_size_zero.tql:6:23\n+  |\n+6 |            batch_size=0\n+  |                       ^ \n+  |"
+    },
+    {
+      "sha": "608ff8edda4c97572995e9f6ccea801b44e99695",
+      "filename": "test/tests/operators/from_kafka/error_batch_timeout_zero.tql",
+      "status": "added",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/579bf8cf4c73db17bf0d9aa0532e075c360052b1/test%2Ftests%2Foperators%2Ffrom_kafka%2Ferror_batch_timeout_zero.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/579bf8cf4c73db17bf0d9aa0532e075c360052b1/test%2Ftests%2Foperators%2Ffrom_kafka%2Ferror_batch_timeout_zero.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Ffrom_kafka%2Ferror_batch_timeout_zero.tql?ref=579bf8cf4c73db17bf0d9aa0532e075c360052b1",
+      "patch": "@@ -0,0 +1,6 @@\n+---\n+error: true\n+---\n+\n+from_kafka \"unused\",\n+           batch_timeout=0s"
+    },
+    {
+      "sha": "f9c308a130c446ee32a04541a021d197471a2fb6",
+      "filename": "test/tests/operators/from_kafka/error_batch_timeout_zero.txt",
+      "status": "added",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/579bf8cf4c73db17bf0d9aa0532e075c360052b1/test%2Ftests%2Foperators%2Ffrom_kafka%2Ferror_batch_timeout_zero.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/579bf8cf4c73db17bf0d9aa0532e075c360052b1/test%2Ftests%2Foperators%2Ffrom_kafka%2Ferror_batch_timeout_zero.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Ffrom_kafka%2Ferror_batch_timeout_zero.txt?ref=579bf8cf4c73db17bf0d9aa0532e075c360052b1",
+      "patch": "@@ -0,0 +1,6 @@\n+error: `batch_timeout` must be a positive duration\n+ --> tests/operators/from_kafka/error_batch_timeout_zero.tql:6:26\n+  |\n+6 |            batch_timeout=0s\n+  |                          ^^ \n+  |"
+    }
+  ]
+}

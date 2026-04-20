@@ -1,0 +1,101 @@
+{
+  "message": "fix(security): enforce sandbox bridge auth",
+  "files": [
+    {
+      "sha": "72f95f72f6af87969347df246b155295283df649",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6dd6bce997c48752134f2d6ed89b27de01ced7e3/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6dd6bce997c48752134f2d6ed89b27de01ced7e3/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=6dd6bce997c48752134f2d6ed89b27de01ced7e3",
+      "patch": "@@ -69,6 +69,7 @@ Docs: https://docs.openclaw.ai\n - Security/Link understanding: block loopback/internal host patterns and private/mapped IPv6 addresses in extracted URL handling to close SSRF bypasses in link CLI flows. (#15604) Thanks @AI-Reviewer-QS.\n - Security/Browser: constrain `POST /trace/stop`, `POST /wait/download`, and `POST /download` output paths to OpenClaw temp roots and reject traversal/escape paths.\n - Security/Browser: require auth for the sandbox browser bridge server (protects `/profiles`, `/tabs`, CDP URLs, and other control endpoints). Thanks @jackhax.\n+- Security: bind local helper servers to loopback and fail closed on non-loopback OAuth callback hosts (reduces localhost/LAN attack surface).\n - Security/Canvas: serve A2UI assets via the shared safe-open path (`openFileWithinRoot`) to close traversal/TOCTOU gaps, with traversal and symlink regression coverage. (#10525) Thanks @abdelsfane.\n - Security/WhatsApp: enforce `0o600` on `creds.json` and `creds.json.bak` on save/backup/restore paths to reduce credential file exposure. (#10529) Thanks @abdelsfane.\n - Security/Gateway: sanitize and truncate untrusted WebSocket header values in pre-handshake close logs to reduce log-poisoning risk. Thanks @thewilloftheshadow."
+    },
+    {
+      "sha": "6e3c9348d80a5422bd7f9ba72b800524fdc35249",
+      "filename": "src/agents/sandbox/browser.ts",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 3,
+      "changes": 18,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6dd6bce997c48752134f2d6ed89b27de01ced7e3/src%2Fagents%2Fsandbox%2Fbrowser.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6dd6bce997c48752134f2d6ed89b27de01ced7e3/src%2Fagents%2Fsandbox%2Fbrowser.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fagents%2Fsandbox%2Fbrowser.ts?ref=6dd6bce997c48752134f2d6ed89b27de01ced7e3",
+      "patch": "@@ -1,3 +1,4 @@\n+import crypto from \"node:crypto\";\n import type { SandboxBrowserContext, SandboxConfig } from \"./types.js\";\n import { startBrowserBridgeServer, stopBrowserBridgeServer } from \"../../browser/bridge-server.js\";\n import { type ResolvedBrowserConfig, resolveProfile } from \"../../browser/config.js\";\n@@ -149,13 +150,24 @@ export async function ensureSandboxBrowser(params: {\n       ? await readDockerPort(containerName, params.cfg.browser.noVncPort)\n       : null;\n \n-  const desiredAuthToken = params.bridgeAuth?.token?.trim() || undefined;\n-  const desiredAuthPassword = params.bridgeAuth?.password?.trim() || undefined;\n-\n   const existing = BROWSER_BRIDGES.get(params.scopeKey);\n   const existingProfile = existing\n     ? resolveProfile(existing.bridge.state.resolved, DEFAULT_OPENCLAW_BROWSER_PROFILE_NAME)\n     : null;\n+\n+  let desiredAuthToken = params.bridgeAuth?.token?.trim() || undefined;\n+  let desiredAuthPassword = params.bridgeAuth?.password?.trim() || undefined;\n+  if (!desiredAuthToken && !desiredAuthPassword) {\n+    // Always require auth for the sandbox bridge server, even if gateway auth\n+    // mode doesn't produce a shared secret (e.g. trusted-proxy).\n+    // Keep it stable across calls by reusing the existing bridge auth.\n+    desiredAuthToken = existing?.authToken;\n+    desiredAuthPassword = existing?.authPassword;\n+    if (!desiredAuthToken && !desiredAuthPassword) {\n+      desiredAuthToken = crypto.randomBytes(24).toString(\"hex\");\n+    }\n+  }\n+\n   const shouldReuse =\n     existing && existing.containerName === containerName && existingProfile?.cdpPort === mappedCdp;\n   const authMatches ="
+    },
+    {
+      "sha": "ef9346bf3402a6632a2fc3ccd0195ad52f69aad7",
+      "filename": "src/browser/bridge-auth-registry.ts",
+      "status": "added",
+      "additions": 34,
+      "deletions": 0,
+      "changes": 34,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6dd6bce997c48752134f2d6ed89b27de01ced7e3/src%2Fbrowser%2Fbridge-auth-registry.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6dd6bce997c48752134f2d6ed89b27de01ced7e3/src%2Fbrowser%2Fbridge-auth-registry.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fbrowser%2Fbridge-auth-registry.ts?ref=6dd6bce997c48752134f2d6ed89b27de01ced7e3",
+      "patch": "@@ -0,0 +1,34 @@\n+type BridgeAuth = {\n+  token?: string;\n+  password?: string;\n+};\n+\n+// In-process registry for loopback-only bridge servers that require auth, but\n+// are addressed via dynamic ephemeral ports (e.g. sandbox browser bridge).\n+const authByPort = new Map<number, BridgeAuth>();\n+\n+export function setBridgeAuthForPort(port: number, auth: BridgeAuth): void {\n+  if (!Number.isFinite(port) || port <= 0) {\n+    return;\n+  }\n+  const token = typeof auth.token === \"string\" ? auth.token.trim() : \"\";\n+  const password = typeof auth.password === \"string\" ? auth.password.trim() : \"\";\n+  authByPort.set(port, {\n+    token: token || undefined,\n+    password: password || undefined,\n+  });\n+}\n+\n+export function getBridgeAuthForPort(port: number): BridgeAuth | undefined {\n+  if (!Number.isFinite(port) || port <= 0) {\n+    return undefined;\n+  }\n+  return authByPort.get(port);\n+}\n+\n+export function deleteBridgeAuthForPort(port: number): void {\n+  if (!Number.isFinite(port) || port <= 0) {\n+    return;\n+  }\n+  authByPort.delete(port);\n+}"
+    },
+    {
+      "sha": "e5b3904b107c34056854e54206a41d6e3f8899b5",
+      "filename": "src/browser/bridge-server.auth.test.ts",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 0,
+      "changes": 8,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6dd6bce997c48752134f2d6ed89b27de01ced7e3/src%2Fbrowser%2Fbridge-server.auth.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6dd6bce997c48752134f2d6ed89b27de01ced7e3/src%2Fbrowser%2Fbridge-server.auth.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fbrowser%2Fbridge-server.auth.test.ts?ref=6dd6bce997c48752134f2d6ed89b27de01ced7e3",
+      "patch": "@@ -73,4 +73,12 @@ describe(\"startBrowserBridgeServer auth\", () => {\n     });\n     expect(authed.status).toBe(200);\n   });\n+\n+  it(\"requires auth params\", async () => {\n+    await expect(\n+      startBrowserBridgeServer({\n+        resolved: buildResolvedConfig(),\n+      }),\n+    ).rejects.toThrow(/requires auth/i);\n+  });\n });"
+    },
+    {
+      "sha": "4ee73167aefa9b1b671bd7c068fee81d2cf91070",
+      "filename": "src/browser/bridge-server.ts",
+      "status": "modified",
+      "additions": 18,
+      "deletions": 0,
+      "changes": 18,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6dd6bce997c48752134f2d6ed89b27de01ced7e3/src%2Fbrowser%2Fbridge-server.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6dd6bce997c48752134f2d6ed89b27de01ced7e3/src%2Fbrowser%2Fbridge-server.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fbrowser%2Fbridge-server.ts?ref=6dd6bce997c48752134f2d6ed89b27de01ced7e3",
+      "patch": "@@ -4,7 +4,9 @@ import type { AddressInfo } from \"node:net\";\n import express from \"express\";\n import type { ResolvedBrowserConfig } from \"./config.js\";\n import type { BrowserRouteRegistrar } from \"./routes/types.js\";\n+import { isLoopbackHost } from \"../gateway/net.js\";\n import { safeEqualSecret } from \"../security/secret-equal.js\";\n+import { deleteBridgeAuthForPort, setBridgeAuthForPort } from \"./bridge-auth-registry.js\";\n import { registerBrowserRoutes } from \"./routes/index.js\";\n import {\n   type BrowserServerState,\n@@ -89,6 +91,9 @@ export async function startBrowserBridgeServer(params: {\n   onEnsureAttachTarget?: (profile: ProfileContext[\"profile\"]) => Promise<void>;\n }): Promise<BrowserBridge> {\n   const host = params.host ?? \"127.0.0.1\";\n+  if (!isLoopbackHost(host)) {\n+    throw new Error(`bridge server must bind to loopback host (got ${host})`);\n+  }\n   const port = params.port ?? 0;\n \n   const app = express();\n@@ -109,6 +114,9 @@ export async function startBrowserBridgeServer(params: {\n \n   const authToken = params.authToken?.trim() || undefined;\n   const authPassword = params.authPassword?.trim() || undefined;\n+  if (!authToken && !authPassword) {\n+    throw new Error(\"bridge server requires auth (authToken/authPassword missing)\");\n+  }\n   if (authToken || authPassword) {\n     app.use((req, res, next) => {\n       if (isAuthorizedBrowserRequest(req, { token: authToken, password: authPassword })) {\n@@ -142,11 +150,21 @@ export async function startBrowserBridgeServer(params: {\n   state.port = resolvedPort;\n   state.resolved.controlPort = resolvedPort;\n \n+  setBridgeAuthForPort(resolvedPort, { token: authToken, password: authPassword });\n+\n   const baseUrl = `http://${host}:${resolvedPort}`;\n   return { server, port: resolvedPort, baseUrl, state };\n }\n \n export async function stopBrowserBridgeServer(server: Server): Promise<void> {\n+  try {\n+    const address = server.address() as AddressInfo | null;\n+    if (address?.port) {\n+      deleteBridgeAuthForPort(address.port);\n+    }\n+  } catch {\n+    // ignore\n+  }\n   await new Promise<void>((resolve) => {\n     server.close(() => resolve());\n   });"
+    },
+    {
+      "sha": "bcc8f9faddf59652864c40174739164436488e6d",
+      "filename": "src/browser/client-fetch.ts",
+      "status": "modified",
+      "additions": 25,
+      "deletions": 1,
+      "changes": 26,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6dd6bce997c48752134f2d6ed89b27de01ced7e3/src%2Fbrowser%2Fclient-fetch.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6dd6bce997c48752134f2d6ed89b27de01ced7e3/src%2Fbrowser%2Fclient-fetch.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fbrowser%2Fclient-fetch.ts?ref=6dd6bce997c48752134f2d6ed89b27de01ced7e3",
+      "patch": "@@ -1,5 +1,6 @@\n import { formatCliCommand } from \"../cli/command-format.js\";\n import { loadConfig } from \"../config/config.js\";\n+import { getBridgeAuthForPort } from \"./bridge-auth-registry.js\";\n import { resolveBrowserControlAuth } from \"./control-auth.js\";\n import {\n   createBrowserControlContext,\n@@ -37,13 +38,36 @@ function withLoopbackBrowserAuth(\n     const auth = resolveBrowserControlAuth(cfg);\n     if (auth.token) {\n       headers.set(\"Authorization\", `Bearer ${auth.token}`);\n-    } else if (auth.password) {\n+      return { ...init, headers };\n+    }\n+    if (auth.password) {\n       headers.set(\"x-openclaw-password\", auth.password);\n+      return { ...init, headers };\n     }\n   } catch {\n     // ignore config/auth lookup failures and continue without auth headers\n   }\n \n+  // Sandbox bridge servers can run with per-process ephemeral auth on dynamic ports.\n+  // Fall back to the in-memory registry if config auth is not available.\n+  try {\n+    const parsed = new URL(url);\n+    const port =\n+      parsed.port && Number.parseInt(parsed.port, 10) > 0\n+        ? Number.parseInt(parsed.port, 10)\n+        : parsed.protocol === \"https:\"\n+          ? 443\n+          : 80;\n+    const bridgeAuth = getBridgeAuthForPort(port);\n+    if (bridgeAuth?.token) {\n+      headers.set(\"Authorization\", `Bearer ${bridgeAuth.token}`);\n+    } else if (bridgeAuth?.password) {\n+      headers.set(\"x-openclaw-password\", bridgeAuth.password);\n+    }\n+  } catch {\n+    // ignore\n+  }\n+\n   return { ...init, headers };\n }\n "
+    },
+    {
+      "sha": "1925649bb4acac692d9aa41245a80d99770a3601",
+      "filename": "src/commands/chutes-oauth.ts",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6dd6bce997c48752134f2d6ed89b27de01ced7e3/src%2Fcommands%2Fchutes-oauth.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6dd6bce997c48752134f2d6ed89b27de01ced7e3/src%2Fcommands%2Fchutes-oauth.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fcommands%2Fchutes-oauth.ts?ref=6dd6bce997c48752134f2d6ed89b27de01ced7e3",
+      "patch": "@@ -8,6 +8,7 @@ import {\n   generateChutesPkce,\n   parseOAuthCallbackInput,\n } from \"../agents/chutes-oauth.js\";\n+import { isLoopbackHost } from \"../gateway/net.js\";\n \n type OAuthPrompt = {\n   message: string;\n@@ -44,6 +45,11 @@ async function waitForLocalCallback(params: {\n     throw new Error(`Chutes OAuth redirect URI must be http:// (got ${params.redirectUri})`);\n   }\n   const hostname = redirectUrl.hostname || \"127.0.0.1\";\n+  if (!isLoopbackHost(hostname)) {\n+    throw new Error(\n+      `Chutes OAuth redirect hostname must be loopback (got ${hostname}). Use http://127.0.0.1:<port>/...`,\n+    );\n+  }\n   const port = redirectUrl.port ? Number.parseInt(redirectUrl.port, 10) : 80;\n   const expectedPath = redirectUrl.pathname || \"/\";\n "
+    },
+    {
+      "sha": "62dd5ef2d7d4dd96827438e4b647250f80097b56",
+      "filename": "src/media/server.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6dd6bce997c48752134f2d6ed89b27de01ced7e3/src%2Fmedia%2Fserver.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6dd6bce997c48752134f2d6ed89b27de01ced7e3/src%2Fmedia%2Fserver.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fmedia%2Fserver.ts?ref=6dd6bce997c48752134f2d6ed89b27de01ced7e3",
+      "patch": "@@ -96,7 +96,7 @@ export async function startMediaServer(\n   const app = express();\n   attachMediaRoutes(app, ttlMs, runtime);\n   return await new Promise((resolve, reject) => {\n-    const server = app.listen(port);\n+    const server = app.listen(port, \"127.0.0.1\");\n     server.once(\"listening\", () => resolve(server));\n     server.once(\"error\", (err) => {\n       runtime.error(danger(`Media server failed: ${String(err)}`));"
+    }
+  ]
+}

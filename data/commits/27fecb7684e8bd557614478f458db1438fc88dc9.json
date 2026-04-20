@@ -1,0 +1,89 @@
+{
+  "message": "Refactor select to reuse set IR path",
+  "files": [
+    {
+      "sha": "26200476a3d4260f4c9723cf5bdb053b7760b1db",
+      "filename": "libtenzir/builtins/operators/set_select.cpp",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 94,
+      "changes": 104,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/27fecb7684e8bd557614478f458db1438fc88dc9/libtenzir%2Fbuiltins%2Foperators%2Fset_select.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/27fecb7684e8bd557614478f458db1438fc88dc9/libtenzir%2Fbuiltins%2Foperators%2Fset_select.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Fbuiltins%2Foperators%2Fset_select.cpp?ref=27fecb7684e8bd557614478f458db1438fc88dc9",
+      "patch": "@@ -6,24 +6,16 @@\n // SPDX-FileCopyrightText: (c) 2024 The Tenzir Contributors\n // SPDX-License-Identifier: BSD-3-Clause\n \n-#include <tenzir/detail/narrow.hpp>\n-#include <tenzir/operator_plugin.hpp>\n+#include <tenzir/compile_ctx.hpp>\n+#include <tenzir/ir.hpp>\n #include <tenzir/plugin.hpp>\n-#include <tenzir/rebatch.hpp>\n-#include <tenzir/tql2/eval.hpp>\n #include <tenzir/tql2/plugin.hpp>\n #include <tenzir/tql2/set.hpp>\n \n-#include <ranges>\n-\n namespace tenzir::plugins::set_select {\n \n namespace {\n \n-struct SelectArgs {\n-  std::vector<ast::expression> fields;\n-};\n-\n auto make_select_assignments(std::vector<ast::expression> args,\n                              diagnostic_handler* dh)\n   -> std::optional<std::vector<ast::assignment>> {\n@@ -61,70 +53,6 @@ auto make_select_assignments(std::vector<ast::expression> args,\n   return assignments;\n }\n \n-class SelectSet final : public Operator<table_slice, table_slice> {\n-public:\n-  explicit SelectSet(SelectArgs args) {\n-    auto assignments = make_select_assignments(std::move(args.fields), nullptr);\n-    TENZIR_ASSERT(assignments);\n-    assignments_ = std::move(*assignments);\n-    for (auto& assignment : assignments_) {\n-      auto [pruned_assignment, moved_fields]\n-        = resolve_move_keyword(std::move(assignment));\n-      assignment = std::move(pruned_assignment);\n-      std::ranges::move(moved_fields, std::back_inserter(moved_fields_));\n-    }\n-  }\n-\n-  auto process(table_slice input, Push<table_slice>& push, OpCtx& ctx)\n-    -> Task<void> override {\n-    auto slice = std::move(input);\n-    // The right-hand side is always evaluated with the original input, because\n-    // side-effects from preceding assignments shall not be reflected when\n-    // calculating the value of the left-hand side.\n-    auto values = std::vector<multi_series>{};\n-    for (auto const& assignment : assignments_) {\n-      values.push_back(eval(assignment.right, slice, ctx));\n-    }\n-    slice = drop(slice, moved_fields_, ctx, false);\n-    // After we know all the multi series values on the right, we can split the\n-    // input table slice and perform the actual assignment.\n-    auto begin = int64_t{0};\n-    auto results = std::vector<table_slice>{};\n-    for (auto values_slice : split_multi_series(values)) {\n-      TENZIR_ASSERT(not values_slice.empty());\n-      auto end = begin + values_slice[0].length();\n-      // We could still perform further splits if metadata is assigned.\n-      auto state = std::vector<table_slice>{};\n-      state.push_back(subslice(slice, begin, end));\n-      begin = end;\n-      auto new_state = std::vector<table_slice>{};\n-      for (auto [assignment, value] :\n-           std::views::zip(assignments_, values_slice)) {\n-        auto offset = int64_t{0};\n-        for (auto& entry : state) {\n-          auto entry_rows = detail::narrow<int64_t>(entry.rows());\n-          auto assigned = assign(assignment.left,\n-                                 value.slice(offset, entry_rows), entry, ctx);\n-          offset += entry_rows;\n-          new_state.insert(new_state.end(),\n-                           std::move_iterator{assigned.begin()},\n-                           std::move_iterator{assigned.end()});\n-        }\n-        std::swap(state, new_state);\n-        new_state.clear();\n-      }\n-      std::ranges::move(state, std::back_inserter(results));\n-    }\n-    for (auto& result : rebatch(std::move(results))) {\n-      co_await push(std::move(result));\n-    }\n-  }\n-\n-private:\n-  std::vector<ast::assignment> assignments_;\n-  std::vector<ast::field_path> moved_fields_;\n-};\n-\n class set final : public operator_plugin2<set_operator> {\n public:\n   auto make(invocation inv, session ctx) const\n@@ -150,7 +78,7 @@ class set final : public operator_plugin2<set_operator> {\n };\n \n class select final : public virtual operator_plugin2<set_operator>,\n-                     public virtual OperatorPlugin {\n+                     public virtual operator_compiler_plugin {\n public:\n   auto name() const -> std::string override {\n     return \"tql2.select\";\n@@ -165,26 +93,14 @@ class select final : public virtual operator_plugin2<set_operator>,\n     return std::make_unique<set_operator>(std::move(*assignments));\n   }\n \n-  auto describe() const -> Description override {\n-    auto d = Describer<SelectArgs, SelectSet>{};\n-    auto fields = d.optional_variadic(\"field\", &SelectArgs::fields, \"selector\");\n-    d.validate([fields](ValidateCtx& ctx) -> Empty {\n-      auto args = ctx.get_all(fields);\n-      auto fields = std::vector<ast::expression>{};\n-      fields.reserve(args.size());\n-      for (auto& arg : args) {\n-        if (not arg) {\n-          continue;\n-        }\n-        fields.push_back(std::move(*arg));\n+  auto compile(ast::invocation inv, compile_ctx ctx) const\n+    -> failure_or<Box<ir::Operator>> override {\n+    for (auto& arg : inv.args) {\n+      if (is<ast::assignment>(arg) or not is<ast::pipeline_expr>(arg)) {\n+        TRY(arg.bind(ctx));\n       }\n-      auto ignored = make_select_assignments(\n-        std::move(fields), &static_cast<diagnostic_handler&>(ctx));\n-      (void)ignored;\n-      return {};\n-    });\n-    d.assignments_are_positional();\n-    return d.order_invariant();\n+    }\n+    return make_set_ir(std::move(inv.args), ctx);\n   }\n };\n "
+    },
+    {
+      "sha": "1a8b0cdb7afc5f61f03885a33fb6a97e55cf7663",
+      "filename": "libtenzir/include/tenzir/ir.hpp",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/27fecb7684e8bd557614478f458db1438fc88dc9/libtenzir%2Finclude%2Ftenzir%2Fir.hpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/27fecb7684e8bd557614478f458db1438fc88dc9/libtenzir%2Finclude%2Ftenzir%2Fir.hpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Finclude%2Ftenzir%2Fir.hpp?ref=27fecb7684e8bd557614478f458db1438fc88dc9",
+      "patch": "@@ -150,6 +150,10 @@ struct optimize_result {\n \n } // namespace ir\n \n+/// Create a set-like IR operator from `select`-style arguments.\n+auto make_set_ir(std::vector<ast::expression> args, diagnostic_handler& dh)\n+  -> failure_or<Box<ir::Operator>>;\n+\n template <>\n inline constexpr auto enable_default_formatter<ir::pipeline> = true;\n "
+    },
+    {
+      "sha": "7242987295df6ebe10a6f7a289f897f722a8e25c",
+      "filename": "libtenzir/include/tenzir/operator_plugin.hpp",
+      "status": "modified",
+      "additions": 0,
+      "deletions": 6,
+      "changes": 6,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/27fecb7684e8bd557614478f458db1438fc88dc9/libtenzir%2Finclude%2Ftenzir%2Foperator_plugin.hpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/27fecb7684e8bd557614478f458db1438fc88dc9/libtenzir%2Finclude%2Ftenzir%2Foperator_plugin.hpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Finclude%2Ftenzir%2Foperator_plugin.hpp?ref=27fecb7684e8bd557614478f458db1438fc88dc9",
+      "patch": "@@ -134,8 +134,6 @@ struct Description {\n   std::optional<Validator> validator;\n   std::optional<Setter<ir::optimize_filter>> set_filter;\n   std::optional<Setter<location>> set_operator_location;\n-  // If true, assignments are treated as positional arguments, not named args.\n-  bool assignments_are_positional = false;\n };\n \n class OperatorPlugin : public virtual operator_compiler_plugin {\n@@ -795,10 +793,6 @@ class Describer {\n     desc_.validator = std::move(validator);\n   }\n \n-  auto assignments_are_positional() -> void {\n-    desc_.assignments_are_positional = true;\n-  }\n-\n   // TODO\n   template <class F>\n   auto optimize(F&& f) -> Description;"
+    },
+    {
+      "sha": "63ee7654526add7d943f403ee129da98140c4769",
+      "filename": "libtenzir/src/ir.cpp",
+      "status": "modified",
+      "additions": 37,
+      "deletions": 0,
+      "changes": 37,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/27fecb7684e8bd557614478f458db1438fc88dc9/libtenzir%2Fsrc%2Fir.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/27fecb7684e8bd557614478f458db1438fc88dc9/libtenzir%2Fsrc%2Fir.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Fsrc%2Fir.cpp?ref=27fecb7684e8bd557614478f458db1438fc88dc9",
+      "patch": "@@ -208,6 +208,37 @@ class set_ir final : public ir::Operator {\n   event_order order_ = event_order::ordered;\n };\n \n+auto make_select_assignments(std::vector<ast::expression> args,\n+                             diagnostic_handler& dh)\n+  -> failure_or<std::vector<ast::assignment>> {\n+  auto assignments = std::vector<ast::assignment>{};\n+  assignments.reserve(1 + args.size());\n+  assignments.emplace_back(\n+    ast::field_path::try_from(ast::this_{}).value(), location::unknown,\n+    ast::record{location::unknown, {}, location::unknown});\n+  for (auto& arg : args) {\n+    if (auto* assignment = try_as<ast::assignment>(arg)) {\n+      auto* selector = try_as<ast::field_path>(assignment->left);\n+      if (not selector) {\n+        diagnostic::error(\"expected selector\").primary(assignment->left).emit(dh);\n+        return failure::promise();\n+      }\n+      assignments.push_back(std::move(*assignment));\n+      continue;\n+    }\n+    auto original_arg = arg;\n+    auto selector = ast::field_path::try_from(std::move(arg));\n+    if (not selector) {\n+      diagnostic::error(\"expected selector\").primary(original_arg).emit(dh);\n+      return failure::promise();\n+    }\n+    auto rhs = selector->inner();\n+    assignments.emplace_back(std::move(*selector), location::unknown,\n+                             std::move(rhs));\n+  }\n+  return assignments;\n+}\n+\n /// Create a `set` operator with the given assignment.\n auto make_set_ir(ast::assignment x) -> Box<ir::Operator> {\n   auto assignments = std::vector<ast::assignment>{};\n@@ -331,6 +362,12 @@ class If final : public Operator<table_slice, table_slice> {\n \n } // namespace\n \n+auto make_set_ir(std::vector<ast::expression> args, diagnostic_handler& dh)\n+  -> failure_or<Box<ir::Operator>> {\n+  TRY(auto assignments, make_select_assignments(std::move(args), dh));\n+  return set_ir{std::move(assignments)};\n+}\n+\n class IfIr final : public ir::Operator {\n public:\n   IfIr() = default;"
+    },
+    {
+      "sha": "99d0dd244e1258fc6ebec20301cba9a2f92f6ce2",
+      "filename": "libtenzir/src/operator_plugin.cpp",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 2,
+      "changes": 3,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/27fecb7684e8bd557614478f458db1438fc88dc9/libtenzir%2Fsrc%2Foperator_plugin.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/27fecb7684e8bd557614478f458db1438fc88dc9/libtenzir%2Fsrc%2Foperator_plugin.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Fsrc%2Foperator_plugin.cpp?ref=27fecb7684e8bd557614478f458db1438fc88dc9",
+      "patch": "@@ -206,8 +206,7 @@ class GenericIr final : public ir::Operator {\n       = desc->first_optional.value_or(desc->positional.size());\n     auto max_positional = desc->positional.size();\n     for (auto& arg : args) {\n-      if (auto* assignment = try_as<ast::assignment>(arg);\n-          assignment and not desc->assignments_are_positional) {\n+      if (auto* assignment = try_as<ast::assignment>(arg)) {\n         // Named argument.\n         auto* sel = try_as<ast::field_path>(assignment->left);\n         if (not sel or sel->has_this() or sel->path().size() != 1"
+    },
+    {
+      "sha": "d7170b8d1a1fde87f060ad4a98c41161f8820d8b",
+      "filename": "test/tests/operators/select/error_invalid_selector.tql",
+      "status": "added",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/27fecb7684e8bd557614478f458db1438fc88dc9/test%2Ftests%2Foperators%2Fselect%2Ferror_invalid_selector.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/27fecb7684e8bd557614478f458db1438fc88dc9/test%2Ftests%2Foperators%2Fselect%2Ferror_invalid_selector.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fselect%2Ferror_invalid_selector.tql?ref=27fecb7684e8bd557614478f458db1438fc88dc9",
+      "patch": "@@ -0,0 +1,6 @@\n+---\n+error: true\n+---\n+\n+from {x: 1}\n+select 1"
+    },
+    {
+      "sha": "8f99f546d97f5f03643664f7263809e24e602abd",
+      "filename": "test/tests/operators/select/error_invalid_selector.txt",
+      "status": "added",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/27fecb7684e8bd557614478f458db1438fc88dc9/test%2Ftests%2Foperators%2Fselect%2Ferror_invalid_selector.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/27fecb7684e8bd557614478f458db1438fc88dc9/test%2Ftests%2Foperators%2Fselect%2Ferror_invalid_selector.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fselect%2Ferror_invalid_selector.txt?ref=27fecb7684e8bd557614478f458db1438fc88dc9",
+      "patch": "@@ -0,0 +1,6 @@\n+error: expected selector\n+ --> tests/operators/select/error_invalid_selector.tql:6:8\n+  |\n+6 | select 1\n+  |        ^ \n+  |"
+    }
+  ]
+}

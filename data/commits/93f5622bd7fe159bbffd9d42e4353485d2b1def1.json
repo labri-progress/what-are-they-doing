@@ -1,0 +1,65 @@
+{
+  "message": "fix(polyfills): add std/os exposure and improve module registration\n\n- Add std/os global exposure to native_main_static.zig (matches embed.zig)\n- Add comprehensive defer cleanup to break reference cycles and prevent leaks\n- Register compression.zig as both 'compression' and 'zlib' for Node.js compat\n- Add _modules.net and _modules.tls registration in native polyfills\n- Create _modules.fs if not exists instead of returning early",
+  "files": [
+    {
+      "sha": "c32326ba123d4d47176a8f0a74cae487947442f2",
+      "filename": "src/native_main_static.zig",
+      "status": "modified",
+      "additions": 68,
+      "deletions": 1,
+      "changes": 69,
+      "blob_url": "https://github.com/teamchong/edgebox/blob/93f5622bd7fe159bbffd9d42e4353485d2b1def1/src%2Fnative_main_static.zig",
+      "raw_url": "https://github.com/teamchong/edgebox/raw/93f5622bd7fe159bbffd9d42e4353485d2b1def1/src%2Fnative_main_static.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/edgebox/contents/src%2Fnative_main_static.zig?ref=93f5622bd7fe159bbffd9d42e4353485d2b1def1",
+      "patch": "@@ -130,14 +130,81 @@ pub fn main() !void {\n         std.debug.print(\"Failed to create QuickJS context\\n\", .{});\n         return error.ContextCreationFailed;\n     };\n-    defer qjs.JS_FreeContext(ctx);\n+    defer {\n+        // Clear global module references to break reference cycles\n+        // Objects created via JS_Eval may hold globalThis references\n+        {\n+            const global = qjs.JS_GetGlobalObject(ctx);\n+\n+            // List of all known globals that might hold circular references\n+            const globals_to_clear = [_][*:0]const u8{\n+                \"_modules\",\n+                \"scriptArgs\",\n+                \"_tty_isatty\",\n+                \"_tty_getWindowSize\",\n+                \"__edgebox_isatty\",\n+                \"__edgebox_get_terminal_size\",\n+                \"__edgebox_fetch\",\n+                \"__edgebox_spawn\",\n+                \"std\",\n+                \"os\",\n+                \"_os\",\n+                \"process\",\n+                \"console\",\n+                \"Buffer\",\n+                \"require\",\n+                \"module\",\n+                \"exports\",\n+                \"__frozen_init_complete\",\n+            };\n+\n+            for (globals_to_clear) |name| {\n+                const atom = qjs.JS_NewAtom(ctx, name);\n+                _ = qjs.JS_DeleteProperty(ctx, global, atom, 0);\n+                qjs.JS_FreeAtom(ctx, atom);\n+            }\n+\n+            qjs.JS_FreeValue(ctx, global);\n+        }\n+\n+        // Free std handlers before context (releases module-level references)\n+        qjs.js_std_free_handlers(rt);\n+        // Run GC multiple times BEFORE freeing context to collect cyclic references\n+        // and all context-owned objects properly\n+        qjs.JS_RunGC(rt);\n+        qjs.JS_RunGC(rt);\n+        qjs.JS_RunGC(rt);\n+        qjs.JS_FreeContext(ctx);\n+    }\n \n     // Initialize std module\n     qjs.js_std_init_handlers(rt);\n     qjs.JS_SetModuleLoaderFunc(rt, null, qjs.js_module_loader, null);\n     _ = qjs.js_init_module_std(ctx, \"std\");\n     _ = qjs.js_init_module_os(ctx, \"os\");\n \n+    // Expose QuickJS std and os modules as global objects for polyfills\n+    // This is needed because the bundled code can't use ES module imports\n+    {\n+        const global = qjs.JS_GetGlobalObject(ctx);\n+        defer qjs.JS_FreeValue(ctx, global);\n+\n+        // Execute code to import modules and expose them globally\n+        const init_code =\n+            \\\\import * as std from 'std';\n+            \\\\import * as os from 'os';\n+            \\\\globalThis.std = std;\n+            \\\\globalThis.os = os;\n+            \\\\globalThis._os = os;\n+        ;\n+        const init_result = qjs.JS_Eval(ctx, init_code, init_code.len, \"<init>\", qjs.JS_EVAL_TYPE_MODULE);\n+        if (qjs.JS_IsException(init_result)) {\n+            // Print but don't fail - some builds may not have these modules\n+            printException(ctx);\n+        }\n+        qjs.JS_FreeValue(ctx, init_result);\n+    }\n+\n     // Register native polyfills\n     registerPolyfills(ctx);\n "
+    },
+    {
+      "sha": "5aed24fdec19dcd12802fe82c3fb954061718803",
+      "filename": "src/polyfills/compression.zig",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 2,
+      "changes": 6,
+      "blob_url": "https://github.com/teamchong/edgebox/blob/93f5622bd7fe159bbffd9d42e4353485d2b1def1/src%2Fpolyfills%2Fcompression.zig",
+      "raw_url": "https://github.com/teamchong/edgebox/raw/93f5622bd7fe159bbffd9d42e4353485d2b1def1/src%2Fpolyfills%2Fcompression.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/edgebox/contents/src%2Fpolyfills%2Fcompression.zig?ref=93f5622bd7fe159bbffd9d42e4353485d2b1def1",
+      "patch": "@@ -401,10 +401,12 @@ pub fn register(ctx: *qjs.JSContext) void {\n         _ = qjs.JS_SetPropertyStr(ctx, comp_obj, binding[0], func);\n     }\n \n-    // Set in _modules for require('compression')\n+    // Set in _modules for require('compression') and require('zlib')\n     const modules_val = qjs.JS_GetPropertyStr(ctx, global, \"_modules\");\n     if (!qjs.JS_IsUndefined(modules_val)) {\n-        _ = qjs.JS_SetPropertyStr(ctx, modules_val, \"compression\", comp_obj);\n+        // Register as both 'compression' and 'zlib' for Node.js compatibility\n+        _ = qjs.JS_SetPropertyStr(ctx, modules_val, \"compression\", qjs.JS_DupValue(ctx, comp_obj));\n+        _ = qjs.JS_SetPropertyStr(ctx, modules_val, \"zlib\", comp_obj);\n         qjs.JS_FreeValue(ctx, modules_val);\n     } else {\n         qjs.JS_FreeValue(ctx, comp_obj);"
+    },
+    {
+      "sha": "0aefa2ef08653ba4d1e99069f780e510806b9c04",
+      "filename": "src/polyfills/fs.zig",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 4,
+      "changes": 19,
+      "blob_url": "https://github.com/teamchong/edgebox/blob/93f5622bd7fe159bbffd9d42e4353485d2b1def1/src%2Fpolyfills%2Ffs.zig",
+      "raw_url": "https://github.com/teamchong/edgebox/raw/93f5622bd7fe159bbffd9d42e4353485d2b1def1/src%2Fpolyfills%2Ffs.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/edgebox/contents/src%2Fpolyfills%2Ffs.zig?ref=93f5622bd7fe159bbffd9d42e4353485d2b1def1",
+      "patch": "@@ -1979,13 +1979,24 @@ pub fn register(ctx: *qjs.JSContext) void {\n     _ = qjs.JS_SetPropertyStr(ctx, global, \"__edgebox_fs_poll_watch\", qjs.JS_NewCFunction(ctx, fsPollWatch, \"__edgebox_fs_poll_watch\", 1));\n     _ = qjs.JS_SetPropertyStr(ctx, global, \"__edgebox_fs_unwatch\", qjs.JS_NewCFunction(ctx, fsUnwatch, \"__edgebox_fs_unwatch\", 1));\n \n-    // Then try to enhance _modules.fs if it exists\n-    const fs_mod = qjs.JS_GetPropertyStr(ctx, modules_val, \"fs\");\n+    // Get or create _modules.fs\n+    var fs_mod = qjs.JS_GetPropertyStr(ctx, modules_val, \"fs\");\n+    var fs_created = false;\n     if (qjs.JS_IsUndefined(fs_mod) or qjs.JS_IsNull(fs_mod)) {\n         qjs.JS_FreeValue(ctx, fs_mod);\n-        return;\n+        // Create a minimal fs module for native builds\n+        fs_mod = qjs.JS_NewObject(ctx);\n+        fs_created = true;\n+        _ = qjs.JS_SetPropertyStr(ctx, fs_mod, \"_native\", quickjs.jsTrue());\n+    }\n+    defer {\n+        if (fs_created) {\n+            // Register the newly created fs module\n+            _ = qjs.JS_SetPropertyStr(ctx, modules_val, \"fs\", fs_mod);\n+        } else {\n+            qjs.JS_FreeValue(ctx, fs_mod);\n+        }\n     }\n-    defer qjs.JS_FreeValue(ctx, fs_mod);\n \n     // Create realpathSync function with native sub-property\n     const realpath_sync_func = qjs.JS_NewCFunction(ctx, fsRealpathSync, \"realpathSync\", 1);"
+    },
+    {
+      "sha": "ebbe30e926c70c06df4c96ff85b98988796db83e",
+      "filename": "src/polyfills/net.zig",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 0,
+      "changes": 16,
+      "blob_url": "https://github.com/teamchong/edgebox/blob/93f5622bd7fe159bbffd9d42e4353485d2b1def1/src%2Fpolyfills%2Fnet.zig",
+      "raw_url": "https://github.com/teamchong/edgebox/raw/93f5622bd7fe159bbffd9d42e4353485d2b1def1/src%2Fpolyfills%2Fnet.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/edgebox/contents/src%2Fpolyfills%2Fnet.zig?ref=93f5622bd7fe159bbffd9d42e4353485d2b1def1",
+      "patch": "@@ -1775,4 +1775,20 @@ pub fn register(ctx: ?*qjs.JSContext) void {\n         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);\n         _ = qjs.JS_SetPropertyStr(ctx, global, binding[0], func);\n     }\n+\n+    // Register in _modules for require('net') if not already set by JS polyfill\n+    const modules_val = qjs.JS_GetPropertyStr(ctx, global, \"_modules\");\n+    if (!qjs.JS_IsUndefined(modules_val)) {\n+        defer qjs.JS_FreeValue(ctx, modules_val);\n+        // Check if JS polyfill already set up net module\n+        const existing = qjs.JS_GetPropertyStr(ctx, modules_val, \"net\");\n+        if (qjs.JS_IsUndefined(existing)) {\n+            // Create minimal net module object with native indicator\n+            const net_obj = qjs.JS_NewObject(ctx);\n+            _ = qjs.JS_SetPropertyStr(ctx, net_obj, \"_native\", quickjs.jsTrue());\n+            _ = qjs.JS_SetPropertyStr(ctx, modules_val, \"net\", net_obj);\n+        } else {\n+            qjs.JS_FreeValue(ctx, existing);\n+        }\n+    }\n }"
+    },
+    {
+      "sha": "05b017fb44711f885c437d981f34a36ec7ad7061",
+      "filename": "src/polyfills/tls.zig",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 0,
+      "changes": 16,
+      "blob_url": "https://github.com/teamchong/edgebox/blob/93f5622bd7fe159bbffd9d42e4353485d2b1def1/src%2Fpolyfills%2Ftls.zig",
+      "raw_url": "https://github.com/teamchong/edgebox/raw/93f5622bd7fe159bbffd9d42e4353485d2b1def1/src%2Fpolyfills%2Ftls.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/edgebox/contents/src%2Fpolyfills%2Ftls.zig?ref=93f5622bd7fe159bbffd9d42e4353485d2b1def1",
+      "patch": "@@ -1753,4 +1753,20 @@ pub fn register(ctx: ?*qjs.JSContext) void {\n         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);\n         _ = qjs.JS_SetPropertyStr(ctx, global, binding[0], func);\n     }\n+\n+    // Register in _modules for require('tls') if not already set by JS polyfill\n+    const modules_val = qjs.JS_GetPropertyStr(ctx, global, \"_modules\");\n+    if (!qjs.JS_IsUndefined(modules_val)) {\n+        defer qjs.JS_FreeValue(ctx, modules_val);\n+        // Check if JS polyfill already set up tls module\n+        const existing = qjs.JS_GetPropertyStr(ctx, modules_val, \"tls\");\n+        if (qjs.JS_IsUndefined(existing)) {\n+            // Create minimal tls module object with native indicator\n+            const tls_obj = qjs.JS_NewObject(ctx);\n+            _ = qjs.JS_SetPropertyStr(ctx, tls_obj, \"_native\", quickjs.jsTrue());\n+            _ = qjs.JS_SetPropertyStr(ctx, modules_val, \"tls\", tls_obj);\n+        } else {\n+            qjs.JS_FreeValue(ctx, existing);\n+        }\n+    }\n }"
+    }
+  ]
+}

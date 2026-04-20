@@ -1,0 +1,77 @@
+{
+  "message": "fix(safety): non-finite timestamp guard, real page_size via sysconf, setpriority nice, tempdir for HNSW serialization\n\n- connectors/mod.rs: reject non-finite (NaN/Inf) floats in parse_timestamp\n  to prevent undefined behavior in the seconds-vs-milliseconds heuristic\n- connectors/claude_code.rs: fix indentation in started_at match block\n- daemon/resource.rs: replace hardcoded 4096 page_size with actual\n  sysconf(_SC_PAGESIZE) call; switch apply_nice from libc::nice() (which\n  has ambiguous -1 return) to libc::setpriority() with explicit range\n  validation (-20..=19); add out-of-range rejection test\n- daemon/worker.rs: add unit tests for resolve_embedder_kind covering\n  hash aliases, semantic aliases, and unknown-model rejection; reformat\n  function signature\n- search/ann_index.rs: replace .hnsw_tmp fixed directory with\n  tempfile::tempdir() to avoid collisions from concurrent saves and\n  guarantee cleanup on error paths via TempDir's Drop impl\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "639299ceda0860a4dca8cf137f5c525bd0e6089f",
+      "filename": "src/connectors/claude_code.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 4,
+      "changes": 8,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/5d421536a88626d0b10a7d3a28305955633e707f/src%2Fconnectors%2Fclaude_code.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/5d421536a88626d0b10a7d3a28305955633e707f/src%2Fconnectors%2Fclaude_code.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/src%2Fconnectors%2Fclaude_code.rs?ref=5d421536a88626d0b10a7d3a28305955633e707f",
+      "patch": "@@ -253,10 +253,10 @@ impl Connector for ClaudeCodeConnector {\n                             // File-level check is sufficient for incremental indexing.\n \n                             started_at = match (started_at, created) {\n-                            (Some(curr), Some(ts)) => Some(curr.min(ts)),\n-                            (None, Some(ts)) => Some(ts),\n-                            (other, None) => other,\n-                        };\n+                                (Some(curr), Some(ts)) => Some(curr.min(ts)),\n+                                (None, Some(ts)) => Some(ts),\n+                                (other, None) => other,\n+                            };\n                             // Track the latest timestamp seen\n                             ended_at = match (ended_at, created) {\n                                 (Some(curr), Some(ts)) => Some(curr.max(ts)),"
+    },
+    {
+      "sha": "f0ffc3085d631e95e5f37aa73db9bf26e7c0ce96",
+      "filename": "src/connectors/mod.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/5d421536a88626d0b10a7d3a28305955633e707f/src%2Fconnectors%2Fmod.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/5d421536a88626d0b10a7d3a28305955633e707f/src%2Fconnectors%2Fmod.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/src%2Fconnectors%2Fmod.rs?ref=5d421536a88626d0b10a7d3a28305955633e707f",
+      "patch": "@@ -694,6 +694,9 @@ pub fn parse_timestamp(val: &serde_json::Value) -> Option<i64> {\n             return Some(ts);\n         }\n         if let Ok(num) = s.parse::<f64>() {\n+            if !num.is_finite() {\n+                return None;\n+            }\n             let ts = if (0.0..100_000_000_000.0).contains(&num) {\n                 (num * 1000.0).round() as i64\n             } else {"
+    },
+    {
+      "sha": "145da54afbeb04ecb90f42f766a8991386f50069",
+      "filename": "src/daemon/resource.rs",
+      "status": "modified",
+      "additions": 35,
+      "deletions": 22,
+      "changes": 57,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/5d421536a88626d0b10a7d3a28305955633e707f/src%2Fdaemon%2Fresource.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/5d421536a88626d0b10a7d3a28305955633e707f/src%2Fdaemon%2Fresource.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/src%2Fdaemon%2Fresource.rs?ref=5d421536a88626d0b10a7d3a28305955633e707f",
+      "patch": "@@ -67,8 +67,9 @@ impl ResourceMonitor {\n     /// Get system page size in bytes.\n     #[cfg(target_os = \"linux\")]\n     fn page_size() -> u64 {\n-        // sysconf(_SC_PAGESIZE) is typically 4096\n-        4096\n+        // SAFETY: sysconf has no pointer arguments and is thread-safe for this key.\n+        let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };\n+        if raw > 0 { raw as u64 } else { 4096 }\n     }\n \n     /// Apply a nice value to the current process.\n@@ -78,24 +79,31 @@ impl ResourceMonitor {\n     pub fn apply_nice(&self, nice_value: i32) -> bool {\n         #[cfg(target_os = \"linux\")]\n         {\n-            // Use libc::nice() for the current process\n-            // Note: nice() only returns -1 on error, and -1 is also a valid nice value\n-            // So we need to check errno\n-            unsafe {\n-                // Reset errno\n-                *libc::__errno_location() = 0;\n-\n-                let result = libc::nice(nice_value);\n-\n-                let errno = *libc::__errno_location();\n-                if errno != 0 {\n-                    warn!(nice = nice_value, errno = errno, \"Failed to set nice value\");\n-                    return false;\n-                }\n+            if !(-20..=19).contains(&nice_value) {\n+                warn!(\n+                    nice = nice_value,\n+                    \"Refusing out-of-range nice value (valid range: -20..=19)\"\n+                );\n+                return false;\n+            }\n \n-                debug!(nice = result, \"Applied nice value\");\n-                true\n+            // SAFETY: setpriority operates on the current process id and does not\n+            // retain pointers. We pass scalar values only.\n+            let result = unsafe {\n+                libc::setpriority(libc::PRIO_PROCESS, self.pid as libc::id_t, nice_value)\n+            };\n+            if result != 0 {\n+                let err = std::io::Error::last_os_error();\n+                warn!(nice = nice_value, error = %err, \"Failed to set nice value\");\n+                return false;\n             }\n+\n+            debug!(\n+                nice = nice_value,\n+                pid = self.pid,\n+                \"Applied absolute nice value\"\n+            );\n+            true\n         }\n \n         #[cfg(not(target_os = \"linux\"))]\n@@ -267,10 +275,15 @@ mod tests {\n         #[cfg(target_os = \"linux\")]\n         {\n             let size = ResourceMonitor::page_size();\n-            // Page size is typically 4096 on most systems\n-            assert!(size >= 4096);\n-            // Should be a power of 2\n-            assert!(size.is_power_of_two() || size == 4096);\n+            assert!(size > 0);\n+            assert!(size.is_power_of_two());\n         }\n     }\n+\n+    #[test]\n+    fn test_apply_nice_rejects_out_of_range() {\n+        let monitor = ResourceMonitor::new();\n+        assert!(!monitor.apply_nice(20));\n+        assert!(!monitor.apply_nice(-21));\n+    }\n }"
+    },
+    {
+      "sha": "4aad6a236de54b5be3828996a264f9721867dd76",
+      "filename": "src/daemon/worker.rs",
+      "status": "modified",
+      "additions": 39,
+      "deletions": 1,
+      "changes": 40,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/5d421536a88626d0b10a7d3a28305955633e707f/src%2Fdaemon%2Fworker.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/5d421536a88626d0b10a7d3a28305955633e707f/src%2Fdaemon%2Fworker.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/src%2Fdaemon%2Fworker.rs?ref=5d421536a88626d0b10a7d3a28305955633e707f",
+      "patch": "@@ -93,7 +93,10 @@ enum WorkerEmbedderKind {\n     FastEmbed,\n }\n \n-fn resolve_embedder_kind(model_name: &str, use_semantic: bool) -> anyhow::Result<WorkerEmbedderKind> {\n+fn resolve_embedder_kind(\n+    model_name: &str,\n+    use_semantic: bool,\n+) -> anyhow::Result<WorkerEmbedderKind> {\n     if !use_semantic\n         || model_name.eq_ignore_ascii_case(\"hash\")\n         || model_name.eq_ignore_ascii_case(\"fnv1a-384\")\n@@ -506,4 +509,39 @@ mod tests {\n         assert_eq!(saturating_u32_from_i64(7), 7);\n         assert_eq!(saturating_u32_from_i64(i64::from(u32::MAX) + 123), u32::MAX);\n     }\n+\n+    #[test]\n+    fn test_resolve_embedder_kind_hash_aliases() {\n+        assert_eq!(\n+            resolve_embedder_kind(\"hash\", false).unwrap(),\n+            WorkerEmbedderKind::Hash\n+        );\n+        assert_eq!(\n+            resolve_embedder_kind(\"FNV1A-384\", true).unwrap(),\n+            WorkerEmbedderKind::Hash\n+        );\n+    }\n+\n+    #[test]\n+    fn test_resolve_embedder_kind_semantic_aliases() {\n+        assert_eq!(\n+            resolve_embedder_kind(\"minilm\", true).unwrap(),\n+            WorkerEmbedderKind::FastEmbed\n+        );\n+        assert_eq!(\n+            resolve_embedder_kind(\"MINILM-384\", true).unwrap(),\n+            WorkerEmbedderKind::FastEmbed\n+        );\n+        assert_eq!(\n+            resolve_embedder_kind(\"fastembed\", true).unwrap(),\n+            WorkerEmbedderKind::FastEmbed\n+        );\n+    }\n+\n+    #[test]\n+    fn test_resolve_embedder_kind_rejects_unknown_semantic_model() {\n+        let err = resolve_embedder_kind(\"e5-large\", true).unwrap_err();\n+        let msg = format!(\"{err:#}\");\n+        assert!(msg.contains(\"unsupported semantic model\"));\n+    }\n }"
+    },
+    {
+      "sha": "f49ce5b0b36fb002573a084415478f012ca5e472",
+      "filename": "src/pages/verify.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 2,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/5d421536a88626d0b10a7d3a28305955633e707f/src%2Fpages%2Fverify.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/5d421536a88626d0b10a7d3a28305955633e707f/src%2Fpages%2Fverify.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/src%2Fpages%2Fverify.rs?ref=5d421536a88626d0b10a7d3a28305955633e707f",
+      "patch": "@@ -162,8 +162,7 @@ pub fn verify_bundle(path: &Path, verbose: bool) -> Result<VerifyResult> {\n     let integrity = if site_dir.join(\"integrity.json\").exists() {\n         check_integrity(&site_dir, verbose)\n     } else {\n-        warnings.push(\"integrity.json not present - skipping integrity check\".to_string());\n-        CheckResult::pass()\n+        CheckResult::fail(\"integrity.json missing \u2014 bundle integrity cannot be verified\")\n     };\n \n     // Check 6: No secrets in site/"
+    },
+    {
+      "sha": "f50d3848d3cb500432e3cd1c1216a610417048af",
+      "filename": "src/search/ann_index.rs",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 13,
+      "changes": 28,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/5d421536a88626d0b10a7d3a28305955633e707f/src%2Fsearch%2Fann_index.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/5d421536a88626d0b10a7d3a28305955633e707f/src%2Fsearch%2Fann_index.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/src%2Fsearch%2Fann_index.rs?ref=5d421536a88626d0b10a7d3a28305955633e707f",
+      "patch": "@@ -316,35 +316,37 @@ impl HnswIndex {\n \n         // Serialize HNSW graph using hnsw_rs's file_dump.\n         // It creates multiple files: basename.hnsw.graph and basename.hnsw.data\n-        let temp_dir = parent.join(\".hnsw_tmp\");\n-        std::fs::create_dir_all(&temp_dir)?;\n+        // Use tempfile::tempdir() to avoid collisions from concurrent saves and\n+        // ensure automatic cleanup on error paths (TempDir drops on scope exit).\n+        let dump_dir = tempfile::tempdir()\n+            .with_context(|| \"create temp dir for HNSW graph serialization\")?;\n         let basename = \"hnsw_graph\";\n-        self.with_hnsw(|hnsw| hnsw.file_dump(&temp_dir, basename))\n+        self.with_hnsw(|hnsw| hnsw.file_dump(dump_dir.path(), basename))\n             .with_context(|| \"serialize HNSW graph\")?;\n \n         // Read the generated files and append to our file.\n-        let graph_file = temp_dir.join(format!(\"{basename}.hnsw.graph\"));\n-        let data_file = temp_dir.join(format!(\"{basename}.hnsw.data\"));\n+        let graph_file = dump_dir.path().join(format!(\"{basename}.hnsw.graph\"));\n+        let data_file = dump_dir.path().join(format!(\"{basename}.hnsw.data\"));\n \n         // Read graph file.\n         let graph_data = std::fs::read(&graph_file)\n             .with_context(|| format!(\"read HNSW graph {graph_file:?}\"))?;\n-        writer.write_all(&(graph_data.len() as u64).to_le_bytes())?;\n+        let graph_len = u64::try_from(graph_data.len())\n+            .map_err(|_| anyhow::anyhow!(\"HNSW graph data length exceeds u64\"))?;\n+        writer.write_all(&graph_len.to_le_bytes())?;\n         writer.write_all(&graph_data)?;\n \n         // Read data file.\n         let data_data =\n             std::fs::read(&data_file).with_context(|| format!(\"read HNSW data {data_file:?}\"))?;\n-        writer.write_all(&(data_data.len() as u64).to_le_bytes())?;\n+        let data_len = u64::try_from(data_data.len())\n+            .map_err(|_| anyhow::anyhow!(\"HNSW data length exceeds u64\"))?;\n+        writer.write_all(&data_len.to_le_bytes())?;\n         writer.write_all(&data_data)?;\n \n         writer.flush()?;\n         drop(writer);\n-\n-        // Clean up temp files.\n-        let _ = std::fs::remove_file(&graph_file);\n-        let _ = std::fs::remove_file(&data_file);\n-        let _ = std::fs::remove_dir(&temp_dir);\n+        // dump_dir is automatically cleaned up when dropped.\n \n         // Atomic rename.\n         std::fs::rename(&temp_path, path)?;\n@@ -420,7 +422,7 @@ impl HnswIndex {\n         // Load HNSW from the temporary dump files using hnsw_rs loader.\n         let mut reloader = HnswIo::new(temp_dir.path(), basename);\n         let options = ReloadOptions::default().set_mmap(false);\n-        debug_assert!(\n+        assert!(\n             !options.use_mmap().0,\n             \"HNSW mmap MUST be disabled \u2014 enabling it would cause use-after-free \\\n              because temp_dir is dropped at function exit\""
+    }
+  ]
+}

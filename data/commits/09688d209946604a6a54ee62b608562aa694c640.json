@@ -1,0 +1,29 @@
+{
+  "message": "feat(server): add GET /events SSE endpoint with reconnect catchup\n\nStreams events as Server-Sent Events with Last-Event-ID support for\nreconnection catchup. Adds Broadcast convenience method and sseEvent type.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "d4ac321c8aa8fff91722646508e2f2cbbfa3ee2b",
+      "filename": "server/server.go",
+      "status": "modified",
+      "additions": 60,
+      "deletions": 0,
+      "changes": 60,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/09688d209946604a6a54ee62b608562aa694c640/server%2Fserver.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/09688d209946604a6a54ee62b608562aa694c640/server%2Fserver.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/server%2Fserver.go?ref=09688d209946604a6a54ee62b608562aa694c640",
+      "patch": "@@ -3,6 +3,7 @@ package server\n import (\n \t\"context\"\n \t\"encoding/json\"\n+\t\"fmt\"\n \t\"net/http\"\n \t\"strings\"\n \t\"sync\"\n@@ -49,6 +50,7 @@ func NewServer(cfg ServerConfig) *Server {\n \ts.mux.HandleFunc(\"/status\", s.handleStatus)\n \ts.mux.HandleFunc(\"/interrupt\", s.handleInterrupt)\n \ts.mux.HandleFunc(\"/input\", s.handleInput)\n+\ts.mux.HandleFunc(\"/events\", s.handleEvents)\n \treturn s\n }\n \n@@ -147,3 +149,61 @@ func (s *Server) handleInput(w http.ResponseWriter, r *http.Request) {\n \t\thttp.Error(w, \"input buffer full\", http.StatusConflict)\n \t}\n }\n+\n+// sseEvent wraps an event type and data for SSE serialization.\n+type sseEvent struct {\n+\tType string\n+\tData any\n+}\n+\n+// Broadcast sends an event to all SSE subscribers via the broadcaster.\n+// The event type becomes the SSE `event:` field, and data is JSON-encoded for the `data:` field.\n+func (s *Server) Broadcast(eventType string, data any) {\n+\ts.broadcaster.Send(sseEvent{Type: eventType, Data: data})\n+}\n+\n+func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {\n+\tif r.Method != http.MethodGet {\n+\t\thttp.Error(w, \"method not allowed\", http.StatusMethodNotAllowed)\n+\t\treturn\n+\t}\n+\n+\tflusher, ok := w.(http.Flusher)\n+\tif !ok {\n+\t\thttp.Error(w, \"streaming not supported\", http.StatusInternalServerError)\n+\t\treturn\n+\t}\n+\n+\tw.Header().Set(\"Content-Type\", \"text/event-stream\")\n+\tw.Header().Set(\"Cache-Control\", \"no-cache\")\n+\tw.Header().Set(\"Connection\", \"keep-alive\")\n+\tw.WriteHeader(http.StatusOK)\n+\tflusher.Flush()\n+\n+\t// Parse Last-Event-ID for catchup\n+\tvar lastID uint64\n+\tif idStr := r.Header.Get(\"Last-Event-ID\"); idStr != \"\" {\n+\t\tfmt.Sscanf(idStr, \"%d\", &lastID)\n+\t}\n+\n+\tch, unsub := s.broadcaster.Subscribe(lastID)\n+\tdefer unsub()\n+\n+\tfor {\n+\t\tselect {\n+\t\tcase <-r.Context().Done():\n+\t\t\treturn\n+\t\tcase item, ok := <-ch:\n+\t\t\tif !ok {\n+\t\t\t\treturn\n+\t\t\t}\n+\t\t\tev, _ := item.Value.(sseEvent)\n+\t\t\tdata, err := json.Marshal(ev.Data)\n+\t\t\tif err != nil {\n+\t\t\t\tcontinue\n+\t\t\t}\n+\t\t\tfmt.Fprintf(w, \"id: %d\\nevent: %s\\ndata: %s\\n\\n\", item.ID, ev.Type, data)\n+\t\t\tflusher.Flush()\n+\t\t}\n+\t}\n+}"
+    },
+    {
+      "sha": "15bcf50b932608956b40b7ed6e94a98b37f279b0",
+      "filename": "server/server_test.go",
+      "status": "modified",
+      "additions": 46,
+      "deletions": 0,
+      "changes": 46,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/09688d209946604a6a54ee62b608562aa694c640/server%2Fserver_test.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/09688d209946604a6a54ee62b608562aa694c640/server%2Fserver_test.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/server%2Fserver_test.go?ref=09688d209946604a6a54ee62b608562aa694c640",
+      "patch": "@@ -129,3 +129,49 @@ func TestInputEndpoint_EmptyText(t *testing.T) {\n \t\tt.Fatalf(\"status code: got %d, want 400\", w.Code)\n \t}\n }\n+\n+func TestEventsEndpoint_SSE(t *testing.T) {\n+\tsrv := NewServer(ServerConfig{RingBufferSize: 100})\n+\n+\t// Start a test HTTP server\n+\tts := httptest.NewServer(srv)\n+\tdefer ts.Close()\n+\n+\t// Connect to SSE endpoint\n+\tresp, err := http.Get(ts.URL + \"/events\")\n+\tif err != nil {\n+\t\tt.Fatalf(\"connect: %v\", err)\n+\t}\n+\tdefer resp.Body.Close()\n+\n+\tif ct := resp.Header.Get(\"Content-Type\"); ct != \"text/event-stream\" {\n+\t\tt.Errorf(\"content-type: got %q, want text/event-stream\", ct)\n+\t}\n+\n+\t// Send an event through the broadcaster\n+\tsrv.Broadcast(\"TEST_EVENT\", map[string]string{\"msg\": \"hello\"})\n+\n+\t// Read the SSE event\n+\tbuf := make([]byte, 4096)\n+\tn, err := resp.Body.Read(buf)\n+\tif err != nil {\n+\t\tt.Fatalf(\"read: %v\", err)\n+\t}\n+\toutput := string(buf[:n])\n+\tif !strings.Contains(output, \"event: TEST_EVENT\") {\n+\t\tt.Errorf(\"expected event type in output, got: %s\", output)\n+\t}\n+\tif !strings.Contains(output, `\"msg\":\"hello\"`) {\n+\t\tt.Errorf(\"expected data in output, got: %s\", output)\n+\t}\n+}\n+\n+func TestEventsEndpoint_MethodNotAllowed(t *testing.T) {\n+\tsrv := NewServer(ServerConfig{})\n+\treq := httptest.NewRequest(http.MethodPost, \"/events\", nil)\n+\tw := httptest.NewRecorder()\n+\tsrv.ServeHTTP(w, req)\n+\tif w.Code != http.StatusMethodNotAllowed {\n+\t\tt.Fatalf(\"status code: got %d, want 405\", w.Code)\n+\t}\n+}"
+    }
+  ]
+}

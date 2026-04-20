@@ -1,0 +1,41 @@
+{
+  "message": "fix(combinator): tighten test assertions and fix lock-order inversion in rate limiter metrics\n\nbulkhead.rs: Rename `let _ = bh.try_acquire()` to `let _pN = ...` so\nthe returned permits are held for the duration of the metrics check\ninstead of being silently dropped (which would release the permits\nbefore the assertion, defeating the test purpose).\n\ncircuit_breaker.rs: Relax the catch_unwind/panic test assertion from\nrequiring Err(Open) to also accepting Ok(Probe).  With zero\nopen_duration, the Open\u2192HalfOpen transition is immediate, so the\nnext should_allow() may legally yield a probe permit.\n\nrate_limit.rs: Eliminate lock-order inversion in metrics() by\nreading state.tokens_fixed under the state lock first, dropping it,\nthen acquiring the metrics read-lock.  Previously both locks were\nheld simultaneously, which inverted the order used by\nprocess_queue() (metrics write \u2192 state lock).  Also adds\n#[allow(clippy::cast_precision_loss)] on new() where the f64\ndivision is intentional, and a new test that proves metrics() does\nnot hold the metrics read-lock while blocked on the state lock.\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "d47e2f1bbf4b802506f391559bd004ce8d7d9010",
+      "filename": "src/combinator/bulkhead.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/64fa609560b7391247d5557686ed905a0be9db94/src%2Fcombinator%2Fbulkhead.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/64fa609560b7391247d5557686ed905a0be9db94/src%2Fcombinator%2Fbulkhead.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fcombinator%2Fbulkhead.rs?ref=64fa609560b7391247d5557686ed905a0be9db94",
+      "patch": "@@ -1135,8 +1135,8 @@ mod tests {\n         let bh1 = registry.get_or_create(\"db\");\n         let bh2 = registry.get_or_create(\"api\");\n \n-        let _ = bh1.try_acquire(1);\n-        let _ = bh2.try_acquire(3);\n+        let _p1 = bh1.try_acquire(1);\n+        let _p2 = bh2.try_acquire(3);\n \n         let all = registry.all_metrics();\n         assert_eq!(all.len(), 2);"
+    },
+    {
+      "sha": "90ed115c24348e11b0ff863916dbcfdad78eeea3",
+      "filename": "src/combinator/circuit_breaker.rs",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 2,
+      "changes": 11,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/64fa609560b7391247d5557686ed905a0be9db94/src%2Fcombinator%2Fcircuit_breaker.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/64fa609560b7391247d5557686ed905a0be9db94/src%2Fcombinator%2Fcircuit_breaker.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fcombinator%2Fcircuit_breaker.rs?ref=64fa609560b7391247d5557686ed905a0be9db94",
+      "patch": "@@ -1808,8 +1808,15 @@ mod tests {\n             \"Panic should record failure and reopen circuit\"\n         );\n \n-        // Subsequent call should be rejected as Open, not HalfOpenFull\n+        // Subsequent call should not be blocked by a leaked probe permit.\n+        // With zero open_duration, Open may transition immediately to HalfOpen.\n         let result = cb.should_allow(now);\n-        assert!(matches!(result, Err(CircuitBreakerError::Open { .. })));\n+        assert!(\n+            matches!(\n+                result,\n+                Ok(Permit::Probe) | Err(CircuitBreakerError::Open { .. })\n+            ),\n+            \"Expected reopened circuit to permit probe or briefly report Open\"\n+        );\n     }\n }"
+    },
+    {
+      "sha": "659e85384b482a30b20a86076f1d5b5cf3a5f637",
+      "filename": "src/combinator/rate_limit.rs",
+      "status": "modified",
+      "additions": 45,
+      "deletions": 3,
+      "changes": 48,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/64fa609560b7391247d5557686ed905a0be9db94/src%2Fcombinator%2Frate_limit.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/64fa609560b7391247d5557686ed905a0be9db94/src%2Fcombinator%2Frate_limit.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fcombinator%2Frate_limit.rs?ref=64fa609560b7391247d5557686ed905a0be9db94",
+      "patch": "@@ -254,6 +254,7 @@ pub struct RateLimiter {\n impl RateLimiter {\n     /// Create a new rate limiter with the given policy.\n     #[must_use]\n+    #[allow(clippy::cast_precision_loss)]\n     pub fn new(policy: RateLimitPolicy) -> Self {\n         let initial_tokens = u64::from(policy.burst) * FIXED_POINT_SCALE;\n         let period_ms = duration_to_millis_saturating(policy.period) as f64;\n@@ -295,10 +296,15 @@ impl RateLimiter {\n     #[must_use]\n     #[allow(clippy::cast_precision_loss)]\n     pub fn metrics(&self) -> RateLimitMetrics {\n+        // Avoid lock-order inversion with process_queue() by not holding\n+        // metrics and state locks at the same time.\n+        let available_tokens = {\n+            let state = self.state.lock().expect(\"lock poisoned\");\n+            state.tokens_fixed as f64 / FIXED_POINT_SCALE as f64\n+        };\n+\n         let mut m = self.metrics.read().expect(\"lock poisoned\").clone();\n-        let state = self.state.lock().expect(\"lock poisoned\");\n-        m.available_tokens = state.tokens_fixed as f64 / FIXED_POINT_SCALE as f64;\n-        drop(state);\n+        m.available_tokens = available_tokens;\n \n         // Use atomic values\n         m.total_allowed = self.total_allowed.load(Ordering::Relaxed);\n@@ -1754,4 +1760,40 @@ mod tests {\n     fn duration_to_millis_saturates_for_large_durations() {\n         assert_eq!(duration_to_millis_saturating(Duration::MAX), u64::MAX);\n     }\n+\n+    #[test]\n+    fn metrics_does_not_hold_metrics_lock_while_waiting_on_state_lock() {\n+        use std::sync::{Arc, Barrier};\n+        use std::thread;\n+\n+        let rl = Arc::new(RateLimiter::new(RateLimitPolicy {\n+            rate: 10,\n+            burst: 10,\n+            ..Default::default()\n+        }));\n+\n+        let state_guard = rl.state.lock().expect(\"lock poisoned\");\n+        let rendezvous = Arc::new(Barrier::new(2));\n+        let rl_clone = Arc::clone(&rl);\n+        let rendezvous_clone = Arc::clone(&rendezvous);\n+\n+        let handle = thread::spawn(move || {\n+            rendezvous_clone.wait();\n+            let _ = rl_clone.metrics();\n+        });\n+\n+        rendezvous.wait();\n+        // Let spawned thread attempt metrics() while state lock is held.\n+        thread::sleep(Duration::from_millis(10));\n+\n+        let metrics_write_guard = rl.metrics.try_write();\n+        assert!(\n+            metrics_write_guard.is_ok(),\n+            \"metrics() must not hold metrics read-lock while blocked on state lock\"\n+        );\n+        drop(metrics_write_guard);\n+\n+        drop(state_guard);\n+        handle.join().expect(\"metrics thread should complete\");\n+    }\n }"
+    }
+  ]
+}

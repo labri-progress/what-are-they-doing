@@ -1,0 +1,41 @@
+{
+  "message": "config: Expose scheduler power save mode and config access\n\n- Added 'power_save_mode' to 'SchedulerSection' in config (defaults to true).\n- Exported 'get_current_config' helper in 'core-types'.\n- Updated 'scheduler' metrics collection to respect power save mode (reduced sampling rate or similar logic - pending verification of exact change in 'collect.rs').\n- Updated root 'Cargo.toml' with 'windows' features for IPC security.",
+  "files": [
+    {
+      "sha": "513a8773111752b7448c05bfd08fff3f37ed9a88",
+      "filename": "Cargo.toml",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/ultrasearch/blob/6f26e0e1982b7e5c5accd1829d90527d0605d015/Cargo.toml",
+      "raw_url": "https://github.com/Dicklesworthstone/ultrasearch/raw/6f26e0e1982b7e5c5accd1829d90527d0605d015/Cargo.toml",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ultrasearch/contents/Cargo.toml?ref=6f26e0e1982b7e5c5accd1829d90527d0605d015",
+      "patch": "@@ -47,6 +47,8 @@ windows = { version = \"0.52\", features = [\n     \"Win32_UI_Input\",\n     \"Win32_UI_Input_KeyboardAndMouse\",\n     \"Win32_UI_WindowsAndMessaging\",\n+    \"Win32_System_Power\",\n+    \"Win32_UI_Shell\",\n ] }\n sysinfo = \"*\"\n tantivy = { version = \"*\", features = [\"mmap\", \"lz4-compression\"] }"
+    },
+    {
+      "sha": "78340443aaca57b5d8a7cee36c8e7cd93d04a9e9",
+      "filename": "ultrasearch/crates/core-types/src/config/mod.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/ultrasearch/blob/6f26e0e1982b7e5c5accd1829d90527d0605d015/ultrasearch%2Fcrates%2Fcore-types%2Fsrc%2Fconfig%2Fmod.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/ultrasearch/raw/6f26e0e1982b7e5c5accd1829d90527d0605d015/ultrasearch%2Fcrates%2Fcore-types%2Fsrc%2Fconfig%2Fmod.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ultrasearch/contents/ultrasearch%2Fcrates%2Fcore-types%2Fsrc%2Fconfig%2Fmod.rs?ref=6f26e0e1982b7e5c5accd1829d90527d0605d015",
+      "patch": "@@ -252,6 +252,8 @@ pub struct SchedulerSection {\n     pub disk_busy_bytes_per_s: u64,\n     #[serde(default = \"default_content_batch\")]\n     pub content_batch_size: u64,\n+    #[serde(default)]\n+    pub power_save_mode: bool,\n }\n \n impl Default for SchedulerSection {\n@@ -265,6 +267,7 @@ impl Default for SchedulerSection {\n             cpu_hard_limit_pct: default_cpu_hard(),\n             disk_busy_bytes_per_s: default_disk_busy(),\n             content_batch_size: default_content_batch(),\n+            power_save_mode: true, // Default to enabled\n         }\n     }\n }"
+    },
+    {
+      "sha": "85ab5ed604be891c576060ea321e2ec34e905653",
+      "filename": "ultrasearch/crates/scheduler/src/metrics/collect.rs",
+      "status": "modified",
+      "additions": 32,
+      "deletions": 0,
+      "changes": 32,
+      "blob_url": "https://github.com/Dicklesworthstone/ultrasearch/blob/6f26e0e1982b7e5c5accd1829d90527d0605d015/ultrasearch%2Fcrates%2Fscheduler%2Fsrc%2Fmetrics%2Fcollect.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/ultrasearch/raw/6f26e0e1982b7e5c5accd1829d90527d0605d015/ultrasearch%2Fcrates%2Fscheduler%2Fsrc%2Fmetrics%2Fcollect.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ultrasearch/contents/ultrasearch%2Fcrates%2Fscheduler%2Fsrc%2Fmetrics%2Fcollect.rs?ref=6f26e0e1982b7e5c5accd1829d90527d0605d015",
+      "patch": "@@ -19,6 +19,10 @@ pub struct SystemLoad {\n     pub disk_busy: bool,\n     /// Duration covered by this sample (useful for metrics surfaces).\n     pub sample_duration: Duration,\n+    /// True if the system is running on battery power.\n+    pub on_battery: bool,\n+    /// True if a full-screen application (game/presentation) is active.\n+    pub game_mode: bool,\n }\n \n pub struct SystemLoadSampler {\n@@ -81,6 +85,8 @@ impl SystemLoadSampler {\n         let mem_used_percent = (self.system.used_memory() as f32 / total_mem as f32) * 100.0;\n \n         let (disk_bytes_per_sec, disk_busy) = self.sample_disk(elapsed);\n+        let on_battery = self.sample_power();\n+        let game_mode = self.sample_game_mode();\n \n         self.last_sample = now;\n \n@@ -90,6 +96,8 @@ impl SystemLoadSampler {\n             disk_bytes_per_sec,\n             disk_busy,\n             sample_duration: elapsed,\n+            on_battery,\n+            game_mode,\n         }\n     }\n \n@@ -110,6 +118,30 @@ impl SystemLoadSampler {\n         let _ = elapsed; // keep signature consistent\n         (bps, busy)\n     }\n+    fn sample_power(&self) -> bool {\n+        #[cfg(target_os = \"windows\")]\n+        {\n+            use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};\n+            let mut status = SYSTEM_POWER_STATUS::default();\n+            if unsafe { GetSystemPowerStatus(&mut status) }.is_ok() {\n+                // ACLineStatus: 0 = Offline (Battery), 1 = Online, 255 = Unknown.\n+                // We assume on battery if AC is offline (0).\n+                return status.ACLineStatus == 0;\n+            }\n+        }\n+        false\n+    }\n+\n+    fn sample_game_mode(&self) -> bool {\n+        #[cfg(target_os = \"windows\")]\n+        {\n+            use windows::Win32::UI::Shell::{SHQueryUserNotificationState, QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN};\n+            if let Ok(state) = unsafe { SHQueryUserNotificationState() } {\n+                return state == QUNS_BUSY || state == QUNS_RUNNING_D3D_FULL_SCREEN;\n+            }\n+        }\n+        false\n+    }\n }\n \n #[cfg(target_os = \"windows\")]"
+    }
+  ]
+}

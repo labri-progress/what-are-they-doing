@@ -1,0 +1,53 @@
+{
+  "message": "Refactor signal targeting and fix container ID extraction with subpaths\n\n- signal.rs: Extract resolve_group_target() helper consolidating pgid>0 check\n  and target selection logic, eliminating duplication across pause/kill/resume;\n  fix resume() to validate pgid is positive before using process group\n- container.rs: Fix docker/podman scope extraction to handle cgroup paths with\n  subpaths (e.g., .scope/xyz) by splitting on '/' before stripping suffix;\n  add tests for docker-*.scope/xyz and libpod-*.scope/xyz patterns\n- main.rs: Clarify --notify-exec as legacy, prefer --notify-cmd\n- compare.rs: Use unwrap_or(Equal) for NaN-safe float sorting\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "efaa3cc18dcf72fcdde4df3b8809fd652cd29c46",
+      "filename": "crates/pt-core/src/action/signal.rs",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 19,
+      "changes": 32,
+      "blob_url": "https://github.com/Dicklesworthstone/process_triage/blob/a74fcf1e57021cbfa558ac495d7442591ae763a6/crates%2Fpt-core%2Fsrc%2Faction%2Fsignal.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/process_triage/raw/a74fcf1e57021cbfa558ac495d7442591ae763a6/crates%2Fpt-core%2Fsrc%2Faction%2Fsignal.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/process_triage/contents/crates%2Fpt-core%2Fsrc%2Faction%2Fsignal.rs?ref=a74fcf1e57021cbfa558ac495d7442591ae763a6",
+      "patch": "@@ -51,6 +51,13 @@ impl SignalActionRunner {\n         Self::new(SignalConfig::default())\n     }\n \n+    fn resolve_group_target(&self, pid: u32, pgid: Option<u32>) -> (u32, bool) {\n+        let pgid = pgid.filter(|pgid| *pgid > 0);\n+        let use_group = self.config.use_process_groups && pgid.is_some();\n+        let target = if use_group { pgid.unwrap() } else { pid };\n+        (target, use_group)\n+    }\n+\n     /// Send a signal to a process.\n     #[cfg(unix)]\n     fn send_signal(&self, pid: u32, signal: i32, use_group: bool) -> Result<(), ActionError> {\n@@ -146,12 +153,7 @@ impl SignalActionRunner {\n     #[cfg(unix)]\n     fn execute_pause(&self, action: &PlanAction) -> Result<(), ActionError> {\n         let pid = action.target.pid.0;\n-        let use_group = self.config.use_process_groups && action.target.pgid.is_some();\n-        let target = if use_group {\n-            action.target.pgid.unwrap_or(pid)\n-        } else {\n-            pid\n-        };\n+        let (target, use_group) = self.resolve_group_target(pid, action.target.pgid);\n \n         self.send_signal(target, libc::SIGSTOP, use_group)?;\n         Ok(())\n@@ -161,12 +163,7 @@ impl SignalActionRunner {\n     #[cfg(unix)]\n     fn execute_kill(&self, action: &PlanAction) -> Result<(), ActionError> {\n         let pid = action.target.pid.0;\n-        let use_group = self.config.use_process_groups && action.target.pgid.is_some();\n-        let target = if use_group {\n-            action.target.pgid.unwrap_or(pid)\n-        } else {\n-            pid\n-        };\n+        let (target, use_group) = self.resolve_group_target(pid, action.target.pgid);\n \n         // Stage 1: SIGTERM\n         self.send_signal(target, libc::SIGTERM, use_group)?;\n@@ -208,7 +205,9 @@ impl SignalActionRunner {\n     /// Execute a resume action (SIGCONT) - raw version.\n     #[cfg(unix)]\n     pub fn resume(&self, pid: u32, use_group: bool, pgid: Option<u32>) -> Result<(), ActionError> {\n-        let target = if use_group { pgid.unwrap_or(pid) } else { pid };\n+        let pgid = pgid.filter(|pgid| *pgid > 0);\n+        let use_group = use_group && pgid.is_some();\n+        let target = if use_group { pgid.unwrap() } else { pid };\n         self.send_signal(target, libc::SIGCONT, use_group)\n     }\n \n@@ -223,12 +222,7 @@ impl SignalActionRunner {\n     #[cfg(unix)]\n     fn execute_resume(&self, action: &PlanAction) -> Result<(), ActionError> {\n         let pid = action.target.pid.0;\n-        let use_group = self.config.use_process_groups && action.target.pgid.is_some();\n-        let target = if use_group {\n-            action.target.pgid.unwrap_or(pid)\n-        } else {\n-            pid\n-        };\n+        let (target, use_group) = self.resolve_group_target(pid, action.target.pgid);\n \n         self.send_signal(target, libc::SIGCONT, use_group)?;\n         Ok(())"
+    },
+    {
+      "sha": "d1d8e3b090647f7b5345c98d4cff9dda79b41d93",
+      "filename": "crates/pt-core/src/collect/container.rs",
+      "status": "modified",
+      "additions": 25,
+      "deletions": 5,
+      "changes": 30,
+      "blob_url": "https://github.com/Dicklesworthstone/process_triage/blob/a74fcf1e57021cbfa558ac495d7442591ae763a6/crates%2Fpt-core%2Fsrc%2Fcollect%2Fcontainer.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/process_triage/raw/a74fcf1e57021cbfa558ac495d7442591ae763a6/crates%2Fpt-core%2Fsrc%2Fcollect%2Fcontainer.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/process_triage/contents/crates%2Fpt-core%2Fsrc%2Fcollect%2Fcontainer.rs?ref=a74fcf1e57021cbfa558ac495d7442591ae763a6",
+      "patch": "@@ -274,11 +274,11 @@ fn extract_docker_id(path: &str) -> Option<String> {\n         }\n     }\n \n-    // Try docker-<id>.scope pattern\n+    // Try docker-<id>.scope pattern (handle optional subpaths)\n     if let Some(idx) = path.find(\"docker-\") {\n         let after = &path[idx + 7..];\n-        let id = after.strip_suffix(\".scope\").or(Some(after))?;\n-        let id = id.split('/').next()?;\n+        let first = after.split('/').next()?;\n+        let id = first.strip_suffix(\".scope\").unwrap_or(first);\n         if is_container_id(id) {\n             return Some(id.to_string());\n         }\n@@ -295,8 +295,8 @@ fn extract_podman_id(path: &str) -> Option<String> {\n \n     if let Some(idx) = path.find(\"libpod-\") {\n         let after = &path[idx + 7..];\n-        let id = after.strip_suffix(\".scope\").unwrap_or(after);\n-        let id = id.split('/').next()?;\n+        let first = after.split('/').next()?;\n+        let id = first.strip_suffix(\".scope\").unwrap_or(first);\n         if is_container_id(id) {\n             return Some(id.to_string());\n         }\n@@ -482,6 +482,16 @@ mod tests {\n         assert_eq!(info.runtime, ContainerRuntime::Docker);\n     }\n \n+    #[test]\n+    fn test_detect_docker_scope_with_subpath() {\n+        let path = \"/system.slice/docker-abc123def456789012345678901234567890123456789012345678901234.scope/xyz\";\n+        let info = detect_container_from_cgroup(path);\n+\n+        assert!(info.in_container);\n+        assert_eq!(info.runtime, ContainerRuntime::Docker);\n+        assert!(info.container_id.is_some());\n+    }\n+\n     #[test]\n     fn test_detect_podman() {\n         let path = \"/machine.slice/libpod-abc123def456789012345678901234567890123456789012345678901234.scope\";\n@@ -491,6 +501,16 @@ mod tests {\n         assert_eq!(info.runtime, ContainerRuntime::Podman);\n     }\n \n+    #[test]\n+    fn test_detect_podman_scope_with_subpath() {\n+        let path = \"/machine.slice/libpod-abc123def456789012345678901234567890123456789012345678901234.scope/xyz\";\n+        let info = detect_container_from_cgroup(path);\n+\n+        assert!(info.in_container);\n+        assert_eq!(info.runtime, ContainerRuntime::Podman);\n+        assert!(info.container_id.is_some());\n+    }\n+\n     #[test]\n     fn test_detect_containerd() {\n         let path ="
+    },
+    {
+      "sha": "b48e9ba747c0e405b88cc2fe4acb6e5fa28e987e",
+      "filename": "crates/pt-core/src/main.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/process_triage/blob/a74fcf1e57021cbfa558ac495d7442591ae763a6/crates%2Fpt-core%2Fsrc%2Fmain.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/process_triage/raw/a74fcf1e57021cbfa558ac495d7442591ae763a6/crates%2Fpt-core%2Fsrc%2Fmain.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/process_triage/contents/crates%2Fpt-core%2Fsrc%2Fmain.rs?ref=a74fcf1e57021cbfa558ac495d7442591ae763a6",
+      "patch": "@@ -800,7 +800,7 @@ struct AgentTailArgs {\n \n #[derive(Args, Debug)]\n struct AgentWatchArgs {\n-    /// Execute command when watch events are emitted (webhook/script)\n+    /// Execute command via shell when watch events are emitted (legacy; prefer --notify-cmd)\n     #[arg(long = \"notify-exec\")]\n     notify_exec: Option<String>,\n "
+    },
+    {
+      "sha": "2df692593d35fa44607ef24fc90fa8bf3f524891",
+      "filename": "crates/pt-core/src/session/compare.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/process_triage/blob/a74fcf1e57021cbfa558ac495d7442591ae763a6/crates%2Fpt-core%2Fsrc%2Fsession%2Fcompare.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/process_triage/raw/a74fcf1e57021cbfa558ac495d7442591ae763a6/crates%2Fpt-core%2Fsrc%2Fsession%2Fcompare.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/process_triage/contents/crates%2Fpt-core%2Fsrc%2Fsession%2Fcompare.rs?ref=a74fcf1e57021cbfa558ac495d7442591ae763a6",
+      "patch": "@@ -337,7 +337,7 @@ fn compute_drift_summary(\n         0.0\n     } else {\n         let mut sorted = score_drifts.clone();\n-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());\n+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));\n         let mid = sorted.len() / 2;\n         if sorted.len() % 2 == 0 {\n             (sorted[mid - 1] + sorted[mid]) / 2.0"
+    }
+  ]
+}

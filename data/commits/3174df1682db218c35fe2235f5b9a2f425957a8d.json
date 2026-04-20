@@ -1,0 +1,41 @@
+{
+  "message": "launcher: add one-click runner for service + ui\n\nNew launcher binary lives in crates/launcher and starts service.exe with --console, waits for IPC readiness via PipeClient status polling, then launches ui.exe and tears down the service when the UI exits. Uses dotenvy config load, colored console output, child guard to kill on drop, and retry loop with tokio runtime.",
+  "files": [
+    {
+      "sha": "9cdab8162ecd2d57271b3100ccf82de6bc23257f",
+      "filename": "Cargo.lock",
+      "status": "modified",
+      "additions": 12,
+      "deletions": 0,
+      "changes": 12,
+      "blob_url": "https://github.com/Dicklesworthstone/ultrasearch/blob/3174df1682db218c35fe2235f5b9a2f425957a8d/Cargo.lock",
+      "raw_url": "https://github.com/Dicklesworthstone/ultrasearch/raw/3174df1682db218c35fe2235f5b9a2f425957a8d/Cargo.lock",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ultrasearch/contents/Cargo.lock?ref=3174df1682db218c35fe2235f5b9a2f425957a8d",
+      "patch": "@@ -3584,6 +3584,18 @@ dependencies = [\n  \"hashbrown 0.14.5\",\n ]\n \n+[[package]]\n+name = \"launcher\"\n+version = \"0.1.0\"\n+dependencies = [\n+ \"anyhow\",\n+ \"console\",\n+ \"dotenvy\",\n+ \"ipc\",\n+ \"tokio\",\n+ \"uuid\",\n+]\n+\n [[package]]\n name = \"lazy_static\"\n version = \"1.5.0\""
+    },
+    {
+      "sha": "2c650db038838c36bfde0577c0b634bd1931991f",
+      "filename": "ultrasearch/crates/launcher/Cargo.toml",
+      "status": "added",
+      "additions": 15,
+      "deletions": 0,
+      "changes": 15,
+      "blob_url": "https://github.com/Dicklesworthstone/ultrasearch/blob/3174df1682db218c35fe2235f5b9a2f425957a8d/ultrasearch%2Fcrates%2Flauncher%2FCargo.toml",
+      "raw_url": "https://github.com/Dicklesworthstone/ultrasearch/raw/3174df1682db218c35fe2235f5b9a2f425957a8d/ultrasearch%2Fcrates%2Flauncher%2FCargo.toml",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ultrasearch/contents/ultrasearch%2Fcrates%2Flauncher%2FCargo.toml?ref=3174df1682db218c35fe2235f5b9a2f425957a8d",
+      "patch": "@@ -0,0 +1,15 @@\n+[package]\n+name = \"launcher\"\n+version = \"0.1.0\"\n+edition = \"2024\"\n+publish = false\n+license = \"MIT OR Apache-2.0\"\n+description = \"One-click launcher that boots the UltraSearch service then opens the UI\"\n+\n+[dependencies]\n+anyhow = { workspace = true }\n+console = { workspace = true }\n+dotenvy = { workspace = true }\n+ipc = { path = \"../ipc\" }\n+tokio = { workspace = true, features = [\"rt\", \"time\", \"net\"] }\n+uuid = { workspace = true }"
+    },
+    {
+      "sha": "5cfb91a62fa34fcf5fdd0f6874f80de887618fa5",
+      "filename": "ultrasearch/crates/launcher/src/main.rs",
+      "status": "added",
+      "additions": 154,
+      "deletions": 0,
+      "changes": 154,
+      "blob_url": "https://github.com/Dicklesworthstone/ultrasearch/blob/3174df1682db218c35fe2235f5b9a2f425957a8d/ultrasearch%2Fcrates%2Flauncher%2Fsrc%2Fmain.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/ultrasearch/raw/3174df1682db218c35fe2235f5b9a2f425957a8d/ultrasearch%2Fcrates%2Flauncher%2Fsrc%2Fmain.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ultrasearch/contents/ultrasearch%2Fcrates%2Flauncher%2Fsrc%2Fmain.rs?ref=3174df1682db218c35fe2235f5b9a2f425957a8d",
+      "patch": "@@ -0,0 +1,154 @@\n+use anyhow::{Context, Result};\n+use console::style;\n+use dotenvy::dotenv;\n+use ipc::{StatusRequest, client::PipeClient};\n+use std::{\n+    env,\n+    io::Write,\n+    path::{Path, PathBuf},\n+    process::{Child, Command, Stdio},\n+    thread::sleep,\n+    time::Duration,\n+};\n+use tokio::runtime::Runtime;\n+use uuid::Uuid;\n+\n+/// Ensures a child process is terminated if this guard is dropped.\n+struct ChildGuard {\n+    name: &'static str,\n+    child: Option<Child>,\n+}\n+\n+impl ChildGuard {\n+    fn spawn(name: &'static str, cmd: &mut Command) -> Result<Self> {\n+        let child = cmd.spawn().with_context(|| format!(\"spawn {}\", name))?;\n+        Ok(Self {\n+            name,\n+            child: Some(child),\n+        })\n+    }\n+\n+    fn wait(mut self) -> Result<()> {\n+        if let Some(mut child) = self.child.take() {\n+            let status = child.wait()?;\n+            if !status.success() {\n+                anyhow::bail!(\"{} exited with status {:?}\", self.name, status.code());\n+            }\n+        }\n+        Ok(())\n+    }\n+\n+    fn kill_if_running(&mut self) {\n+        if let Some(child) = &mut self.child\n+            && child.try_wait().ok().flatten().is_none()\n+        {\n+            let _ = child.kill();\n+            let _ = child.wait();\n+        }\n+    }\n+}\n+\n+impl Drop for ChildGuard {\n+    fn drop(&mut self) {\n+        self.kill_if_running();\n+    }\n+}\n+\n+fn main() -> Result<()> {\n+    dotenv().ok();\n+    let exe_dir = current_exe_dir()?;\n+\n+    let service_path = resolve_binary(&exe_dir, \"service\")?;\n+    let ui_path = resolve_binary(&exe_dir, \"ui\")?;\n+\n+    println!(\n+        \"{} {}\",\n+        style(\"Launching UltraSearch\").bold().green(),\n+        style(\"one-click mode\").cyan()\n+    );\n+\n+    let mut service_cmd = Command::new(&service_path);\n+    service_cmd\n+        .arg(\"--console\")\n+        .stdin(Stdio::null())\n+        .stdout(Stdio::inherit())\n+        .stderr(Stdio::inherit());\n+    let mut service = ChildGuard::spawn(\"service\", &mut service_cmd)?;\n+    println!(\"{}\", style(\"service started, waiting for IPC...\").dim());\n+\n+    wait_for_ipc_ready()?;\n+\n+    let mut ui_cmd = Command::new(&ui_path);\n+    ui_cmd\n+        .stdin(Stdio::null())\n+        .stdout(Stdio::inherit())\n+        .stderr(Stdio::inherit());\n+    let ui = ChildGuard::spawn(\"ui\", &mut ui_cmd)?;\n+    println!(\"{}\", style(\"ui launched; press Ctrl+C to exit\").dim());\n+\n+    // When UI exits, tear down service.\n+    ui.wait()?;\n+    service.kill_if_running();\n+    println!(\"{}\", style(\"UltraSearch closed\").green());\n+    Ok(())\n+}\n+\n+fn current_exe_dir() -> Result<PathBuf> {\n+    let exe = env::current_exe().context(\"current_exe\")?;\n+    let dir = exe\n+        .parent()\n+        .map(Path::to_path_buf)\n+        .context(\"executable has no parent dir\")?;\n+    Ok(dir)\n+}\n+\n+fn resolve_binary(dir: &Path, stem: &str) -> Result<PathBuf> {\n+    let name = if cfg!(windows) {\n+        format!(\"{stem}.exe\")\n+    } else {\n+        stem.to_string()\n+    };\n+    let path = dir.join(name);\n+    if !path.exists() {\n+        anyhow::bail!(\n+            \"{} not found at {}. Build release binaries first with `cargo build --release`.\",\n+            stem,\n+            path.display()\n+        );\n+    }\n+    Ok(path)\n+}\n+\n+fn wait_for_ipc_ready() -> Result<()> {\n+    #[cfg(not(windows))]\n+    {\n+        return Ok(()); // IPC pipe only on Windows; nothing to probe elsewhere.\n+    }\n+\n+    #[cfg(windows)]\n+    {\n+        let rt = Runtime::new().context(\"build tokio runtime\")?;\n+        let client = PipeClient::default().with_request_timeout(Duration::from_millis(400));\n+        let mut attempts: u32 = 0;\n+        loop {\n+            let res = rt.block_on(client.status(StatusRequest { id: Uuid::new_v4() }));\n+            match res {\n+                Ok(_) => {\n+                    println!(\"{}\", style(\"IPC ready\").green());\n+                    return Ok(());\n+                }\n+                Err(err) if attempts < 40 => {\n+                    attempts += 1;\n+                    print!(\".\");\n+                    let _ = std::io::stdout().flush();\n+                    sleep(Duration::from_millis(250));\n+                    continue;\n+                }\n+                Err(err) => {\n+                    println!();\n+                    anyhow::bail!(\"IPC not ready after retries: {err}\");\n+                }\n+            }\n+        }\n+    }\n+}"
+    }
+  ]
+}

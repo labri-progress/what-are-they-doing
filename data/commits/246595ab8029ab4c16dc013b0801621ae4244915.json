@@ -1,0 +1,29 @@
+{
+  "message": "fix: improve robustness of agentmail and checkpointing\n\n- agentmail: Return server errors from RegisterSessionAgent/UpdateSessionActivity instead of swallowing them, improving observability.\n- checkpoint: Limit git command output to 10MB to prevent OOM during status/diff capture.",
+  "files": [
+    {
+      "sha": "4c0455d7d808ebb6054817622d370862fba2de5e",
+      "filename": "internal/agentmail/session.go",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 4,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/246595ab8029ab4c16dc013b0801621ae4244915/internal%2Fagentmail%2Fsession.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/246595ab8029ab4c16dc013b0801621ae4244915/internal%2Fagentmail%2Fsession.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fagentmail%2Fsession.go?ref=246595ab8029ab4c16dc013b0801621ae4244915",
+      "patch": "@@ -167,8 +167,8 @@ func (c *Client) RegisterSessionAgent(ctx context.Context, sessionName, workingD\n \t\t\tTaskDescription: fmt.Sprintf(\"NTM session coordinator for %s\", sessionName),\n \t\t})\n \t\tif serverErr != nil {\n-\t\t\t// Log but don't fail - local state is already updated\n-\t\t\treturn existing, nil\n+\t\t\t// Return local state but pass error up so caller can warn\n+\t\t\treturn existing, fmt.Errorf(\"updating server activity: %w\", serverErr)\n \t\t}\n \t\treturn existing, nil\n \t}\n@@ -233,14 +233,16 @@ func (c *Client) UpdateSessionActivity(ctx context.Context, sessionName, project\n \t}\n \n \t// Re-register to update last_active_ts on server\n-\t_, _ = c.RegisterAgent(ctx, RegisterAgentOptions{\n+\t_, err = c.RegisterAgent(ctx, RegisterAgentOptions{\n \t\tProjectKey:      info.ProjectKey,\n \t\tProgram:         \"ntm\",\n \t\tModel:           \"coordinator\",\n \t\tName:            info.AgentName,\n \t\tTaskDescription: fmt.Sprintf(\"NTM session coordinator for %s\", sessionName),\n \t})\n-\t// Ignore server errors - local state is already updated\n+\tif err != nil {\n+\t\treturn fmt.Errorf(\"updating server activity: %w\", err)\n+\t}\n \treturn nil\n }\n "
+    },
+    {
+      "sha": "3834377e123fdbb299189d700e1939bdebdf81a8",
+      "filename": "internal/checkpoint/capture.go",
+      "status": "modified",
+      "additions": 41,
+      "deletions": 6,
+      "changes": 47,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/246595ab8029ab4c16dc013b0801621ae4244915/internal%2Fcheckpoint%2Fcapture.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/246595ab8029ab4c16dc013b0801621ae4244915/internal%2Fcheckpoint%2Fcapture.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fcheckpoint%2Fcapture.go?ref=246595ab8029ab4c16dc013b0801621ae4244915",
+      "patch": "@@ -2,7 +2,9 @@ package checkpoint\n \n import (\n \t\"bytes\"\n+\t\"context\"\n \t\"fmt\"\n+\t\"io\"\n \t\"os\"\n \t\"os/exec\"\n \t\"path/filepath\"\n@@ -228,19 +230,52 @@ func isGitRepo(dir string) bool {\n \treturn cmd.Run() == nil || fileExists(gitDir)\n }\n \n-// gitCommand runs a git command in the specified directory.\n+// MaxGitOutputBytes limits the size of git command output to prevent OOM.\n+// 10MB is sufficient for most status/diff operations while preventing abuse.\n+const MaxGitOutputBytes = 10 * 1024 * 1024\n+\n+// gitCommand runs a git command in the specified directory with output size limit.\n func gitCommand(dir string, args ...string) (string, error) {\n \tallArgs := append([]string{\"-C\", dir}, args...)\n-\tcmd := exec.Command(\"git\", allArgs...)\n-\tvar stdout, stderr bytes.Buffer\n-\tcmd.Stdout = &stdout\n+\tctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)\n+\tdefer cancel()\n+\n+\tcmd := exec.CommandContext(ctx, \"git\", allArgs...)\n+\t\n+\t// Capture stderr separately for error reporting\n+\tvar stderr bytes.Buffer\n \tcmd.Stderr = &stderr\n \n-\tif err := cmd.Run(); err != nil {\n+\tstdoutPipe, err := cmd.StdoutPipe()\n+\tif err != nil {\n+\t\treturn \"\", fmt.Errorf(\"creating stdout pipe: %w\", err)\n+\t}\n+\n+\tif err := cmd.Start(); err != nil {\n+\t\treturn \"\", fmt.Errorf(\"starting git %s: %w\", strings.Join(args, \" \"), err)\n+\t}\n+\n+\t// Read up to limit + 1 byte to detect truncation\n+\tdata, err := io.ReadAll(io.LimitReader(stdoutPipe, MaxGitOutputBytes+1))\n+\tif err != nil {\n+\t\treturn \"\", fmt.Errorf(\"reading git output: %w\", err)\n+\t}\n+\n+\t// Check for truncation\n+\tif len(data) > MaxGitOutputBytes {\n+\t\t_ = cmd.Process.Kill() // Kill process if it's spewing too much data\n+\t\treturn \"\", fmt.Errorf(\"git output exceeded limit of %d bytes\", MaxGitOutputBytes)\n+\t}\n+\n+\tif err := cmd.Wait(); err != nil {\n+\t\t// Verify context error first\n+\t\tif ctx.Err() == context.DeadlineExceeded {\n+\t\t\treturn \"\", fmt.Errorf(\"git command timed out\")\n+\t\t}\n \t\treturn \"\", fmt.Errorf(\"git %s: %w: %s\", strings.Join(args, \" \"), err, stderr.String())\n \t}\n \n-\treturn stdout.String(), nil\n+\treturn string(data), nil\n }\n \n // parseGitStatus parses git status --porcelain output."
+    }
+  ]
+}

@@ -1,0 +1,149 @@
+{
+  "message": "refactor(msteams): extract sdk + storage helpers",
+  "files": [
+    {
+      "sha": "3b1b3bc9397adeee550f91010020866c91fcde77",
+      "filename": "src/msteams/conversation-store-fs.ts",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 15,
+      "changes": 25,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6d223303eb4d4b87872569de770cd28301f3bfe1/src%2Fmsteams%2Fconversation-store-fs.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6d223303eb4d4b87872569de770cd28301f3bfe1/src%2Fmsteams%2Fconversation-store-fs.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fmsteams%2Fconversation-store-fs.ts?ref=6d223303eb4d4b87872569de770cd28301f3bfe1",
+      "patch": "@@ -1,16 +1,15 @@\n import crypto from \"node:crypto\";\n import fs from \"node:fs\";\n-import os from \"node:os\";\n import path from \"node:path\";\n \n import lockfile from \"proper-lockfile\";\n \n-import { resolveStateDir } from \"../config/paths.js\";\n import type {\n   MSTeamsConversationStore,\n   MSTeamsConversationStoreEntry,\n   StoredConversationReference,\n } from \"./conversation-store.js\";\n+import { resolveMSTeamsStorePath } from \"./storage.js\";\n \n type ConversationStoreData = {\n   version: 1;\n@@ -34,16 +33,6 @@ const STORE_LOCK_OPTIONS = {\n   stale: 30_000,\n } as const;\n \n-function resolveStorePath(\n-  env: NodeJS.ProcessEnv = process.env,\n-  homedir?: () => string,\n-): string {\n-  const stateDir = homedir\n-    ? resolveStateDir(env, homedir)\n-    : resolveStateDir(env);\n-  return path.join(stateDir, STORE_FILENAME);\n-}\n-\n function safeParseJson<T>(raw: string): T | null {\n   try {\n     return JSON.parse(raw) as T;\n@@ -167,11 +156,17 @@ export function createMSTeamsConversationStoreFs(params?: {\n   env?: NodeJS.ProcessEnv;\n   homedir?: () => string;\n   ttlMs?: number;\n+  stateDir?: string;\n+  storePath?: string;\n }): MSTeamsConversationStore {\n-  const env = params?.env ?? process.env;\n-  const homedir = params?.homedir ?? os.homedir;\n   const ttlMs = params?.ttlMs ?? CONVERSATION_TTL_MS;\n-  const filePath = resolveStorePath(env, homedir);\n+  const filePath = resolveMSTeamsStorePath({\n+    filename: STORE_FILENAME,\n+    env: params?.env,\n+    homedir: params?.homedir,\n+    stateDir: params?.stateDir,\n+    storePath: params?.storePath,\n+  });\n \n   const empty: ConversationStoreData = { version: 1, conversations: {} };\n "
+    },
+    {
+      "sha": "05476f7007093c4f5681078c63ec45f24477b7f0",
+      "filename": "src/msteams/monitor-handler.ts",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 68,
+      "changes": 82,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6d223303eb4d4b87872569de770cd28301f3bfe1/src%2Fmsteams%2Fmonitor-handler.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6d223303eb4d4b87872569de770cd28301f3bfe1/src%2Fmsteams%2Fmonitor-handler.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fmsteams%2Fmonitor-handler.ts?ref=6d223303eb4d4b87872569de770cd28301f3bfe1",
+      "patch": "@@ -1,6 +1,5 @@\n import { formatAgentEnvelope } from \"../auto-reply/envelope.js\";\n import { dispatchReplyFromConfig } from \"../auto-reply/reply/dispatch-from-config.js\";\n-import { createReplyDispatcherWithTyping } from \"../auto-reply/reply/reply-dispatcher.js\";\n import type { ClawdbotConfig } from \"../config/types.js\";\n import { danger, logVerbose, shouldLogVerbose } from \"../globals.js\";\n import { enqueueSystemEvent } from \"../infra/system-events.js\";\n@@ -23,36 +22,24 @@ import type {\n   MSTeamsConversationStore,\n   StoredConversationReference,\n } from \"./conversation-store.js\";\n-import {\n-  classifyMSTeamsSendError,\n-  formatMSTeamsSendErrorHint,\n-  formatUnknownError,\n-} from \"./errors.js\";\n+import { formatUnknownError } from \"./errors.js\";\n import {\n   extractMSTeamsConversationMessageId,\n   normalizeMSTeamsConversationId,\n   parseMSTeamsActivityTimestamp,\n   stripMSTeamsMentionTags,\n   wasMSTeamsBotMentioned,\n } from \"./inbound.js\";\n-import {\n-  type MSTeamsAdapter,\n-  renderReplyPayloadsToMessages,\n-  sendMSTeamsMessages,\n-} from \"./messenger.js\";\n+import type { MSTeamsAdapter } from \"./messenger.js\";\n+import type { MSTeamsMonitorLogger } from \"./monitor-types.js\";\n import {\n   resolveMSTeamsReplyPolicy,\n   resolveMSTeamsRouteConfig,\n } from \"./policy.js\";\n import { extractMSTeamsPollVote, type MSTeamsPollStore } from \"./polls.js\";\n+import { createMSTeamsReplyDispatcher } from \"./reply-dispatcher.js\";\n import type { MSTeamsTurnContext } from \"./sdk-types.js\";\n \n-export type MSTeamsMonitorLogger = {\n-  debug: (message: string, meta?: Record<string, unknown>) => void;\n-  info: (message: string, meta?: Record<string, unknown>) => void;\n-  error: (message: string, meta?: Record<string, unknown>) => void;\n-};\n-\n export type MSTeamsAccessTokenProvider = {\n   getAccessToken: (scope: string) => Promise<string>;\n };\n@@ -456,59 +443,18 @@ function createMSTeamsMessageHandler(deps: MSTeamsMessageHandlerDeps) {\n       );\n     }\n \n-    // Send typing indicator\n-    const sendTypingIndicator = async () => {\n-      try {\n-        await context.sendActivities([{ type: \"typing\" }]);\n-      } catch {\n-        // Typing indicator is best-effort.\n-      }\n-    };\n-\n     // Create reply dispatcher\n     const { dispatcher, replyOptions, markDispatchIdle } =\n-      createReplyDispatcherWithTyping({\n-        responsePrefix: cfg.messages?.responsePrefix,\n-        deliver: async (payload) => {\n-          const messages = renderReplyPayloadsToMessages([payload], {\n-            textChunkLimit: textLimit,\n-            chunkText: true,\n-            mediaMode: \"split\",\n-          });\n-          await sendMSTeamsMessages({\n-            replyStyle,\n-            adapter,\n-            appId,\n-            conversationRef,\n-            context,\n-            messages,\n-            // Enable default retry/backoff for throttling/transient failures.\n-            retry: {},\n-            onRetry: (event) => {\n-              log.debug(\"retrying send\", {\n-                replyStyle,\n-                ...event,\n-              });\n-            },\n-          });\n-        },\n-        onError: (err, info) => {\n-          const errMsg = formatUnknownError(err);\n-          const classification = classifyMSTeamsSendError(err);\n-          const hint = formatMSTeamsSendErrorHint(classification);\n-          runtime.error?.(\n-            danger(\n-              `msteams ${info.kind} reply failed: ${errMsg}${hint ? ` (${hint})` : \"\"}`,\n-            ),\n-          );\n-          log.error(\"reply failed\", {\n-            kind: info.kind,\n-            error: errMsg,\n-            classification,\n-            hint,\n-          });\n-        },\n-        onReplyStart: sendTypingIndicator,\n+      createMSTeamsReplyDispatcher({\n+        cfg,\n+        runtime,\n+        log,\n+        adapter,\n+        appId,\n+        conversationRef,\n+        context,\n+        replyStyle,\n+        textLimit,\n       });\n \n     // Dispatch to agent"
+    },
+    {
+      "sha": "014081ffd223cee22a5bbc32ede44ed9ccd6cc16",
+      "filename": "src/msteams/monitor-types.ts",
+      "status": "added",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6d223303eb4d4b87872569de770cd28301f3bfe1/src%2Fmsteams%2Fmonitor-types.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6d223303eb4d4b87872569de770cd28301f3bfe1/src%2Fmsteams%2Fmonitor-types.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fmsteams%2Fmonitor-types.ts?ref=6d223303eb4d4b87872569de770cd28301f3bfe1",
+      "patch": "@@ -0,0 +1,5 @@\n+export type MSTeamsMonitorLogger = {\n+  debug: (message: string, meta?: Record<string, unknown>) => void;\n+  info: (message: string, meta?: Record<string, unknown>) => void;\n+  error: (message: string, meta?: Record<string, unknown>) => void;\n+};"
+    },
+    {
+      "sha": "f859daaa2ba6a17910c9fdecb7fedae05d2ca25e",
+      "filename": "src/msteams/monitor.ts",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 14,
+      "changes": 18,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6d223303eb4d4b87872569de770cd28301f3bfe1/src%2Fmsteams%2Fmonitor.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6d223303eb4d4b87872569de770cd28301f3bfe1/src%2Fmsteams%2Fmonitor.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fmsteams%2Fmonitor.ts?ref=6d223303eb4d4b87872569de770cd28301f3bfe1",
+      "patch": "@@ -9,6 +9,7 @@ import { formatUnknownError } from \"./errors.js\";\n import type { MSTeamsAdapter } from \"./messenger.js\";\n import { registerMSTeamsHandlers } from \"./monitor-handler.js\";\n import { createMSTeamsPollStoreFs, type MSTeamsPollStore } from \"./polls.js\";\n+import { createMSTeamsAdapter, loadMSTeamsSdkWithAuth } from \"./sdk.js\";\n import { resolveMSTeamsCredentials } from \"./token.js\";\n \n const log = getChildLogger({ name: \"msteams\" });\n@@ -65,25 +66,14 @@ export async function monitorMSTeamsProvider(\n   log.info(`starting provider (port ${port})`);\n \n   // Dynamic import to avoid loading SDK when provider is disabled\n-  const agentsHosting = await import(\"@microsoft/agents-hosting\");\n   const express = await import(\"express\");\n \n-  const {\n-    ActivityHandler,\n-    CloudAdapter,\n-    MsalTokenProvider,\n-    authorizeJWT,\n-    getAuthConfigWithDefaults,\n-  } = agentsHosting;\n+  const { sdk, authConfig } = await loadMSTeamsSdkWithAuth(creds);\n+  const { ActivityHandler, MsalTokenProvider, authorizeJWT } = sdk;\n \n   // Auth configuration - create early so adapter is available for deliverReplies\n-  const authConfig = getAuthConfigWithDefaults({\n-    clientId: creds.appId,\n-    clientSecret: creds.appPassword,\n-    tenantId: creds.tenantId,\n-  });\n   const tokenProvider = new MsalTokenProvider(authConfig);\n-  const adapter = new CloudAdapter(authConfig);\n+  const adapter = createMSTeamsAdapter(authConfig, sdk);\n \n   const handler = registerMSTeamsHandlers(new ActivityHandler(), {\n     cfg,"
+    },
+    {
+      "sha": "ba1f9cf69dbf66ce04a46e37a8f264c93d4b077c",
+      "filename": "src/msteams/polls-store-memory.test.ts",
+      "status": "removed",
+      "additions": 0,
+      "deletions": 25,
+      "changes": 25,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/8875dbd44910c78df5d0b86902633720b6d6ff33/src%2Fmsteams%2Fpolls-store-memory.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/8875dbd44910c78df5d0b86902633720b6d6ff33/src%2Fmsteams%2Fpolls-store-memory.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fmsteams%2Fpolls-store-memory.test.ts?ref=8875dbd44910c78df5d0b86902633720b6d6ff33",
+      "patch": "@@ -1,25 +0,0 @@\n-import { describe, expect, it } from \"vitest\";\n-\n-import { createMSTeamsPollStoreMemory } from \"./polls-store-memory.js\";\n-\n-describe(\"msteams poll memory store\", () => {\n-  it(\"stores polls and records normalized votes\", async () => {\n-    const store = createMSTeamsPollStoreMemory();\n-    await store.createPoll({\n-      id: \"poll-1\",\n-      question: \"Lunch?\",\n-      options: [\"Pizza\", \"Sushi\"],\n-      maxSelections: 1,\n-      createdAt: new Date().toISOString(),\n-      votes: {},\n-    });\n-\n-    const poll = await store.recordVote({\n-      pollId: \"poll-1\",\n-      voterId: \"user-1\",\n-      selections: [\"0\", \"1\"],\n-    });\n-\n-    expect(poll?.votes[\"user-1\"]).toEqual([\"0\"]);\n-  });\n-});"
+    },
+    {
+      "sha": "554067ffdfe9d2ef3aa1b203dd3a5008160760b9",
+      "filename": "src/msteams/polls-store.test.ts",
+      "status": "added",
+      "additions": 42,
+      "deletions": 0,
+      "changes": 42,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6d223303eb4d4b87872569de770cd28301f3bfe1/src%2Fmsteams%2Fpolls-store.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6d223303eb4d4b87872569de770cd28301f3bfe1/src%2Fmsteams%2Fpolls-store.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fmsteams%2Fpolls-store.test.ts?ref=6d223303eb4d4b87872569de770cd28301f3bfe1",
+      "patch": "@@ -0,0 +1,42 @@\n+import fs from \"node:fs\";\n+import os from \"node:os\";\n+import path from \"node:path\";\n+\n+import { describe, expect, it } from \"vitest\";\n+\n+import { createMSTeamsPollStoreFs } from \"./polls.js\";\n+import { createMSTeamsPollStoreMemory } from \"./polls-store-memory.js\";\n+\n+const createFsStore = async () => {\n+  const stateDir = await fs.promises.mkdtemp(\n+    path.join(os.tmpdir(), \"clawdbot-msteams-polls-\"),\n+  );\n+  return createMSTeamsPollStoreFs({ stateDir });\n+};\n+\n+const createMemoryStore = () => createMSTeamsPollStoreMemory();\n+\n+describe.each([\n+  { name: \"memory\", createStore: createMemoryStore },\n+  { name: \"fs\", createStore: createFsStore },\n+])(\"$name poll store\", ({ createStore }) => {\n+  it(\"stores polls and records normalized votes\", async () => {\n+    const store = await createStore();\n+    await store.createPoll({\n+      id: \"poll-1\",\n+      question: \"Lunch?\",\n+      options: [\"Pizza\", \"Sushi\"],\n+      maxSelections: 1,\n+      createdAt: new Date().toISOString(),\n+      votes: {},\n+    });\n+\n+    const poll = await store.recordVote({\n+      pollId: \"poll-1\",\n+      voterId: \"user-1\",\n+      selections: [\"0\", \"1\"],\n+    });\n+\n+    expect(poll?.votes[\"user-1\"]).toEqual([\"0\"]);\n+  });\n+});"
+    },
+    {
+      "sha": "9a7c9dc6e45ec89e78fa5ebfe43c192b1bb08959",
+      "filename": "src/msteams/polls.ts",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 15,
+      "changes": 23,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6d223303eb4d4b87872569de770cd28301f3bfe1/src%2Fmsteams%2Fpolls.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6d223303eb4d4b87872569de770cd28301f3bfe1/src%2Fmsteams%2Fpolls.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fmsteams%2Fpolls.ts?ref=6d223303eb4d4b87872569de770cd28301f3bfe1",
+      "patch": "@@ -4,7 +4,7 @@ import path from \"node:path\";\n \n import lockfile from \"proper-lockfile\";\n \n-import { resolveStateDir } from \"../config/paths.js\";\n+import { resolveMSTeamsStorePath } from \"./storage.js\";\n \n export type MSTeamsPollVote = {\n   pollId: string;\n@@ -239,19 +239,6 @@ export type MSTeamsPollStoreFsOptions = {\n   storePath?: string;\n };\n \n-function resolveStorePath(params?: MSTeamsPollStoreFsOptions): string {\n-  if (params?.storePath) {\n-    return params.storePath;\n-  }\n-  if (params?.stateDir) {\n-    return path.join(params.stateDir, STORE_FILENAME);\n-  }\n-  const stateDir = params?.homedir\n-    ? resolveStateDir(params.env ?? process.env, params.homedir)\n-    : resolveStateDir(params?.env ?? process.env);\n-  return path.join(stateDir, STORE_FILENAME);\n-}\n-\n function safeParseJson<T>(raw: string): T | null {\n   try {\n     return JSON.parse(raw) as T;\n@@ -364,7 +351,13 @@ export function normalizeMSTeamsPollSelections(\n export function createMSTeamsPollStoreFs(\n   params?: MSTeamsPollStoreFsOptions,\n ): MSTeamsPollStore {\n-  const filePath = resolveStorePath(params);\n+  const filePath = resolveMSTeamsStorePath({\n+    filename: STORE_FILENAME,\n+    env: params?.env,\n+    homedir: params?.homedir,\n+    stateDir: params?.stateDir,\n+    storePath: params?.storePath,\n+  });\n   const empty: PollStoreData = { version: 1, polls: {} };\n \n   const readStore = async (): Promise<PollStoreData> => {"
+    },
+    {
+      "sha": "887eef6882fc746be60e4d91236f1b48da0deeac",
+      "filename": "src/msteams/probe.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 10,
+      "changes": 13,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6d223303eb4d4b87872569de770cd28301f3bfe1/src%2Fmsteams%2Fprobe.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6d223303eb4d4b87872569de770cd28301f3bfe1/src%2Fmsteams%2Fprobe.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fmsteams%2Fprobe.ts?ref=6d223303eb4d4b87872569de770cd28301f3bfe1",
+      "patch": "@@ -1,5 +1,6 @@\n import type { MSTeamsConfig } from \"../config/types.js\";\n import { formatUnknownError } from \"./errors.js\";\n+import { loadMSTeamsSdkWithAuth } from \"./sdk.js\";\n import { resolveMSTeamsCredentials } from \"./token.js\";\n \n export type ProbeMSTeamsResult = {\n@@ -20,16 +21,8 @@ export async function probeMSTeams(\n   }\n \n   try {\n-    const { MsalTokenProvider, getAuthConfigWithDefaults } = await import(\n-      \"@microsoft/agents-hosting\"\n-    );\n-    const authConfig = getAuthConfigWithDefaults({\n-      clientId: creds.appId,\n-      clientSecret: creds.appPassword,\n-      tenantId: creds.tenantId,\n-    });\n-\n-    const tokenProvider = new MsalTokenProvider(authConfig);\n+    const { sdk, authConfig } = await loadMSTeamsSdkWithAuth(creds);\n+    const tokenProvider = new sdk.MsalTokenProvider(authConfig);\n     await tokenProvider.getAccessToken(\"https://api.botframework.com/.default\");\n     return { ok: true, appId: creds.appId };\n   } catch (err) {"
+    },
+    {
+      "sha": "bf030046185f4aa574d13d67acf25b01e1984e17",
+      "filename": "src/msteams/reply-dispatcher.ts",
+      "status": "added",
+      "additions": 81,
+      "deletions": 0,
+      "changes": 81,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6d223303eb4d4b87872569de770cd28301f3bfe1/src%2Fmsteams%2Freply-dispatcher.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6d223303eb4d4b87872569de770cd28301f3bfe1/src%2Fmsteams%2Freply-dispatcher.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fmsteams%2Freply-dispatcher.ts?ref=6d223303eb4d4b87872569de770cd28301f3bfe1",
+      "patch": "@@ -0,0 +1,81 @@\n+import { createReplyDispatcherWithTyping } from \"../auto-reply/reply/reply-dispatcher.js\";\n+import type { ClawdbotConfig, MSTeamsReplyStyle } from \"../config/types.js\";\n+import { danger } from \"../globals.js\";\n+import type { RuntimeEnv } from \"../runtime.js\";\n+import type { StoredConversationReference } from \"./conversation-store.js\";\n+import {\n+  classifyMSTeamsSendError,\n+  formatMSTeamsSendErrorHint,\n+  formatUnknownError,\n+} from \"./errors.js\";\n+import {\n+  type MSTeamsAdapter,\n+  renderReplyPayloadsToMessages,\n+  sendMSTeamsMessages,\n+} from \"./messenger.js\";\n+import type { MSTeamsMonitorLogger } from \"./monitor-types.js\";\n+import type { MSTeamsTurnContext } from \"./sdk-types.js\";\n+\n+export function createMSTeamsReplyDispatcher(params: {\n+  cfg: ClawdbotConfig;\n+  runtime: RuntimeEnv;\n+  log: MSTeamsMonitorLogger;\n+  adapter: MSTeamsAdapter;\n+  appId: string;\n+  conversationRef: StoredConversationReference;\n+  context: MSTeamsTurnContext;\n+  replyStyle: MSTeamsReplyStyle;\n+  textLimit: number;\n+}) {\n+  const sendTypingIndicator = async () => {\n+    try {\n+      await params.context.sendActivities([{ type: \"typing\" }]);\n+    } catch {\n+      // Typing indicator is best-effort.\n+    }\n+  };\n+\n+  return createReplyDispatcherWithTyping({\n+    responsePrefix: params.cfg.messages?.responsePrefix,\n+    deliver: async (payload) => {\n+      const messages = renderReplyPayloadsToMessages([payload], {\n+        textChunkLimit: params.textLimit,\n+        chunkText: true,\n+        mediaMode: \"split\",\n+      });\n+      await sendMSTeamsMessages({\n+        replyStyle: params.replyStyle,\n+        adapter: params.adapter,\n+        appId: params.appId,\n+        conversationRef: params.conversationRef,\n+        context: params.context,\n+        messages,\n+        // Enable default retry/backoff for throttling/transient failures.\n+        retry: {},\n+        onRetry: (event) => {\n+          params.log.debug(\"retrying send\", {\n+            replyStyle: params.replyStyle,\n+            ...event,\n+          });\n+        },\n+      });\n+    },\n+    onError: (err, info) => {\n+      const errMsg = formatUnknownError(err);\n+      const classification = classifyMSTeamsSendError(err);\n+      const hint = formatMSTeamsSendErrorHint(classification);\n+      params.runtime.error?.(\n+        danger(\n+          `msteams ${info.kind} reply failed: ${errMsg}${hint ? ` (${hint})` : \"\"}`,\n+        ),\n+      );\n+      params.log.error(\"reply failed\", {\n+        kind: info.kind,\n+        error: errMsg,\n+        classification,\n+        hint,\n+      });\n+    },\n+    onReplyStart: sendTypingIndicator,\n+  });\n+}"
+    },
+    {
+      "sha": "2d0f7a959e99499884638088da1b0f35c5ef104c",
+      "filename": "src/msteams/sdk.ts",
+      "status": "added",
+      "additions": 34,
+      "deletions": 0,
+      "changes": 34,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6d223303eb4d4b87872569de770cd28301f3bfe1/src%2Fmsteams%2Fsdk.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6d223303eb4d4b87872569de770cd28301f3bfe1/src%2Fmsteams%2Fsdk.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fmsteams%2Fsdk.ts?ref=6d223303eb4d4b87872569de770cd28301f3bfe1",
+      "patch": "@@ -0,0 +1,34 @@\n+import type { MSTeamsAdapter } from \"./messenger.js\";\n+import type { MSTeamsCredentials } from \"./token.js\";\n+\n+export type MSTeamsSdk = Awaited<\n+  ReturnType<typeof import(\"@microsoft/agents-hosting\")>\n+>;\n+\n+export async function loadMSTeamsSdk(): Promise<MSTeamsSdk> {\n+  return await import(\"@microsoft/agents-hosting\");\n+}\n+\n+export function buildMSTeamsAuthConfig(\n+  creds: MSTeamsCredentials,\n+  sdk: MSTeamsSdk,\n+) {\n+  return sdk.getAuthConfigWithDefaults({\n+    clientId: creds.appId,\n+    clientSecret: creds.appPassword,\n+    tenantId: creds.tenantId,\n+  });\n+}\n+\n+export function createMSTeamsAdapter(\n+  authConfig: unknown,\n+  sdk: MSTeamsSdk,\n+): MSTeamsAdapter {\n+  return new sdk.CloudAdapter(authConfig) as unknown as MSTeamsAdapter;\n+}\n+\n+export async function loadMSTeamsSdkWithAuth(creds: MSTeamsCredentials) {\n+  const sdk = await loadMSTeamsSdk();\n+  const authConfig = buildMSTeamsAuthConfig(creds, sdk);\n+  return { sdk, authConfig };\n+}"
+    },
+    {
+      "sha": "dde3b3945ac1debe352f7f00e0e2ac37b333ef87",
+      "filename": "src/msteams/send.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 11,
+      "changes": 14,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6d223303eb4d4b87872569de770cd28301f3bfe1/src%2Fmsteams%2Fsend.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6d223303eb4d4b87872569de770cd28301f3bfe1/src%2Fmsteams%2Fsend.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fmsteams%2Fsend.ts?ref=6d223303eb4d4b87872569de770cd28301f3bfe1",
+      "patch": "@@ -16,6 +16,7 @@ import {\n   sendMSTeamsMessages,\n } from \"./messenger.js\";\n import { buildMSTeamsPollCard } from \"./polls.js\";\n+import { createMSTeamsAdapter, loadMSTeamsSdkWithAuth } from \"./sdk.js\";\n import { resolveMSTeamsCredentials } from \"./token.js\";\n \n let _log: ReturnType<typeof getChildLoggerFn> | undefined;\n@@ -156,17 +157,8 @@ async function resolveMSTeamsSendContext(params: {\n   const { conversationId, ref } = found;\n   const log = await getLog();\n \n-  // Dynamic import to avoid loading SDK when not needed\n-  const agentsHosting = await import(\"@microsoft/agents-hosting\");\n-  const { CloudAdapter, getAuthConfigWithDefaults } = agentsHosting;\n-\n-  const authConfig = getAuthConfigWithDefaults({\n-    clientId: creds.appId,\n-    clientSecret: creds.appPassword,\n-    tenantId: creds.tenantId,\n-  });\n-\n-  const adapter = new CloudAdapter(authConfig);\n+  const { sdk, authConfig } = await loadMSTeamsSdkWithAuth(creds);\n+  const adapter = createMSTeamsAdapter(authConfig, sdk);\n \n   return {\n     appId: creds.appId,"
+    },
+    {
+      "sha": "9b625d4b803334f4e457c677359cb00d2e63169e",
+      "filename": "src/msteams/storage.ts",
+      "status": "added",
+      "additions": 24,
+      "deletions": 0,
+      "changes": 24,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6d223303eb4d4b87872569de770cd28301f3bfe1/src%2Fmsteams%2Fstorage.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6d223303eb4d4b87872569de770cd28301f3bfe1/src%2Fmsteams%2Fstorage.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fmsteams%2Fstorage.ts?ref=6d223303eb4d4b87872569de770cd28301f3bfe1",
+      "patch": "@@ -0,0 +1,24 @@\n+import path from \"node:path\";\n+\n+import { resolveStateDir } from \"../config/paths.js\";\n+\n+export type MSTeamsStorePathOptions = {\n+  env?: NodeJS.ProcessEnv;\n+  homedir?: () => string;\n+  stateDir?: string;\n+  storePath?: string;\n+  filename: string;\n+};\n+\n+export function resolveMSTeamsStorePath(\n+  params: MSTeamsStorePathOptions,\n+): string {\n+  if (params.storePath) return params.storePath;\n+  if (params.stateDir) return path.join(params.stateDir, params.filename);\n+\n+  const env = params.env ?? process.env;\n+  const stateDir = params.homedir\n+    ? resolveStateDir(env, params.homedir)\n+    : resolveStateDir(env);\n+  return path.join(stateDir, params.filename);\n+}"
+    }
+  ]
+}

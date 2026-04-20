@@ -1,0 +1,101 @@
+{
+  "message": "perf(sync,channel): skip redundant Waker clones via will_wake() guard\n\nApply a consistent optimization across all sync primitives and channel\ntypes: before cloning a new waker into the waiter list, check whether\nthe existing waker already points to the same task via `will_wake()`.\nThis avoids an unnecessary `Waker::clone()` (which typically involves\nan Arc refcount increment + vtable call) on every re-poll when the\nexecutor re-uses the same waker \u2014 the overwhelmingly common case.\n\nAffected sync primitives:\n- mutex.rs: LockFuture and OwnedMutexGuard::lock_owned waiter refresh\n  (2 sites)\n- rwlock.rs: ReadFuture, WriteFuture, OwnedReadFuture, OwnedWriteFuture\n  waiter refresh (4 sites)\n- once_cell.rs: WaitInit waiter refresh (1 site)\n- semaphore.rs: AcquireFuture and OwnedAcquireFuture waiter refresh\n  (2 sites)\n- notify.rs: Notified future \u2014 uses a three-arm match to handle the\n  existing-and-same, existing-and-different, and None cases without\n  unconditional clone (1 site)\n\nAffected channel types:\n- mpsc.rs: Recv future recv_waker registration \u2014 match guard avoids\n  clone on re-poll (1 site)\n- oneshot.rs: RecvFuture waker registration \u2014 same match guard pattern\n  (1 site)\n- watch.rs: Add new `refresh_waker()` method on WatchInner that updates\n  an already-queued waiter's waker in-place without pre-cloning the\n  Waker or Arc<AtomicBool>. ChangedFuture now calls refresh_waker()\n  first and only falls back to register_waker() with a fresh allocation\n  if the waiter was pruned. This eliminates both Waker::clone() and\n  Arc::clone() on the common re-poll path.\n\nThe pattern is identical everywhere: guard the clone_from() with\n`if !existing.will_wake(new_waker)` so we only pay the clone cost\nwhen the executor actually changes the waker between polls.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "c13b031f2f4be96f7dff745716f450bcd9273bf4",
+      "filename": "src/channel/mpsc.rs",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 1,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/2226a85febf4957f4f6dc5985be897e50c39a555/src%2Fchannel%2Fmpsc.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/2226a85febf4957f4f6dc5985be897e50c39a555/src%2Fchannel%2Fmpsc.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fchannel%2Fmpsc.rs?ref=2226a85febf4957f4f6dc5985be897e50c39a555",
+      "patch": "@@ -712,7 +712,11 @@ impl<T> Future for Recv<'_, T> {\n             return Poll::Ready(Err(RecvError::Disconnected));\n         }\n \n-        inner.recv_waker = Some(ctx.waker().clone());\n+        // Skip waker clone if unchanged \u2014 common on re-poll.\n+        match &inner.recv_waker {\n+            Some(existing) if existing.will_wake(ctx.waker()) => {}\n+            _ => inner.recv_waker = Some(ctx.waker().clone()),\n+        }\n         Poll::Pending\n     }\n }"
+    },
+    {
+      "sha": "5a439de45896c7c0b5e4c888b1eb25a2e43f4ff8",
+      "filename": "src/channel/oneshot.rs",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 2,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/2226a85febf4957f4f6dc5985be897e50c39a555/src%2Fchannel%2Foneshot.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/2226a85febf4957f4f6dc5985be897e50c39a555/src%2Fchannel%2Foneshot.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fchannel%2Foneshot.rs?ref=2226a85febf4957f4f6dc5985be897e50c39a555",
+      "patch": "@@ -367,8 +367,11 @@ impl<T> Future for RecvFuture<'_, T> {\n             return Poll::Ready(Err(RecvError::Cancelled));\n         }\n \n-        // 4. Register waker\n-        inner.waker = Some(ctx.waker().clone());\n+        // 4. Register waker (skip clone if unchanged \u2014 common on re-poll)\n+        match &inner.waker {\n+            Some(existing) if existing.will_wake(ctx.waker()) => {}\n+            _ => inner.waker = Some(ctx.waker().clone()),\n+        }\n         Poll::Pending\n     }\n }"
+    },
+    {
+      "sha": "3c834092d9a8b3482598aef8c62ecff1c2eefd28",
+      "filename": "src/channel/watch.rs",
+      "status": "modified",
+      "additions": 27,
+      "deletions": 5,
+      "changes": 32,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/2226a85febf4957f4f6dc5985be897e50c39a555/src%2Fchannel%2Fwatch.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/2226a85febf4957f4f6dc5985be897e50c39a555/src%2Fchannel%2Fwatch.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fchannel%2Fwatch.rs?ref=2226a85febf4957f4f6dc5985be897e50c39a555",
+      "patch": "@@ -176,6 +176,24 @@ impl<T> WatchInner<T> {\n         }\n         waiters.push(waiter);\n     }\n+\n+    /// Update the waker for an already-queued waiter without pre-cloning.\n+    /// Returns `true` if the waiter was found and refreshed, `false` if not found\n+    /// (caller should fall back to `register_waker` with a new `WatchWaiter`).\n+    fn refresh_waker(&self, queued: &Arc<AtomicBool>, new_waker: &Waker) -> bool {\n+        let mut waiters = self.waiters.lock().expect(\"watch lock poisoned\");\n+        waiters.retain(|entry| Arc::strong_count(&entry.queued) > 1);\n+        if let Some(existing) = waiters\n+            .iter_mut()\n+            .find(|entry| Arc::ptr_eq(&entry.queued, queued))\n+        {\n+            if !existing.waker.will_wake(new_waker) {\n+                existing.waker.clone_from(new_waker);\n+            }\n+            return true;\n+        }\n+        false\n+    }\n }\n \n /// Creates a new watch channel with an initial value.\n@@ -482,11 +500,15 @@ impl<T> Future for ChangedFuture<'_, '_, T> {\n             }\n             Some(w) => {\n                 // Still queued, but the task's waker may have changed.\n-                // Refresh stored waker to avoid waking a stale task.\n-                this.receiver.inner.register_waker(WatchWaiter {\n-                    waker: context.waker().clone(),\n-                    queued: Arc::clone(w),\n-                });\n+                // Refresh in-place without pre-cloning \u2014 avoids Waker clone +\n+                // Arc::clone on the common re-poll path.\n+                if !this.receiver.inner.refresh_waker(w, context.waker()) {\n+                    // Waiter was pruned (stale); re-register with a fresh entry.\n+                    this.receiver.inner.register_waker(WatchWaiter {\n+                        waker: context.waker().clone(),\n+                        queued: Arc::clone(w),\n+                    });\n+                }\n             }\n             None => {\n                 // First poll \u2014 create a new waiter."
+    },
+    {
+      "sha": "1670efda7eee3a988c99dff07bbe1676a78d48b4",
+      "filename": "src/sync/mutex.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 2,
+      "changes": 8,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/2226a85febf4957f4f6dc5985be897e50c39a555/src%2Fsync%2Fmutex.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/2226a85febf4957f4f6dc5985be897e50c39a555/src%2Fsync%2Fmutex.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fsync%2Fmutex.rs?ref=2226a85febf4957f4f6dc5985be897e50c39a555",
+      "patch": "@@ -266,7 +266,9 @@ impl<'a, T> Future for LockFuture<'a, '_, T> {\n                     .iter_mut()\n                     .find(|w| Arc::ptr_eq(&w.queued, waiter))\n                 {\n-                    existing.waker.clone_from(context.waker());\n+                    if !existing.waker.will_wake(context.waker()) {\n+                        existing.waker.clone_from(context.waker());\n+                    }\n                 }\n             }\n             None => {\n@@ -440,7 +442,9 @@ impl<T> OwnedMutexGuard<T> {\n                             .iter_mut()\n                             .find(|w| Arc::ptr_eq(&w.queued, waiter))\n                         {\n-                            existing.waker.clone_from(context.waker());\n+                            if !existing.waker.will_wake(context.waker()) {\n+                                existing.waker.clone_from(context.waker());\n+                            }\n                         }\n                     }\n                     None => {"
+    },
+    {
+      "sha": "95fbe3bf3f91c76f4839d875bf7a9ba06cda075f",
+      "filename": "src/sync/notify.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 2,
+      "changes": 8,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/2226a85febf4957f4f6dc5985be897e50c39a555/src%2Fsync%2Fnotify.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/2226a85febf4957f4f6dc5985be897e50c39a555/src%2Fsync%2Fnotify.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fsync%2Fnotify.rs?ref=2226a85febf4957f4f6dc5985be897e50c39a555",
+      "patch": "@@ -350,8 +350,12 @@ impl Future for Notified<'_> {\n                             self.state = NotifiedState::Done;\n                             return Poll::Ready(());\n                         }\n-                        // Update waker while we have the lock.\n-                        waiters.entries[index].waker = Some(cx.waker().clone());\n+                        // Update waker while we have the lock, but only if it changed.\n+                        match &mut waiters.entries[index].waker {\n+                            Some(existing) if existing.will_wake(cx.waker()) => {}\n+                            Some(existing) => existing.clone_from(cx.waker()),\n+                            slot @ None => *slot = Some(cx.waker().clone()),\n+                        }\n                     } else {\n                         // Entry was popped by tail shrinking. This only\n                         // happens if our waker was taken by notify_one/notify_waiters,"
+    },
+    {
+      "sha": "28b7630d0a46cf1be5f0362fb964303d34e9ef13",
+      "filename": "src/sync/once_cell.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 1,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/2226a85febf4957f4f6dc5985be897e50c39a555/src%2Fsync%2Fonce_cell.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/2226a85febf4957f4f6dc5985be897e50c39a555/src%2Fsync%2Fonce_cell.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fsync%2Fonce_cell.rs?ref=2226a85febf4957f4f6dc5985be897e50c39a555",
+      "patch": "@@ -434,7 +434,9 @@ impl<T> OnceCell<T> {\n                 if let Some(existing) = guard.waiters.iter_mut().find(|entry| {\n                     Arc::ptr_eq(&entry.queued, flag) && entry.queued.load(Ordering::Acquire)\n                 }) {\n-                    existing.waker.clone_from(waker);\n+                    if !existing.waker.will_wake(waker) {\n+                        existing.waker.clone_from(waker);\n+                    }\n                 }\n                 None\n             }"
+    },
+    {
+      "sha": "c4a8809b535168ecf90317e3fc44b3061b8526bb",
+      "filename": "src/sync/rwlock.rs",
+      "status": "modified",
+      "additions": 12,
+      "deletions": 4,
+      "changes": 16,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/2226a85febf4957f4f6dc5985be897e50c39a555/src%2Fsync%2Frwlock.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/2226a85febf4957f4f6dc5985be897e50c39a555/src%2Fsync%2Frwlock.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fsync%2Frwlock.rs?ref=2226a85febf4957f4f6dc5985be897e50c39a555",
+      "patch": "@@ -491,7 +491,9 @@ impl<'a, T> Future for ReadFuture<'a, '_, T> {\n                     .iter_mut()\n                     .find(|w| Arc::ptr_eq(&w.queued, waiter))\n                 {\n-                    existing.waker.clone_from(context.waker());\n+                    if !existing.waker.will_wake(context.waker()) {\n+                        existing.waker.clone_from(context.waker());\n+                    }\n                 }\n             }\n             None => {\n@@ -622,7 +624,9 @@ impl<'a, T> Future for WriteFuture<'a, '_, T> {\n                     .iter_mut()\n                     .find(|w| Arc::ptr_eq(&w.queued, waiter))\n                 {\n-                    existing.waker.clone_from(context.waker());\n+                    if !existing.waker.will_wake(context.waker()) {\n+                        existing.waker.clone_from(context.waker());\n+                    }\n                 }\n             }\n             None => {\n@@ -880,7 +884,9 @@ impl<T> Future for OwnedReadFuture<'_, T> {\n                     .iter_mut()\n                     .find(|w| Arc::ptr_eq(&w.queued, waiter))\n                 {\n-                    existing.waker.clone_from(context.waker());\n+                    if !existing.waker.will_wake(context.waker()) {\n+                        existing.waker.clone_from(context.waker());\n+                    }\n                 }\n             }\n             None => {\n@@ -993,7 +999,9 @@ impl<T> Future for OwnedWriteFuture<'_, T> {\n                     .iter_mut()\n                     .find(|w| Arc::ptr_eq(&w.queued, waiter))\n                 {\n-                    existing.waker.clone_from(context.waker());\n+                    if !existing.waker.will_wake(context.waker()) {\n+                        existing.waker.clone_from(context.waker());\n+                    }\n                 }\n             }\n             None => {"
+    },
+    {
+      "sha": "27adecbdb838734c6cba002b23b505181d489ac3",
+      "filename": "src/sync/semaphore.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 2,
+      "changes": 8,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/2226a85febf4957f4f6dc5985be897e50c39a555/src%2Fsync%2Fsemaphore.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/2226a85febf4957f4f6dc5985be897e50c39a555/src%2Fsync%2Fsemaphore.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fsync%2Fsemaphore.rs?ref=2226a85febf4957f4f6dc5985be897e50c39a555",
+      "patch": "@@ -318,7 +318,9 @@ impl<'a> Future for AcquireFuture<'a, '_> {\n             .iter_mut()\n             .find(|waiter| waiter.id == waiter_id)\n         {\n-            existing.waker.clone_from(context.waker());\n+            if !existing.waker.will_wake(context.waker()) {\n+                existing.waker.clone_from(context.waker());\n+            }\n         } else {\n             state.waiters.push_back(Waiter {\n                 id: waiter_id,\n@@ -529,7 +531,9 @@ impl Future for OwnedAcquireFuture {\n             .iter_mut()\n             .find(|waiter| waiter.id == waiter_id)\n         {\n-            existing.waker.clone_from(context.waker());\n+            if !existing.waker.will_wake(context.waker()) {\n+                existing.waker.clone_from(context.waker());\n+            }\n         } else {\n             state.waiters.push_back(Waiter {\n                 id: waiter_id,"
+    }
+  ]
+}

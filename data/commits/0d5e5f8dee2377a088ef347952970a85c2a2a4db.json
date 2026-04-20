@@ -1,0 +1,29 @@
+{
+  "message": "fix: heartbeat falls back to last session contact",
+  "files": [
+    {
+      "sha": "27c9aad5a7e2df39a8a7e9b6b9eea36fd8820e6b",
+      "filename": "src/web/auto-reply.test.ts",
+      "status": "modified",
+      "additions": 31,
+      "deletions": 0,
+      "changes": 31,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/0d5e5f8dee2377a088ef347952970a85c2a2a4db/src%2Fweb%2Fauto-reply.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/0d5e5f8dee2377a088ef347952970a85c2a2a4db/src%2Fweb%2Fauto-reply.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fweb%2Fauto-reply.test.ts?ref=0d5e5f8dee2377a088ef347952970a85c2a2a4db",
+      "patch": "@@ -105,6 +105,37 @@ describe(\"runWebHeartbeatOnce\", () => {\n     });\n     expect(sender).toHaveBeenCalledWith(\"+1555\", \"ALERT\", { verbose: false });\n   });\n+\n+  it(\"falls back to most recent session when no to is provided\", async () => {\n+    const sender: typeof sendMessageWeb = vi\n+      .fn()\n+      .mockResolvedValue({ messageId: \"m1\", toJid: \"jid\" });\n+    const resolver = vi.fn(async () => ({ text: \"ALERT\" }));\n+    // Seed session store\n+    const now = Date.now();\n+    const store = {\n+      \"+1222\": { sessionId: \"s1\", updatedAt: now - 1000 },\n+      \"+1333\": { sessionId: \"s2\", updatedAt: now },\n+    };\n+    const storePath = resolveStorePath();\n+    await fs.mkdir(resolveStorePath().replace(\"sessions.json\", \"\"), {\n+      recursive: true,\n+    });\n+    await fs.writeFile(storePath, JSON.stringify(store));\n+    setLoadConfigMock({\n+      inbound: {\n+        allowFrom: [\"+1999\"],\n+        reply: { mode: \"command\", session: {} },\n+      },\n+    });\n+    await runWebHeartbeatOnce({\n+      to: \"+1999\",\n+      verbose: false,\n+      sender,\n+      replyResolver: resolver,\n+    });\n+    expect(sender).toHaveBeenCalledWith(\"+1333\", \"ALERT\", { verbose: false });\n+  });\n });\n \n describe(\"web auto-reply\", () => {"
+    },
+    {
+      "sha": "1f0d70018d3d7118a6aefe07cbf30e81f91e6568",
+      "filename": "src/web/auto-reply.ts",
+      "status": "modified",
+      "additions": 44,
+      "deletions": 9,
+      "changes": 53,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/0d5e5f8dee2377a088ef347952970a85c2a2a4db/src%2Fweb%2Fauto-reply.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/0d5e5f8dee2377a088ef347952970a85c2a2a4db/src%2Fweb%2Fauto-reply.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fweb%2Fauto-reply.ts?ref=0d5e5f8dee2377a088ef347952970a85c2a2a4db",
+      "patch": "@@ -2,10 +2,12 @@ import { getReplyFromConfig } from \"../auto-reply/reply.js\";\n import type { ReplyPayload } from \"../auto-reply/types.js\";\n import { waitForever } from \"../cli/wait.js\";\n import { loadConfig } from \"../config/config.js\";\n+import { loadSessionStore, resolveStorePath } from \"../config/sessions.js\";\n import { danger, isVerbose, logVerbose, success } from \"../globals.js\";\n import { logInfo } from \"../logger.js\";\n import { getChildLogger } from \"../logging.js\";\n import { defaultRuntime, type RuntimeEnv } from \"../runtime.js\";\n+import { normalizeE164 } from \"../utils.js\";\n import { monitorWebInbox } from \"./inbound.js\";\n import { loadWebMedia } from \"./media.js\";\n import { sendMessageWeb } from \"./outbound.js\";\n@@ -141,6 +143,23 @@ export async function runWebHeartbeatOnce(opts: {\n   }\n }\n \n+function getFallbackRecipient(cfg: ReturnType<typeof loadConfig>) {\n+  const sessionCfg = cfg.inbound?.reply?.session;\n+  const storePath = resolveStorePath(sessionCfg?.store);\n+  const store = loadSessionStore(storePath);\n+  const candidates = Object.entries(store).filter(([key]) => key !== \"global\");\n+  if (candidates.length === 0) {\n+    return (\n+      (Array.isArray(cfg.inbound?.allowFrom) && cfg.inbound.allowFrom[0]) ||\n+      null\n+    );\n+  }\n+  const mostRecent = candidates.sort(\n+    (a, b) => (b[1]?.updatedAt ?? 0) - (a[1]?.updatedAt ?? 0),\n+  )[0];\n+  return mostRecent ? normalizeE164(mostRecent[0]) : null;\n+}\n+\n async function deliverWebReply(params: {\n   replyResult: ReplyPayload;\n   msg: WebInboundMsg;\n@@ -437,15 +456,31 @@ export async function monitorWebProvider(\n       if (!replyHeartbeatMinutes) return;\n       const tickStart = Date.now();\n       if (!lastInboundMsg) {\n-        heartbeatLogger.info(\n-          {\n-            connectionId,\n-            reason: \"no-recent-inbound\",\n-            durationMs: Date.now() - tickStart,\n-          },\n-          \"reply heartbeat skipped\",\n-        );\n-        console.log(success(\"heartbeat: skipped (no recent inbound)\"));\n+        const fallbackTo = getFallbackRecipient(cfg);\n+        if (!fallbackTo) {\n+          heartbeatLogger.info(\n+            {\n+              connectionId,\n+              reason: \"no-recent-inbound\",\n+              durationMs: Date.now() - tickStart,\n+            },\n+            \"reply heartbeat skipped\",\n+          );\n+          console.log(success(\"heartbeat: skipped (no recent inbound)\"));\n+          return;\n+        }\n+        if (isVerbose()) {\n+          heartbeatLogger.info(\n+            { connectionId, to: fallbackTo, reason: \"fallback-session\" },\n+            \"reply heartbeat start\",\n+          );\n+        }\n+        await runWebHeartbeatOnce({\n+          to: fallbackTo,\n+          verbose,\n+          replyResolver,\n+          runtime,\n+        });\n         return;\n       }\n "
+    }
+  ]
+}

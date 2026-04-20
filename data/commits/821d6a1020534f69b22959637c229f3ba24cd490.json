@@ -1,0 +1,41 @@
+{
+  "message": "fix(llm): enforce streaming timeout",
+  "files": [
+    {
+      "sha": "3df96e93d8adb098ad4ae6d7c9557ea5ce43ba61",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/steipete/summarize/blob/821d6a1020534f69b22959637c229f3ba24cd490/CHANGELOG.md",
+      "raw_url": "https://github.com/steipete/summarize/raw/821d6a1020534f69b22959637c229f3ba24cd490/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/steipete/summarize/contents/CHANGELOG.md?ref=821d6a1020534f69b22959637c229f3ba24cd490",
+      "patch": "@@ -11,6 +11,7 @@\n - Compute cost totals via tokentally\u2019s tally helpers.\n - Improve fetch spinner with elapsed time and throughput updates.\n - Show Firecrawl fallback status and reason when scraping kicks in.\n+- Enforce a hard deadline for stalled streaming LLM responses.\n \n ## 0.1.1 - 2025-12-19\n "
+    },
+    {
+      "sha": "451dcfa9636e0d6800b8aac0b29b4aea8fef4c38",
+      "filename": "src/llm/generate-text.ts",
+      "status": "modified",
+      "additions": 70,
+      "deletions": 7,
+      "changes": 77,
+      "blob_url": "https://github.com/steipete/summarize/blob/821d6a1020534f69b22959637c229f3ba24cd490/src%2Fllm%2Fgenerate-text.ts",
+      "raw_url": "https://github.com/steipete/summarize/raw/821d6a1020534f69b22959637c229f3ba24cd490/src%2Fllm%2Fgenerate-text.ts",
+      "contents_url": "https://api.github.com/repos/steipete/summarize/contents/src%2Fllm%2Fgenerate-text.ts?ref=821d6a1020534f69b22959637c229f3ba24cd490",
+      "patch": "@@ -249,11 +249,74 @@ export async function streamTextWithModelId({\n   const parsed = parseGatewayStyleModelId(modelId)\n \n   const controller = new AbortController()\n-  const timeout = setTimeout(() => controller.abort(), timeoutMs)\n+  let timeoutId: ReturnType<typeof setTimeout> | null = null\n+  const startedAtMs = Date.now()\n+  let lastError: unknown = null\n+  const timeoutError = new Error('LLM request timed out')\n+  const markTimedOut = () => {\n+    if (lastError === timeoutError) return\n+    lastError = timeoutError\n+    controller.abort()\n+  }\n+\n+  const startTimeout = () => {\n+    if (timeoutId) return\n+    timeoutId = setTimeout(markTimedOut, timeoutMs)\n+  }\n+\n+  const stopTimeout = () => {\n+    if (!timeoutId) return\n+    clearTimeout(timeoutId)\n+    timeoutId = null\n+  }\n+\n+  const nextWithDeadline = async <T>(promise: Promise<T>): Promise<T> => {\n+    const elapsed = Date.now() - startedAtMs\n+    const remaining = timeoutMs - elapsed\n+    if (remaining <= 0) {\n+      markTimedOut()\n+      throw timeoutError\n+    }\n+    let timer: ReturnType<typeof setTimeout> | null = null\n+    try {\n+      return await Promise.race([\n+        promise,\n+        new Promise<never>((_, reject) => {\n+          timer = setTimeout(() => {\n+            markTimedOut()\n+            reject(timeoutError)\n+          }, remaining)\n+        }),\n+      ])\n+    } finally {\n+      if (timer) clearTimeout(timer)\n+    }\n+  }\n+\n+  const wrapTextStream = (textStream: AsyncIterable<string>): AsyncIterable<string> => ({\n+    async *[Symbol.asyncIterator]() {\n+      startTimeout()\n+      const iterator = textStream[Symbol.asyncIterator]()\n+      try {\n+        while (true) {\n+          const result = await nextWithDeadline(iterator.next())\n+          if (result.done) break\n+          yield result.value\n+        }\n+      } finally {\n+        stopTimeout()\n+        if (typeof iterator.return === 'function') {\n+          const cleanup = iterator.return()\n+          if (cleanup && typeof (cleanup as Promise<unknown>).catch === 'function') {\n+            ;(cleanup as Promise<unknown>).catch(() => {})\n+          }\n+        }\n+      }\n+    },\n+  })\n \n   try {\n     const { streamText } = await import('ai')\n-    let lastError: unknown = null\n     const onError = ({ error }: { error: unknown }) => {\n       if (parsed.provider === 'anthropic') {\n         lastError = normalizeAnthropicModelAccessError(error, parsed.model) ?? error\n@@ -277,7 +340,7 @@ export async function streamTextWithModelId({\n         onError,\n       })\n       return {\n-        textStream: result.textStream,\n+        textStream: wrapTextStream(result.textStream),\n         canonicalModelId: parsed.canonical,\n         provider: parsed.provider,\n         usage: result.totalUsage.then((raw) => normalizeTokenUsage(raw)).catch(() => null),\n@@ -303,7 +366,7 @@ export async function streamTextWithModelId({\n         onError,\n       })\n       return {\n-        textStream: result.textStream,\n+        textStream: wrapTextStream(result.textStream),\n         canonicalModelId: parsed.canonical,\n         provider: parsed.provider,\n         usage: result.totalUsage.then((raw) => normalizeTokenUsage(raw)).catch(() => null),\n@@ -326,7 +389,7 @@ export async function streamTextWithModelId({\n         onError,\n       })\n       return {\n-        textStream: result.textStream,\n+        textStream: wrapTextStream(result.textStream),\n         canonicalModelId: parsed.canonical,\n         provider: parsed.provider,\n         usage: result.totalUsage.then((raw) => normalizeTokenUsage(raw)).catch(() => null),\n@@ -353,7 +416,7 @@ export async function streamTextWithModelId({\n       onError,\n     })\n     return {\n-      textStream: result.textStream,\n+      textStream: wrapTextStream(result.textStream),\n       canonicalModelId: parsed.canonical,\n       provider: parsed.provider,\n       usage: result.totalUsage.then((raw) => normalizeTokenUsage(raw)).catch(() => null),\n@@ -369,6 +432,6 @@ export async function streamTextWithModelId({\n     }\n     throw error\n   } finally {\n-    clearTimeout(timeout)\n+    stopTimeout()\n   }\n }"
+    },
+    {
+      "sha": "21169928664593832df3480d18e8225a81224298",
+      "filename": "tests/llm.generate-text.test.ts",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 0,
+      "changes": 22,
+      "blob_url": "https://github.com/steipete/summarize/blob/821d6a1020534f69b22959637c229f3ba24cd490/tests%2Fllm.generate-text.test.ts",
+      "raw_url": "https://github.com/steipete/summarize/raw/821d6a1020534f69b22959637c229f3ba24cd490/tests%2Fllm.generate-text.test.ts",
+      "contents_url": "https://api.github.com/repos/steipete/summarize/contents/tests%2Fllm.generate-text.test.ts?ref=821d6a1020534f69b22959637c229f3ba24cd490",
+      "patch": "@@ -259,4 +259,26 @@ describe('llm generate/stream', () => {\n       })\n     ).rejects.toThrow(/timed out/i)\n   })\n+\n+  it('times out when a stream stalls before yielding', async () => {\n+    streamTextMock.mockImplementationOnce(() => ({\n+      textStream: {\n+        async *[Symbol.asyncIterator]() {\n+          await new Promise(() => {})\n+        },\n+      },\n+      totalUsage: new Promise(() => {}),\n+    }))\n+    const result = await streamTextWithModelId({\n+      modelId: 'openai/gpt-5.2',\n+      apiKeys: { openaiApiKey: 'k', xaiApiKey: null, googleApiKey: null, anthropicApiKey: null },\n+      prompt: 'hi',\n+      timeoutMs: 5,\n+      fetchImpl: globalThis.fetch.bind(globalThis),\n+      maxOutputTokens: 10,\n+    })\n+    const iterator = result.textStream[Symbol.asyncIterator]()\n+    const nextPromise = iterator.next()\n+    await expect(nextPromise).rejects.toThrow(/timed out/i)\n+  }, 250)\n })"
+    }
+  ]
+}

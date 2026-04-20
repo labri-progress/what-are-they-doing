@@ -1,0 +1,29 @@
+{
+  "message": "fix(runtime): add region close notification so scope awaits child completion\n\nThe scope was returning from child region teardown before the region had\nactually transitioned to Closed state, allowing parent tasks to observe\nstale intermediate state from child regions that were still draining.\n\nRegion close notification (src/record/region.rs):\n- Add RegionCloseState struct with closed flag and optional Waker\n- Add close_notify field (Arc<Mutex<RegionCloseState>>) to RegionRecord\n- Fire waker when region transitions to Closed in try_close() and\n  restore_snapshot(), ensuring both normal shutdown and snapshot-forced\n  closure paths notify waiters\n\nScope await (src/cx/scope.rs):\n- After advance_region_state(), clone close_notify handle and await\n  RegionCloseFuture that polls the closed flag\n- RegionCloseFuture registers waker on Pending, returns Ready when\n  closed is true\n- Uses will_wake() check to avoid unnecessary waker cloning\n\nThis ensures the scope only returns after the child region is fully\nclosed and its heap is reclaimed.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "5d58f95d6deb6af7609d2bc1f8db40ba6c72201e",
+      "filename": "src/cx/scope.rs",
+      "status": "modified",
+      "additions": 25,
+      "deletions": 0,
+      "changes": 25,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/834172e16d6a147ede61e637d7f6c777fc9ce065/src%2Fcx%2Fscope.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/834172e16d6a147ede61e637d7f6c777fc9ce065/src%2Fcx%2Fscope.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fcx%2Fscope.rs?ref=834172e16d6a147ede61e637d7f6c777fc9ce065",
+      "patch": "@@ -835,7 +835,32 @@ impl<P: Policy> Scope<'_, P> {\n             }\n         }\n \n+        let close_notify = state.region(child_region).map(|r| r.close_notify.clone());\n         state.advance_region_state(child_region);\n+\n+        if let Some(notify) = close_notify {\n+            struct RegionCloseFuture {\n+                state: Arc<parking_lot::Mutex<crate::record::region::RegionCloseState>>,\n+            }\n+            \n+            impl Future for RegionCloseFuture {\n+                type Output = ();\n+                fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {\n+                    let mut state = self.state.lock();\n+                    if state.closed {\n+                        Poll::Ready(())\n+                    } else {\n+                        if !state.waker.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {\n+                            state.waker = Some(cx.waker().clone());\n+                        }\n+                        Poll::Pending\n+                    }\n+                }\n+            }\n+\n+            RegionCloseFuture { state: notify }.await;\n+        }\n+\n         Ok(outcome)\n     }\n "
+    },
+    {
+      "sha": "95f667b2eaf5cb9b3133491bf35e3c6b196d613f",
+      "filename": "src/record/region.rs",
+      "status": "modified",
+      "additions": 25,
+      "deletions": 0,
+      "changes": 25,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/834172e16d6a147ede61e637d7f6c777fc9ce065/src%2Frecord%2Fregion.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/834172e16d6a147ede61e637d7f6c777fc9ce065/src%2Frecord%2Fregion.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Frecord%2Fregion.rs?ref=834172e16d6a147ede61e637d7f6c777fc9ce065",
+      "patch": "@@ -11,6 +11,15 @@ use crate::types::{Budget, CancelReason, CurveBudget, RRefAccess, RegionId, Task\n use parking_lot::RwLock;\n use std::sync::atomic::{AtomicU8, Ordering};\n \n+/// State for waking tasks waiting on a region to close.\n+#[derive(Debug)]\n+pub struct RegionCloseState {\n+    /// Whether the region is fully closed.\n+    pub closed: bool,\n+    /// Waker for a task waiting for the region to close.\n+    pub waker: Option<std::task::Waker>,\n+}\n+\n /// The state of a region in its lifecycle.\n ///\n /// State machine:\n@@ -272,6 +281,8 @@ pub struct RegionRecord {\n     pub parent: Option<RegionId>,\n     /// Logical time when the region was created.\n     pub created_at: Time,\n+    /// Notification state for tasks waiting on this region to close.\n+    pub close_notify: std::sync::Arc<parking_lot::Mutex<RegionCloseState>>,\n     /// Current state (atomic for concurrent access).\n     state: AtomicRegionState,\n     /// Inner mutable state (guarded by a lock).\n@@ -323,6 +334,10 @@ impl RegionRecord {\n             id,\n             parent,\n             created_at,\n+            close_notify: std::sync::Arc::new(parking_lot::Mutex::new(RegionCloseState {\n+                closed: false,\n+                waker: None,\n+            })),\n             state: AtomicRegionState::new(RegionState::Open),\n             inner: RwLock::new(RegionInner {\n                 budget,\n@@ -755,6 +770,11 @@ impl RegionRecord {\n         if transitioned {\n             self.trace_state_change(RegionState::Closed);\n             self.clear_heap();\n+            let mut notify = self.close_notify.lock();\n+            notify.closed = true;\n+            if let Some(waker) = notify.waker.take() {\n+                waker.wake();\n+            }\n         }\n         transitioned\n     }\n@@ -989,6 +1009,11 @@ impl RegionRecord {\n         // Ensure heap is reclaimed if the snapshot forces the region closed\n         if state == RegionState::Closed && prev_state != RegionState::Closed {\n             self.clear_heap();\n+            let mut notify = self.close_notify.lock();\n+            notify.closed = true;\n+            if let Some(waker) = notify.waker.take() {\n+                waker.wake();\n+            }\n         }\n     }\n }"
+    }
+  ]
+}

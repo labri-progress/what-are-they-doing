@@ -1,0 +1,28 @@
+{
+  "message": "feat(wal-fec): add recovery audit types and decode proof structures (SS3.4.1)\n\nAdd structured types for WAL-FEC recovery auditing:\n\n- WalFecRecoveryFallbackReason: enumeration of reasons recovery may\n  fall back to SQLite-compatible truncation (missing sidecar, salt\n  mismatch, insufficient symbols, decode failure, payload mismatch)\n- WalFecDecodeProof: per-group audit artifact recording available vs\n  required symbols, validated source/repair counts, decode outcome,\n  and recovered frame numbers\n- WalFecRecoveredGroup: successful recovery payload with metadata,\n  recovered pages, frame numbers, db_size_pages, and decode proof\n- WalFecRecoveryOutcome: final action enum (Recovered or\n  TruncateBeforeGroup) for the recovery state machine\n\nAlso add BTreeMap import for ordered recovery tracking.\nUpdate issue tracker with latest spec section progress.\n\nSpec reference: SS3.4.1 (WAL-FEC Recovery).\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "279347d8b89aadc971f5eae880165d0f079aa900",
+      "filename": ".beads/issues.jsonl",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/deef7a3fc13bea123c6a5380019e55e4e9ad1a6a/.beads%2Fissues.jsonl",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/deef7a3fc13bea123c6a5380019e55e4e9ad1a6a/.beads%2Fissues.jsonl",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/.beads%2Fissues.jsonl?ref=deef7a3fc13bea123c6a5380019e55e4e9ad1a6a"
+    },
+    {
+      "sha": "38e837bc6931515b2b764908b5a0a39ba6e8afee",
+      "filename": "crates/fsqlite-wal/src/wal_fec.rs",
+      "status": "modified",
+      "additions": 56,
+      "deletions": 1,
+      "changes": 57,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/deef7a3fc13bea123c6a5380019e55e4e9ad1a6a/crates%2Ffsqlite-wal%2Fsrc%2Fwal_fec.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/deef7a3fc13bea123c6a5380019e55e4e9ad1a6a/crates%2Ffsqlite-wal%2Fsrc%2Fwal_fec.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-wal%2Fsrc%2Fwal_fec.rs?ref=deef7a3fc13bea123c6a5380019e55e4e9ad1a6a",
+      "patch": "@@ -11,6 +11,7 @@ use std::fs::{self, File, OpenOptions};\n use std::io::Write;\n use std::mem::size_of;\n use std::path::{Path, PathBuf};\n+use std::collections::BTreeMap;\n use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};\n use std::sync::{Arc, mpsc};\n use std::thread::{self, JoinHandle};\n@@ -21,7 +22,9 @@ use fsqlite_types::{ObjectId, Oti, PageSize, SymbolRecord, SymbolRecordFlags};\n use tracing::{debug, error, info, warn};\n use xxhash_rust::xxh3::xxh3_64;\n \n-use crate::checksum::{WalSalts, Xxh3Checksum128, wal_fec_source_hash_xxh3_128};\n+use crate::checksum::{\n+    WalSalts, Xxh3Checksum128, verify_wal_fec_source_hash, wal_fec_source_hash_xxh3_128,\n+};\n \n /// Magic bytes for [`WalFecGroupMeta`].\n pub const WAL_FEC_GROUP_META_MAGIC: [u8; 8] = *b\"FSQLWFEC\";\n@@ -497,6 +500,58 @@ pub struct WalFecScanResult {\n     pub truncated_tail: bool,\n }\n \n+/// Why WAL-FEC recovery fell back to SQLite-compatible truncation.\n+#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n+pub enum WalFecRecoveryFallbackReason {\n+    MissingSidecarGroup,\n+    SidecarUnreadable,\n+    SaltMismatch,\n+    InsufficientSymbols,\n+    DecodeFailed,\n+    DecodedPayloadMismatch,\n+}\n+\n+/// Recovery audit artifact for a single WAL-FEC group attempt (\u00a73.4.1).\n+#[derive(Debug, Clone, PartialEq, Eq)]\n+pub struct WalFecDecodeProof {\n+    pub group_id: WalFecGroupId,\n+    pub required_symbols: u32,\n+    pub available_symbols: u32,\n+    pub validated_source_symbols: u32,\n+    pub validated_repair_symbols: u32,\n+    pub decode_attempted: bool,\n+    pub decode_succeeded: bool,\n+    pub recovered_frame_nos: Vec<u32>,\n+    pub fallback_reason: Option<WalFecRecoveryFallbackReason>,\n+}\n+\n+/// Successful recovery payload for one commit group.\n+#[derive(Debug, Clone, PartialEq, Eq)]\n+pub struct WalFecRecoveredGroup {\n+    pub meta: WalFecGroupMeta,\n+    pub recovered_pages: Vec<Vec<u8>>,\n+    pub recovered_frame_nos: Vec<u32>,\n+    pub db_size_pages: u32,\n+    pub decode_proof: WalFecDecodeProof,\n+}\n+\n+/// Final action for a WAL-FEC recovery attempt.\n+#[derive(Debug, Clone, PartialEq, Eq)]\n+pub enum WalFecRecoveryOutcome {\n+    Recovered(WalFecRecoveredGroup),\n+    TruncateBeforeGroup {\n+        truncate_before_frame_no: u32,\n+        decode_proof: WalFecDecodeProof,\n+    },\n+}\n+\n+/// Candidate WAL source frame payload read from `.wal`.\n+#[derive(Debug, Clone, PartialEq, Eq)]\n+pub struct WalFrameCandidate {\n+    pub frame_no: u32,\n+    pub page_data: Vec<u8>,\n+}\n+\n const DEFAULT_REPAIR_PIPELINE_QUEUE_CAPACITY: usize = 64;\n const REPAIR_PIPELINE_FLUSH_POLL_INTERVAL: Duration = Duration::from_millis(1);\n "
+    }
+  ]
+}

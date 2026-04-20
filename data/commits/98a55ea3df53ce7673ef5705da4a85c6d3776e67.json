@@ -1,0 +1,41 @@
+{
+  "message": "perf(db): materialized inbox stats cache + InboxStatsRow model\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "7029080dc7c81a2842688255200c5578c583a30d",
+      "filename": "crates/mcp-agent-mail-db/src/cache.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/98a55ea3df53ce7673ef5705da4a85c6d3776e67/crates%2Fmcp-agent-mail-db%2Fsrc%2Fcache.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/98a55ea3df53ce7673ef5705da4a85c6d3776e67/crates%2Fmcp-agent-mail-db%2Fsrc%2Fcache.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-db%2Fsrc%2Fcache.rs?ref=98a55ea3df53ce7673ef5705da4a85c6d3776e67",
+      "patch": "@@ -35,11 +35,12 @@ use std::time::{Duration, Instant};\n \n use indexmap::IndexMap;\n \n-use crate::models::{AgentRow, ProjectRow};\n+use crate::models::{AgentRow, InboxStatsRow, ProjectRow};\n use mcp_agent_mail_core::{InternedStr, LockLevel, OrderedMutex, OrderedRwLock};\n \n const PROJECT_TTL: Duration = Duration::from_secs(300); // 5 min\n const AGENT_TTL: Duration = Duration::from_secs(300); // 5 min\n+const INBOX_STATS_TTL: Duration = Duration::from_secs(30); // 30 sec (shorter: counters change often)\n const MAX_ENTRIES_PER_CATEGORY: usize = 16_384;\n /// Minimum interval between deferred touch flushes.\n const TOUCH_FLUSH_INTERVAL: Duration = Duration::from_secs(30);"
+    },
+    {
+      "sha": "b6471d19997cc314334f12d4fa3f2561fa7193b2",
+      "filename": "crates/mcp-agent-mail-db/src/models.rs",
+      "status": "modified",
+      "additions": 32,
+      "deletions": 0,
+      "changes": 32,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/98a55ea3df53ce7673ef5705da4a85c6d3776e67/crates%2Fmcp-agent-mail-db%2Fsrc%2Fmodels.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/98a55ea3df53ce7673ef5705da4a85c6d3776e67/crates%2Fmcp-agent-mail-db%2Fsrc%2Fmodels.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-db%2Fsrc%2Fmodels.rs?ref=98a55ea3df53ce7673ef5705da4a85c6d3776e67",
+      "patch": "@@ -433,3 +433,35 @@ impl Default for ProjectSiblingSuggestionRow {\n         }\n     }\n }\n+\n+// =============================================================================\n+// Inbox Stats (materialized aggregate counters)\n+// =============================================================================\n+\n+/// Materialized aggregate counters for an agent's inbox.\n+///\n+/// Maintained by SQLite triggers on `message_recipients` so that inbox\n+/// stats queries are O(1) instead of scanning the recipients table.\n+#[derive(Model, Debug, Clone, Serialize, Deserialize)]\n+#[sqlmodel(table = \"inbox_stats\")]\n+pub struct InboxStatsRow {\n+    /// The agent whose inbox these stats describe.\n+    #[sqlmodel(primary_key)]\n+    pub agent_id: i64,\n+\n+    /// Total messages delivered to this agent.\n+    #[sqlmodel(default = \"0\")]\n+    pub total_count: i64,\n+\n+    /// Messages not yet marked as read.\n+    #[sqlmodel(default = \"0\")]\n+    pub unread_count: i64,\n+\n+    /// Messages with `ack_required=1` that haven't been acknowledged.\n+    #[sqlmodel(default = \"0\")]\n+    pub ack_pending_count: i64,\n+\n+    /// Timestamp of the most recent message (microseconds since epoch).\n+    #[sqlmodel(nullable)]\n+    pub last_message_ts: Option<i64>,\n+}"
+    },
+    {
+      "sha": "71744eadc9a03719d654139d2536892ecdf34084",
+      "filename": "crates/mcp-agent-mail-db/src/queries.rs",
+      "status": "modified",
+      "additions": 66,
+      "deletions": 2,
+      "changes": 68,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/98a55ea3df53ce7673ef5705da4a85c6d3776e67/crates%2Fmcp-agent-mail-db%2Fsrc%2Fqueries.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/98a55ea3df53ce7673ef5705da4a85c6d3776e67/crates%2Fmcp-agent-mail-db%2Fsrc%2Fqueries.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-db%2Fsrc%2Fqueries.rs?ref=98a55ea3df53ce7673ef5705da4a85c6d3776e67",
+      "patch": "@@ -10,8 +10,8 @@\n \n use crate::error::DbError;\n use crate::models::{\n-    AgentLinkRow, AgentRow, FileReservationRow, MessageRecipientRow, MessageRow, ProductRow,\n-    ProjectRow,\n+    AgentLinkRow, AgentRow, FileReservationRow, InboxStatsRow, MessageRecipientRow, MessageRow,\n+    ProductRow, ProjectRow,\n };\n use crate::pool::DbPool;\n use crate::timestamps::now_micros;\n@@ -1883,6 +1883,70 @@ pub async fn acknowledge_message(\n     }\n }\n \n+// =============================================================================\n+// Inbox Stats Queries (materialized aggregate counters)\n+// =============================================================================\n+\n+/// Fetch materialized inbox stats for an agent (O(1) primary key lookup).\n+///\n+/// Returns `None` if the agent has never received any messages (no row\n+/// in `inbox_stats`).\n+pub async fn get_inbox_stats(\n+    cx: &Cx,\n+    pool: &DbPool,\n+    agent_id: i64,\n+) -> Outcome<Option<InboxStatsRow>, DbError> {\n+    let conn = match acquire_conn(cx, pool).await {\n+        Outcome::Ok(c) => c,\n+        Outcome::Err(e) => return Outcome::Err(e),\n+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),\n+        Outcome::Panicked(p) => return Outcome::Panicked(p),\n+    };\n+\n+    let tracked = tracked(&*conn);\n+\n+    let sql = \"SELECT agent_id, total_count, unread_count, ack_pending_count, last_message_ts \\\n+               FROM inbox_stats WHERE agent_id = ?\";\n+    let params = [Value::BigInt(agent_id)];\n+\n+    let out = map_sql_outcome(traw_query(cx, &tracked, sql, &params).await);\n+    match out {\n+        Outcome::Ok(rows) => {\n+            if rows.is_empty() {\n+                Outcome::Ok(None)\n+            } else {\n+                let row = &rows[0];\n+                let stats = InboxStatsRow {\n+                    agent_id: match row.get_named(\"agent_id\") {\n+                        Ok(v) => v,\n+                        Err(e) => return Outcome::Err(map_sql_error(&e)),\n+                    },\n+                    total_count: match row.get_named(\"total_count\") {\n+                        Ok(v) => v,\n+                        Err(e) => return Outcome::Err(map_sql_error(&e)),\n+                    },\n+                    unread_count: match row.get_named(\"unread_count\") {\n+                        Ok(v) => v,\n+                        Err(e) => return Outcome::Err(map_sql_error(&e)),\n+                    },\n+                    ack_pending_count: match row.get_named(\"ack_pending_count\") {\n+                        Ok(v) => v,\n+                        Err(e) => return Outcome::Err(map_sql_error(&e)),\n+                    },\n+                    last_message_ts: match row.get_named(\"last_message_ts\") {\n+                        Ok(v) => v,\n+                        Err(e) => return Outcome::Err(map_sql_error(&e)),\n+                    },\n+                };\n+                Outcome::Ok(Some(stats))\n+            }\n+        }\n+        Outcome::Err(e) => Outcome::Err(e),\n+        Outcome::Cancelled(r) => Outcome::Cancelled(r),\n+        Outcome::Panicked(p) => Outcome::Panicked(p),\n+    }\n+}\n+\n // =============================================================================\n // FileReservation Queries\n // ============================================================================="
+    }
+  ]
+}

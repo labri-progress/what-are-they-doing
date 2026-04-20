@@ -1,0 +1,89 @@
+{
+  "message": "fix(node): correctness fixes across CRDT, lease, ZK attestation, revocation, and cancellation\n\nFix LWW-Map equal-timestamp non-determinism in crdt.rs by using lexicographic\ncomparison on serialized values instead of insertion-order-dependent >= check,\nensuring commutativity. Fix off-by-one in lease_service.rs expiration check\n(now >= instead of > for fail-closed zero-remaining semantics). Add future-proof\nrejection in zk_attestation.rs for attestations with generated_at_ms ahead of\ncurrent time. Add future-epoch rejection in revocation_freshness_gate.rs for\nproofs claiming epochs ahead of current_epoch. Propagate leak errors from\nforce_finalize_internal into drain timeout error strings in\ncancellation_protocol.rs. Clear incident history after rollback in\ncrash_loop_detector.rs to prevent stale incidents from influencing future\ndecisions. Remove dead unreachable slash check in staking_governance.rs.\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "a26229e33cf1a700fb4cc93eebfb864a2c77e40e",
+      "filename": "crates/franken-node/src/connector/cancellation_protocol.rs",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 2,
+      "changes": 18,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/f412c0ca1b89b2b9a17e2483b4850ffe9676334c/crates%2Ffranken-node%2Fsrc%2Fconnector%2Fcancellation_protocol.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/f412c0ca1b89b2b9a17e2483b4850ffe9676334c/crates%2Ffranken-node%2Fsrc%2Fconnector%2Fcancellation_protocol.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fconnector%2Fcancellation_protocol.rs?ref=f412c0ca1b89b2b9a17e2483b4850ffe9676334c",
+      "patch": "@@ -540,13 +540,17 @@ impl CancellationProtocol {\n                             elapsed_ms, self.budget.timeout_ms\n                         ),\n                     );\n-                    self.force_finalize_internal();\n+                    let force_res = self.force_finalize_internal();\n+                    let mut err_str = error_codes::ERR_CANCEL_DRAIN_TIMEOUT.to_string();\n+                    if let Some(leak_err) = force_res.error {\n+                        err_str = format!(\"{}; {}\", err_str, leak_err);\n+                    }\n                     return Ok(PhaseTransitionResult {\n                         from,\n                         to: self.phase,\n                         force_finalized: true,\n                         event_code: event_codes::CAN_004.to_string(),\n-                        error: Some(error_codes::ERR_CANCEL_DRAIN_TIMEOUT.to_string()),\n+                        error: Some(err_str),\n                     });\n                 }\n \n@@ -872,6 +876,16 @@ mod tests {\n         assert!(proto.was_force_finalized());\n     }\n \n+    #[test]\n+    fn drain_timeout_with_leak_preserves_leak_error() {\n+        let mut proto = make_protocol(\"publish\", 2000);\n+        proto.resource_guard_mut().acquire(\"leaked_conn\");\n+        proto.request().unwrap();\n+        let result = proto.drain(3000).unwrap();\n+        assert!(result.force_finalized);\n+        assert!(result.error.unwrap().contains(\"ERR_CANCEL_LEAK\"));\n+    }\n+\n     // \u2500\u2500 Protocol: leak detection \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n \n     #[test]"
+    },
+    {
+      "sha": "b5e479da3b38bde90b157b75c2c3355772a53b90",
+      "filename": "crates/franken-node/src/connector/crdt.rs",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 4,
+      "changes": 26,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/f412c0ca1b89b2b9a17e2483b4850ffe9676334c/crates%2Ffranken-node%2Fsrc%2Fconnector%2Fcrdt.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/f412c0ca1b89b2b9a17e2483b4850ffe9676334c/crates%2Ffranken-node%2Fsrc%2Fconnector%2Fcrdt.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fconnector%2Fcrdt.rs?ref=f412c0ca1b89b2b9a17e2483b4850ffe9676334c",
+      "patch": "@@ -85,12 +85,19 @@ impl LwwMap {\n     }\n \n     pub fn set(&mut self, key: String, value: serde_json::Value, timestamp: u64) {\n-        match self.entries.get(&key) {\n-            Some(existing) if existing.timestamp >= timestamp => {}\n-            _ => {\n-                self.entries.insert(key, LwwEntry { value, timestamp });\n+        if let Some(existing) = self.entries.get(&key) {\n+            if existing.timestamp > timestamp {\n+                return;\n+            }\n+            if existing.timestamp == timestamp {\n+                let current_str = serde_json::to_string(&existing.value).unwrap_or_default();\n+                let new_str = serde_json::to_string(&value).unwrap_or_default();\n+                if current_str >= new_str {\n+                    return;\n+                }\n             }\n         }\n+        self.entries.insert(key, LwwEntry { value, timestamp });\n     }\n \n     pub fn merge(&self, other: &LwwMap) -> Result<LwwMap, CrdtError> {\n@@ -312,6 +319,17 @@ mod tests {\n         assert_eq!(aa.entries, a.entries);\n     }\n \n+    #[test]\n+    fn lww_map_merge_equal_timestamp_commutative() {\n+        let mut a = LwwMap::new();\n+        a.set(\"k\".into(), json!(\"a\"), 1);\n+        let mut b = LwwMap::new();\n+        b.set(\"k\".into(), json!(\"b\"), 1);\n+        let ab = a.merge(&b).unwrap();\n+        let ba = b.merge(&a).unwrap();\n+        assert_eq!(ab.entries[\"k\"].value, ba.entries[\"k\"].value);\n+    }\n+\n     // === OR-Set tests ===\n \n     #[test]"
+    },
+    {
+      "sha": "bb105f40ddd857d4f11513a6c4e834badd20a672",
+      "filename": "crates/franken-node/src/connector/lease_service.rs",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 5,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/f412c0ca1b89b2b9a17e2483b4850ffe9676334c/crates%2Ffranken-node%2Fsrc%2Fconnector%2Flease_service.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/f412c0ca1b89b2b9a17e2483b4850ffe9676334c/crates%2Ffranken-node%2Fsrc%2Fconnector%2Flease_service.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fconnector%2Flease_service.rs?ref=f412c0ca1b89b2b9a17e2483b4850ffe9676334c",
+      "patch": "@@ -43,7 +43,7 @@ impl Lease {\n     /// Check if the lease is expired at time `now`.\n     pub fn is_expired(&self, now: u64) -> bool {\n         match self.expires_at() {\n-            Some(expires_at) => now > expires_at,\n+            Some(expires_at) => now >= expires_at,\n             None => true, // fail closed when expiry arithmetic overflows\n         }\n     }\n@@ -389,8 +389,8 @@ mod tests {\n     fn lease_expires_after_ttl() {\n         let mut svc = LeaseService::new();\n         let l = svc.grant(\"h\", LeasePurpose::Operation, 60, 100, \"tr\", \"ts\");\n-        assert!(!l.is_expired(160)); // at TTL boundary\n-        assert!(l.is_expired(161)); // past TTL\n+        assert!(!l.is_expired(159)); // just before TTL boundary\n+        assert!(l.is_expired(160)); // at TTL boundary (fail-closed: 0 remaining = expired)\n     }\n \n     #[test]\n@@ -414,8 +414,8 @@ mod tests {\n         let mut svc = LeaseService::new();\n         let l = svc.grant(\"h\", LeasePurpose::Operation, 60, 100, \"tr\", \"ts\");\n         let renewed = svc.renew(&l.lease_id, 150, \"tr2\", \"ts2\").unwrap();\n-        assert!(!renewed.is_expired(210)); // 150 + 60 = 210\n-        assert!(renewed.is_expired(211));\n+        assert!(!renewed.is_expired(209)); // 150 + 60 = 210, one before boundary\n+        assert!(renewed.is_expired(210)); // at boundary (fail-closed)\n     }\n \n     #[test]"
+    },
+    {
+      "sha": "c39fa94893932da6f5aa492470ad6c088fe535d9",
+      "filename": "crates/franken-node/src/registry/staking_governance.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 11,
+      "changes": 13,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/f412c0ca1b89b2b9a17e2483b4850ffe9676334c/crates%2Ffranken-node%2Fsrc%2Fregistry%2Fstaking_governance.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/f412c0ca1b89b2b9a17e2483b4850ffe9676334c/crates%2Ffranken-node%2Fsrc%2Fregistry%2Fstaking_governance.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fregistry%2Fstaking_governance.rs?ref=f412c0ca1b89b2b9a17e2483b4850ffe9676334c",
+      "patch": "@@ -640,17 +640,8 @@ impl CapabilityStakeGate {\n             );\n         }\n \n-        // Check no unresolved slash events\n-        if record.state == StakeState::Slashed || record.state == StakeState::UnderAppeal {\n-            return (\n-                false,\n-                STAKE_007,\n-                format!(\n-                    \"publisher {publisher_id} has unresolved slash (state={})\",\n-                    record.state\n-                ),\n-            );\n-        }\n+        // Note: slashed/under-appeal stakes are caught in the None branch\n+        // above via get_any_stake_for_publisher. Here `record` is always Active.\n \n         // Check cooldown has elapsed\n         if let Some(account) = ledger.accounts.get(publisher_id)"
+    },
+    {
+      "sha": "a53fbc6c85a37a9c4a1e049b03f1245b021a936e",
+      "filename": "crates/franken-node/src/runtime/crash_loop_detector.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/f412c0ca1b89b2b9a17e2483b4850ffe9676334c/crates%2Ffranken-node%2Fsrc%2Fruntime%2Fcrash_loop_detector.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/f412c0ca1b89b2b9a17e2483b4850ffe9676334c/crates%2Ffranken-node%2Fsrc%2Fruntime%2Fcrash_loop_detector.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fruntime%2Fcrash_loop_detector.rs?ref=f412c0ca1b89b2b9a17e2483b4850ffe9676334c",
+      "patch": "@@ -316,8 +316,9 @@ impl CrashLoopDetector {\n \n         // All checks pass \u2014 automatic rollback\n         self.last_rollback_epoch = now;\n-        // Clear crash window after rollback\n+        // Clear crash window and incident history after rollback\n         self.crash_times.clear();\n+        self.incidents.clear();\n \n         let decision = RollbackDecision {\n             connector_id: connector_id.to_string(),"
+    },
+    {
+      "sha": "e994d7a25033c4a97c2dc864deb1684b0c142d34",
+      "filename": "crates/franken-node/src/security/revocation_freshness_gate.rs",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 2,
+      "changes": 18,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/f412c0ca1b89b2b9a17e2483b4850ffe9676334c/crates%2Ffranken-node%2Fsrc%2Fsecurity%2Frevocation_freshness_gate.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/f412c0ca1b89b2b9a17e2483b4850ffe9676334c/crates%2Ffranken-node%2Fsrc%2Fsecurity%2Frevocation_freshness_gate.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fsecurity%2Frevocation_freshness_gate.rs?ref=f412c0ca1b89b2b9a17e2483b4850ffe9676334c",
+      "patch": "@@ -296,6 +296,15 @@ impl RevocationFreshnessGate {\n         // Verify proof integrity\n         self.verify_proof(proof)?;\n \n+        if proof.epoch > current_epoch {\n+            return Err(FreshnessError::ProofTampered {\n+                detail: format!(\n+                    \"proof epoch {} is in the future (current={})\",\n+                    proof.epoch, current_epoch\n+                ),\n+            });\n+        }\n+\n         let max_staleness = tier.max_staleness_epochs();\n         let staleness = current_epoch.saturating_sub(proof.epoch);\n \n@@ -810,7 +819,12 @@ mod tests {\n     fn very_large_epoch() {\n         let mut g = gate();\n         let p = proof(SafetyTier::Advisory, u64::MAX - 5, \"n-large\");\n-        let d = g.check(&p, u64::MAX - 5, true, false, \"act\", \"tr\").unwrap();\n-        assert!(d.allowed);\n+        let err = g.check(&p, u64::MAX - 10, true, false, \"act\", \"tr\").unwrap_err();\n+        match err {\n+            FreshnessError::ProofTampered { detail } => {\n+                assert!(detail.contains(\"in the future\"));\n+            }\n+            _ => panic!(\"Expected ProofTampered error\"),\n+        }\n     }\n }"
+    },
+    {
+      "sha": "ae7c2101c2c212451c2000c7022185cfc125d31a",
+      "filename": "crates/franken-node/src/security/zk_attestation.rs",
+      "status": "modified",
+      "additions": 41,
+      "deletions": 0,
+      "changes": 41,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/f412c0ca1b89b2b9a17e2483b4850ffe9676334c/crates%2Ffranken-node%2Fsrc%2Fsecurity%2Fzk_attestation.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/f412c0ca1b89b2b9a17e2483b4850ffe9676334c/crates%2Ffranken-node%2Fsrc%2Fsecurity%2Fzk_attestation.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fsecurity%2Fzk_attestation.rs?ref=f412c0ca1b89b2b9a17e2483b4850ffe9676334c",
+      "patch": "@@ -651,6 +651,25 @@ impl AttestationLedger {\n             };\n         }\n \n+        if now_ms < attestation.generated_at_ms {\n+            self.record_audit(\n+                format!(\"audit-{}-future\", aid),\n+                event_codes::FN_ZK_004.to_string(),\n+                Some(aid.clone()),\n+                Some(pid.clone()),\n+                trace_id.clone(),\n+                now_ms,\n+                \"Attestation generated in the future\".to_string(),\n+            );\n+            return ZkVerificationResult::Rejected {\n+                attestation_id: aid,\n+                policy_id: pid,\n+                trace_id,\n+                reason: \"Proof generated in the future\".to_string(),\n+                error_code: error_codes::ERR_ZKA_INVALID_PROOF.to_string(),\n+            };\n+        }\n+\n         // INV-ZKA-SELECTIVE: check proof structure\n         if !invariants::check_selective(attestation) {\n             self.record_audit(\n@@ -1234,6 +1253,28 @@ mod tests {\n         }\n     }\n \n+    #[test]\n+    fn test_verify_future_proof_rejected() {\n+        let mut ledger = AttestationLedger::new();\n+        let policy = test_policy();\n+        let att = generate_test_attestation(\n+            &mut ledger,\n+            \"att-future\",\n+            &policy,\n+            PredicateOutcome::Pass,\n+            1_000_000,\n+        );\n+        // Verify with a `now_ms` that is *before* the generation time\n+        let result = ledger.verify_proof(&att, &policy, 999_999, \"trace-future\".to_string());\n+        assert!(!result.is_verified());\n+        match &result {\n+            ZkVerificationResult::Rejected { error_code, .. } => {\n+                assert_eq!(error_code, error_codes::ERR_ZKA_INVALID_PROOF);\n+            }\n+            _ => unreachable!(\"Expected Rejected\"),\n+        }\n+    }\n+\n     #[test]\n     fn test_verify_failing_predicate_rejected() {\n         let mut ledger = AttestationLedger::new();"
+    }
+  ]
+}

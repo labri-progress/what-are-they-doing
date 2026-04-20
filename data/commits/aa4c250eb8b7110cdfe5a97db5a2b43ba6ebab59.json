@@ -1,0 +1,137 @@
+{
+  "message": "fix(cron): split run and delivery status tracking",
+  "files": [
+    {
+      "sha": "4b53d52eba18547871e4f275228bc26e8cc892b9",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59",
+      "patch": "@@ -45,6 +45,7 @@ Docs: https://docs.openclaw.ai\n - Cron/Service: execute manual `cron.run` jobs outside the cron lock (while still persisting started/finished state atomically) so `cron.list` and `cron.status` remain responsive during long forced runs. (#23628) Thanks @dsgraves.\n - Cron/Timer: keep a watchdog recheck timer armed while `onTimer` is actively executing so the scheduler continues polling even if a due-run tick stalls for an extended period. (#23628) Thanks @dsgraves.\n - Cron/Run: enforce the same per-job timeout guard for manual `cron.run` executions as timer-driven runs, including abort propagation for isolated agent jobs, so forced runs cannot wedge indefinitely. (#23704) Thanks @tkuehnl.\n+- Cron/Status: split execution outcome (`lastRunStatus`) from delivery outcome (`lastDeliveryStatus`) in persisted cron state, finished events, and run history so failed/unknown announcement delivery is visible without conflating it with run errors.\n - Agents/Compaction: restore embedded compaction safeguard/context-pruning extension loading in production by wiring bundled extension factories into the resource loader instead of runtime file-path resolution. (#22349) Thanks @Glucksberg.\n - Feishu/Media: for inbound video messages that include both `file_key` (video) and `image_key` (thumbnail), prefer `file_key` when downloading media so video attachments are saved instead of silently failing on thumbnail keys. (#23633)\n - Hooks/Cron: suppress duplicate main-session events for delivered hook turns and mark `SILENT_REPLY_TOKEN` (`NO_REPLY`) early exits as delivered to prevent hook context pollution. (#20678) Thanks @JonathanWorks."
+    },
+    {
+      "sha": "2889688013c7b93c02e030a169bb86152245b151",
+      "filename": "src/cron/run-log.test.ts",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 1,
+      "changes": 6,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59/src%2Fcron%2Frun-log.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59/src%2Fcron%2Frun-log.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fcron%2Frun-log.test.ts?ref=aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59",
+      "patch": "@@ -105,7 +105,7 @@ describe(\"cron run log\", () => {\n     });\n   });\n \n-  it(\"ignores invalid and non-finished lines while preserving delivered flag\", async () => {\n+  it(\"ignores invalid and non-finished lines while preserving delivery fields\", async () => {\n     await withRunLogDir(\"openclaw-cron-log-filter-\", async (dir) => {\n       const logPath = path.join(dir, \"runs\", \"job-1.jsonl\");\n       await fs.mkdir(path.dirname(logPath), { recursive: true });\n@@ -120,6 +120,8 @@ describe(\"cron run log\", () => {\n             action: \"finished\",\n             status: \"ok\",\n             delivered: true,\n+            deliveryStatus: \"not-delivered\",\n+            deliveryError: \"announce failed\",\n           }),\n         ].join(\"\\n\") + \"\\n\",\n         \"utf-8\",\n@@ -129,6 +131,8 @@ describe(\"cron run log\", () => {\n       expect(entries).toHaveLength(1);\n       expect(entries[0]?.ts).toBe(2);\n       expect(entries[0]?.delivered).toBe(true);\n+      expect(entries[0]?.deliveryStatus).toBe(\"not-delivered\");\n+      expect(entries[0]?.deliveryError).toBe(\"announce failed\");\n     });\n   });\n "
+    },
+    {
+      "sha": "0fd6de76e94659dda84a585a0950e9c16824e58e",
+      "filename": "src/cron/run-log.ts",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 1,
+      "changes": 15,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59/src%2Fcron%2Frun-log.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59/src%2Fcron%2Frun-log.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fcron%2Frun-log.ts?ref=aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59",
+      "patch": "@@ -1,6 +1,6 @@\n import fs from \"node:fs/promises\";\n import path from \"node:path\";\n-import type { CronRunStatus, CronRunTelemetry } from \"./types.js\";\n+import type { CronDeliveryStatus, CronRunStatus, CronRunTelemetry } from \"./types.js\";\n \n export type CronRunLogEntry = {\n   ts: number;\n@@ -10,6 +10,8 @@ export type CronRunLogEntry = {\n   error?: string;\n   summary?: string;\n   delivered?: boolean;\n+  deliveryStatus?: CronDeliveryStatus;\n+  deliveryError?: string;\n   sessionId?: string;\n   sessionKey?: string;\n   runAtMs?: number;\n@@ -131,6 +133,17 @@ export async function readCronRunLogEntries(\n       if (typeof obj.delivered === \"boolean\") {\n         entry.delivered = obj.delivered;\n       }\n+      if (\n+        obj.deliveryStatus === \"delivered\" ||\n+        obj.deliveryStatus === \"not-delivered\" ||\n+        obj.deliveryStatus === \"unknown\" ||\n+        obj.deliveryStatus === \"not-requested\"\n+      ) {\n+        entry.deliveryStatus = obj.deliveryStatus;\n+      }\n+      if (typeof obj.deliveryError === \"string\") {\n+        entry.deliveryError = obj.deliveryError;\n+      }\n       if (typeof obj.sessionId === \"string\" && obj.sessionId.trim().length > 0) {\n         entry.sessionId = obj.sessionId;\n       }"
+    },
+    {
+      "sha": "10c8319fb26381616212a6be037554acb93caf4e",
+      "filename": "src/cron/service.persists-delivered-status.test.ts",
+      "status": "modified",
+      "additions": 45,
+      "deletions": 4,
+      "changes": 49,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59/src%2Fcron%2Fservice.persists-delivered-status.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59/src%2Fcron%2Fservice.persists-delivered-status.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fcron%2Fservice.persists-delivered-status.test.ts?ref=aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59",
+      "patch": "@@ -40,7 +40,7 @@ function buildMainSessionSystemEventJob(name: string): CronAddInput {\n function createIsolatedCronWithFinishedBarrier(params: {\n   storePath: string;\n   delivered?: boolean;\n-  onFinished?: (evt: { jobId: string; delivered?: boolean }) => void;\n+  onFinished?: (evt: { jobId: string; delivered?: boolean; deliveryStatus?: string }) => void;\n }) {\n   const finished = createFinishedBarrier();\n   const cron = new CronService({\n@@ -56,7 +56,11 @@ function createIsolatedCronWithFinishedBarrier(params: {\n     })),\n     onEvent: (evt) => {\n       if (evt.action === \"finished\") {\n-        params.onFinished?.({ jobId: evt.jobId, delivered: evt.delivered });\n+        params.onFinished?.({\n+          jobId: evt.jobId,\n+          delivered: evt.delivered,\n+          deliveryStatus: evt.deliveryStatus,\n+        });\n       }\n       finished.onEvent(evt);\n     },\n@@ -94,7 +98,10 @@ describe(\"CronService persists delivered status\", () => {\n     });\n \n     expect(updated?.state.lastStatus).toBe(\"ok\");\n+    expect(updated?.state.lastRunStatus).toBe(\"ok\");\n     expect(updated?.state.lastDelivered).toBe(true);\n+    expect(updated?.state.lastDeliveryStatus).toBe(\"delivered\");\n+    expect(updated?.state.lastDeliveryError).toBeUndefined();\n \n     cron.stop();\n   });\n@@ -114,12 +121,15 @@ describe(\"CronService persists delivered status\", () => {\n     });\n \n     expect(updated?.state.lastStatus).toBe(\"ok\");\n+    expect(updated?.state.lastRunStatus).toBe(\"ok\");\n     expect(updated?.state.lastDelivered).toBe(false);\n+    expect(updated?.state.lastDeliveryStatus).toBe(\"not-delivered\");\n+    expect(updated?.state.lastDeliveryError).toBeUndefined();\n \n     cron.stop();\n   });\n \n-  it(\"persists lastDelivered=undefined when isolated job does not deliver\", async () => {\n+  it(\"persists not-requested delivery state when delivery is not configured\", async () => {\n     const store = await makeStorePath();\n     const { cron, finished } = createIsolatedCronWithFinishedBarrier({\n       storePath: store.storePath,\n@@ -133,7 +143,35 @@ describe(\"CronService persists delivered status\", () => {\n     });\n \n     expect(updated?.state.lastStatus).toBe(\"ok\");\n+    expect(updated?.state.lastRunStatus).toBe(\"ok\");\n     expect(updated?.state.lastDelivered).toBeUndefined();\n+    expect(updated?.state.lastDeliveryStatus).toBe(\"not-requested\");\n+    expect(updated?.state.lastDeliveryError).toBeUndefined();\n+\n+    cron.stop();\n+  });\n+\n+  it(\"persists unknown delivery state when delivery is requested but the runner omits delivered\", async () => {\n+    const store = await makeStorePath();\n+    const { cron, finished } = createIsolatedCronWithFinishedBarrier({\n+      storePath: store.storePath,\n+    });\n+\n+    await cron.start();\n+    const { updated } = await runSingleJobAndReadState({\n+      cron,\n+      finished,\n+      job: {\n+        ...buildIsolatedAgentTurnJob(\"delivery-unknown\"),\n+        delivery: { mode: \"announce\", channel: \"telegram\", to: \"123\" },\n+      },\n+    });\n+\n+    expect(updated?.state.lastStatus).toBe(\"ok\");\n+    expect(updated?.state.lastRunStatus).toBe(\"ok\");\n+    expect(updated?.state.lastDelivered).toBeUndefined();\n+    expect(updated?.state.lastDeliveryStatus).toBe(\"unknown\");\n+    expect(updated?.state.lastDeliveryError).toBeUndefined();\n \n     cron.stop();\n   });\n@@ -153,15 +191,17 @@ describe(\"CronService persists delivered status\", () => {\n     });\n \n     expect(updated?.state.lastStatus).toBe(\"ok\");\n+    expect(updated?.state.lastRunStatus).toBe(\"ok\");\n     expect(updated?.state.lastDelivered).toBeUndefined();\n+    expect(updated?.state.lastDeliveryStatus).toBe(\"not-requested\");\n     expect(enqueueSystemEvent).toHaveBeenCalled();\n \n     cron.stop();\n   });\n \n   it(\"emits delivered in the finished event\", async () => {\n     const store = await makeStorePath();\n-    let capturedEvent: { jobId: string; delivered?: boolean } | undefined;\n+    let capturedEvent: { jobId: string; delivered?: boolean; deliveryStatus?: string } | undefined;\n     const { cron, finished } = createIsolatedCronWithFinishedBarrier({\n       storePath: store.storePath,\n       delivered: true,\n@@ -179,6 +219,7 @@ describe(\"CronService persists delivered status\", () => {\n \n     expect(capturedEvent).toBeDefined();\n     expect(capturedEvent?.delivered).toBe(true);\n+    expect(capturedEvent?.deliveryStatus).toBe(\"delivered\");\n     cron.stop();\n   });\n });"
+    },
+    {
+      "sha": "5b77315791720ad716d6af439faab22df70725c9",
+      "filename": "src/cron/service/ops.ts",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59/src%2Fcron%2Fservice%2Fops.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59/src%2Fcron%2Fservice%2Fops.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fcron%2Fservice%2Fops.ts?ref=aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59",
+      "patch": "@@ -309,6 +309,8 @@ export async function run(state: CronServiceState, id: string, mode?: \"due\" | \"f\n       error: coreResult.error,\n       summary: coreResult.summary,\n       delivered: coreResult.delivered,\n+      deliveryStatus: job.state.lastDeliveryStatus,\n+      deliveryError: job.state.lastDeliveryError,\n       sessionId: coreResult.sessionId,\n       sessionKey: coreResult.sessionKey,\n       runAtMs: prepared.startedAt,"
+    },
+    {
+      "sha": "19b139b3703e1e4ea89958c5418cd7efa2f3b7ad",
+      "filename": "src/cron/service/state.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59/src%2Fcron%2Fservice%2Fstate.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59/src%2Fcron%2Fservice%2Fstate.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fcron%2Fservice%2Fstate.ts?ref=aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59",
+      "patch": "@@ -1,6 +1,7 @@\n import type { CronConfig } from \"../../config/types.cron.js\";\n import type { HeartbeatRunResult } from \"../../infra/heartbeat-wake.js\";\n import type {\n+  CronDeliveryStatus,\n   CronJob,\n   CronJobCreate,\n   CronJobPatch,\n@@ -19,6 +20,8 @@ export type CronEvent = {\n   error?: string;\n   summary?: string;\n   delivered?: boolean;\n+  deliveryStatus?: CronDeliveryStatus;\n+  deliveryError?: string;\n   sessionId?: string;\n   sessionKey?: string;\n   nextRunAtMs?: number;"
+    },
+    {
+      "sha": "7f5bc01c05f45c6e72057e41ac2922b62e322a18",
+      "filename": "src/cron/service/timer.ts",
+      "status": "modified",
+      "additions": 24,
+      "deletions": 1,
+      "changes": 25,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59/src%2Fcron%2Fservice%2Ftimer.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59/src%2Fcron%2Fservice%2Ftimer.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fcron%2Fservice%2Ftimer.ts?ref=aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59",
+      "patch": "@@ -2,7 +2,13 @@ import type { HeartbeatRunResult } from \"../../infra/heartbeat-wake.js\";\n import { DEFAULT_AGENT_ID } from \"../../routing/session-key.js\";\n import { resolveCronDeliveryPlan } from \"../delivery.js\";\n import { sweepCronRunSessions } from \"../session-reaper.js\";\n-import type { CronJob, CronRunOutcome, CronRunStatus, CronRunTelemetry } from \"../types.js\";\n+import type {\n+  CronDeliveryStatus,\n+  CronJob,\n+  CronRunOutcome,\n+  CronRunStatus,\n+  CronRunTelemetry,\n+} from \"../types.js\";\n import {\n   computeJobNextRunAtMs,\n   nextWakeAtMs,\n@@ -63,6 +69,16 @@ function errorBackoffMs(consecutiveErrors: number): number {\n   return ERROR_BACKOFF_SCHEDULE_MS[Math.max(0, idx)];\n }\n \n+function resolveDeliveryStatus(params: { job: CronJob; delivered?: boolean }): CronDeliveryStatus {\n+  if (params.delivered === true) {\n+    return \"delivered\";\n+  }\n+  if (params.delivered === false) {\n+    return \"not-delivered\";\n+  }\n+  return resolveCronDeliveryPlan(params.job).requested ? \"unknown\" : \"not-requested\";\n+}\n+\n /**\n  * Apply the result of a job execution to the job's state.\n  * Handles consecutive error tracking, exponential backoff, one-shot disable,\n@@ -81,10 +97,15 @@ export function applyJobResult(\n ): boolean {\n   job.state.runningAtMs = undefined;\n   job.state.lastRunAtMs = result.startedAt;\n+  job.state.lastRunStatus = result.status;\n   job.state.lastStatus = result.status;\n   job.state.lastDurationMs = Math.max(0, result.endedAt - result.startedAt);\n   job.state.lastError = result.error;\n   job.state.lastDelivered = result.delivered;\n+  const deliveryStatus = resolveDeliveryStatus({ job, delivered: result.delivered });\n+  job.state.lastDeliveryStatus = deliveryStatus;\n+  job.state.lastDeliveryError =\n+    deliveryStatus === \"not-delivered\" && result.error ? result.error : undefined;\n   job.updatedAtMs = result.endedAt;\n \n   // Track consecutive errors for backoff / auto-disable.\n@@ -748,6 +769,8 @@ function emitJobFinished(\n     error: result.error,\n     summary: result.summary,\n     delivered: result.delivered,\n+    deliveryStatus: job.state.lastDeliveryStatus,\n+    deliveryError: job.state.lastDeliveryError,\n     sessionId: result.sessionId,\n     sessionKey: result.sessionKey,\n     runAtMs,"
+    },
+    {
+      "sha": "ec1f8752c5becf589678c675ed84c89b03edb147",
+      "filename": "src/cron/types.ts",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 0,
+      "changes": 8,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59/src%2Fcron%2Ftypes.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59/src%2Fcron%2Ftypes.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fcron%2Ftypes.ts?ref=aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59",
+      "patch": "@@ -28,6 +28,7 @@ export type CronDelivery = {\n export type CronDeliveryPatch = Partial<CronDelivery>;\n \n export type CronRunStatus = \"ok\" | \"error\" | \"skipped\";\n+export type CronDeliveryStatus = \"delivered\" | \"not-delivered\" | \"unknown\" | \"not-requested\";\n \n export type CronUsageSummary = {\n   input_tokens?: number;\n@@ -86,13 +87,20 @@ export type CronJobState = {\n   nextRunAtMs?: number;\n   runningAtMs?: number;\n   lastRunAtMs?: number;\n+  /** Preferred execution outcome field. */\n+  lastRunStatus?: CronRunStatus;\n+  /** Back-compat alias for lastRunStatus. */\n   lastStatus?: \"ok\" | \"error\" | \"skipped\";\n   lastError?: string;\n   lastDurationMs?: number;\n   /** Number of consecutive execution errors (reset on success). Used for backoff. */\n   consecutiveErrors?: number;\n   /** Number of consecutive schedule computation errors. Auto-disables job after threshold. */\n   scheduleErrorCount?: number;\n+  /** Explicit delivery outcome, separate from execution outcome. */\n+  lastDeliveryStatus?: CronDeliveryStatus;\n+  /** Delivery-specific error text when available. */\n+  lastDeliveryError?: string;\n   /** Whether the last run's output was delivered to the target channel. */\n   lastDelivered?: boolean;\n };"
+    },
+    {
+      "sha": "b162436d003c0b74c771f172d4b19dfe7ff03a89",
+      "filename": "src/gateway/protocol/schema/cron.ts",
+      "status": "modified",
+      "additions": 19,
+      "deletions": 6,
+      "changes": 25,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59/src%2Fgateway%2Fprotocol%2Fschema%2Fcron.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59/src%2Fgateway%2Fprotocol%2Fschema%2Fcron.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fprotocol%2Fschema%2Fcron.ts?ref=aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59",
+      "patch": "@@ -21,6 +21,17 @@ function cronAgentTurnPayloadSchema(params: { message: TSchema }) {\n \n const CronSessionTargetSchema = Type.Union([Type.Literal(\"main\"), Type.Literal(\"isolated\")]);\n const CronWakeModeSchema = Type.Union([Type.Literal(\"next-heartbeat\"), Type.Literal(\"now\")]);\n+const CronRunStatusSchema = Type.Union([\n+  Type.Literal(\"ok\"),\n+  Type.Literal(\"error\"),\n+  Type.Literal(\"skipped\"),\n+]);\n+const CronDeliveryStatusSchema = Type.Union([\n+  Type.Literal(\"delivered\"),\n+  Type.Literal(\"not-delivered\"),\n+  Type.Literal(\"unknown\"),\n+  Type.Literal(\"not-requested\"),\n+]);\n const CronCommonOptionalFields = {\n   agentId: Type.Optional(Type.Union([NonEmptyString, Type.Null()])),\n   sessionKey: Type.Optional(Type.Union([NonEmptyString, Type.Null()])),\n@@ -151,13 +162,14 @@ export const CronJobStateSchema = Type.Object(\n     nextRunAtMs: Type.Optional(Type.Integer({ minimum: 0 })),\n     runningAtMs: Type.Optional(Type.Integer({ minimum: 0 })),\n     lastRunAtMs: Type.Optional(Type.Integer({ minimum: 0 })),\n-    lastStatus: Type.Optional(\n-      Type.Union([Type.Literal(\"ok\"), Type.Literal(\"error\"), Type.Literal(\"skipped\")]),\n-    ),\n+    lastRunStatus: Type.Optional(CronRunStatusSchema),\n+    lastStatus: Type.Optional(CronRunStatusSchema),\n     lastError: Type.Optional(Type.String()),\n     lastDurationMs: Type.Optional(Type.Integer({ minimum: 0 })),\n     consecutiveErrors: Type.Optional(Type.Integer({ minimum: 0 })),\n     lastDelivered: Type.Optional(Type.Boolean()),\n+    lastDeliveryStatus: Type.Optional(CronDeliveryStatusSchema),\n+    lastDeliveryError: Type.Optional(Type.String()),\n   },\n   { additionalProperties: false },\n );\n@@ -238,11 +250,12 @@ export const CronRunLogEntrySchema = Type.Object(\n     ts: Type.Integer({ minimum: 0 }),\n     jobId: NonEmptyString,\n     action: Type.Literal(\"finished\"),\n-    status: Type.Optional(\n-      Type.Union([Type.Literal(\"ok\"), Type.Literal(\"error\"), Type.Literal(\"skipped\")]),\n-    ),\n+    status: Type.Optional(CronRunStatusSchema),\n     error: Type.Optional(Type.String()),\n     summary: Type.Optional(Type.String()),\n+    delivered: Type.Optional(Type.Boolean()),\n+    deliveryStatus: Type.Optional(CronDeliveryStatusSchema),\n+    deliveryError: Type.Optional(Type.String()),\n     sessionId: Type.Optional(NonEmptyString),\n     sessionKey: Type.Optional(NonEmptyString),\n     runAtMs: Type.Optional(Type.Integer({ minimum: 0 })),"
+    },
+    {
+      "sha": "be6f63ed134f44b021d32d535fe8ba1b91a512cc",
+      "filename": "src/gateway/server-cron.ts",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59/src%2Fgateway%2Fserver-cron.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59/src%2Fgateway%2Fserver-cron.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fserver-cron.ts?ref=aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59",
+      "patch": "@@ -297,6 +297,8 @@ export function buildGatewayCronService(params: {\n           error: evt.error,\n           summary: evt.summary,\n           delivered: evt.delivered,\n+          deliveryStatus: evt.deliveryStatus,\n+          deliveryError: evt.deliveryError,\n           sessionId: evt.sessionId,\n           sessionKey: evt.sessionKey,\n           runAtMs: evt.runAtMs,"
+    },
+    {
+      "sha": "ed924f7920e292cf77aa6b8a6f2ad7a41958d875",
+      "filename": "src/gateway/server.cron.test.ts",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59/src%2Fgateway%2Fserver.cron.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59/src%2Fgateway%2Fserver.cron.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fserver.cron.test.ts?ref=aa4c250eb8b7110cdfe5a97db5a2b43ba6ebab59",
+      "patch": "@@ -407,18 +407,23 @@ describe(\"gateway server cron\", () => {\n         action?: unknown;\n         status?: unknown;\n         summary?: unknown;\n+        deliveryStatus?: unknown;\n       };\n       expect(last.action).toBe(\"finished\");\n       expect(last.jobId).toBe(jobId);\n       expect(last.status).toBe(\"ok\");\n       expect(last.summary).toBe(\"hello\");\n+      expect(last.deliveryStatus).toBe(\"not-requested\");\n \n       const runsRes = await rpcReq(ws, \"cron.runs\", { id: jobId, limit: 50 });\n       expect(runsRes.ok).toBe(true);\n       const entries = (runsRes.payload as { entries?: unknown } | null)?.entries;\n       expect(Array.isArray(entries)).toBe(true);\n       expect((entries as Array<{ jobId?: unknown }>).at(-1)?.jobId).toBe(jobId);\n       expect((entries as Array<{ summary?: unknown }>).at(-1)?.summary).toBe(\"hello\");\n+      expect((entries as Array<{ deliveryStatus?: unknown }>).at(-1)?.deliveryStatus).toBe(\n+        \"not-requested\",\n+      );\n \n       const statusRes = await rpcReq(ws, \"cron.status\", {});\n       expect(statusRes.ok).toBe(true);"
+    }
+  ]
+}

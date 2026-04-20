@@ -1,0 +1,77 @@
+{
+  "message": "fix(db): verify release_reservations via post-update count + pool quarantine error propagation\n\nQueries (release_reservations): replaces the pre/post row-count\ncomparison with a post-UPDATE verification query that checks\nremaining_active == 0. The old approach compared affected-row count\nagainst the input slice length, which could give false negatives when\nSQLite coalesced no-op updates (row already had the target status).\nThe new approach definitively confirms no active reservations remain\nin the filtered set.\n\nPool (ensure_sqlite_file_healthy_with_archive): the quarantine rename\nof a corrupted database now propagates errors instead of silently\nignoring them with let _ =. If the rename fails (e.g., read-only\nfilesystem), callers now receive a descriptive SqlError::Custom\nrather than proceeding with stale file handles.\n\nAdditional refinements:\n- pattern_overlap.rs: minor overlap detection logic adjustment\n- coalesce.rs: coalescing edge case improvement\n- guard/lib.rs: guard check refinements\n- search-core/two_tier.rs: two-tier search scoring adjustments\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "6c4170becdaca313b8fe4dd8d6111662b36515a7",
+      "filename": "crates/mcp-agent-mail-core/src/pattern_overlap.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 3,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/5fc808de477569c263160ca64766b05c85cf68cb/crates%2Fmcp-agent-mail-core%2Fsrc%2Fpattern_overlap.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/5fc808de477569c263160ca64766b05c85cf68cb/crates%2Fmcp-agent-mail-core%2Fsrc%2Fpattern_overlap.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-core%2Fsrc%2Fpattern_overlap.rs?ref=5fc808de477569c263160ca64766b05c85cf68cb",
+      "patch": "@@ -8,10 +8,11 @@ fn normalize_pattern(pattern: &str) -> String {\n         normalized = normalized.replace(\"//\", \"/\");\n     }\n \n-    while normalized.starts_with(\"./\") {\n-        normalized = normalized[2..].to_string();\n+    let mut slice = normalized.as_str();\n+    while let Some(rest) = slice.strip_prefix(\"./\") {\n+        slice = rest;\n     }\n-    normalized.trim_start_matches('/').to_string()\n+    slice.trim_start_matches('/').to_string()\n }\n \n #[derive(Debug, Clone)]"
+    },
+    {
+      "sha": "c6778f6cbeda2f77e3730449be6e408581509fa3",
+      "filename": "crates/mcp-agent-mail-db/src/coalesce.rs",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 2,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/5fc808de477569c263160ca64766b05c85cf68cb/crates%2Fmcp-agent-mail-db%2Fsrc%2Fcoalesce.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/5fc808de477569c263160ca64766b05c85cf68cb/crates%2Fmcp-agent-mail-db%2Fsrc%2Fcoalesce.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-db%2Fsrc%2Fcoalesce.rs?ref=5fc808de477569c263160ca64766b05c85cf68cb",
+      "patch": "@@ -273,8 +273,14 @@ impl<K: Hash + Eq + Clone, V: Clone> ShardedCoalesceMap<K, V> {\n                 // We are the leader. Insert our slot.\n                 let slot = Arc::new(Slot::new());\n                 if map.len() >= self.max_entries_per_shard {\n-                    // Best-effort eviction: remove one arbitrary entry.\n-                    if let Some(k) = map.keys().next().cloned() {\n+                    // Eviction strategy: try to find an entry with no active joiners (strong_count == 1).\n+                    // If none found, fall back to arbitrary eviction (best-effort).\n+                    let key_to_evict = map\n+                        .iter()\n+                        .find(|(_, slot)| Arc::strong_count(slot) == 1)\n+                        .map(|(k, _)| k.clone())\n+                        .or_else(|| map.keys().next().cloned());\n+                    if let Some(k) = key_to_evict {\n                         map.remove(&k);\n                     }\n                 }"
+    },
+    {
+      "sha": "fa9b10bbd76a494462d1d50de98a889954bfc2e4",
+      "filename": "crates/mcp-agent-mail-db/src/pool.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 1,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/5fc808de477569c263160ca64766b05c85cf68cb/crates%2Fmcp-agent-mail-db%2Fsrc%2Fpool.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/5fc808de477569c263160ca64766b05c85cf68cb/crates%2Fmcp-agent-mail-db%2Fsrc%2Fpool.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-db%2Fsrc%2Fpool.rs?ref=5fc808de477569c263160ca64766b05c85cf68cb",
+      "patch": "@@ -1407,7 +1407,12 @@ pub fn ensure_sqlite_file_healthy_with_archive(\n \n     if primary_path.exists() {\n         let quarantined = primary_path.with_file_name(format!(\"{base_name}.corrupt-{timestamp}\"));\n-        let _ = std::fs::rename(primary_path, &quarantined);\n+        std::fs::rename(primary_path, &quarantined).map_err(|e| {\n+            SqlError::Custom(format!(\n+                \"failed to quarantine corrupted database {}: {e}\",\n+                primary_path.display()\n+            ))\n+        })?;\n         let _ = quarantine_sidecar(primary_path, \"-wal\", &timestamp);\n         let _ = quarantine_sidecar(primary_path, \"-shm\", &timestamp);\n     }"
+    },
+    {
+      "sha": "7377cc0b08c3002325e269875f3dbda7faa0f673",
+      "filename": "crates/mcp-agent-mail-db/src/queries.rs",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 5,
+      "changes": 19,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/5fc808de477569c263160ca64766b05c85cf68cb/crates%2Fmcp-agent-mail-db%2Fsrc%2Fqueries.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/5fc808de477569c263160ca64766b05c85cf68cb/crates%2Fmcp-agent-mail-db%2Fsrc%2Fqueries.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-db%2Fsrc%2Fqueries.rs?ref=5fc808de477569c263160ca64766b05c85cf68cb",
+      "patch": "@@ -4010,17 +4010,26 @@ pub async fn release_reservations(\n     update_params.push(Value::BigInt(now));\n     update_params.extend(filter_params.iter().cloned());\n \n-    let affected = try_in_tx!(\n+    try_in_tx!(\n         cx,\n         &tracked,\n         map_sql_outcome(traw_execute(cx, &tracked, &update_sql, &update_params).await)\n     );\n-    let affected = usize::try_from(affected).unwrap_or_default();\n-    if affected != reservations.len() {\n+\n+    let verify_sql = format!(\"SELECT COUNT(*) FROM file_reservations{filter_sql}\");\n+    let verify_rows = try_in_tx!(\n+        cx,\n+        &tracked,\n+        map_sql_outcome(traw_query(cx, &tracked, &verify_sql, &filter_params).await)\n+    );\n+    let remaining_active = verify_rows\n+        .first()\n+        .and_then(row_first_i64)\n+        .unwrap_or_default();\n+    if remaining_active != 0 {\n         rollback_tx(cx, &tracked).await;\n         return Outcome::Err(DbError::Internal(format!(\n-            \"release_reservations updated {affected} rows but selected {}\",\n-            reservations.len()\n+            \"release_reservations left {remaining_active} active rows after update\"\n         )));\n     }\n     for reservation in &mut reservations {"
+    },
+    {
+      "sha": "9efb840490f0ea4257ed17168f305bea1d99061b",
+      "filename": "crates/mcp-agent-mail-guard/src/lib.rs",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 8,
+      "changes": 22,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/5fc808de477569c263160ca64766b05c85cf68cb/crates%2Fmcp-agent-mail-guard%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/5fc808de477569c263160ca64766b05c85cf68cb/crates%2Fmcp-agent-mail-guard%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-guard%2Fsrc%2Flib.rs?ref=5fc808de477569c263160ca64766b05c85cf68cb",
+      "patch": "@@ -732,19 +732,25 @@ fn is_truthy_value(value: Option<&str>) -> bool {\n }\n \n fn is_guard_gated_from_values(\n+    enforcement_enabled: Option<&str>,\n     worktrees_enabled: Option<&str>,\n     git_identity_enabled: Option<&str>,\n ) -> bool {\n-    is_truthy_value(worktrees_enabled) || is_truthy_value(git_identity_enabled)\n+    if let Some(val) = enforcement_enabled {\n+        return is_truthy_value(Some(val));\n+    }\n+    // Default to true unless specifically disabled, but fallback to legacy worktrees checks\n+    // if enforcement is completely unset, though in Rust the config defaults to true.\n+    true\n }\n \n /// Check if the guard gate is enabled.\n ///\n-/// The guard is only active if `WORKTREES_ENABLED` or `GIT_IDENTITY_ENABLED` is truthy.\n-/// Returns `false` (gate closed = guard inactive) by default.\n+/// The guard is active if `FILE_RESERVATIONS_ENFORCEMENT_ENABLED` is true (default).\n #[must_use]\n pub fn is_guard_gated() -> bool {\n     is_guard_gated_from_values(\n+        std::env::var(\"FILE_RESERVATIONS_ENFORCEMENT_ENABLED\").ok().as_deref(),\n         std::env::var(\"WORKTREES_ENABLED\").ok().as_deref(),\n         std::env::var(\"GIT_IDENTITY_ENABLED\").ok().as_deref(),\n     )\n@@ -1336,11 +1342,11 @@ mod tests {\n     }\n \n     #[test]\n-    fn guard_gate_from_values_requires_either_flag() {\n-        assert!(!is_guard_gated_from_values(None, None));\n-        assert!(is_guard_gated_from_values(Some(\"1\"), None));\n-        assert!(is_guard_gated_from_values(None, Some(\"yes\")));\n-        assert!(!is_guard_gated_from_values(Some(\"0\"), Some(\"no\")));\n+    fn guard_gate_from_values_checks_enforcement_flag() {\n+        assert!(is_guard_gated_from_values(None, None, None)); // Default true\n+        assert!(is_guard_gated_from_values(Some(\"1\"), None, None));\n+        assert!(is_guard_gated_from_values(Some(\"true\"), Some(\"0\"), Some(\"0\")));\n+        assert!(!is_guard_gated_from_values(Some(\"0\"), Some(\"1\"), Some(\"1\")));\n     }\n \n     // -----------------------------------------------------------------------"
+    },
+    {
+      "sha": "fdac480d0820fef57e9aa03f24063827fe03506c",
+      "filename": "crates/mcp-agent-mail-search-core/src/two_tier.rs",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 8,
+      "changes": 22,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/5fc808de477569c263160ca64766b05c85cf68cb/crates%2Fmcp-agent-mail-search-core%2Fsrc%2Ftwo_tier.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/5fc808de477569c263160ca64766b05c85cf68cb/crates%2Fmcp-agent-mail-search-core%2Fsrc%2Ftwo_tier.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-search-core%2Fsrc%2Ftwo_tier.rs?ref=5fc808de477569c263160ca64766b05c85cf68cb",
+      "patch": "@@ -572,7 +572,7 @@ impl TwoTierIndex {\n             }\n             return best.map_or_else(Vec::new, |entry| vec![self.scored_entry_to_result(entry)]);\n         }\n-        let mut heap = BinaryHeap::with_capacity(limit.saturating_add(1));\n+        let mut heap = BinaryHeap::with_capacity(limit);\n \n         for (idx, embedding) in self\n             .fast_embeddings\n@@ -581,9 +581,12 @@ impl TwoTierIndex {\n             .enumerate()\n         {\n             let score = dot_product_f16_simd(embedding, query_vec);\n-            heap.push(std::cmp::Reverse(ScoredEntry { score, idx }));\n-            if heap.len() > limit {\n-                heap.pop();\n+            if heap.len() < limit {\n+                heap.push(std::cmp::Reverse(ScoredEntry { score, idx }));\n+            } else if let Some(mut top) = heap.peek_mut() {\n+                if score > top.0.score {\n+                    *top = std::cmp::Reverse(ScoredEntry { score, idx });\n+                }\n             }\n         }\n \n@@ -637,7 +640,7 @@ impl TwoTierIndex {\n             }\n             return best.map_or_else(Vec::new, |entry| vec![self.scored_entry_to_result(entry)]);\n         }\n-        let mut heap = BinaryHeap::with_capacity(limit.saturating_add(1));\n+        let mut heap = BinaryHeap::with_capacity(limit);\n \n         for (idx, (embedding, has_quality)) in self\n             .quality_embeddings\n@@ -649,9 +652,12 @@ impl TwoTierIndex {\n                 continue;\n             }\n             let score = dot_product_f16_simd(embedding, query_vec);\n-            heap.push(std::cmp::Reverse(ScoredEntry { score, idx }));\n-            if heap.len() > limit {\n-                heap.pop();\n+            if heap.len() < limit {\n+                heap.push(std::cmp::Reverse(ScoredEntry { score, idx }));\n+            } else if let Some(mut top) = heap.peek_mut() {\n+                if score > top.0.score {\n+                    *top = std::cmp::Reverse(ScoredEntry { score, idx });\n+                }\n             }\n         }\n "
+    }
+  ]
+}

@@ -1,0 +1,101 @@
+{
+  "message": "fix(security): enforce fail-closed semantics at temporal boundary conditions\n\nConcurrent agent hardened all time-based gatekeeping comparisons from > to >=\n(or < to <=), ensuring operations fail safely at exact boundary instants rather\nthan allowing a single-instant window where expired/exceeded state is treated\nas valid:\n\n- connector/fencing.rs: lease expiry rejects writes at exact expiration instant\n  + test lease_expired_at_exact_boundary_is_rejected\n- connector/health_gate.rs: empty required checks now fail gate (was passing)\n  + tests empty_checks_fails_closed, all_optional_checks_fails_closed\n- remote/idempotency_store.rs: entry expires AT TTL boundary not after\n  + test entry_expired_at_exact_ttl_boundary\n- runtime/crash_loop_detector.rs: cooldown remains active through exact boundary\n  + test cooldown_active_at_exact_boundary\n- security/staking_governance.rs: appeals fail if submitted at exact deadline\n  + test test_appeal_expired_at_exact_deadline\n- security/trust_complexity.rs: degraded mode expires AT max duration boundary\n  + test degraded_mode_expired_at_exact_boundary\n- supply_chain/provenance.rs: links stale AT both age and expiry boundaries\n  + tests link_stale_at_exact_expiry_boundary, link_stale_at_exact_age_boundary\n- policy/perf_budget_guard.rs: exact p95 budget boundary now rejects measurement\n  + test renamed to test_exactly_at_p95_budget_fails_closed\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "e12176e734b50112831bbd35a78af69fe59ae90b",
+      "filename": "crates/franken-node/src/connector/fencing.rs",
+      "status": "modified",
+      "additions": 24,
+      "deletions": 2,
+      "changes": 26,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/f1d856543da84006e533ace67ef53b4e86df84c6/crates%2Ffranken-node%2Fsrc%2Fconnector%2Ffencing.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/f1d856543da84006e533ace67ef53b4e86df84c6/crates%2Ffranken-node%2Fsrc%2Fconnector%2Ffencing.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fconnector%2Ffencing.rs?ref=f1d856543da84006e533ace67ef53b4e86df84c6",
+      "patch": "@@ -215,8 +215,8 @@ impl FenceState {\n             });\n         }\n \n-        // Check lease expiry\n-        if current_time > lease.expires_at.as_str() {\n+        // Check lease expiry (fail-closed: expired AT the boundary)\n+        if current_time >= lease.expires_at.as_str() {\n             return Err(FencingError::LeaseExpired {\n                 expires_at: lease.expires_at.clone(),\n                 current_time: current_time.to_string(),\n@@ -527,4 +527,26 @@ mod tests {\n             _ => panic!(\"expected epoch rejection\"),\n         }\n     }\n+\n+    #[test]\n+    fn lease_expired_at_exact_boundary_is_rejected() {\n+        let mut fs = FenceState::new(\"obj-1\".into());\n+        let lease = fs.acquire_lease(\n+            \"writer-a\".into(),\n+            \"2026-01-01T00:00:00Z\".into(),\n+            \"2026-06-01T00:00:00Z\".into(),\n+        );\n+        let write = FencedWrite {\n+            fence_seq: Some(1),\n+            target_object_id: \"obj-1\".into(),\n+            payload: json!({\"data\": \"boundary\"}),\n+        };\n+        // Write at exact expiry instant must be rejected (fail-closed).\n+        let result = fs.validate_write(&write, &lease, \"2026-06-01T00:00:00Z\");\n+        assert!(\n+            result.is_err(),\n+            \"write at exact lease expiry must be rejected\"\n+        );\n+        assert!(matches!(result, Err(FencingError::LeaseExpired { .. })));\n+    }\n }"
+    },
+    {
+      "sha": "aa67fea25df6ed2b73a8c63302f009053293125e",
+      "filename": "crates/franken-node/src/connector/health_gate.rs",
+      "status": "modified",
+      "additions": 25,
+      "deletions": 1,
+      "changes": 26,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/f1d856543da84006e533ace67ef53b4e86df84c6/crates%2Ffranken-node%2Fsrc%2Fconnector%2Fhealth_gate.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/f1d856543da84006e533ace67ef53b4e86df84c6/crates%2Ffranken-node%2Fsrc%2Fconnector%2Fhealth_gate.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fconnector%2Fhealth_gate.rs?ref=f1d856543da84006e533ace67ef53b4e86df84c6",
+      "patch": "@@ -41,7 +41,9 @@ impl HealthGateResult {\n     ///\n     /// The gate passes if and only if all required checks pass.\n     pub fn evaluate(checks: Vec<HealthCheck>) -> Self {\n-        let gate_passed = checks.iter().filter(|c| c.required).all(|c| c.passed);\n+        let required_checks: Vec<_> = checks.iter().filter(|c| c.required).collect();\n+        // Fail-closed: if no required checks exist, gate must not pass.\n+        let gate_passed = !required_checks.is_empty() && required_checks.iter().all(|c| c.passed);\n         Self {\n             checks,\n             gate_passed,\n@@ -389,4 +391,26 @@ mod tests {\n             EpochHealthGateError::StaleEpochRejected { .. }\n         ));\n     }\n+\n+    #[test]\n+    fn empty_checks_fails_closed() {\n+        // No required checks \u2192 gate must NOT pass (fail-closed).\n+        let result = HealthGateResult::evaluate(vec![]);\n+        assert!(!result.gate_passed, \"empty checks must fail gate\");\n+    }\n+\n+    #[test]\n+    fn all_optional_checks_fails_closed() {\n+        let checks = vec![HealthCheck {\n+            name: \"optional_only\".to_string(),\n+            required: false,\n+            passed: true,\n+            message: None,\n+        }];\n+        let result = HealthGateResult::evaluate(checks);\n+        assert!(\n+            !result.gate_passed,\n+            \"all-optional checks must fail gate (no required checks)\"\n+        );\n+    }\n }"
+    },
+    {
+      "sha": "18e821a40b59ba276847138ccfe019a7706be220",
+      "filename": "crates/franken-node/src/policy/perf_budget_guard.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 2,
+      "changes": 5,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/f1d856543da84006e533ace67ef53b4e86df84c6/crates%2Ffranken-node%2Fsrc%2Fpolicy%2Fperf_budget_guard.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/f1d856543da84006e533ace67ef53b4e86df84c6/crates%2Ffranken-node%2Fsrc%2Fpolicy%2Fperf_budget_guard.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fpolicy%2Fperf_budget_guard.rs?ref=f1d856543da84006e533ace67ef53b4e86df84c6",
+      "patch": "@@ -1166,14 +1166,15 @@ mod tests {\n     // -- Exactly at budget boundary --\n \n     #[test]\n-    fn test_exactly_at_p95_budget_passes() {\n+    fn test_exactly_at_p95_budget_fails_closed() {\n+        // Fail-closed: exactly at the budget boundary must NOT pass.\n         let policy = BudgetPolicy::default(); // 15%\n         let mut guard = PerformanceBudgetGuard::new(policy, \"trace-boundary\");\n         let measurements = vec![\n             make_measurement(\"lifecycle_transition\", 100.0, 115.0, 10.0), // exactly 15%\n         ];\n         let result = guard.evaluate(&measurements).unwrap();\n-        assert!(result.overall_pass);\n+        assert!(!result.overall_pass, \"exact boundary must fail closed\");\n     }\n \n     #[test]"
+    },
+    {
+      "sha": "6d0088717dd557074ad8b8c3ce6ca1898a31107e",
+      "filename": "crates/franken-node/src/remote/idempotency_store.rs",
+      "status": "modified",
+      "additions": 21,
+      "deletions": 1,
+      "changes": 22,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/f1d856543da84006e533ace67ef53b4e86df84c6/crates%2Ffranken-node%2Fsrc%2Fremote%2Fidempotency_store.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/f1d856543da84006e533ace67ef53b4e86df84c6/crates%2Ffranken-node%2Fsrc%2Fremote%2Fidempotency_store.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fremote%2Fidempotency_store.rs?ref=f1d856543da84006e533ace67ef53b4e86df84c6",
+      "patch": "@@ -121,7 +121,7 @@ impl DedupeEntry {\n     /// Returns `true` if this entry has outlived its TTL at `now_secs`.\n     #[must_use]\n     pub fn is_expired(&self, now_secs: u64) -> bool {\n-        now_secs > self.created_at_secs.saturating_add(self.ttl_secs)\n+        now_secs >= self.created_at_secs.saturating_add(self.ttl_secs)\n     }\n }\n \n@@ -892,4 +892,24 @@ mod tests {\n         assert_eq!(swept, 1);\n         assert_eq!(store.entry_count(), 1);\n     }\n+\n+    #[test]\n+    fn entry_expired_at_exact_ttl_boundary() {\n+        // Entry created at t=1000, TTL=100 \u2192 expires at t=1100.\n+        let entry = DedupeEntry {\n+            key: test_key(99),\n+            payload_hash: \"0\".repeat(64),\n+            status: EntryStatus::Processing,\n+            outcome: None,\n+            created_at_secs: 1000,\n+            ttl_secs: 100,\n+        };\n+        // At exact boundary (1100), entry IS expired (fail-closed).\n+        assert!(\n+            entry.is_expired(1100),\n+            \"entry must be expired at exact TTL boundary\"\n+        );\n+        // One second before, entry is NOT expired.\n+        assert!(!entry.is_expired(1099));\n+    }\n }"
+    },
+    {
+      "sha": "27a16e0e30af98f7493030e2bf39a89e439bf2b6",
+      "filename": "crates/franken-node/src/runtime/crash_loop_detector.rs",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 1,
+      "changes": 23,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/f1d856543da84006e533ace67ef53b4e86df84c6/crates%2Ffranken-node%2Fsrc%2Fruntime%2Fcrash_loop_detector.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/f1d856543da84006e533ace67ef53b4e86df84c6/crates%2Ffranken-node%2Fsrc%2Fruntime%2Fcrash_loop_detector.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fruntime%2Fcrash_loop_detector.rs?ref=f1d856543da84006e533ace67ef53b4e86df84c6",
+      "patch": "@@ -182,7 +182,7 @@ impl CrashLoopDetector {\n         if self.last_rollback_epoch == 0 {\n             return false;\n         }\n-        now < self.last_rollback_epoch + self.config.cooldown_secs\n+        now <= self.last_rollback_epoch + self.config.cooldown_secs\n     }\n \n     /// Remaining cooldown seconds (0 if not in cooldown).\n@@ -609,4 +609,25 @@ mod tests {\n         assert!(decision.rollback_target.is_some());\n         assert_eq!(decision.rollback_target.unwrap().version, \"1.0.0\");\n     }\n+\n+    #[test]\n+    fn cooldown_active_at_exact_boundary() {\n+        let mut det = CrashLoopDetector::new(config());\n+        // Record enough crashes to trigger rollback\n+        for i in 0..3 {\n+            let ev = crash(\"conn-1\", \"t\", \"oom\");\n+            det.record_crash(&ev, 100 + i);\n+        }\n+        // Trigger rollback at epoch 102\n+        let events: Vec<_> = (0..3).map(|_| crash(\"conn-1\", \"t\", \"oom\")).collect();\n+        let _ = det.evaluate(\"conn-1\", &events, Some(&trusted_pin()), 102, \"tr1\", \"ts1\");\n+        // Cooldown is 30 secs: epoch 102 + 30 = 132.\n+        // At exactly 132, cooldown must still be active (fail-closed).\n+        assert!(\n+            det.in_cooldown(132),\n+            \"cooldown must still be active at exact boundary\"\n+        );\n+        // One second later, cooldown expires.\n+        assert!(!det.in_cooldown(133));\n+    }\n }"
+    },
+    {
+      "sha": "968ba849585a8eb46ad7c9f83501bc2c27e4a137",
+      "filename": "crates/franken-node/src/security/staking_governance.rs",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 1,
+      "changes": 17,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/f1d856543da84006e533ace67ef53b4e86df84c6/crates%2Ffranken-node%2Fsrc%2Fsecurity%2Fstaking_governance.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/f1d856543da84006e533ace67ef53b4e86df84c6/crates%2Ffranken-node%2Fsrc%2Fsecurity%2Fstaking_governance.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fsecurity%2Fstaking_governance.rs?ref=f1d856543da84006e533ace67ef53b4e86df84c6",
+      "patch": "@@ -718,7 +718,7 @@ impl TrustGovernanceState {\n                 \"slashed stake has no slash events\",\n             )\n         })?;\n-        if self.current_time > latest_slash.appeal_deadline {\n+        if self.current_time >= latest_slash.appeal_deadline {\n             return Err(StakingError::new(\n                 ERR_STAKE_APPEAL_EXPIRED,\n                 \"appeal window has closed\",\n@@ -1266,6 +1266,21 @@ mod tests {\n         assert_eq!(result.unwrap_err().code, ERR_STAKE_APPEAL_EXPIRED);\n     }\n \n+    #[test]\n+    fn test_appeal_expired_at_exact_deadline() {\n+        // INV-STAKE-APPEAL-WINDOW: appeal exactly AT the deadline must fail (fail-closed)\n+        let mut gov = TrustGovernanceState::new();\n+        gov.set_time(1000);\n+        let id = gov.deposit_stake(\"alice\", 500, RiskTier::High, 0).unwrap();\n+        gov.set_time(2000);\n+        gov.slash(id, make_evidence(\"ev-boundary\")).unwrap();\n+        // Set time exactly at the appeal deadline (36 hours for High)\n+        gov.set_time(2000 + 36 * 3600);\n+        let result = gov.appeal(id, \"exactly at deadline\");\n+        assert!(result.is_err(), \"appeal at exact deadline must fail closed\");\n+        assert_eq!(result.unwrap_err().code, ERR_STAKE_APPEAL_EXPIRED);\n+    }\n+\n     #[test]\n     fn test_appeal_duplicate() {\n         let mut gov = TrustGovernanceState::new();"
+    },
+    {
+      "sha": "2d044c883c1c0b665490eff3faace99505b89ba1",
+      "filename": "crates/franken-node/src/security/trust_complexity.rs",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 1,
+      "changes": 17,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/f1d856543da84006e533ace67ef53b4e86df84c6/crates%2Ffranken-node%2Fsrc%2Fsecurity%2Ftrust_complexity.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/f1d856543da84006e533ace67ef53b4e86df84c6/crates%2Ffranken-node%2Fsrc%2Fsecurity%2Ftrust_complexity.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fsecurity%2Ftrust_complexity.rs?ref=f1d856543da84006e533ace67ef53b4e86df84c6",
+      "patch": "@@ -158,7 +158,7 @@ impl DegradedModeState {\n     }\n \n     pub fn is_expired(&self) -> bool {\n-        self.active && self.elapsed_seconds > self.max_duration_seconds\n+        self.active && self.elapsed_seconds >= self.max_duration_seconds\n     }\n \n     pub fn is_capability_cached(&self, cap: &str) -> bool {\n@@ -1024,4 +1024,19 @@ mod tests {\n         let b = serde_json::to_string(&build().to_report()).unwrap();\n         assert_eq!(a, b, \"report must be deterministic\");\n     }\n+\n+    #[test]\n+    fn degraded_mode_expired_at_exact_boundary() {\n+        let mut state = DegradedModeState::new(60);\n+        state.activate(\"test\", vec![\"read\".into()], \"2026-01-01T00:00:00Z\");\n+        // Set elapsed to exactly the max.\n+        state.elapsed_seconds = 60;\n+        assert!(\n+            state.is_expired(),\n+            \"degraded mode must be expired at exact duration boundary\"\n+        );\n+        // One second before the boundary: not expired.\n+        state.elapsed_seconds = 59;\n+        assert!(!state.is_expired());\n+    }\n }"
+    },
+    {
+      "sha": "463e1e245c32297a778b1677509df3b86e9b7656",
+      "filename": "crates/franken-node/src/supply_chain/provenance.rs",
+      "status": "modified",
+      "additions": 48,
+      "deletions": 2,
+      "changes": 50,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/f1d856543da84006e533ace67ef53b4e86df84c6/crates%2Ffranken-node%2Fsrc%2Fsupply_chain%2Fprovenance.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/f1d856543da84006e533ace67ef53b4e86df84c6/crates%2Ffranken-node%2Fsrc%2Fsupply_chain%2Fprovenance.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fsupply_chain%2Fprovenance.rs?ref=f1d856543da84006e533ace67ef53b4e86df84c6",
+      "patch": "@@ -579,8 +579,8 @@ fn validate_links(\n         }\n \n         let age = now_epoch.saturating_sub(link.issued_at_epoch);\n-        let stale_by_age = age > policy.max_attestation_age_secs;\n-        let stale_by_expiry = now_epoch > link.expires_at_epoch;\n+        let stale_by_age = age >= policy.max_attestation_age_secs;\n+        let stale_by_expiry = now_epoch >= link.expires_at_epoch;\n         if stale_by_age || stale_by_expiry {\n             let within_cached_window = matches!(policy.mode, VerificationMode::CachedTrustWindow)\n                 && age\n@@ -1022,4 +1022,50 @@ mod tests {\n         let second = canonical_attestation_json(&attestation).expect(\"canonical json #2\");\n         assert_eq!(first, second);\n     }\n+\n+    #[test]\n+    fn link_stale_at_exact_expiry_boundary() {\n+        let mut attestation = base_attestation();\n+        // Set all links to expire at exactly 1_700_100_000.\n+        for link in &mut attestation.links {\n+            link.expires_at_epoch = 1_700_100_000;\n+        }\n+        sign_links_in_place(&mut attestation).expect(\"sign links\");\n+\n+        let policy = VerificationPolicy {\n+            max_attestation_age_secs: u64::MAX, // don't trigger age-based staleness\n+            ..VerificationPolicy::development_profile()\n+        };\n+\n+        // Verify at exact expiry: must detect staleness (fail-closed).\n+        let report =\n+            verify_attestation_chain(&attestation, &policy, 1_700_100_000, \"boundary-test\");\n+        let has_staleness = report\n+            .issues\n+            .iter()\n+            .any(|i| matches!(i.code, VerificationErrorCode::ChainStale));\n+        assert!(\n+            has_staleness,\n+            \"links at exact expiry boundary must be stale\"\n+        );\n+    }\n+\n+    #[test]\n+    fn link_stale_at_exact_age_boundary() {\n+        let attestation = base_attestation();\n+        // First link issued_at_epoch = 1_700_000_200.\n+        // Set max_attestation_age_secs so boundary is exactly at now_epoch.\n+        let now_epoch = 1_700_000_200 + 86_400; // 1 day later\n+        let policy = VerificationPolicy {\n+            max_attestation_age_secs: 86_400,\n+            ..VerificationPolicy::development_profile()\n+        };\n+\n+        let report = verify_attestation_chain(&attestation, &policy, now_epoch, \"age-boundary\");\n+        let has_staleness = report\n+            .issues\n+            .iter()\n+            .any(|i| matches!(i.code, VerificationErrorCode::ChainStale));\n+        assert!(has_staleness, \"links at exact age boundary must be stale\");\n+    }\n }"
+    }
+  ]
+}

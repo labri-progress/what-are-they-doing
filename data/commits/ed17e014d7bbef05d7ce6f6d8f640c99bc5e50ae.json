@@ -1,0 +1,29 @@
+{
+  "message": "fix: path traversal and jq validation bugs in checksum_sync and build_state\n\nchecksum_sync.sh:\n- Add _cs_normalize_path() to properly resolve .. and . components\n- Fix security bug where path traversal (/../data/projects/foo) could bypass\n  protected path checks because the fallback code didn't normalize paths\n\nbuild_state.sh:\n- Refactor build_state_update_status() to use _build_state_jq_update() helper\n- Ensures JSON output validation (non-empty AND valid JSON) before replacing\n- Previously only checked non-empty, could write invalid JSON on jq errors\n\nBoth bugs identified during systematic code review.\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "cf10368c376ecdc5782c59bf932616075eec9013",
+      "filename": "src/build_state.sh",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 16,
+      "changes": 20,
+      "blob_url": "https://github.com/Dicklesworthstone/doodlestein_self_releaser/blob/ed17e014d7bbef05d7ce6f6d8f640c99bc5e50ae/src%2Fbuild_state.sh",
+      "raw_url": "https://github.com/Dicklesworthstone/doodlestein_self_releaser/raw/ed17e014d7bbef05d7ce6f6d8f640c99bc5e50ae/src%2Fbuild_state.sh",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/doodlestein_self_releaser/contents/src%2Fbuild_state.sh?ref=ed17e014d7bbef05d7ce6f6d8f640c99bc5e50ae",
+      "patch": "@@ -445,23 +445,11 @@ build_state_update_status() {\n   local now\n   now=$(date -u +\"%Y-%m-%dT%H:%M:%SZ\")\n \n-  # Update status and timestamp\n-  local tmp_file=\"${state_file}.tmp.$$\"\n-  if ! jq --arg status \"$status\" --arg now \"$now\" \\\n-    '.status = $status | .updated_at = $now' \"$state_file\" > \"$tmp_file\" 2>/dev/null; then\n-    log_error \"Failed to update build state: jq parse error\"\n-    rm -f \"$tmp_file\"\n-    return 1\n-  fi\n-\n-  # Verify jq produced valid output before replacing\n-  if [[ ! -s \"$tmp_file\" ]]; then\n-    log_error \"Failed to update build state: jq produced empty output\"\n-    rm -f \"$tmp_file\"\n-    return 1\n-  fi\n+  # Use safe jq update helper (validates non-empty and valid JSON)\n+  _build_state_jq_update \"$state_file\" \\\n+    --arg status \"$status\" --arg now \"$now\" \\\n+    '.status = $status | .updated_at = $now' || return 1\n \n-  mv \"$tmp_file\" \"$state_file\"\n   log_debug \"Build status updated: $tool $version -> $status\"\n }\n "
+    },
+    {
+      "sha": "e35d9f43314532d31914aaf4766d154b5cec2f78",
+      "filename": "src/checksum_sync.sh",
+      "status": "modified",
+      "additions": 55,
+      "deletions": 11,
+      "changes": 66,
+      "blob_url": "https://github.com/Dicklesworthstone/doodlestein_self_releaser/blob/ed17e014d7bbef05d7ce6f6d8f640c99bc5e50ae/src%2Fchecksum_sync.sh",
+      "raw_url": "https://github.com/Dicklesworthstone/doodlestein_self_releaser/raw/ed17e014d7bbef05d7ce6f6d8f640c99bc5e50ae/src%2Fchecksum_sync.sh",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/doodlestein_self_releaser/contents/src%2Fchecksum_sync.sh?ref=ed17e014d7bbef05d7ce6f6d8f640c99bc5e50ae",
+      "patch": "@@ -40,25 +40,69 @@ _cs_log_debug() { [[ \"${CS_DEBUG:-}\" == \"1\" ]] && echo \"${_CS_BLUE}[checksum-syn\n # Safety Checks\n # ============================================================================\n \n+# Normalize a path without relying on realpath (resolves ., .., and //)\n+# Duplicated from guardrails.sh for standalone use\n+_cs_normalize_path() {\n+    local path=\"$1\"\n+    local is_abs=false\n+    [[ \"$path\" == /* ]] && is_abs=true\n+\n+    local IFS='/'\n+    local -a parts=()\n+    read -r -a parts <<< \"$path\"\n+\n+    local -a stack=()\n+    local part\n+    for part in \"${parts[@]}\"; do\n+        case \"$part\" in\n+            \"\"|\".\")\n+                continue\n+                ;;\n+            \"..\")\n+                if [[ ${#stack[@]} -gt 0 ]]; then\n+                    unset 'stack[${#stack[@]}-1]'\n+                elif ! $is_abs; then\n+                    stack+=(\"..\")\n+                fi\n+                ;;\n+            *)\n+                stack+=(\"$part\")\n+                ;;\n+        esac\n+    done\n+\n+    local normalized=\"\"\n+    if $is_abs; then\n+        normalized=\"/\"\n+    fi\n+    if [[ ${#stack[@]} -gt 0 ]]; then\n+        local joined\n+        joined=$(IFS=/; printf '%s' \"${stack[*]}\")\n+        normalized+=\"$joined\"\n+    fi\n+\n+    [[ -z \"$normalized\" ]] && normalized=\"/\"\n+    printf '%s' \"$normalized\"\n+}\n+\n # Verify path is safe to modify (not in protected directories)\n # Args: path\n # Returns: 0 if safe, 1 if protected\n _cs_is_safe_path() {\n     local path=\"$1\"\n     local abs_path\n-    # realpath -m is GNU-only; use portable fallback for macOS\n+\n+    # Convert to absolute path first\n+    if [[ \"$path\" != /* ]]; then\n+        path=\"$PWD/$path\"\n+    fi\n+\n+    # Normalize path to resolve .., ., and //\n+    # Use realpath if available (handles symlinks), otherwise use pure-bash fallback\n     if command -v realpath &>/dev/null && realpath -m / &>/dev/null 2>&1; then\n-        abs_path=$(realpath -m \"$path\" 2>/dev/null || echo \"$path\")\n-    elif [[ -e \"$path\" ]]; then\n-        # Path exists, use cd + pwd to resolve\n-        abs_path=$(cd \"$(dirname \"$path\")\" && pwd)/$(basename \"$path\")\n+        abs_path=$(realpath -m \"$path\" 2>/dev/null || _cs_normalize_path \"$path\")\n     else\n-        # Path doesn't exist, just clean it up minimally\n-        # Remove trailing slashes and normalize // to /\n-        abs_path=\"${path%/}\"\n-        abs_path=\"${abs_path//\\/\\//\\/}\"\n-        # If relative, prepend PWD\n-        [[ \"$abs_path\" != /* ]] && abs_path=\"$PWD/$abs_path\"\n+        abs_path=$(_cs_normalize_path \"$path\")\n     fi\n \n     for protected in \"${CHECKSUM_SYNC_PROTECTED_PATHS[@]}\"; do"
+    }
+  ]
+}

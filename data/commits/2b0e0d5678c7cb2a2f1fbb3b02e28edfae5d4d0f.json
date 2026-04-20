@@ -1,0 +1,29 @@
+{
+  "message": "feat: add ToolMiddleware interface for approval gates (GAP-8.05)\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "71e3c17c2b8dd91fdf5dd3cbf2533b77ef2f14c5",
+      "filename": "internal/agent/tool_registry.go",
+      "status": "modified",
+      "additions": 24,
+      "deletions": 2,
+      "changes": 26,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/2b0e0d5678c7cb2a2f1fbb3b02e28edfae5d4d0f/internal%2Fagent%2Ftool_registry.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/2b0e0d5678c7cb2a2f1fbb3b02e28edfae5d4d0f/internal%2Fagent%2Ftool_registry.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/internal%2Fagent%2Ftool_registry.go?ref=2b0e0d5678c7cb2a2f1fbb3b02e28edfae5d4d0f",
+      "patch": "@@ -49,15 +49,28 @@ type RegisteredTool struct {\n \tLimit ToolOutputLimit\n }\n \n+// ToolMiddleware is called after argument validation but before tool execution.\n+// Return a non-nil error to block execution (the error message is returned to the LLM).\n+type ToolMiddleware func(ctx context.Context, toolName string, args map[string]any) error\n+\n type ToolRegistry struct {\n-\tmu    sync.RWMutex\n-\ttools map[string]RegisteredTool\n+\tmu         sync.RWMutex\n+\ttools      map[string]RegisteredTool\n+\tmiddleware []ToolMiddleware\n }\n \n func NewToolRegistry() *ToolRegistry {\n \treturn &ToolRegistry{tools: map[string]RegisteredTool{}}\n }\n \n+// Use appends a middleware to the tool execution pipeline.\n+// Middleware runs after argument validation but before tool execution.\n+func (r *ToolRegistry) Use(mw ToolMiddleware) {\n+\tr.mu.Lock()\n+\tdefer r.mu.Unlock()\n+\tr.middleware = append(r.middleware, mw)\n+}\n+\n func (r *ToolRegistry) Register(t RegisteredTool) error {\n \tif err := llm.ValidateToolName(t.Definition.Name); err != nil {\n \t\treturn err\n@@ -163,6 +176,15 @@ func (r *ToolRegistry) ExecuteCall(ctx context.Context, env ExecutionEnvironment\n \t\treturn truncateResult(name, callID, msg, true, t.Limit)\n \t}\n \n+\tr.mu.RLock()\n+\tmws := r.middleware\n+\tr.mu.RUnlock()\n+\tfor _, mw := range mws {\n+\t\tif err := mw(ctx, name, args); err != nil {\n+\t\t\treturn truncateResult(name, callID, err.Error(), true, t.Limit)\n+\t\t}\n+\t}\n+\n \tv, err := t.Exec(ctx, env, args)\n \tif err != nil {\n \t\tfull := \"\""
+    },
+    {
+      "sha": "5812da7348f305980b496f8f00f6806de3debb3c",
+      "filename": "internal/agent/tool_registry_test.go",
+      "status": "modified",
+      "additions": 60,
+      "deletions": 0,
+      "changes": 60,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/2b0e0d5678c7cb2a2f1fbb3b02e28edfae5d4d0f/internal%2Fagent%2Ftool_registry_test.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/2b0e0d5678c7cb2a2f1fbb3b02e28edfae5d4d0f/internal%2Fagent%2Ftool_registry_test.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/internal%2Fagent%2Ftool_registry_test.go?ref=2b0e0d5678c7cb2a2f1fbb3b02e28edfae5d4d0f",
+      "patch": "@@ -3,6 +3,7 @@ package agent\n import (\n \t\"context\"\n \t\"encoding/json\"\n+\t\"fmt\"\n \t\"strings\"\n \t\"testing\"\n \t\"unicode/utf8\"\n@@ -352,6 +353,65 @@ func TestTruncateChars_UTF8Aware(t *testing.T) {\n \t}\n }\n \n+func TestToolRegistry_Middleware_CalledBeforeExecution(t *testing.T) {\n+\treg := NewToolRegistry()\n+\treg.Register(RegisteredTool{\n+\t\tDefinition: llm.ToolDefinition{\n+\t\t\tName:        \"test_tool\",\n+\t\t\tDescription: \"test\",\n+\t\t\tParameters:  map[string]any{\"type\": \"object\"},\n+\t\t},\n+\t\tExec: func(ctx context.Context, env ExecutionEnvironment, args map[string]any) (any, error) {\n+\t\t\treturn \"executed\", nil\n+\t\t},\n+\t})\n+\n+\tvar middlewareCalled bool\n+\treg.Use(func(ctx context.Context, name string, args map[string]any) error {\n+\t\tmiddlewareCalled = true\n+\t\treturn nil\n+\t})\n+\n+\tresult := reg.ExecuteCall(context.Background(), nil, llm.ToolCallData{Name: \"test_tool\", ID: \"c1\"})\n+\tif !middlewareCalled {\n+\t\tt.Error(\"middleware must be called before execution\")\n+\t}\n+\tif result.IsError {\n+\t\tt.Errorf(\"expected success, got error: %s\", result.Output)\n+\t}\n+}\n+\n+func TestToolRegistry_Middleware_CanBlockExecution(t *testing.T) {\n+\treg := NewToolRegistry()\n+\tvar execCalled bool\n+\treg.Register(RegisteredTool{\n+\t\tDefinition: llm.ToolDefinition{\n+\t\t\tName:        \"test_tool\",\n+\t\t\tDescription: \"test\",\n+\t\t\tParameters:  map[string]any{\"type\": \"object\"},\n+\t\t},\n+\t\tExec: func(ctx context.Context, env ExecutionEnvironment, args map[string]any) (any, error) {\n+\t\t\texecCalled = true\n+\t\t\treturn \"executed\", nil\n+\t\t},\n+\t})\n+\n+\treg.Use(func(ctx context.Context, name string, args map[string]any) error {\n+\t\treturn fmt.Errorf(\"permission denied: tool blocked by policy\")\n+\t})\n+\n+\tresult := reg.ExecuteCall(context.Background(), nil, llm.ToolCallData{Name: \"test_tool\", ID: \"c1\"})\n+\tif !result.IsError {\n+\t\tt.Error(\"middleware rejection should produce error result\")\n+\t}\n+\tif !strings.Contains(result.Output, \"permission denied\") {\n+\t\tt.Errorf(\"expected 'permission denied' in output, got: %s\", result.Output)\n+\t}\n+\tif execCalled {\n+\t\tt.Error(\"tool should not have been executed when middleware blocked\")\n+\t}\n+}\n+\n func TestDefaultToolLimit_MatchesSpecTable(t *testing.T) {\n \ttype want struct {\n \t\ttool   string"
+    }
+  ]
+}

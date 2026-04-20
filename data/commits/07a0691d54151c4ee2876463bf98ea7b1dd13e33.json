@@ -1,0 +1,53 @@
+{
+  "message": "feat: harden gmail message search body handling (#88) (thanks @mbelinky)",
+  "files": [
+    {
+      "sha": "0108a084cd495cc4ae322f3a29ffa86718f0155b",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/steipete/gogcli/blob/07a0691d54151c4ee2876463bf98ea7b1dd13e33/CHANGELOG.md",
+      "raw_url": "https://github.com/steipete/gogcli/raw/07a0691d54151c4ee2876463bf98ea7b1dd13e33/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/steipete/gogcli/contents/CHANGELOG.md?ref=07a0691d54151c4ee2876463bf98ea7b1dd13e33",
+      "patch": "@@ -8,6 +8,7 @@\n - People: profile lookup, directory search, and relations commands. (#84) \u2014 thanks @salmonumbrella.\n - Calendar: show event timezone and local times; add --weekday output. (#92) \u2014 thanks @salmonumbrella.\n - Gmail: show thread message count in search output. (#99) \u2014 thanks @jeanregisser.\n+- Gmail: message-level search with optional body decoding. (#88) \u2014 thanks @mbelinky.\n \n ### Fixed\n "
+    },
+    {
+      "sha": "6de74d6bd8420bc6c8678ff50edb0f18b728c0c6",
+      "filename": "internal/cmd/gmail_messages.go",
+      "status": "modified",
+      "additions": 28,
+      "deletions": 25,
+      "changes": 53,
+      "blob_url": "https://github.com/steipete/gogcli/blob/07a0691d54151c4ee2876463bf98ea7b1dd13e33/internal%2Fcmd%2Fgmail_messages.go",
+      "raw_url": "https://github.com/steipete/gogcli/raw/07a0691d54151c4ee2876463bf98ea7b1dd13e33/internal%2Fcmd%2Fgmail_messages.go",
+      "contents_url": "https://api.github.com/repos/steipete/gogcli/contents/internal%2Fcmd%2Fgmail_messages.go?ref=07a0691d54151c4ee2876463bf98ea7b1dd13e33",
+      "patch": "@@ -122,9 +122,10 @@ func fetchMessageDetails(ctx context.Context, svc *gmail.Service, messages []*gm\n \tsem := make(chan struct{}, maxConcurrency)\n \n \ttype result struct {\n-\t\tindex int\n-\t\titem  messageItem\n-\t\terr   error\n+\t\tindex     int\n+\t\tmessageID string\n+\t\titem      messageItem\n+\t\terr       error\n \t}\n \n \tresults := make(chan result, len(messages))\n@@ -142,7 +143,7 @@ func fetchMessageDetails(ctx context.Context, svc *gmail.Service, messages []*gm\n \t\t\tcase sem <- struct{}{}:\n \t\t\t\tdefer func() { <-sem }()\n \t\t\tcase <-ctx.Done():\n-\t\t\t\tresults <- result{index: idx, err: ctx.Err()}\n+\t\t\t\tresults <- result{index: idx, messageID: messageID, err: ctx.Err()}\n \t\t\t\treturn\n \t\t\t}\n \n@@ -154,7 +155,7 @@ func fetchMessageDetails(ctx context.Context, svc *gmail.Service, messages []*gm\n \t\t\t}\n \t\t\tmsg, err := call.Context(ctx).Do()\n \t\t\tif err != nil {\n-\t\t\t\tresults <- result{index: idx, err: err}\n+\t\t\t\tresults <- result{index: idx, messageID: messageID, err: fmt.Errorf(\"message %s: %w\", messageID, err)}\n \t\t\t\treturn\n \t\t\t}\n \n@@ -182,7 +183,7 @@ func fetchMessageDetails(ctx context.Context, svc *gmail.Service, messages []*gm\n \t\t\t\titem.Labels = names\n \t\t\t}\n \n-\t\t\tresults <- result{index: idx, item: item}\n+\t\t\tresults <- result{index: idx, messageID: messageID, item: item}\n \t\t}(i, m.Id)\n \t}\n \n@@ -192,31 +193,19 @@ func fetchMessageDetails(ctx context.Context, svc *gmail.Service, messages []*gm\n \t}()\n \n \tordered := make([]messageItem, len(messages))\n-\thasErr := false\n+\tvar firstErr error\n \tfor r := range results {\n \t\tif r.err != nil {\n-\t\t\thasErr = true\n+\t\t\tif firstErr == nil {\n+\t\t\t\tfirstErr = r.err\n+\t\t\t}\n \t\t\tordered[r.index] = messageItem{}\n \t\t\tcontinue\n \t\t}\n \t\tordered[r.index] = r.item\n \t}\n-\tif hasErr {\n-\t\tfor _, m := range messages {\n-\t\t\tif m == nil || m.Id == \"\" {\n-\t\t\t\tcontinue\n-\t\t\t}\n-\t\t\tcall := svc.Users.Messages.Get(\"me\", m.Id)\n-\t\t\tif includeBody {\n-\t\t\t\tcall = call.Format(\"full\")\n-\t\t\t} else {\n-\t\t\t\tcall = call.Format(\"metadata\").MetadataHeaders(\"From\", \"Subject\", \"Date\")\n-\t\t\t}\n-\t\t\t_, err := call.Context(ctx).Do()\n-\t\t\tif err != nil {\n-\t\t\t\treturn nil, err\n-\t\t\t}\n-\t\t}\n+\tif firstErr != nil {\n+\t\treturn nil, firstErr\n \t}\n \n \titems := make([]messageItem, 0, len(ordered))\n@@ -239,5 +228,19 @@ func sanitizeMessageBody(body string) string {\n \tbody = strings.ReplaceAll(body, \"\\n\", \" \")\n \tbody = strings.ReplaceAll(body, \"\\r\", \" \")\n \tbody = strings.TrimSpace(body)\n-\treturn truncate(body, 200)\n+\treturn truncateRunes(body, 200)\n+}\n+\n+func truncateRunes(s string, maxLen int) string {\n+\tif maxLen <= 0 {\n+\t\treturn \"\"\n+\t}\n+\trunes := []rune(s)\n+\tif len(runes) <= maxLen {\n+\t\treturn s\n+\t}\n+\tif maxLen <= 3 {\n+\t\treturn string(runes[:maxLen])\n+\t}\n+\treturn string(runes[:maxLen-3]) + \"...\"\n }"
+    },
+    {
+      "sha": "bcdf9a50c2ed8b62c90851ce7808cc2c64623c82",
+      "filename": "internal/cmd/gmail_messages_test.go",
+      "status": "added",
+      "additions": 69,
+      "deletions": 0,
+      "changes": 69,
+      "blob_url": "https://github.com/steipete/gogcli/blob/07a0691d54151c4ee2876463bf98ea7b1dd13e33/internal%2Fcmd%2Fgmail_messages_test.go",
+      "raw_url": "https://github.com/steipete/gogcli/raw/07a0691d54151c4ee2876463bf98ea7b1dd13e33/internal%2Fcmd%2Fgmail_messages_test.go",
+      "contents_url": "https://api.github.com/repos/steipete/gogcli/contents/internal%2Fcmd%2Fgmail_messages_test.go?ref=07a0691d54151c4ee2876463bf98ea7b1dd13e33",
+      "patch": "@@ -0,0 +1,69 @@\n+package cmd\n+\n+import (\n+\t\"context\"\n+\t\"net/http\"\n+\t\"net/http/httptest\"\n+\t\"strings\"\n+\t\"sync/atomic\"\n+\t\"testing\"\n+\t\"time\"\n+\n+\t\"google.golang.org/api/gmail/v1\"\n+\t\"google.golang.org/api/option\"\n+)\n+\n+func TestSanitizeMessageBody_TruncateUTF8(t *testing.T) {\n+\tlong := strings.Repeat(\"\u20ac\", 210)\n+\tgot := sanitizeMessageBody(long)\n+\tif !strings.HasSuffix(got, \"...\") {\n+\t\tt.Fatalf(\"expected truncation suffix, got %q\", got)\n+\t}\n+\tif len([]rune(got)) != 200 {\n+\t\tt.Fatalf(\"expected 200 runes, got %d\", len([]rune(got)))\n+\t}\n+}\n+\n+func TestSanitizeMessageBody_StripsHTML(t *testing.T) {\n+\tgot := sanitizeMessageBody(\"<html><body>Hi</body></html>\")\n+\tif got != \"Hi\" {\n+\t\tt.Fatalf(\"unexpected sanitized body: %q\", got)\n+\t}\n+}\n+\n+func TestFetchMessageDetails_NoRetryOnError(t *testing.T) {\n+\tvar calls int32\n+\n+\tsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n+\t\tif !strings.Contains(r.URL.Path, \"/users/me/messages/\") {\n+\t\t\thttp.NotFound(w, r)\n+\t\t\treturn\n+\t\t}\n+\t\tatomic.AddInt32(&calls, 1)\n+\t\tif strings.Contains(r.URL.Path, \"/users/me/messages/m1\") {\n+\t\t\thttp.Error(w, \"boom\", http.StatusInternalServerError)\n+\t\t\treturn\n+\t\t}\n+\t\tw.Header().Set(\"Content-Type\", \"application/json\")\n+\t\t_, _ = w.Write([]byte(`{\"id\":\"m2\",\"threadId\":\"t2\",\"payload\":{\"headers\":[{\"name\":\"From\",\"value\":\"me@example.com\"}]}}`))\n+\t}))\n+\tdefer srv.Close()\n+\n+\tsvc, err := gmail.NewService(context.Background(),\n+\t\toption.WithoutAuthentication(),\n+\t\toption.WithHTTPClient(srv.Client()),\n+\t\toption.WithEndpoint(srv.URL+\"/\"),\n+\t)\n+\tif err != nil {\n+\t\tt.Fatalf(\"NewService: %v\", err)\n+\t}\n+\n+\tmessages := []*gmail.Message{{Id: \"m1\"}, {Id: \"m2\"}}\n+\t_, err = fetchMessageDetails(context.Background(), svc, messages, map[string]string{}, time.UTC, false)\n+\tif err == nil || !strings.Contains(err.Error(), \"message m1\") {\n+\t\tt.Fatalf(\"expected message error, got %v\", err)\n+\t}\n+\tif got := atomic.LoadInt32(&calls); got != 2 {\n+\t\tt.Fatalf(\"expected 2 calls, got %d\", got)\n+\t}\n+}"
+    },
+    {
+      "sha": "73443d6ec206403874d21098a0cc12d814e33d4d",
+      "filename": "internal/cmd/gmail_thread_helpers_test.go",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 0,
+      "changes": 16,
+      "blob_url": "https://github.com/steipete/gogcli/blob/07a0691d54151c4ee2876463bf98ea7b1dd13e33/internal%2Fcmd%2Fgmail_thread_helpers_test.go",
+      "raw_url": "https://github.com/steipete/gogcli/raw/07a0691d54151c4ee2876463bf98ea7b1dd13e33/internal%2Fcmd%2Fgmail_thread_helpers_test.go",
+      "contents_url": "https://api.github.com/repos/steipete/gogcli/contents/internal%2Fcmd%2Fgmail_thread_helpers_test.go?ref=07a0691d54151c4ee2876463bf98ea7b1dd13e33",
+      "patch": "@@ -170,6 +170,22 @@ func TestFindPartBody_DecodesBase64Transfer(t *testing.T) {\n \t}\n }\n \n+func TestDecodeTransferEncoding_Base64Whitespace(t *testing.T) {\n+\tencoded := []byte(\"cGxhaW4gYm9keQ==\\n\")\n+\tgot := decodeTransferEncoding(encoded, \"base64\")\n+\tif string(got) != \"plain body\" {\n+\t\tt.Fatalf(\"unexpected decoded body: %q\", got)\n+\t}\n+}\n+\n+func TestDecodeBodyCharset_ISO88591(t *testing.T) {\n+\tinput := []byte{0x63, 0x61, 0x66, 0xe9} // \"caf\u00e9\" in ISO-8859-1\n+\tgot := decodeBodyCharset(input, \"text/plain; charset=iso-8859-1\")\n+\tif string(got) != \"caf\u00e9\" {\n+\t\tt.Fatalf(\"unexpected decoded charset: %q\", string(got))\n+\t}\n+}\n+\n func TestMimeTypeMatches(t *testing.T) {\n \tif !mimeTypeMatches(\"Text/Plain; charset=UTF-8\", \"text/plain\") {\n \t\tt.Fatalf(\"expected mime match\")"
+    }
+  ]
+}

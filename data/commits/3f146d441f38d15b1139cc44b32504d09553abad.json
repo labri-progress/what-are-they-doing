@@ -1,0 +1,125 @@
+{
+  "message": "feat: add /compact slash command for manual context compaction\n\nAdds ForceCompact to ContextManager (runs all 4 compaction layers\nunconditionally), Session.Compact() wrapper, POST /compact server\nendpoint, and TUI /compact command interception with slash command\nparsing infrastructure.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "a1f35fa331330c36b5753f87a3cacf8112e01979",
+      "filename": "agent/context_manager.go",
+      "status": "modified",
+      "additions": 79,
+      "deletions": 0,
+      "changes": 79,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/3f146d441f38d15b1139cc44b32504d09553abad/agent%2Fcontext_manager.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/3f146d441f38d15b1139cc44b32504d09553abad/agent%2Fcontext_manager.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/agent%2Fcontext_manager.go?ref=3f146d441f38d15b1139cc44b32504d09553abad",
+      "patch": "@@ -221,6 +221,85 @@ func (cm *ContextManager) MaybeCompact(\n \t}\n }\n \n+// ForceCompact runs all compaction layers unconditionally, regardless of context pressure.\n+// Used for user-initiated compaction (e.g. /compact command).\n+func (cm *ContextManager) ForceCompact(\n+\tctx context.Context,\n+\thistory *[]Turn,\n+\temitFn func(EventKind, any),\n+) {\n+\t// Reset token measurement so inter-layer estimates use char/4.\n+\tcm.mu.Lock()\n+\tcm.lastInputTokens = 0\n+\tcm.historyLenAtMeasure = 0\n+\tcm.mu.Unlock()\n+\n+\t// Layer 1: Observation masking.\n+\tbefore := EstimateTokens(*history)\n+\tmaskObservations(*history, cm.PreserveRecentTurns)\n+\tafter := EstimateTokens(*history)\n+\temitFn(EventContextCompaction, ContextCompactionData{\n+\t\tLayer:           \"observation_mask\",\n+\t\tTurnsBefore:     len(*history),\n+\t\tTurnsAfter:      len(*history),\n+\t\tEstTokensBefore: before,\n+\t\tEstTokensAfter:  after,\n+\t})\n+\n+\t// Layer 2: Thinking clearing.\n+\tbefore = EstimateTokens(*history)\n+\tclearThinking(*history, cm.PreserveRecentTurns)\n+\tafter = EstimateTokens(*history)\n+\temitFn(EventContextCompaction, ContextCompactionData{\n+\t\tLayer:           \"thinking_clear\",\n+\t\tTurnsBefore:     len(*history),\n+\t\tTurnsAfter:      len(*history),\n+\t\tEstTokensBefore: before,\n+\t\tEstTokensAfter:  after,\n+\t})\n+\n+\t// Layer 3: Deterministic checkpoint.\n+\tturnsBefore := len(*history)\n+\tbefore = EstimateTokens(*history)\n+\t*history = checkpoint(*history, cm.PreserveRecentTurns)\n+\tafter = EstimateTokens(*history)\n+\temitFn(EventContextCompaction, ContextCompactionData{\n+\t\tLayer:           \"checkpoint\",\n+\t\tTurnsBefore:     turnsBefore,\n+\t\tTurnsAfter:      len(*history),\n+\t\tEstTokensBefore: before,\n+\t\tEstTokensAfter:  after,\n+\t})\n+\n+\t// Layer 4: LLM summarization (only if client is available).\n+\tif cm.client != nil {\n+\t\tturnsBefore = len(*history)\n+\t\tbefore = EstimateTokens(*history)\n+\t\tresult, err := cm.summarizeWithLLM(ctx, *history, cm.PreserveRecentTurns)\n+\t\tif err != nil {\n+\t\t\temitFn(EventWarning, WarningData{\n+\t\t\t\tMessage: \"LLM summarization failed: \" + err.Error(),\n+\t\t\t})\n+\t\t} else {\n+\t\t\t*history = result\n+\t\t\tafter = EstimateTokens(*history)\n+\t\t\temitFn(EventContextCompaction, ContextCompactionData{\n+\t\t\t\tLayer:           \"summarize\",\n+\t\t\t\tTurnsBefore:     turnsBefore,\n+\t\t\t\tTurnsAfter:      len(*history),\n+\t\t\t\tEstTokensBefore: before,\n+\t\t\t\tEstTokensAfter:  after,\n+\t\t\t})\n+\t\t}\n+\t}\n+\n+\t// Reset token measurement after compaction.\n+\tcm.mu.Lock()\n+\tcm.lastInputTokens = 0\n+\tcm.historyLenAtMeasure = 0\n+\tcm.mu.Unlock()\n+}\n+\n // --- Observation masking (Layer 1) ---\n \n // maskObservations replaces tool result content in old turns with one-line summaries."
+    },
+    {
+      "sha": "2d9239f782b4828c19a20d20f5b9b0b0f958757b",
+      "filename": "agent/context_manager_test.go",
+      "status": "modified",
+      "additions": 97,
+      "deletions": 0,
+      "changes": 97,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/3f146d441f38d15b1139cc44b32504d09553abad/agent%2Fcontext_manager_test.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/3f146d441f38d15b1139cc44b32504d09553abad/agent%2Fcontext_manager_test.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/agent%2Fcontext_manager_test.go?ref=3f146d441f38d15b1139cc44b32504d09553abad",
+      "patch": "@@ -1869,3 +1869,100 @@ func assistantWithToolCall(id, name, argsJSON string) llm.Message {\n func startsWith(s, prefix string) bool {\n \treturn len(s) >= len(prefix) && s[:len(prefix)] == prefix\n }\n+\n+// --- ForceCompact tests ---\n+\n+func TestForceCompact_RunsAllLayers(t *testing.T) {\n+\t// Use a fake LLM adapter so L4 (summarize) can run.\n+\tadapter := &fakeAdapter{\n+\t\tname: \"openai\",\n+\t\tsteps: []func(req llm.Request) llm.Response{\n+\t\t\tfunc(req llm.Request) llm.Response {\n+\t\t\t\treturn llm.Response{Message: llm.Assistant(\"[CONTEXT SUMMARY] forced\")}\n+\t\t\t},\n+\t\t},\n+\t}\n+\tclient := llm.NewClient()\n+\tclient.Register(adapter)\n+\tprofile := &baseProfile{id: \"openai\", model: \"test\", contextWindow: 100_000}\n+\tcm := NewContextManager(profile, client)\n+\tcm.PreserveRecentTurns = 2\n+\n+\t// Build history with tool results (for L1) and thinking (for L2).\n+\thistory := []Turn{\n+\t\tNewTurn(TurnUserInput, llm.User(\"first question\")),\n+\t\tNewTurn(TurnAssistant, llm.Message{\n+\t\t\tRole: llm.RoleAssistant,\n+\t\t\tContent: []llm.ContentPart{\n+\t\t\t\t{Kind: llm.ContentThinking, Thinking: &llm.ThinkingData{Text: \"deep thoughts\"}},\n+\t\t\t\t{Kind: llm.ContentToolCall, ToolCall: &llm.ToolCallData{ID: \"c1\", Name: \"shell\", Arguments: json.RawMessage(`{\"command\":\"ls\"}`)}},\n+\t\t\t},\n+\t\t}),\n+\t\tNewTurn(TurnToolResults, llm.ToolResult(\"c1\", strings.Repeat(\"x\", 500), false)),\n+\t\tNewTurn(TurnUserInput, llm.User(\"second question\")),\n+\t\tNewTurn(TurnAssistant, llm.Message{\n+\t\t\tRole: llm.RoleAssistant,\n+\t\t\tContent: []llm.ContentPart{\n+\t\t\t\t{Kind: llm.ContentToolCall, ToolCall: &llm.ToolCallData{ID: \"c2\", Name: \"communicate\", Arguments: json.RawMessage(`{\"action\":\"result\",\"message\":\"done\"}`)}},\n+\t\t\t},\n+\t\t}),\n+\t\tNewTurn(TurnToolResults, llm.ToolResult(\"c2\", \"ok\", false)),\n+\t}\n+\n+\tvar layers []string\n+\temitFn := func(kind EventKind, data any) {\n+\t\tif kind == EventContextCompaction {\n+\t\t\tif d, ok := data.(ContextCompactionData); ok {\n+\t\t\t\tlayers = append(layers, d.Layer)\n+\t\t\t}\n+\t\t}\n+\t}\n+\n+\tcm.ForceCompact(context.Background(), &history, emitFn)\n+\n+\t// All 4 layers should have fired.\n+\tif len(layers) < 4 {\n+\t\tt.Fatalf(\"expected all 4 layers to fire, got %d: %v\", len(layers), layers)\n+\t}\n+\texpected := []string{\"observation_mask\", \"thinking_clear\", \"checkpoint\", \"summarize\"}\n+\tfor i, want := range expected {\n+\t\tif i >= len(layers) || layers[i] != want {\n+\t\t\tt.Errorf(\"layer[%d] = %q, want %q (all: %v)\", i, layers[i], want, layers)\n+\t\t}\n+\t}\n+}\n+\n+func TestForceCompact_BelowThreshold(t *testing.T) {\n+\t// Even with tiny history well below auto-compact thresholds,\n+\t// ForceCompact should still run the layers.\n+\tprofile := &baseProfile{id: \"openai\", model: \"test\", contextWindow: 1_000_000}\n+\tcm := NewContextManager(profile, nil) // no LLM client \u2192 L4 skipped\n+\tcm.PreserveRecentTurns = 2\n+\n+\thistory := []Turn{\n+\t\tNewTurn(TurnUserInput, llm.User(\"hi\")),\n+\t\tNewTurn(TurnAssistant, llm.Message{\n+\t\t\tRole: llm.RoleAssistant,\n+\t\t\tContent: []llm.ContentPart{\n+\t\t\t\t{Kind: llm.ContentToolCall, ToolCall: &llm.ToolCallData{ID: \"c1\", Name: \"shell\", Arguments: json.RawMessage(`{\"command\":\"echo hi\"}`)}},\n+\t\t\t},\n+\t\t}),\n+\t\tNewTurn(TurnToolResults, llm.ToolResult(\"c1\", \"hello world\", false)),\n+\t}\n+\n+\tvar layers []string\n+\temitFn := func(kind EventKind, data any) {\n+\t\tif kind == EventContextCompaction {\n+\t\t\tif d, ok := data.(ContextCompactionData); ok {\n+\t\t\t\tlayers = append(layers, d.Layer)\n+\t\t\t}\n+\t\t}\n+\t}\n+\n+\tcm.ForceCompact(context.Background(), &history, emitFn)\n+\n+\t// L1-L3 should fire. L4 skipped (no client).\n+\tif len(layers) < 3 {\n+\t\tt.Fatalf(\"expected at least 3 layers, got %d: %v\", len(layers), layers)\n+\t}\n+}"
+    },
+    {
+      "sha": "7e81d3d0d39089b72ef28afb0dd551244125f51c",
+      "filename": "agent/session.go",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 0,
+      "changes": 22,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/3f146d441f38d15b1139cc44b32504d09553abad/agent%2Fsession.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/3f146d441f38d15b1139cc44b32504d09553abad/agent%2Fsession.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/agent%2Fsession.go?ref=3f146d441f38d15b1139cc44b32504d09553abad",
+      "patch": "@@ -302,6 +302,28 @@ func (s *Session) SetReasoningEffort(effort string) {\n \ts.cfg.ReasoningEffort = strings.TrimSpace(effort)\n }\n \n+// Compact forces context compaction regardless of current pressure.\n+// Runs all compaction layers (observation masking, thinking clearing,\n+// checkpoint, and LLM summarization). Safe to call while idle.\n+func (s *Session) Compact(ctx context.Context) error {\n+\tif s.contextMgr == nil {\n+\t\treturn fmt.Errorf(\"context manager not initialized\")\n+\t}\n+\n+\ts.mu.Lock()\n+\thistCopy := append([]Turn{}, s.history...)\n+\ts.mu.Unlock()\n+\n+\ts.contextMgr.ForceCompact(ctx, &histCopy, s.emit)\n+\n+\ts.mu.Lock()\n+\ts.history = histCopy\n+\ts.mu.Unlock()\n+\n+\ts.maybeAutoSave()\n+\treturn nil\n+}\n+\n // SetModel changes the model used for future LLM calls.\n // Takes effect on the next request.\n func (s *Session) SetModel(model string) {"
+    },
+    {
+      "sha": "743198a8a4bd2605d50e159a03a169ff21c0e034",
+      "filename": "cmd/serf-tui/embedded.go",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/3f146d441f38d15b1139cc44b32504d09553abad/cmd%2Fserf-tui%2Fembedded.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/3f146d441f38d15b1139cc44b32504d09553abad/cmd%2Fserf-tui%2Fembedded.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/cmd%2Fserf-tui%2Fembedded.go?ref=3f146d441f38d15b1139cc44b32504d09553abad",
+      "patch": "@@ -125,6 +125,7 @@ func startEmbedded(ctx context.Context, cfg embeddedConfig) (*embeddedServer, er\n \t}\n \n \tsrv := server.NewServer(server.ServerConfig{})\n+\tsrv.SetCompactFunc(sess.Compact)\n \n \t// Bridge session events to SSE broadcaster.\n \tgo server.Bridge(srv, sess.Events())"
+    },
+    {
+      "sha": "11cfa24146c60607acd85c5389b6b6108ec44277",
+      "filename": "cmd/serf-tui/input.go",
+      "status": "modified",
+      "additions": 32,
+      "deletions": 0,
+      "changes": 32,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/3f146d441f38d15b1139cc44b32504d09553abad/cmd%2Fserf-tui%2Finput.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/3f146d441f38d15b1139cc44b32504d09553abad/cmd%2Fserf-tui%2Finput.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/cmd%2Fserf-tui%2Finput.go?ref=3f146d441f38d15b1139cc44b32504d09553abad",
+      "patch": "@@ -5,11 +5,28 @@ import (\n \t\"encoding/json\"\n \t\"fmt\"\n \t\"net/http\"\n+\t\"strings\"\n \n \ttea \"github.com/charmbracelet/bubbletea\"\n )\n \n type inputSentMsg struct{ err error }\n+type compactDoneMsg struct{ err error }\n+\n+// parseSlashCommand returns the command name and arguments if the input starts\n+// with a slash command. Returns (\"\", \"\") if not a slash command.\n+func parseSlashCommand(input string) (cmd, args string) {\n+\tinput = strings.TrimSpace(input)\n+\tif !strings.HasPrefix(input, \"/\") {\n+\t\treturn \"\", \"\"\n+\t}\n+\tparts := strings.SplitN(input[1:], \" \", 2)\n+\tcmd = parts[0]\n+\tif len(parts) > 1 {\n+\t\targs = parts[1]\n+\t}\n+\treturn cmd, args\n+}\n \n func sendInput(addr, text string) tea.Cmd {\n \treturn func() tea.Msg {\n@@ -30,6 +47,21 @@ func sendInput(addr, text string) tea.Cmd {\n \t}\n }\n \n+func sendCompact(addr string) tea.Cmd {\n+\treturn func() tea.Msg {\n+\t\turl := fmt.Sprintf(\"http://%s/compact\", addr)\n+\t\tresp, err := http.Post(url, \"\", nil)\n+\t\tif err != nil {\n+\t\t\treturn compactDoneMsg{err}\n+\t\t}\n+\t\tresp.Body.Close()\n+\t\tif resp.StatusCode != http.StatusNoContent {\n+\t\t\treturn compactDoneMsg{fmt.Errorf(\"server returned %d\", resp.StatusCode)}\n+\t\t}\n+\t\treturn compactDoneMsg{}\n+\t}\n+}\n+\n func sendInterrupt(addr string) tea.Cmd {\n \treturn func() tea.Msg {\n \t\turl := fmt.Sprintf(\"http://%s/interrupt\", addr)"
+    },
+    {
+      "sha": "d022ac8e47afeeacc01983843e145c954375434b",
+      "filename": "cmd/serf-tui/input_test.go",
+      "status": "added",
+      "additions": 83,
+      "deletions": 0,
+      "changes": 83,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/3f146d441f38d15b1139cc44b32504d09553abad/cmd%2Fserf-tui%2Finput_test.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/3f146d441f38d15b1139cc44b32504d09553abad/cmd%2Fserf-tui%2Finput_test.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/cmd%2Fserf-tui%2Finput_test.go?ref=3f146d441f38d15b1139cc44b32504d09553abad",
+      "patch": "@@ -0,0 +1,83 @@\n+package main\n+\n+import (\n+\t\"fmt\"\n+\t\"net/http\"\n+\t\"net/http/httptest\"\n+\t\"testing\"\n+)\n+\n+func TestSendCompact_Success(t *testing.T) {\n+\tcalled := false\n+\tts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n+\t\tif r.URL.Path != \"/compact\" {\n+\t\t\tt.Errorf(\"unexpected path: %s\", r.URL.Path)\n+\t\t}\n+\t\tif r.Method != http.MethodPost {\n+\t\t\tt.Errorf(\"unexpected method: %s\", r.Method)\n+\t\t}\n+\t\tcalled = true\n+\t\tw.WriteHeader(http.StatusNoContent)\n+\t}))\n+\tdefer ts.Close()\n+\n+\t// Strip \"http://\" prefix to get addr.\n+\taddr := ts.URL[len(\"http://\"):]\n+\tcmd := sendCompact(addr)\n+\tmsg := cmd()\n+\n+\tresult, ok := msg.(compactDoneMsg)\n+\tif !ok {\n+\t\tt.Fatalf(\"expected compactDoneMsg, got %T\", msg)\n+\t}\n+\tif result.err != nil {\n+\t\tt.Errorf(\"unexpected error: %v\", result.err)\n+\t}\n+\tif !called {\n+\t\tt.Error(\"server handler not called\")\n+\t}\n+}\n+\n+func TestSendCompact_ServerError(t *testing.T) {\n+\tts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n+\t\thttp.Error(w, \"boom\", http.StatusInternalServerError)\n+\t}))\n+\tdefer ts.Close()\n+\n+\taddr := ts.URL[len(\"http://\"):]\n+\tcmd := sendCompact(addr)\n+\tmsg := cmd()\n+\n+\tresult, ok := msg.(compactDoneMsg)\n+\tif !ok {\n+\t\tt.Fatalf(\"expected compactDoneMsg, got %T\", msg)\n+\t}\n+\tif result.err == nil {\n+\t\tt.Error(\"expected error, got nil\")\n+\t}\n+}\n+\n+func TestSlashCompactInterception(t *testing.T) {\n+\t// Verify that /compact is recognized as a slash command.\n+\ttests := []struct {\n+\t\tinput string\n+\t\twant  bool\n+\t}{\n+\t\t{\"/compact\", true},\n+\t\t{\" /compact \", true},\n+\t\t{\"/compact extra args\", true},\n+\t\t{\"hello /compact\", false},\n+\t\t{\"/notacommand\", false},\n+\t\t{\"\", false},\n+\t}\n+\n+\tfor _, tt := range tests {\n+\t\tt.Run(fmt.Sprintf(\"%q\", tt.input), func(t *testing.T) {\n+\t\t\tcmd, _ := parseSlashCommand(tt.input)\n+\t\t\tgot := cmd == \"compact\"\n+\t\t\tif got != tt.want {\n+\t\t\t\tt.Errorf(\"parseSlashCommand(%q) compact = %v, want %v\", tt.input, got, tt.want)\n+\t\t\t}\n+\t\t})\n+\t}\n+}"
+    },
+    {
+      "sha": "8c54680c52ff8e1ff03a556582c71848d022cc3f",
+      "filename": "cmd/serf-tui/model.go",
+      "status": "modified",
+      "additions": 37,
+      "deletions": 5,
+      "changes": 42,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/3f146d441f38d15b1139cc44b32504d09553abad/cmd%2Fserf-tui%2Fmodel.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/3f146d441f38d15b1139cc44b32504d09553abad/cmd%2Fserf-tui%2Fmodel.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/cmd%2Fserf-tui%2Fmodel.go?ref=3f146d441f38d15b1139cc44b32504d09553abad",
+      "patch": "@@ -75,12 +75,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {\n \t\t\treturn m, nil\n \t\tcase \"enter\":\n \t\t\ttext := strings.TrimSpace(m.input.Value())\n-\t\t\tif text != \"\" {\n-\t\t\t\tm.messages = append(m.messages, chatMessage{Kind: msgUser, Text: text})\n-\t\t\t\tm.input.Reset()\n-\t\t\t\tm.refreshViewport()\n-\t\t\t\tcmds = append(cmds, sendInput(m.addr, text))\n+\t\t\tif text == \"\" {\n+\t\t\t\treturn m, tea.Batch(cmds...)\n \t\t\t}\n+\t\t\t// Check for slash commands.\n+\t\t\tif cmd, _ := parseSlashCommand(text); cmd != \"\" {\n+\t\t\t\tswitch cmd {\n+\t\t\t\tcase \"compact\":\n+\t\t\t\t\tm.input.Reset()\n+\t\t\t\t\tm.messages = append(m.messages, chatMessage{Kind: msgSystem, Text: \"Compacting context...\"})\n+\t\t\t\t\tm.refreshViewport()\n+\t\t\t\t\tcmds = append(cmds, sendCompact(m.addr))\n+\t\t\t\t\treturn m, tea.Batch(cmds...)\n+\t\t\t\tdefault:\n+\t\t\t\t\tm.input.Reset()\n+\t\t\t\t\tm.messages = append(m.messages, chatMessage{Kind: msgSystem, Text: fmt.Sprintf(\"Unknown command: /%s\", cmd)})\n+\t\t\t\t\tm.refreshViewport()\n+\t\t\t\t\treturn m, tea.Batch(cmds...)\n+\t\t\t\t}\n+\t\t\t}\n+\t\t\tm.messages = append(m.messages, chatMessage{Kind: msgUser, Text: text})\n+\t\t\tm.input.Reset()\n+\t\t\tm.refreshViewport()\n+\t\t\tcmds = append(cmds, sendInput(m.addr, text))\n \t\t\treturn m, tea.Batch(cmds...)\n \t\t}\n \n@@ -123,6 +140,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {\n \t\t\tm.refreshViewport()\n \t\t}\n \t\treturn m, nil\n+\n+\tcase compactDoneMsg:\n+\t\tif msg.err != nil {\n+\t\t\tm.messages = append(m.messages, chatMessage{\n+\t\t\t\tKind: msgSystem,\n+\t\t\t\tText: fmt.Sprintf(\"Compact failed: %s\", msg.err),\n+\t\t\t})\n+\t\t} else {\n+\t\t\tm.messages = append(m.messages, chatMessage{\n+\t\t\t\tKind: msgSystem,\n+\t\t\t\tText: \"Context compacted.\",\n+\t\t\t})\n+\t\t}\n+\t\tm.refreshViewport()\n+\t\treturn m, nil\n \t}\n \n \t// Update sub-components"
+    },
+    {
+      "sha": "e434d9b16b9d1c3b1fb782a2f2091aae70047694",
+      "filename": "cmd/serf/serve.go",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/3f146d441f38d15b1139cc44b32504d09553abad/cmd%2Fserf%2Fserve.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/3f146d441f38d15b1139cc44b32504d09553abad/cmd%2Fserf%2Fserve.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/cmd%2Fserf%2Fserve.go?ref=3f146d441f38d15b1139cc44b32504d09553abad",
+      "patch": "@@ -99,6 +99,7 @@ func runServe(args []string) error {\n \tdefer cancel()\n \n \tsrv := server.NewServer(server.ServerConfig{})\n+\tsrv.SetCompactFunc(sess.Compact)\n \n \t// Bridge session events to SSE broadcaster.\n \tgo server.Bridge(srv, sess.Events())"
+    },
+    {
+      "sha": "09a72912ecc609ede6fac76cd4eca5d5730afe38",
+      "filename": "server/server.go",
+      "status": "modified",
+      "additions": 34,
+      "deletions": 5,
+      "changes": 39,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/3f146d441f38d15b1139cc44b32504d09553abad/server%2Fserver.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/3f146d441f38d15b1139cc44b32504d09553abad/server%2Fserver.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/server%2Fserver.go?ref=3f146d441f38d15b1139cc44b32504d09553abad",
+      "patch": "@@ -28,11 +28,12 @@ type Server struct {\n \tmux         *http.ServeMux\n \tbroadcaster *Broadcaster\n \n-\tmu         sync.RWMutex\n-\tstatus     StatusInfo\n-\tcancelFunc context.CancelFunc\n-\tprocessing bool\n-\tinputCh    chan string\n+\tmu          sync.RWMutex\n+\tstatus      StatusInfo\n+\tcancelFunc  context.CancelFunc\n+\tcompactFunc func(context.Context) error\n+\tprocessing  bool\n+\tinputCh     chan string\n }\n \n // NewServer creates a new Server.\n@@ -49,6 +50,7 @@ func NewServer(cfg ServerConfig) *Server {\n \t}\n \ts.mux.HandleFunc(\"/status\", s.handleStatus)\n \ts.mux.HandleFunc(\"/interrupt\", s.handleInterrupt)\n+\ts.mux.HandleFunc(\"/compact\", s.handleCompact)\n \ts.mux.HandleFunc(\"/input\", s.handleInput)\n \ts.mux.HandleFunc(\"/events\", s.handleEvents)\n \treturn s\n@@ -103,6 +105,33 @@ func (s *Server) SetCancelFunc(cancel context.CancelFunc) {\n \ts.mu.Unlock()\n }\n \n+// SetCompactFunc sets the function called by POST /compact.\n+func (s *Server) SetCompactFunc(fn func(context.Context) error) {\n+\ts.mu.Lock()\n+\ts.compactFunc = fn\n+\ts.mu.Unlock()\n+}\n+\n+func (s *Server) handleCompact(w http.ResponseWriter, r *http.Request) {\n+\tif r.Method != http.MethodPost {\n+\t\thttp.Error(w, \"method not allowed\", http.StatusMethodNotAllowed)\n+\t\treturn\n+\t}\n+\ts.mu.RLock()\n+\tfn := s.compactFunc\n+\ts.mu.RUnlock()\n+\n+\tif fn == nil {\n+\t\thttp.Error(w, \"compact not available\", http.StatusServiceUnavailable)\n+\t\treturn\n+\t}\n+\tif err := fn(r.Context()); err != nil {\n+\t\thttp.Error(w, err.Error(), http.StatusInternalServerError)\n+\t\treturn\n+\t}\n+\tw.WriteHeader(http.StatusNoContent)\n+}\n+\n func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {\n \tif r.Method != http.MethodGet {\n \t\thttp.Error(w, \"method not allowed\", http.StatusMethodNotAllowed)"
+    },
+    {
+      "sha": "815186a8665d23394b87b8124fb3a804c1bd1d4d",
+      "filename": "server/server_test.go",
+      "status": "modified",
+      "additions": 61,
+      "deletions": 0,
+      "changes": 61,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/3f146d441f38d15b1139cc44b32504d09553abad/server%2Fserver_test.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/3f146d441f38d15b1139cc44b32504d09553abad/server%2Fserver_test.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/server%2Fserver_test.go?ref=3f146d441f38d15b1139cc44b32504d09553abad",
+      "patch": "@@ -3,6 +3,7 @@ package server\n import (\n \t\"context\"\n \t\"encoding/json\"\n+\t\"fmt\"\n \t\"net/http\"\n \t\"net/http/httptest\"\n \t\"strings\"\n@@ -166,6 +167,66 @@ func TestEventsEndpoint_SSE(t *testing.T) {\n \t}\n }\n \n+func TestCompactEndpoint(t *testing.T) {\n+\tsrv := NewServer(ServerConfig{})\n+\n+\tcalled := false\n+\tsrv.SetCompactFunc(func(ctx context.Context) error {\n+\t\tcalled = true\n+\t\treturn nil\n+\t})\n+\n+\treq := httptest.NewRequest(http.MethodPost, \"/compact\", nil)\n+\tw := httptest.NewRecorder()\n+\tsrv.ServeHTTP(w, req)\n+\n+\tif w.Code != http.StatusNoContent {\n+\t\tt.Fatalf(\"status code: got %d, want 204\", w.Code)\n+\t}\n+\tif !called {\n+\t\tt.Error(\"compact function should have been called\")\n+\t}\n+}\n+\n+func TestCompactEndpoint_NoFunc(t *testing.T) {\n+\tsrv := NewServer(ServerConfig{})\n+\n+\treq := httptest.NewRequest(http.MethodPost, \"/compact\", nil)\n+\tw := httptest.NewRecorder()\n+\tsrv.ServeHTTP(w, req)\n+\n+\tif w.Code != http.StatusServiceUnavailable {\n+\t\tt.Fatalf(\"status code: got %d, want 503\", w.Code)\n+\t}\n+}\n+\n+func TestCompactEndpoint_Error(t *testing.T) {\n+\tsrv := NewServer(ServerConfig{})\n+\tsrv.SetCompactFunc(func(ctx context.Context) error {\n+\t\treturn fmt.Errorf(\"compaction failed\")\n+\t})\n+\n+\treq := httptest.NewRequest(http.MethodPost, \"/compact\", nil)\n+\tw := httptest.NewRecorder()\n+\tsrv.ServeHTTP(w, req)\n+\n+\tif w.Code != http.StatusInternalServerError {\n+\t\tt.Fatalf(\"status code: got %d, want 500\", w.Code)\n+\t}\n+}\n+\n+func TestCompactEndpoint_MethodNotAllowed(t *testing.T) {\n+\tsrv := NewServer(ServerConfig{})\n+\n+\treq := httptest.NewRequest(http.MethodGet, \"/compact\", nil)\n+\tw := httptest.NewRecorder()\n+\tsrv.ServeHTTP(w, req)\n+\n+\tif w.Code != http.StatusMethodNotAllowed {\n+\t\tt.Fatalf(\"status code: got %d, want 405\", w.Code)\n+\t}\n+}\n+\n func TestEventsEndpoint_MethodNotAllowed(t *testing.T) {\n \tsrv := NewServer(ServerConfig{})\n \treq := httptest.NewRequest(http.MethodPost, \"/events\", nil)"
+    }
+  ]
+}

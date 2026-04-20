@@ -1,0 +1,64 @@
+{
+  "message": "feat(btree): extract rowid from index key records for IdxRowid opcode\n\nImplement proper index cursor rowid extraction where the rowid is stored\nas the trailing integer field in the serialized key record:\n\n- cursor.rs: Update rowid() to parse the cell payload as a record and\n  extract the last field as an integer when cell.rowid is None (index\n  cursor path). Add comprehensive tests covering normal index keys,\n  overflow payloads, and error cases for malformed records.\n\n- engine.rs: Wire IdxRowid opcode to actually extract the rowid from\n  the index cursor via cursor_rowid() instead of being a no-op. This\n  is essential for queries that need to look up table rows after\n  finding matches in an index.\n\n- Minor formatting fixes in connection.rs and codegen.rs\n\nThis completes the index maintenance chain: INSERT now emits IdxInsert\nto add index entries, and SELECT can now use IdxRowid to retrieve the\ntable rowid for fetching the full row data.\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "7c4287d29dd11fe9bf39d342573897b3c960f47e",
+      "filename": ".beads/issues.jsonl",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 3,
+      "changes": 8,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/070df89bb89c39344c563d66a59355f2c637c3cb/.beads%2Fissues.jsonl",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/070df89bb89c39344c563d66a59355f2c637c3cb/.beads%2Fissues.jsonl",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/.beads%2Fissues.jsonl?ref=070df89bb89c39344c563d66a59355f2c637c3cb"
+    },
+    {
+      "sha": "b8c709c3a7315b6cfd257083c634cf2ccba55187",
+      "filename": "crates/fsqlite-btree/src/cursor.rs",
+      "status": "modified",
+      "additions": 69,
+      "deletions": 6,
+      "changes": 75,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/070df89bb89c39344c563d66a59355f2c637c3cb/crates%2Ffsqlite-btree%2Fsrc%2Fcursor.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/070df89bb89c39344c563d66a59355f2c637c3cb/crates%2Ffsqlite-btree%2Fsrc%2Fcursor.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-btree%2Fsrc%2Fcursor.rs?ref=070df89bb89c39344c563d66a59355f2c637c3cb",
+      "patch": "@@ -29,6 +29,7 @@ use fsqlite_error::{FrankenError, Result};\n use fsqlite_pager::TransactionHandle;\n use fsqlite_types::cx::Cx;\n use fsqlite_types::limits::BTREE_MAX_DEPTH;\n+use fsqlite_types::record::parse_record;\n use fsqlite_types::serial_type::write_varint;\n use fsqlite_types::{PageNumber, WitnessKey};\n use tracing::{debug, warn};\n@@ -1397,12 +1398,22 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {\n         }\n         let top = self.stack.last().unwrap();\n         let cell = self.parse_cell_at(top, top.cell_idx)?;\n-        cell.rowid.ok_or_else(|| {\n-            // For index cursors, rowid is extracted from the payload.\n-            // For now, return error if no rowid in cell.\n-            let _ = cx; // suppress unused warning\n-            FrankenError::internal(\"cell has no rowid (index cursor?)\")\n-        })\n+        if let Some(rowid) = cell.rowid {\n+            return Ok(rowid);\n+        }\n+\n+        // Index cursor: rowid is stored as the trailing field in the\n+        // serialized key record.\n+        let key = self.read_cell_payload(cx, top, &cell)?;\n+        let key_values = parse_record(&key).ok_or_else(|| FrankenError::DatabaseCorrupt {\n+            detail: \"malformed index key record while extracting rowid\".to_owned(),\n+        })?;\n+        key_values\n+            .last()\n+            .and_then(fsqlite_types::SqliteValue::as_integer)\n+            .ok_or_else(|| FrankenError::DatabaseCorrupt {\n+                detail: \"index key record missing trailing integer rowid\".to_owned(),\n+            })\n     }\n \n     fn eof(&self) -> bool {\n@@ -1419,7 +1430,9 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {\n mod tests {\n     use super::*;\n     use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};\n+    use fsqlite_types::record::serialize_record;\n     use fsqlite_types::serial_type::write_varint;\n+    use fsqlite_types::SqliteValue;\n     use proptest::strategy::Strategy as _;\n     use std::cell::RefCell;\n     use std::collections::{BTreeMap, BTreeSet};\n@@ -1905,6 +1918,56 @@ mod tests {\n         assert_eq!(cursor.payload(&cx).unwrap(), b\"banana\");\n     }\n \n+    #[test]\n+    fn test_cursor_index_rowid_extracted_from_trailing_record_field() {\n+        let mut store = MemPageStore::new(USABLE);\n+        store.pages.insert(2, build_leaf_index(&[]));\n+\n+        let cx = Cx::new();\n+        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);\n+        let key = serialize_record(&[\n+            SqliteValue::Text(\"beacon\".to_owned()),\n+            SqliteValue::Integer(73),\n+        ]);\n+\n+        cursor.index_insert(&cx, &key).unwrap();\n+        assert!(cursor.index_move_to(&cx, &key).unwrap().is_found());\n+        assert_eq!(cursor.rowid(&cx).unwrap(), 73);\n+    }\n+\n+    #[test]\n+    fn test_cursor_index_rowid_with_overflow_key_payload() {\n+        let mut store = MemPageStore::new(USABLE);\n+        store.pages.insert(2, build_leaf_index(&[]));\n+\n+        let cx = Cx::new();\n+        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);\n+        let key = serialize_record(&[\n+            SqliteValue::Blob(vec![0xAB; 2_500]),\n+            SqliteValue::Integer(901),\n+        ]);\n+\n+        cursor.index_insert(&cx, &key).unwrap();\n+        assert!(cursor.index_move_to(&cx, &key).unwrap().is_found());\n+        assert_eq!(cursor.rowid(&cx).unwrap(), 901);\n+    }\n+\n+    #[test]\n+    fn test_cursor_index_rowid_rejects_record_without_trailing_integer() {\n+        let mut store = MemPageStore::new(USABLE);\n+        store.pages.insert(2, build_leaf_index(&[]));\n+\n+        let cx = Cx::new();\n+        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);\n+        let key = serialize_record(&[SqliteValue::Text(\"missing-rowid\".to_owned())]);\n+\n+        cursor.index_insert(&cx, &key).unwrap();\n+        assert!(cursor.index_move_to(&cx, &key).unwrap().is_found());\n+\n+        let err = cursor.rowid(&cx).unwrap_err();\n+        assert!(matches!(err, FrankenError::DatabaseCorrupt { .. }));\n+    }\n+\n     #[test]\n     fn test_cursor_table_insert_with_overflow_payload() {\n         let mut store = MemPageStore::new(USABLE);"
+    },
+    {
+      "sha": "b9fa1323b3c1e76216d2b947d652ec22fe9c7ec3",
+      "filename": "crates/fsqlite-core/src/connection.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 1,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/070df89bb89c39344c563d66a59355f2c637c3cb/crates%2Ffsqlite-core%2Fsrc%2Fconnection.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/070df89bb89c39344c563d66a59355f2c637c3cb/crates%2Ffsqlite-core%2Fsrc%2Fconnection.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-core%2Fsrc%2Fconnection.rs?ref=070df89bb89c39344c563d66a59355f2c637c3cb",
+      "patch": "@@ -12410,7 +12410,9 @@ mod tests {\n         assert_eq!(rows.len(), 1);\n         assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(7));\n \n-        let rows = conn.query(\"PRAGMA fsqlite.raptorq_repair_symbols;\").unwrap();\n+        let rows = conn\n+            .query(\"PRAGMA fsqlite.raptorq_repair_symbols;\")\n+            .unwrap();\n         assert_eq!(rows.len(), 1);\n         assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(7));\n     }"
+    },
+    {
+      "sha": "04be92c82e8eb63486785fed836f544f524eab89",
+      "filename": "crates/fsqlite-vdbe/src/codegen.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 4,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/070df89bb89c39344c563d66a59355f2c637c3cb/crates%2Ffsqlite-vdbe%2Fsrc%2Fcodegen.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/070df89bb89c39344c563d66a59355f2c637c3cb/crates%2Ffsqlite-vdbe%2Fsrc%2Fcodegen.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-vdbe%2Fsrc%2Fcodegen.rs?ref=070df89bb89c39344c563d66a59355f2c637c3cb",
+      "patch": "@@ -32,9 +32,8 @@ const OE_REPLACE: u16 = 5;\n /// Convert AST `ConflictAction` to p5 OE_* flag value.\n fn conflict_action_to_oe(action: Option<&ConflictAction>) -> u16 {\n     match action {\n-        None => OE_ABORT,\n         Some(ConflictAction::Rollback) => OE_ROLLBACK,\n-        Some(ConflictAction::Abort) => OE_ABORT,\n+        None | Some(ConflictAction::Abort) => OE_ABORT,\n         Some(ConflictAction::Fail) => OE_FAIL,\n         Some(ConflictAction::Ignore) => OE_IGNORE,\n         Some(ConflictAction::Replace) => OE_REPLACE,\n@@ -3813,8 +3812,7 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx\n         Expr::Placeholder(pt, _) => {\n             let idx = match pt {\n                 fsqlite_ast::PlaceholderType::Numbered(n) => *n as i32,\n-                fsqlite_ast::PlaceholderType::Anonymous => b.next_anon_placeholder_idx() as i32,\n-                // Named placeholders: convert to sequential numbers for now\n+                // Anonymous and named placeholders are assigned sequentially.\n                 _ => b.next_anon_placeholder_idx() as i32,\n             };\n             b.emit_op(Opcode::Variable, idx, reg, 0, P4::None, 0);"
+    },
+    {
+      "sha": "fba35ae8e88bb35080b0888187a022e936941ea9",
+      "filename": "crates/fsqlite-vdbe/src/engine.rs",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 1,
+      "changes": 14,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/070df89bb89c39344c563d66a59355f2c637c3cb/crates%2Ffsqlite-vdbe%2Fsrc%2Fengine.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/070df89bb89c39344c563d66a59355f2c637c3cb/crates%2Ffsqlite-vdbe%2Fsrc%2Fengine.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-vdbe%2Fsrc%2Fengine.rs?ref=070df89bb89c39344c563d66a59355f2c637c3cb",
+      "patch": "@@ -2413,7 +2413,19 @@ impl VdbeEngine {\n                     pc = op.p2 as usize;\n                 }\n \n-                Opcode::DeferredSeek | Opcode::IdxRowid | Opcode::FinishSeek => {\n+                Opcode::IdxRowid => {\n+                    // Extract rowid from index cursor p1 into register p2.\n+                    // For storage cursors this delegates to B-tree cursor\n+                    // rowid(), which decodes the trailing rowid field from the\n+                    // index key record.\n+                    let cursor_id = op.p1;\n+                    let target = op.p2;\n+                    let val = self.cursor_rowid(cursor_id)?;\n+                    self.set_reg(target, val);\n+                    pc += 1;\n+                }\n+\n+                Opcode::DeferredSeek | Opcode::FinishSeek => {\n                     pc += 1;\n                 }\n "
+    }
+  ]
+}

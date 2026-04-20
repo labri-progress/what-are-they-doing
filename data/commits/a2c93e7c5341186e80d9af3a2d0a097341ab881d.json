@@ -1,0 +1,65 @@
+{
+  "message": "Add Ratatui TUI infrastructure scaffolding\n\nEstablish ui module structure with placeholder files for Ratatui-based\nterminal user interface implementation: main TUI loop, widget components,\nand theming system.\n\nModule purpose (per PLAN \u00a7 3.1, \u00a7 6):\nThe ui layer provides the interactive terminal interface for search input,\nresults browsing, and conversation detail viewing using Ratatui (modern\ntui-rs fork) with crossterm backend for cross-platform terminal control\n(Windows/Linux/macOS support without platform-specific code paths).\n\nPlanned tui.rs responsibilities (PLAN \u00a7 6.1-6.3):\n\nEvent loop structure:\n- Initialize crossterm terminal: enable raw mode (disable line buffering,\n  capture Ctrl+C), enter alternate screen (preserve user's shell scrollback),\n  enable mouse capture for potential future mouse interaction support\n- Create ratatui::Terminal with CrosstermBackend wrapping stdout, set up\n  panic hook to restore terminal state on unwrap/panic (critical: if TUI\n  panics without restoring, user's terminal left in raw mode rendering\n  shell unusable until reset)\n- Main loop: poll crossterm events (KeyEvent, MouseEvent, Resize) with\n  timeout via crossterm::event::poll(Duration::from_millis(100)) for\n  periodic UI refresh (e.g., update indexing progress bar even without\n  user input)\n- On KeyEvent:\n  - '/' key: focus search input box, capture text input until Enter/Esc\n  - 'q' key: send shutdown command, break event loop, restore terminal\n  - 'f', 'a', 't', 'w' keys: open filter/agent/time/workspace selection\n    modals (per PLAN \u00a7 6.3 hotkeys)\n  - Arrow/vim keys (\u2191\u2193jk): move selection in results list, PgUp/PgDn\n    for page scrolling, Tab to cycle focus between search/results/detail\n    panes\n- On tick: check crossbeam channel for UiEvent::SearchResult or\n  UiEvent::IndexProgress messages from background threads, update state,\n  trigger redraw\n- Render: call terminal.draw(|frame| { render_app(frame, &app_state) })\n  to rebuild UI via Ratatui widget composition\n\nLayout structure (PLAN \u00a7 6.2):\nThree-pane vertical split using ratatui::layout::Layout with constraints:\n- Top bar (1-2 rows): Paragraph widget for search input with cursor\n  position, horizontal Span widgets for filter pills (agent:Codex,\n  time:7d), right-aligned status text (e.g., \"Indexing... 45%\")\n- Content area (remaining height): Horizontal split (40%/60% default):\n  - Left pane: List widget for search results, each row formatted as\n    \"[ICON] [TIME] [WORKSPACE] Title snippet\" with color_coded style\n    based on agent (Codex:cyan, Claude:purple, Gemini:blue, Amp:magenta,\n    Cline:green, OpenCode:yellow per PLAN \u00a7 6.2 color spec)\n  - Right pane: Tabs widget switching between \"Messages\", \"Code Snippets\",\n    \"Raw JSON\" tabs, content area shows Paragraph with wrapped text for\n    selected conversation's messages or syntax-highlighted snippets\n- Bottom status line (1 row): hints like \"Enter:open | /:search | f:filters\n  | q:quit\" using Span widgets with Modifier::DIM\n\nApp state management:\nDefine AppState struct holding:\n- search_query: String (current search input text)\n- search_results: Vec<ConversationSearchHit> (from Tantivy query)\n- selected_result_idx: usize (which conversation highlighted in list)\n- active_filters: Filters struct (agent slugs, time range, workspace path)\n- focus: FocusPane enum (SearchInput | ResultsList | DetailPane)\n- indexing_progress: HashMap<String, (usize, usize)> (per-agent current/total)\n- theme: Theme (from config, see theme.rs below)\n\nPlanned components/widgets.rs responsibilities (PLAN \u00a7 6.4):\nCustom widget implementations extending Ratatui's built-in widgets:\n- SearchInputWidget: Paragraph with cursor rendering (insert \"|\" at\n  cursor position in text), handle character insert/delete/backspace,\n  emit SearchQuery events on change for debounced search trigger\n- ResultsListWidget: StatefulList wrapper with custom row rendering\u2014\n  format ListItem with colored agent icons (\u2192 use Unicode symbols:\n  \"\u26a1\" Codex, \"\u269b\" Claude, \"\u25c6\" Gemini, \"\u25b2\" Amp, \"\u25cf\" Cline, \"\u25a3\" OpenCode),\n  relative timestamps via humantime crate (e.g., \"3h ago\", \"2d ago\"),\n  highlight style (reverse video + bold) for selected row\n- ConversationDetailWidget: Scrollable Paragraph for message rendering,\n  role-based prefixes (\"You: \", \"Agent: \", \"Tool: \"), timestamp headers,\n  horizontal separators between turns (using symbols::line::HORIZONTAL)\n- FilterPillWidget: Inline Span cluster showing active filters with\n  \"[x]\" close buttons (future: click to remove filter, for now just\n  visual)\n\nPlanned components/theme.rs responsibilities (PLAN \u00a7 6.4):\nTheme system with light/dark variants:\n- Theme struct with Color fields: background, foreground, highlight,\n  agent_colors: HashMap<String, Color> for per-agent color coding,\n  border_style: Style for Block borders, status_dim: Style for hint text\n- load_theme(config: &AppConfig) \u2192 Theme: read config.general.theme\n  string (\"dark\" | \"light\"), return corresponding Color constants:\n  - Dark theme: background:BLACK, foreground:WHITE, highlight:CYAN,\n    agent_colors:{codex:CYAN, claude:MAGENTA, gemini:BLUE, ...}\n  - Light theme: background:WHITE, foreground:BLACK, highlight:BLUE,\n    agent_colors adjusted for readability on light background\n- Apply theme: pass &Theme to all widget render calls, use theme.foreground\n  for default Style::fg(), theme.highlight for selected items\n- Optional: support custom themes from config.toml with color hex codes\n  (parse via ratatui::style::Color::Rgb(r,g,b) from \"#rrggbb\" strings)\n\nError handling in TUI context:\nSince TUI runs in raw mode, panic messages are invisible (printed to\nalternate screen buffer that gets cleared on exit). Install custom panic\nhook that restores terminal before panic message display:\n```rust\nlet original_hook = std::panic::take_hook();\nstd::panic::set_hook(Box::new(move |panic_info| {\n    crossterm::terminal::disable_raw_mode().ok();\n    crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen).ok();\n    original_hook(panic_info);\n}));\n```\nFor anyhow errors in render loop, catch and display error screen\n(full-screen red Paragraph with error.to_string() + backtrace if\navailable) with \"Press 'q' to exit\" hint, restore terminal on quit.\n\nIntegration with background threads:\nTUI thread owns mpsc receiver end of crossbeam channel, background indexer\nand search threads send UiEvent messages. In event loop tick handler:\n```rust\nwhile let Ok(event) = ui_rx.try_recv() {\n    match event {\n        UiEvent::SearchResult(results) => {\n            app_state.search_results = results;\n            app_state.selected_result_idx = 0;\n        }\n        UiEvent::IndexProgress { agent, current, total } => {\n            app_state.indexing_progress.insert(agent, (current, total));\n        }\n        _ => {}\n    }\n}\n```\nRender function reads app_state to display latest results and progress\nwithout blocking on channel receive (non-blocking try_recv).\n\nThis commit contains only module declarations (mod.rs, tui.rs,\ncomponents/mod.rs, components/widgets.rs, components/theme.rs) with\nplaceholder comments to establish the ui/ namespace per implementation\nchecklist (PLAN \u00a7 14.3: minimal TUI with dummy data after core modules,\nbefore connectors). Actual Ratatui widget composition, event loop, and\ncrossterm terminal setup will be implemented in subsequent commit to\ndemonstrate end-to-end UI flow with hardcoded search results before\nwiring storage/search/indexer.\n\nRelated: PLAN_TO_MAKE_CODING_AGENT_SESSION_SEARCH.md \u00a7 3.1 (UI component),\n\u00a7 3.2 (threading model), \u00a7 6 (TUI design), Cargo.toml (ratatui, crossterm\ndependencies), README.md (ui/ module description).\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "6c9dfa1455c4625106a0d1a354df94990146cf68",
+      "filename": "src/ui/components/mod.rs",
+      "status": "added",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/a2c93e7c5341186e80d9af3a2d0a097341ab881d/src%2Fui%2Fcomponents%2Fmod.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/a2c93e7c5341186e80d9af3a2d0a097341ab881d/src%2Fui%2Fcomponents%2Fmod.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/src%2Fui%2Fcomponents%2Fmod.rs?ref=a2c93e7c5341186e80d9af3a2d0a097341ab881d",
+      "patch": "@@ -0,0 +1,3 @@\n+//! UI components registry.\n+pub mod theme;\n+pub mod widgets;"
+    },
+    {
+      "sha": "faf8e2ee3c58f0ae85c7b9de3325a9005a4f7b49",
+      "filename": "src/ui/components/theme.rs",
+      "status": "added",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/a2c93e7c5341186e80d9af3a2d0a097341ab881d/src%2Fui%2Fcomponents%2Ftheme.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/a2c93e7c5341186e80d9af3a2d0a097341ab881d/src%2Fui%2Fcomponents%2Ftheme.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/src%2Fui%2Fcomponents%2Ftheme.rs?ref=a2c93e7c5341186e80d9af3a2d0a097341ab881d",
+      "patch": "@@ -0,0 +1 @@\n+//! Theme definitions placeholder."
+    },
+    {
+      "sha": "7c685d6020ea663f57c7b5f39e87853dc8876531",
+      "filename": "src/ui/components/widgets.rs",
+      "status": "added",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/a2c93e7c5341186e80d9af3a2d0a097341ab881d/src%2Fui%2Fcomponents%2Fwidgets.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/a2c93e7c5341186e80d9af3a2d0a097341ab881d/src%2Fui%2Fcomponents%2Fwidgets.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/src%2Fui%2Fcomponents%2Fwidgets.rs?ref=a2c93e7c5341186e80d9af3a2d0a097341ab881d",
+      "patch": "@@ -0,0 +1 @@\n+//! Custom widgets placeholder."
+    },
+    {
+      "sha": "274f78ed7795427c2a576756ff868b9b6e24dc01",
+      "filename": "src/ui/mod.rs",
+      "status": "added",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/a2c93e7c5341186e80d9af3a2d0a097341ab881d/src%2Fui%2Fmod.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/a2c93e7c5341186e80d9af3a2d0a097341ab881d/src%2Fui%2Fmod.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/src%2Fui%2Fmod.rs?ref=a2c93e7c5341186e80d9af3a2d0a097341ab881d",
+      "patch": "@@ -0,0 +1,3 @@\n+//! TUI entrypoint and layout.\n+pub mod components;\n+pub mod tui;"
+    },
+    {
+      "sha": "fcf2cd1e7c44befea0f2fe712dd10160de4e88b4",
+      "filename": "src/ui/tui.rs",
+      "status": "added",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/a2c93e7c5341186e80d9af3a2d0a097341ab881d/src%2Fui%2Ftui.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/a2c93e7c5341186e80d9af3a2d0a097341ab881d/src%2Fui%2Ftui.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/src%2Fui%2Ftui.rs?ref=a2c93e7c5341186e80d9af3a2d0a097341ab881d",
+      "patch": "@@ -0,0 +1 @@\n+//! Ratatui-based interface placeholder."
+    }
+  ]
+}

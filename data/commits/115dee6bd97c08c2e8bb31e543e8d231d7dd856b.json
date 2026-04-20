@@ -1,0 +1,41 @@
+{
+  "message": "feat(cli): expand Config subcommand with --show, --paths, --json flags\n\n- Refactor Commands::Config from unit variant to struct variant with\n  three optional flags: --show (print config summary as text),\n  --paths (print path and precedence details), --json (print config\n  as JSON) \u2014 enables non-interactive config inspection for scripts\n  and CI pipelines\n- Update handle_config() signature to accept the new flags and make\n  it async to support package manager path resolution\n- Add imports for PackageManager resolution types (ResolvedPaths,\n  ResolvedResource, ResourceOrigin), SettingsScope, Serialize,\n  serde_json, and bubbletea TUI types needed by the expanded handler\n- Move Config handler from ultra-fast sync path to async subcommand\n  path since --show/--json may need package resolution\n- Update CLI parser tests: replace simple pattern match with\n  exhaustive field assertions for all three flags (4 test cases)\n- Update conformance fixture_runner to match Config { .. } instead\n  of Config unit variant\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "a3064628c3e474c8a925f0d18040b935e4ef7173",
+      "filename": "src/cli.rs",
+      "status": "modified",
+      "additions": 58,
+      "deletions": 2,
+      "changes": 60,
+      "blob_url": "https://github.com/Dicklesworthstone/pi_agent_rust/blob/115dee6bd97c08c2e8bb31e543e8d231d7dd856b/src%2Fcli.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/pi_agent_rust/raw/115dee6bd97c08c2e8bb31e543e8d231d7dd856b/src%2Fcli.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/pi_agent_rust/contents/src%2Fcli.rs?ref=115dee6bd97c08c2e8bb31e543e8d231d7dd856b",
+      "patch": "@@ -710,7 +710,53 @@ mod tests {\n     #[test]\n     fn parse_config_subcommand() {\n         let cli = Cli::parse_from([\"pi\", \"config\"]);\n-        assert!(matches!(cli.command, Some(Commands::Config)));\n+        match cli.command {\n+            Some(Commands::Config { show, paths, json }) => {\n+                assert!(!show);\n+                assert!(!paths);\n+                assert!(!json);\n+            }\n+            other => panic!(\"expected Config, got {other:?}\"),\n+        }\n+    }\n+\n+    #[test]\n+    fn parse_config_show_flag() {\n+        let cli = Cli::parse_from([\"pi\", \"config\", \"--show\"]);\n+        match cli.command {\n+            Some(Commands::Config { show, paths, json }) => {\n+                assert!(show);\n+                assert!(!paths);\n+                assert!(!json);\n+            }\n+            other => panic!(\"expected Config --show, got {other:?}\"),\n+        }\n+    }\n+\n+    #[test]\n+    fn parse_config_paths_flag() {\n+        let cli = Cli::parse_from([\"pi\", \"config\", \"--paths\"]);\n+        match cli.command {\n+            Some(Commands::Config { show, paths, json }) => {\n+                assert!(!show);\n+                assert!(paths);\n+                assert!(!json);\n+            }\n+            other => panic!(\"expected Config --paths, got {other:?}\"),\n+        }\n+    }\n+\n+    #[test]\n+    fn parse_config_json_flag() {\n+        let cli = Cli::parse_from([\"pi\", \"config\", \"--json\"]);\n+        match cli.command {\n+            Some(Commands::Config { show, paths, json }) => {\n+                assert!(!show);\n+                assert!(!paths);\n+                assert!(json);\n+            }\n+            other => panic!(\"expected Config --json, got {other:?}\"),\n+        }\n     }\n \n     #[test]\n@@ -1109,7 +1155,17 @@ pub enum Commands {\n     List,\n \n     /// Open configuration UI\n-    Config,\n+    Config {\n+        /// Print configuration summary as text (non-interactive)\n+        #[arg(long)]\n+        show: bool,\n+        /// Print path and precedence details only\n+        #[arg(long)]\n+        paths: bool,\n+        /// Print configuration details as JSON\n+        #[arg(long)]\n+        json: bool,\n+    },\n \n     /// Diagnose environment health and extension compatibility\n     Doctor {"
+    },
+    {
+      "sha": "29caab2b7d4c8678887b2c7a530d649f902cee0f",
+      "filename": "src/main.rs",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 7,
+      "changes": 17,
+      "blob_url": "https://github.com/Dicklesworthstone/pi_agent_rust/blob/115dee6bd97c08c2e8bb31e543e8d231d7dd856b/src%2Fmain.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/pi_agent_rust/raw/115dee6bd97c08c2e8bb31e543e8d231d7dd856b/src%2Fmain.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/pi_agent_rust/contents/src%2Fmain.rs?ref=115dee6bd97c08c2e8bb31e543e8d231d7dd856b",
+      "patch": "@@ -12,24 +12,29 @@\n use std::io::{self, IsTerminal, Read, Write};\n use std::path::{Path, PathBuf};\n use std::sync::Arc;\n+use std::sync::Mutex as StdMutex;\n use std::time::Duration;\n \n use anyhow::{Result, bail};\n use asupersync::runtime::reactor::create_reactor;\n use asupersync::runtime::{RuntimeBuilder, RuntimeHandle};\n use asupersync::sync::Mutex;\n+use bubbletea::{Cmd, KeyMsg, KeyType, Message as BubbleMessage, Program, quit};\n use clap::Parser;\n use pi::agent::{AbortHandle, Agent, AgentConfig, AgentEvent, AgentSession};\n use pi::app::StartupError;\n use pi::auth::{AuthCredential, AuthStorage};\n use pi::cli;\n use pi::compaction::ResolvedCompactionSettings;\n use pi::config::Config;\n+use pi::config::SettingsScope;\n use pi::extension_index::ExtensionIndexStore;\n use pi::extensions::{ALL_CAPABILITIES, Capability, PolicyDecision, extension_event_from_agent};\n use pi::model::{AssistantMessage, ContentBlock, StopReason};\n use pi::models::{ModelEntry, ModelRegistry, default_models_path};\n-use pi::package_manager::{PackageEntry, PackageManager, PackageScope};\n+use pi::package_manager::{\n+    PackageEntry, PackageManager, PackageScope, ResolvedPaths, ResolvedResource, ResourceOrigin,\n+};\n use pi::provider::InputType;\n use pi::provider_metadata::{self, PROVIDER_METADATA};\n use pi::providers;\n@@ -38,6 +43,8 @@ use pi::session::Session;\n use pi::session_index::SessionIndex;\n use pi::tools::ToolRegistry;\n use pi::tui::PiConsole;\n+use serde::Serialize;\n+use serde_json::{Value, json};\n use tracing_subscriber::EnvFilter;\n \n fn main() {\n@@ -65,10 +72,6 @@ fn main_impl() -> Result<()> {\n     // Ultra-fast paths that don't need tracing or the async runtime.\n     if let Some(command) = &cli.command {\n         match command {\n-            cli::Commands::Config => {\n-                handle_config(&cwd);\n-                return Ok(());\n-            }\n             cli::Commands::List => {\n                 let manager = PackageManager::new(cwd);\n                 handle_package_list_blocking(&manager)?;\n@@ -851,8 +854,8 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {\n         cli::Commands::List => {\n             handle_package_list(&manager).await?;\n         }\n-        cli::Commands::Config => {\n-            handle_config(cwd);\n+        cli::Commands::Config { show, paths, json } => {\n+            handle_config(&manager, cwd, show, paths, json).await?;\n         }\n         cli::Commands::Doctor {\n             path,"
+    },
+    {
+      "sha": "3ed6b199a2fcdb73cfd1b4a248b21f975ed6cf00",
+      "filename": "tests/conformance/fixture_runner.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/pi_agent_rust/blob/115dee6bd97c08c2e8bb31e543e8d231d7dd856b/tests%2Fconformance%2Ffixture_runner.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/pi_agent_rust/raw/115dee6bd97c08c2e8bb31e543e8d231d7dd856b/tests%2Fconformance%2Ffixture_runner.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/pi_agent_rust/contents/tests%2Fconformance%2Ffixture_runner.rs?ref=115dee6bd97c08c2e8bb31e543e8d231d7dd856b",
+      "patch": "@@ -272,7 +272,7 @@ fn command_value(command: Option<&Commands>) -> Value {\n         Some(Commands::List) => json!({\n             \"name\": \"list\",\n         }),\n-        Some(Commands::Config) => json!({\n+        Some(Commands::Config { .. }) => json!({\n             \"name\": \"config\",\n         }),\n         Some(Commands::Search {"
+    }
+  ]
+}

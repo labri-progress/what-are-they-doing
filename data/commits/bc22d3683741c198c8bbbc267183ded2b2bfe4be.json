@@ -1,0 +1,29 @@
+{
+  "message": "fix(gemini-web): avoid Keychain hangs",
+  "files": [
+    {
+      "sha": "848d76a3df3f36071965d29e8a149f2343176b35",
+      "filename": "src/gemini-web/executor.ts",
+      "status": "modified",
+      "additions": 56,
+      "deletions": 3,
+      "changes": 59,
+      "blob_url": "https://github.com/steipete/oracle/blob/bc22d3683741c198c8bbbc267183ded2b2bfe4be/src%2Fgemini-web%2Fexecutor.ts",
+      "raw_url": "https://github.com/steipete/oracle/raw/bc22d3683741c198c8bbbc267183ded2b2bfe4be/src%2Fgemini-web%2Fexecutor.ts",
+      "contents_url": "https://api.github.com/repos/steipete/oracle/contents/src%2Fgemini-web%2Fexecutor.ts?ref=bc22d3683741c198c8bbbc267183ded2b2bfe4be",
+      "patch": "@@ -35,7 +35,7 @@ function resolveVenvPip(venvDir: string): string {\n   return path.join(venvDir, 'bin', 'pip');\n }\n \n-async function spawnPython(args: string[], log?: BrowserLogger): Promise<SpawnResult> {\n+async function spawnPython(args: string[], log?: BrowserLogger, envOverrides?: Record<string, string>): Promise<SpawnResult> {\n   const venvDir = resolveVenvDir();\n   const venvPython = resolveVenvPython(venvDir);\n   const pythonPath =\n@@ -44,7 +44,7 @@ async function spawnPython(args: string[], log?: BrowserLogger): Promise<SpawnRe\n   return new Promise((resolve, reject) => {\n     const proc = spawn(pythonPath, [WRAPPER_SCRIPT, ...args], {\n       cwd: VENDOR_DIR,\n-      env: { ...process.env },\n+      env: { ...process.env, ...(envOverrides ?? {}) },\n     });\n \n     let stdout = '';\n@@ -148,6 +148,58 @@ async function ensureVenvSetup(log?: BrowserLogger): Promise<void> {\n   log?.('[gemini-web] Python environment ready');\n }\n \n+async function loadGeminiCookiesFromChrome(\n+  browserConfig: BrowserRunOptions['config'],\n+  log?: BrowserLogger,\n+): Promise<Record<string, string>> {\n+  try {\n+    // biome-ignore lint/suspicious/noExplicitAny: third-party module without types\n+    const mod: any = await import('chrome-cookies-secure');\n+    // biome-ignore lint/suspicious/noExplicitAny: third-party module without types\n+    const chromeCookies: any = mod.default ?? mod;\n+\n+    const profile = typeof browserConfig?.chromeProfile === 'string' && browserConfig.chromeProfile.trim().length > 0\n+      ? browserConfig.chromeProfile.trim()\n+      : undefined;\n+\n+    // browser-cookie3 (Python) can hang on macOS Keychain prompts; prefer Node extraction when possible.\n+    const cookieMap = (await chromeCookies.getCookiesPromised(\n+      'https://gemini.google.com',\n+      'object',\n+      profile,\n+    )) as Record<string, string>;\n+\n+    const secure1psid = cookieMap['__Secure-1PSID'];\n+    const secure1psidts = cookieMap['__Secure-1PSIDTS'];\n+    const nid = cookieMap['NID'];\n+\n+    if (!secure1psid || !secure1psidts) {\n+      return {};\n+    }\n+\n+    log?.('[gemini-web] Loaded Gemini auth cookies from Chrome (node).');\n+\n+    return {\n+      // Passed to vendor wrapper.py; do not log these values.\n+      // biome-ignore lint/style/useNamingConvention: env keys intentionally uppercase\n+      ORACLE_GEMINI_SECURE_1PSID: secure1psid,\n+      // biome-ignore lint/style/useNamingConvention: env keys intentionally uppercase\n+      ORACLE_GEMINI_SECURE_1PSIDTS: secure1psidts,\n+      ...(nid\n+        ? {\n+            // biome-ignore lint/style/useNamingConvention: env keys intentionally uppercase\n+            ORACLE_GEMINI_NID: nid,\n+          }\n+        : {}),\n+    };\n+  } catch (error) {\n+    log?.(\n+      `[gemini-web] Failed to load Chrome cookies via node (falling back to Python cookie loader): ${error instanceof Error ? error.message : String(error ?? '')}`,\n+    );\n+    return {};\n+  }\n+}\n+\n export function createGeminiWebExecutor(\n   geminiOptions: GeminiWebOptions,\n ): (runOptions: BrowserRunOptions) => Promise<BrowserRunResult> {\n@@ -186,7 +238,8 @@ export function createGeminiWebExecutor(\n \n     log?.(`[gemini-web] Calling wrapper with ${args.length} args`);\n \n-    const result = await spawnPython(args, log);\n+    const cookieEnv = await loadGeminiCookiesFromChrome(runOptions.config, log);\n+    const result = await spawnPython(args, log, cookieEnv);\n \n     if (result.exitCode !== 0) {\n       const errorMsg = result.stderr || 'Unknown error from Gemini WebAPI';"
+    },
+    {
+      "sha": "3a2425d6cad89818c8d4f89506c10839746dba57",
+      "filename": "vendor/gemini-webapi/wrapper.py",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 1,
+      "changes": 12,
+      "blob_url": "https://github.com/steipete/oracle/blob/bc22d3683741c198c8bbbc267183ded2b2bfe4be/vendor%2Fgemini-webapi%2Fwrapper.py",
+      "raw_url": "https://github.com/steipete/oracle/raw/bc22d3683741c198c8bbbc267183ded2b2bfe4be/vendor%2Fgemini-webapi%2Fwrapper.py",
+      "contents_url": "https://api.github.com/repos/steipete/oracle/contents/vendor%2Fgemini-webapi%2Fwrapper.py?ref=bc22d3683741c198c8bbbc267183ded2b2bfe4be",
+      "patch": "@@ -3,6 +3,7 @@\n import sys\n import asyncio\n import json\n+import os\n from pathlib import Path\n \n try:\n@@ -186,8 +187,17 @@ async def run(args):\n \n     print(f\"Initializing Gemini client...\", file=sys.stderr)\n \n+    secure_1psid = os.environ.get(\"ORACLE_GEMINI_SECURE_1PSID\")\n+    secure_1psidts = os.environ.get(\"ORACLE_GEMINI_SECURE_1PSIDTS\")\n+    nid = os.environ.get(\"ORACLE_GEMINI_NID\")\n+\n     try:\n-        client = GeminiClient()\n+        if secure_1psid and secure_1psidts:\n+            client = GeminiClient(secure_1psid=secure_1psid, secure_1psidts=secure_1psidts)\n+            if nid:\n+                client.cookies[\"NID\"] = nid\n+        else:\n+            client = GeminiClient()\n         await client.init(timeout=120, auto_close=False, auto_refresh=True)\n     except Exception as e:\n         print(f\"Error initializing client: {e}\", file=sys.stderr)"
+    }
+  ]
+}

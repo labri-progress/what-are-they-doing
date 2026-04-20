@@ -1,0 +1,41 @@
+{
+  "message": "fix(sync+distributed): pool waiter wakeup, resource tracker efficiency, recovery overflow\n\npool.rs:\n- Wake a blocked acquirer when an unhealthy idle resource is rejected. Previously\n  reject_unhealthy_idle_resource decremented active/total_acquisitions but never\n  woke waiters, so a blocked acquire() would remain parked even though a pool\n  slot became available. Now pops the first waiter and wakes it so it can retry\n  with a fresh create or grab another idle resource\n\nresource.rs:\n- Replace `batch.observers = inner.observers.clone()` with\n  `batch.observers.clone_from(&inner.observers)` in both\n  prepare_pressure_notifications and prepare_limit_exceeded \u2014 clone_from can\n  reuse the existing allocation in batch.observers instead of always allocating\n  a new Vec\n- Add #[allow(clippy::significant_drop_tightening)] on try_acquire and\n  ResourceGuard::drop where clippy incorrectly suggests narrowing the lock\n  scope but the inner reference is still borrowed by prepare_pressure_notifications\n- Minor formatting normalization\n\nrecovery.rs:\n- Replace arithmetic addition with saturating_add for ESI range validation in\n  add_collected_with_verify. If total_source_symbols() + min_symbols overflows\n  (extremely unlikely but theoretically possible with adversarial object params),\n  the comparison would wrap and accept invalid ESIs. saturating_add caps at\n  u32::MAX which correctly rejects nothing (safe) rather than accepting\n  everything (unsafe)\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "fb59d20702c431a73cb7c5afc92d07d0215ebe61",
+      "filename": "src/distributed/recovery.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 2,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/1c89019fe179f351b3ffa5e838ab4de142fbe57d/src%2Fdistributed%2Frecovery.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/1c89019fe179f351b3ffa5e838ab4de142fbe57d/src%2Fdistributed%2Frecovery.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fdistributed%2Frecovery.rs?ref=1c89019fe179f351b3ffa5e838ab4de142fbe57d",
+      "patch": "@@ -317,8 +317,10 @@ impl RecoveryCollector {\n     /// object parameters are known.\n     pub fn add_collected_with_verify(&mut self, cs: CollectedSymbol) -> Result<bool, Error> {\n         if let Some(params) = &self.object_params {\n-            let max_expected = params.total_source_symbols() + self.config.min_symbols;\n-            if cs.symbol.esi() > max_expected + 100 {\n+            let max_expected = params\n+                .total_source_symbols()\n+                .saturating_add(self.config.min_symbols);\n+            if cs.symbol.esi() > max_expected.saturating_add(100) {\n                 self.metrics.symbols_corrupt += 1;\n                 return Err(Error::new(ErrorKind::CorruptedSymbol).with_message(format!(\n                     \"ESI {} exceeds expected range for object\","
+    },
+    {
+      "sha": "5de1160719bea9f53900c26e7580de2dd9532ea9",
+      "filename": "src/sync/pool.rs",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 4,
+      "changes": 15,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/1c89019fe179f351b3ffa5e838ab4de142fbe57d/src%2Fsync%2Fpool.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/1c89019fe179f351b3ffa5e838ab4de142fbe57d/src%2Fsync%2Fpool.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fsync%2Fpool.rs?ref=1c89019fe179f351b3ffa5e838ab4de142fbe57d",
+      "patch": "@@ -1137,10 +1137,17 @@ where\n     /// pops an idle entry. If health-check rejects that entry we must undo\n     /// those counters, and (when metrics are enabled) record a destroy event.\n     fn reject_unhealthy_idle_resource(&self) {\n-        let mut state = self.state.lock().expect(\"pool state lock poisoned\");\n-        state.active = state.active.saturating_sub(1);\n-        state.total_acquisitions = state.total_acquisitions.saturating_sub(1);\n-        drop(state);\n+        let waiter = {\n+            let mut state = self.state.lock().expect(\"pool state lock poisoned\");\n+            state.active = state.active.saturating_sub(1);\n+            state.total_acquisitions = state.total_acquisitions.saturating_sub(1);\n+            // A slot just freed up \u2014 wake one blocked acquirer so it can\n+            // try to create or grab another idle resource.\n+            state.waiters.pop_front()\n+        };\n+        if let Some(waiter) = waiter {\n+            waiter.waker.wake();\n+        }\n \n         #[cfg(feature = \"metrics\")]\n         if let Some(ref metrics) = self.metrics {"
+    },
+    {
+      "sha": "53e6b9261624bd6cc95a518b050546a9131b44d8",
+      "filename": "src/util/resource.rs",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 3,
+      "changes": 11,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/1c89019fe179f351b3ffa5e838ab4de142fbe57d/src%2Futil%2Fresource.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/1c89019fe179f351b3ffa5e838ab4de142fbe57d/src%2Futil%2Fresource.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Futil%2Fresource.rs?ref=1c89019fe179f351b3ffa5e838ab4de142fbe57d",
+      "patch": "@@ -219,7 +219,10 @@ impl SymbolPool {\n \n     /// Returns a buffer to the pool.\n     pub fn deallocate(&mut self, mut buffer: SymbolBuffer) {\n-        debug_assert!(buffer.in_use, \"deallocating a buffer that is not marked in-use\");\n+        debug_assert!(\n+            buffer.in_use,\n+            \"deallocating a buffer that is not marked in-use\"\n+        );\n         debug_assert_eq!(\n             buffer.len(),\n             self.config.symbol_size as usize,\n@@ -448,6 +451,7 @@ impl ResourceTracker {\n     }\n \n     /// Attempts to acquire a resource request.\n+    #[allow(clippy::significant_drop_tightening)] // false positive: inner still borrowed by prepare_pressure_notifications\n     pub fn try_acquire(&self, usage: ResourceUsage) -> Result<ResourceGuard, ResourceExhausted> {\n         let batch = {\n             let mut inner = self.inner.lock().expect(\"lock poisoned\");\n@@ -481,6 +485,7 @@ pub struct ResourceGuard {\n }\n \n impl Drop for ResourceGuard {\n+    #[allow(clippy::significant_drop_tightening)] // false positive: inner still borrowed by prepare_pressure_notifications\n     fn drop(&mut self) {\n         let batch = {\n             let mut inner = self.inner.lock().expect(\"lock poisoned\");\n@@ -560,7 +565,7 @@ fn ratio(value: usize, limit: usize) -> f64 {\n fn prepare_pressure_notifications(inner: &mut ResourceTrackerInner) -> NotificationBatch {\n     let pressure = compute_pressure(&inner.current, &inner.limits);\n     let mut batch = NotificationBatch::empty();\n-    batch.observers = inner.observers.clone();\n+    batch.observers.clone_from(&inner.observers);\n \n     if (pressure - inner.last_pressure).abs() > f64::EPSILON {\n         inner.last_pressure = pressure;\n@@ -605,7 +610,7 @@ fn prepare_limit_exceeded(\n     projected: &ResourceUsage,\n ) -> NotificationBatch {\n     let mut batch = NotificationBatch::empty();\n-    batch.observers = inner.observers.clone();\n+    batch.observers.clone_from(&inner.observers);\n     let limits = &inner.limits;\n \n     if projected.symbol_memory > limits.max_symbol_memory {"
+    }
+  ]
+}

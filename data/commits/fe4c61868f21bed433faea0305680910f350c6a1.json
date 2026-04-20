@@ -1,0 +1,53 @@
+{
+  "message": "fix(security): replace SQL string interpolation with insert_json and harden readonly validation\n\nSQL injection prevention (cost.rs):\n- insert_attribution replaced hand-built SQL string interpolation (with\n  manual quote escaping) with insert_json() using serde_json::Value,\n  eliminating a class of SQL injection vulnerabilities.\n\nSQL readonly validation hardening (guardrails.rs):\n- Whitespace normalization now replaces ALL whitespace chars (tabs,\n  newlines, etc.) with spaces before checking for forbidden keywords,\n  preventing bypass via embedded newlines/tabs in SQL queries.\n\nSchema additions:\n- New sys_filesystems table for filesystem usage snapshots (mount,\n  total_bytes, used_bytes, usage_pct)\n- New MAIL_FILE_RESERVATIONS and RCH_COMPILATIONS table constants\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "bd0bc859f73a74d07667568a0e11daa269bf25f3",
+      "filename": "crates/vc_query/src/cost.rs",
+      "status": "modified",
+      "additions": 17,
+      "deletions": 38,
+      "changes": 55,
+      "blob_url": "https://github.com/Dicklesworthstone/vibe_cockpit/blob/fe4c61868f21bed433faea0305680910f350c6a1/crates%2Fvc_query%2Fsrc%2Fcost.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/vibe_cockpit/raw/fe4c61868f21bed433faea0305680910f350c6a1/crates%2Fvc_query%2Fsrc%2Fcost.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/vibe_cockpit/contents/crates%2Fvc_query%2Fsrc%2Fcost.rs?ref=fe4c61868f21bed433faea0305680910f350c6a1",
+      "patch": "@@ -564,45 +564,24 @@ impl<'a> CostQueryBuilder<'a> {\n     ///\n     /// Returns [`QueryError`] if insertion into snapshot storage fails.\n     pub fn insert_attribution(&self, attribution: &CostAttribution) -> Result<(), QueryError> {\n-        let confidence_json = serde_json::to_string(&attribution.confidence_factors)\n-            .unwrap_or_else(|_| \"{}\".to_string());\n-        let raw_json = serde_json::to_string(&attribution).unwrap_or_else(|_| \"{}\".to_string());\n-\n-        let sql = format!(\n-            \"INSERT INTO cost_attribution_snapshot \\\n-             (repo_id, repo_path, machine_id, agent_type, provider, \\\n-              estimated_cost_usd, tokens_input, tokens_output, tokens_total, \\\n-              sessions_count, requests_count, confidence, confidence_factors_json, raw_json) \\\n-             VALUES ({}, {}, {}, {}, '{}', {}, {}, {}, {}, {}, {}, {}, '{}', '{}')\",\n-            attribution.repo_id.as_ref().map_or_else(\n-                || \"NULL\".to_string(),\n-                |s| format!(\"'{}'\", s.replace('\\'', \"''\"))\n-            ),\n-            attribution.repo_path.as_ref().map_or_else(\n-                || \"NULL\".to_string(),\n-                |s| format!(\"'{}'\", s.replace('\\'', \"''\"))\n-            ),\n-            attribution.machine_id.as_ref().map_or_else(\n-                || \"NULL\".to_string(),\n-                |s| format!(\"'{}'\", s.replace('\\'', \"''\"))\n-            ),\n-            attribution.agent_type.as_ref().map_or_else(\n-                || \"NULL\".to_string(),\n-                |s| format!(\"'{}'\", s.replace('\\'', \"''\"))\n-            ),\n-            attribution.provider.replace('\\'', \"''\"),\n-            attribution.estimated_cost_usd,\n-            attribution.tokens_input,\n-            attribution.tokens_output,\n-            attribution.tokens_total,\n-            attribution.sessions_count,\n-            attribution.requests_count,\n-            attribution.confidence,\n-            confidence_json.replace('\\'', \"''\"),\n-            raw_json.replace('\\'', \"''\"),\n-        );\n+        let row = serde_json::json!({\n+            \"repo_id\": attribution.repo_id,\n+            \"repo_path\": attribution.repo_path,\n+            \"machine_id\": attribution.machine_id,\n+            \"agent_type\": attribution.agent_type,\n+            \"provider\": attribution.provider,\n+            \"estimated_cost_usd\": attribution.estimated_cost_usd,\n+            \"tokens_input\": attribution.tokens_input,\n+            \"tokens_output\": attribution.tokens_output,\n+            \"tokens_total\": attribution.tokens_total,\n+            \"sessions_count\": attribution.sessions_count,\n+            \"requests_count\": attribution.requests_count,\n+            \"confidence\": attribution.confidence,\n+            \"confidence_factors_json\": serde_json::to_string(&attribution.confidence_factors).unwrap_or_else(|_| \"{}\".to_string()),\n+            \"raw_json\": serde_json::to_string(&attribution).unwrap_or_else(|_| \"{}\".to_string()),\n+        });\n \n-        self.store.execute_batch(&sql)?;\n+        self.store.insert_json(\"cost_attribution_snapshot\", &row)?;\n         Ok(())\n     }\n }"
+    },
+    {
+      "sha": "842e631fac9688ad0c4366fedefc526e3b632892",
+      "filename": "crates/vc_query/src/guardrails.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 1,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/vibe_cockpit/blob/fe4c61868f21bed433faea0305680910f350c6a1/crates%2Fvc_query%2Fsrc%2Fguardrails.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/vibe_cockpit/raw/fe4c61868f21bed433faea0305680910f350c6a1/crates%2Fvc_query%2Fsrc%2Fguardrails.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/vibe_cockpit/contents/crates%2Fvc_query%2Fsrc%2Fguardrails.rs?ref=fe4c61868f21bed433faea0305680910f350c6a1",
+      "patch": "@@ -318,7 +318,9 @@ impl QueryValidator {\n     /// Returns [`ValidationError`] when a forbidden statement is detected or the query is not\n     /// `SELECT`/`WITH`.\n     pub fn validate_readonly(&self, sql: &str) -> Result<(), ValidationError> {\n-        let normalized = sql.trim().to_uppercase();\n+        // Replace all whitespace characters with a single space to avoid bypasses\n+        let normalized: String = sql.chars().map(|c| if c.is_whitespace() { ' ' } else { c }).collect();\n+        let normalized = normalized.trim().to_uppercase();\n         // Pad with spaces to simplify boundary checks (catches keywords at start/end)\n         let padded = format!(\" {normalized} \");\n "
+    },
+    {
+      "sha": "a7d5d3bc48b7742257d9aebf4d71d6f6f0b9cc0f",
+      "filename": "crates/vc_store/src/migrations/001_initial_schema.sql",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 0,
+      "changes": 11,
+      "blob_url": "https://github.com/Dicklesworthstone/vibe_cockpit/blob/fe4c61868f21bed433faea0305680910f350c6a1/crates%2Fvc_store%2Fsrc%2Fmigrations%2F001_initial_schema.sql",
+      "raw_url": "https://github.com/Dicklesworthstone/vibe_cockpit/raw/fe4c61868f21bed433faea0305680910f350c6a1/crates%2Fvc_store%2Fsrc%2Fmigrations%2F001_initial_schema.sql",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/vibe_cockpit/contents/crates%2Fvc_store%2Fsrc%2Fmigrations%2F001_initial_schema.sql?ref=fe4c61868f21bed433faea0305680910f350c6a1",
+      "patch": "@@ -81,6 +81,17 @@ CREATE TABLE IF NOT EXISTS sys_top_processes (\n     raw_json TEXT\n );\n \n+-- Filesystems snapshot\n+CREATE TABLE IF NOT EXISTS sys_filesystems (\n+    machine_id TEXT,\n+    collected_at TIMESTAMP,\n+    mount TEXT,\n+    total_bytes BIGINT,\n+    used_bytes BIGINT,\n+    usage_pct REAL,\n+    PRIMARY KEY (machine_id, collected_at, mount)\n+);\n+\n -- Repository status snapshots (from ru)\n CREATE TABLE IF NOT EXISTS repo_status_snapshots (\n     machine_id TEXT,"
+    },
+    {
+      "sha": "339c29974fe47f6f72c70f6f72965792cf596ef3",
+      "filename": "crates/vc_store/src/schema.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/vibe_cockpit/blob/fe4c61868f21bed433faea0305680910f350c6a1/crates%2Fvc_store%2Fsrc%2Fschema.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/vibe_cockpit/raw/fe4c61868f21bed433faea0305680910f350c6a1/crates%2Fvc_store%2Fsrc%2Fschema.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/vibe_cockpit/contents/crates%2Fvc_store%2Fsrc%2Fschema.rs?ref=fe4c61868f21bed433faea0305680910f350c6a1",
+      "patch": "@@ -9,15 +9,18 @@ pub mod tables {\n     pub const SYS_FALLBACK_SAMPLES: &str = \"sys_fallback_samples\";\n     pub const SYS_SAMPLES: &str = \"sys_samples\";\n     pub const SYS_TOP_PROCESSES: &str = \"sys_top_processes\";\n+    pub const SYS_FILESYSTEMS: &str = \"sys_filesystems\";\n     pub const REPO_STATUS_SNAPSHOTS: &str = \"repo_status_snapshots\";\n     pub const ACCOUNT_USAGE_SNAPSHOTS: &str = \"account_usage_snapshots\";\n     pub const ACCOUNT_PROFILE_SNAPSHOTS: &str = \"account_profile_snapshots\";\n     pub const AGENT_SESSIONS: &str = \"agent_sessions\";\n     pub const MAIL_MESSAGES: &str = \"mail_messages\";\n+    pub const MAIL_FILE_RESERVATIONS: &str = \"mail_file_reservations\";\n     pub const NTM_SESSIONS_SNAPSHOT: &str = \"ntm_sessions_snapshot\";\n     pub const NTM_ACTIVITY_SNAPSHOT: &str = \"ntm_activity_snapshot\";\n     pub const NTM_AGENT_SNAPSHOT: &str = \"ntm_agent_snapshot\";\n     pub const RCH_METRICS: &str = \"rch_metrics\";\n+    pub const RCH_COMPILATIONS: &str = \"rch_compilations\";\n     pub const NET_EVENTS: &str = \"net_events\";\n     pub const DCG_EVENTS: &str = \"dcg_events\";\n     pub const PROCESS_TRIAGE: &str = \"process_triage\";"
+    }
+  ]
+}

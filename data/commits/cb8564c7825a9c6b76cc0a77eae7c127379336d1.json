@@ -1,0 +1,41 @@
+{
+  "message": "Add SessionState enum replacing closed bool per spec 2.3\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "6ef953cadc82881f7067e006ba763c867ac968a3",
+      "filename": "internal/agent/session.go",
+      "status": "modified",
+      "additions": 38,
+      "deletions": 9,
+      "changes": 47,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/cb8564c7825a9c6b76cc0a77eae7c127379336d1/internal%2Fagent%2Fsession.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/cb8564c7825a9c6b76cc0a77eae7c127379336d1/internal%2Fagent%2Fsession.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/internal%2Fagent%2Fsession.go?ref=cb8564c7825a9c6b76cc0a77eae7c127379336d1",
+      "patch": "@@ -15,6 +15,16 @@ import (\n \t\"primeradiant.com/serf/internal/llm\"\n )\n \n+// SessionState represents the current lifecycle state of a session.\n+type SessionState string\n+\n+const (\n+\tSessionIdle          SessionState = \"IDLE\"\n+\tSessionProcessing    SessionState = \"PROCESSING\"\n+\tSessionAwaitingInput SessionState = \"AWAITING_INPUT\"\n+\tSessionClosed        SessionState = \"CLOSED\"\n+)\n+\n type SessionConfig struct {\n \tMaxToolRoundsPerInput   int `json:\"max_tool_rounds_per_input,omitempty\"`\n \tMaxTurns                int `json:\"max_turns,omitempty\"`\n@@ -96,9 +106,9 @@ type Session struct {\n \tevents chan SessionEvent\n \tenvInfo EnvironmentInfo\n \n-\tmu      sync.Mutex\n-\tclosed  bool\n-\tturns   int\n+\tmu    sync.Mutex\n+\tstate SessionState\n+\tturns int\n \thistory []Turn\n \n \treg *ToolRegistry\n@@ -148,6 +158,7 @@ func NewSession(client *llm.Client, profile ProviderProfile, env ExecutionEnviro\n \t\tprofile:   profile,\n \t\tenv:       env,\n \t\tstateDir:  cfg.StateDir,\n+\t\tstate:     SessionIdle,\n \t\tevents:    make(chan SessionEvent, 256),\n \t\thistory:   []Turn{},\n \t\tsubagents: map[string]*subagent{},\n@@ -247,6 +258,7 @@ func RestoreSession(client *llm.Client, profile ProviderProfile, env ExecutionEn\n \t\tprofile:   profile,\n \t\tenv:       env,\n \t\tstateDir:  cfg.StateDir,\n+\t\tstate:     SessionIdle,\n \t\tevents:    make(chan SessionEvent, 256),\n \t\thistory:   append([]Turn{}, snap.History...),\n \t\tturns:     snap.TurnCount,\n@@ -324,6 +336,13 @@ func RestoreSession(client *llm.Client, profile ProviderProfile, env ExecutionEn\n func (s *Session) ID() string                  { return s.id }\n func (s *Session) Events() <-chan SessionEvent { return s.events }\n \n+// State returns the current session state.\n+func (s *Session) State() SessionState {\n+\ts.mu.Lock()\n+\tdefer s.mu.Unlock()\n+\treturn s.state\n+}\n+\n // Snapshot captures the current session state as a SessionSnapshot.\n func (s *Session) Snapshot() SessionSnapshot {\n \ts.mu.Lock()\n@@ -347,7 +366,7 @@ func (s *Session) Snapshot() SessionSnapshot {\n func (s *Session) SetReasoningEffort(effort string) {\n \ts.mu.Lock()\n \tdefer s.mu.Unlock()\n-\tif s.closed {\n+\tif s.state == SessionClosed {\n \t\treturn\n \t}\n \ts.cfg.ReasoningEffort = strings.TrimSpace(effort)\n@@ -357,7 +376,7 @@ func (s *Session) SetReasoningEffort(effort string) {\n func (s *Session) Steer(msg string) {\n \ts.mu.Lock()\n \tdefer s.mu.Unlock()\n-\tif s.closed {\n+\tif s.state == SessionClosed {\n \t\treturn\n \t}\n \tif strings.TrimSpace(msg) == \"\" {\n@@ -370,7 +389,7 @@ func (s *Session) Steer(msg string) {\n func (s *Session) FollowUp(msg string) {\n \ts.mu.Lock()\n \tdefer s.mu.Unlock()\n-\tif s.closed {\n+\tif s.state == SessionClosed {\n \t\treturn\n \t}\n \tif strings.TrimSpace(msg) == \"\" {\n@@ -381,11 +400,11 @@ func (s *Session) FollowUp(msg string) {\n \n func (s *Session) Close() {\n \ts.mu.Lock()\n-\tif s.closed {\n+\tif s.state == SessionClosed {\n \t\ts.mu.Unlock()\n \t\treturn\n \t}\n-\ts.closed = true\n+\ts.state = SessionClosed\n \ts.mu.Unlock()\n \n \tif s.mcpMgr != nil {\n@@ -569,10 +588,11 @@ func (s *Session) emit(kind EventKind, data map[string]any) {\n \n func (s *Session) processOneInput(ctx context.Context, input string) (string, error) {\n \ts.mu.Lock()\n-\tif s.closed {\n+\tif s.state == SessionClosed {\n \t\ts.mu.Unlock()\n \t\treturn \"\", fmt.Errorf(\"session is closed\")\n \t}\n+\ts.state = SessionProcessing\n \ts.resultDelivered = false\n \ts.resultText = \"\"\n \ts.mu.Unlock()\n@@ -734,6 +754,9 @@ func (s *Session) processOneInput(ctx context.Context, input string) (string, er\n \n \t\tcalls := resp.ToolCalls()\n \t\tif len(calls) == 0 {\n+\t\t\ts.mu.Lock()\n+\t\t\ts.state = SessionIdle\n+\t\t\ts.mu.Unlock()\n \t\t\treturn txt, nil\n \t\t}\n \n@@ -789,10 +812,16 @@ func (s *Session) processOneInput(ctx context.Context, input string) (string, er\n \t\ttext := s.resultText\n \t\ts.mu.Unlock()\n \t\tif delivered {\n+\t\t\ts.mu.Lock()\n+\t\t\ts.state = SessionIdle\n+\t\t\ts.mu.Unlock()\n \t\t\treturn text, nil\n \t\t}\n \t}\n \n+\ts.mu.Lock()\n+\ts.state = SessionIdle\n+\ts.mu.Unlock()\n \treturn \"\", fmt.Errorf(\"max tool rounds reached\")\n }\n "
+    },
+    {
+      "sha": "e67ec46af90b433eda39e15300b4aedbcbf97487",
+      "filename": "internal/agent/session_dod_test.go",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/cb8564c7825a9c6b76cc0a77eae7c127379336d1/internal%2Fagent%2Fsession_dod_test.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/cb8564c7825a9c6b76cc0a77eae7c127379336d1/internal%2Fagent%2Fsession_dod_test.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/internal%2Fagent%2Fsession_dod_test.go?ref=cb8564c7825a9c6b76cc0a77eae7c127379336d1",
+      "patch": "@@ -638,7 +638,7 @@ func TestSession_AbortSignal_ClosesSessionAndEmitsSessionEnd(t *testing.T) {\n \t}\n \n \tsess.mu.Lock()\n-\tclosed := sess.closed\n+\tclosed := sess.state == SessionClosed\n \tsess.mu.Unlock()\n \tif !closed {\n \t\tt.Fatalf(\"expected session to be closed on abort signal\")\n@@ -780,7 +780,7 @@ func TestSession_AuthenticationError_ClosesSession(t *testing.T) {\n \t}\n \n \tsess.mu.Lock()\n-\tclosed := sess.closed\n+\tclosed := sess.state == SessionClosed\n \tsess.mu.Unlock()\n \tif !closed {\n \t\tt.Fatalf(\"expected session to be closed on authentication error\")"
+    },
+    {
+      "sha": "2d25de702bfadc6874cfc43ff54a048aeb497ce6",
+      "filename": "internal/agent/session_test.go",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 0,
+      "changes": 16,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/cb8564c7825a9c6b76cc0a77eae7c127379336d1/internal%2Fagent%2Fsession_test.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/cb8564c7825a9c6b76cc0a77eae7c127379336d1/internal%2Fagent%2Fsession_test.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/internal%2Fagent%2Fsession_test.go?ref=cb8564c7825a9c6b76cc0a77eae7c127379336d1",
+      "patch": "@@ -928,3 +928,19 @@ func TestSession_PauseTurn_ContinuesLoop(t *testing.T) {\n \t\tt.Fatalf(\"result: %q\", result)\n \t}\n }\n+\n+func TestSessionState_Transitions(t *testing.T) {\n+\t// Verify state type and constants exist\n+\tif SessionIdle != SessionState(\"IDLE\") {\n+\t\tt.Fatal(\"SessionIdle wrong\")\n+\t}\n+\tif SessionProcessing != SessionState(\"PROCESSING\") {\n+\t\tt.Fatal(\"SessionProcessing wrong\")\n+\t}\n+\tif SessionAwaitingInput != SessionState(\"AWAITING_INPUT\") {\n+\t\tt.Fatal(\"SessionAwaitingInput wrong\")\n+\t}\n+\tif SessionClosed != SessionState(\"CLOSED\") {\n+\t\tt.Fatal(\"SessionClosed wrong\")\n+\t}\n+}"
+    }
+  ]
+}

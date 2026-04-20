@@ -1,0 +1,137 @@
+{
+  "message": "Address review feedback for sort comparator",
+  "files": [
+    {
+      "sha": "b2f3e27fbda4d68f5dfbc6dc470b11ea9cb605df",
+      "filename": "libtenzir/builtins/functions/numeric.cpp",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 6,
+      "changes": 12,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/0ad166da7ee3548954c2776c97f78eb07e2ebb56/libtenzir%2Fbuiltins%2Ffunctions%2Fnumeric.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/0ad166da7ee3548954c2776c97f78eb07e2ebb56/libtenzir%2Fbuiltins%2Ffunctions%2Fnumeric.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Fbuiltins%2Ffunctions%2Fnumeric.cpp?ref=0ad166da7ee3548954c2776c97f78eb07e2ebb56",
+      "patch": "@@ -134,11 +134,11 @@ class count_instance final : public aggregation_instance {\n     : expr_{std::move(expr)}, lambda_{std::move(lambda)} {\n     if (lambda_ and lambda_->is_unary()) {\n       // Aggregation functions do not evaluate their arguments for null values,\n-      // so we patch the lambda expression from `left => right` to `left =>\n-      // right if left != null else false`\n-      lambda_->right = ast::binary_expr{\n+      // so we patch the lambda body from `left => body` to\n+      // `left => body if left != null else false`.\n+      lambda_->body = ast::binary_expr{\n         ast::binary_expr{\n-          lambda_->right,\n+          lambda_->body,\n           located{ast::binary_op::if_, location::unknown},\n           ast::binary_expr{\n             lambda_->left_as_field_path().inner(),\n@@ -165,13 +165,13 @@ class count_instance final : public aggregation_instance {\n       const auto typed_pred = pred.as<bool_type>();\n       if (not typed_pred) {\n         diagnostic::warning(\"expected `bool`, got `{}`\", pred.type.kind())\n-          .primary(lambda_->right)\n+          .primary(lambda_->body)\n           .emit(ctx);\n         continue;\n       }\n       if (typed_pred->array->null_count() > 0) {\n         diagnostic::warning(\"expected `bool`, got `null`\")\n-          .primary(lambda_->right)\n+          .primary(lambda_->body)\n           .emit(ctx);\n       }\n       count_ += typed_pred->array->true_count();"
+    },
+    {
+      "sha": "86026dd98e3043ed1839e0d1e5cced25f42a257a",
+      "filename": "libtenzir/builtins/operators/sort.cpp",
+      "status": "modified",
+      "additions": 37,
+      "deletions": 22,
+      "changes": 59,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/0ad166da7ee3548954c2776c97f78eb07e2ebb56/libtenzir%2Fbuiltins%2Foperators%2Fsort.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/0ad166da7ee3548954c2776c97f78eb07e2ebb56/libtenzir%2Fbuiltins%2Foperators%2Fsort.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Fbuiltins%2Foperators%2Fsort.cpp?ref=0ad166da7ee3548954c2776c97f78eb07e2ebb56",
+      "patch": "@@ -10,6 +10,7 @@\n #include <tenzir/arrow_utils.hpp>\n #include <tenzir/concept/parseable/numeric/integral.hpp>\n #include <tenzir/concept/parseable/tenzir/pipeline.hpp>\n+#include <tenzir/diagnostics.hpp>\n #include <tenzir/error.hpp>\n #include <tenzir/logger.hpp>\n #include <tenzir/operator_plugin.hpp>\n@@ -38,6 +39,7 @@ struct comparator_warning_state {\n   bool invalid_result_length = false;\n   bool null_result = false;\n   bool non_boolean_result = false;\n+  diagnostic_deduplicator eval_diagnostics = {};\n };\n \n auto empty_scope_slice() -> table_slice {\n@@ -49,6 +51,24 @@ auto empty_scope_slice() -> table_slice {\n   };\n }\n \n+class deduplicating_diagnostic_handler final : public diagnostic_handler {\n+public:\n+  deduplicating_diagnostic_handler(diagnostic_handler& inner,\n+                                   diagnostic_deduplicator& deduplicator)\n+    : inner_{inner}, deduplicator_{deduplicator} {\n+  }\n+\n+  void emit(diagnostic diag) override {\n+    if (deduplicator_.insert(diag)) {\n+      inner_.emit(std::move(diag));\n+    }\n+  }\n+\n+private:\n+  diagnostic_handler& inner_;\n+  diagnostic_deduplicator& deduplicator_;\n+};\n+\n auto eval_sort_predicate(const ast::lambda_expr& cmp, const data& left,\n                          const data& right, const table_slice& scope,\n                          comparator_warning_state& warning_state, session ctx)\n@@ -62,11 +82,13 @@ auto eval_sort_predicate(const ast::lambda_expr& cmp, const data& left,\n     = check(ast::field_path::try_from(ast::root_field{cmp.param(1), false}));\n   auto slice = assign(lhs_path, std::move(left_series), scope, ctx.dh());\n   slice = assign(rhs_path, std::move(right_series), slice, ctx.dh());\n-  auto result = eval(cmp.right, slice, ctx.dh());\n+  auto cmp_dh = deduplicating_diagnostic_handler{\n+    ctx.dh(), warning_state.eval_diagnostics};\n+  auto result = eval(cmp.body, slice, cmp_dh);\n   if (result.length() != 1) {\n     if (not warning_state.invalid_result_length) {\n       diagnostic::warning(\"`cmp` lambda must return exactly one value\")\n-        .primary(cmp.right)\n+        .primary(cmp.body)\n         .emit(ctx);\n       warning_state.invalid_result_length = true;\n     }\n@@ -79,15 +101,15 @@ auto eval_sort_predicate(const ast::lambda_expr& cmp, const data& left,\n   if (is<caf::none_t>(value)) {\n     if (not warning_state.null_result) {\n       diagnostic::warning(\"`cmp` lambda must return `bool`, got `null`\")\n-        .primary(cmp.right)\n+        .primary(cmp.body)\n         .emit(ctx);\n       warning_state.null_result = true;\n     }\n     return false;\n   }\n   if (not warning_state.non_boolean_result) {\n     diagnostic::warning(\"`cmp` lambda must return `bool`\")\n-      .primary(cmp.right)\n+      .primary(cmp.body)\n       .emit(ctx);\n     warning_state.non_boolean_result = true;\n   }\n@@ -748,25 +770,13 @@ class plugin2 final : public virtual operator_plugin2<sort_operator2>,\n   auto make_function(function_plugin::invocation inv, session ctx) const\n     -> failure_or<function_ptr> override {\n     auto expr = ast::expression{};\n-    auto order = std::string{\"asc\"};\n+    auto descending = false;\n     auto cmp = std::optional<ast::lambda_expr>{};\n     TRY(argument_parser2::function(name())\n           .positional(\"x\", expr, \"list|record\")\n-          .named_optional(\"order\", order, \"asc|desc\")\n+          .named_optional(\"desc\", descending, \"bool\")\n           .named(\"cmp\", cmp, \"(left, right) => bool\")\n           .parse(inv, ctx));\n-    bool descending = false;\n-    if (order == \"asc\") {\n-      descending = false;\n-    } else if (order == \"desc\") {\n-      descending = true;\n-    } else {\n-      diagnostic::error(\"unsupported `order`: {}\", order)\n-        .primary(inv.call)\n-        .hint(\"`order` must be either `asc` or `desc`\")\n-        .emit(ctx);\n-      return failure::promise();\n-    }\n     if (cmp and not cmp->is_binary()) {\n       diagnostic::error(\"`cmp` must be a binary lambda\")\n         .primary(*cmp)\n@@ -777,9 +787,14 @@ class plugin2 final : public virtual operator_plugin2<sort_operator2>,\n     return function_use::make([call = inv.call, expr = std::move(expr),\n                                descending,\n                                cmp = std::move(cmp)](auto eval, session ctx) {\n-      auto offset = int64_t{0};\n-      return map_series(eval(expr), [&](series arg) {\n-        auto scope = eval.slice(offset, offset + arg.length());\n+      auto input = eval.get_input();\n+      return map_series(eval(expr), [call, descending, cmp, ctx,\n+                                     input = std::move(input),\n+                                     offset = int64_t{0}](series arg) mutable {\n+        auto scope = std::optional<table_slice>{};\n+        if (input) {\n+          scope = subslice(*input, offset, offset + arg.length());\n+        }\n         offset += arg.length();\n         auto f = detail::overload{\n           [&](const arrow::NullArray&) {\n@@ -791,7 +806,7 @@ class plugin2 final : public virtual operator_plugin2<sort_operator2>,\n           [&](const arrow::StructArray&) {\n             if (descending or cmp) {\n               diagnostic::warning(\n-                \"`order` and `cmp` are only applied when sorting lists\")\n+                \"`desc` and `cmp` are only applied when sorting lists\")\n                 .primary(call)\n                 .note(\"record fields are always sorted ascending by key\")\n                 .emit(ctx);"
+    },
+    {
+      "sha": "fc3105535bae5f8b74733961da4da171c6ba1441",
+      "filename": "libtenzir/builtins/operators/where_map.cpp",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 5,
+      "changes": 10,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/0ad166da7ee3548954c2776c97f78eb07e2ebb56/libtenzir%2Fbuiltins%2Foperators%2Fwhere_map.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/0ad166da7ee3548954c2776c97f78eb07e2ebb56/libtenzir%2Fbuiltins%2Foperators%2Fwhere_map.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Fbuiltins%2Foperators%2Fwhere_map.cpp?ref=0ad166da7ee3548954c2776c97f78eb07e2ebb56",
+      "patch": "@@ -349,10 +349,10 @@ struct arguments {\n     if (argument_parser2::function(name)\n           .positional(\"list\", args.field, \"list\")\n           .positional(\"x\", expr, \"any\")\n-          .positional(\"expr\", args.lambda.right, \"any\")\n+          .positional(\"expr\", args.lambda.body, \"any\")\n           .parse(inv, sp.as_session())) {\n       diagnostic::warning(\"deprecated; please use a lambda expression instead\")\n-        .primary(expr.get_location().combine(args.lambda.right))\n+        .primary(expr.get_location().combine(args.lambda.body))\n         .hint(\"instead of `x, y`, provide `x => y`\")\n         .emit(ctx);\n       std::move(dh).forward_to(ctx);\n@@ -408,7 +408,7 @@ auto make_where_function(function_plugin::invocation inv, session ctx)\n                   all_true = false;\n                   if (pred.array->null_count() > 0) {\n                     diagnostic::warning(\"expected `bool`, got `null`\")\n-                      .primary(args.lambda.right)\n+                      .primary(args.lambda.body)\n                       .emit(ctx);\n                   }\n                   if (pred.array->true_count() == 0) {\n@@ -423,7 +423,7 @@ auto make_where_function(function_plugin::invocation inv, session ctx)\n                 [&](const auto&) {\n                   diagnostic::warning(\"expected `bool`, got `{}`\",\n                                       result.type.kind())\n-                    .primary(args.lambda.right)\n+                    .primary(args.lambda.body)\n                     .emit(ctx);\n                   all_true = false;\n                   ids.append_bits(false, result.length());\n@@ -770,7 +770,7 @@ auto make_map_function(function_plugin::invocation inv, session ctx)\n           }\n           diagnostic::warning(\n             \"lambda must evaluate to compatible types within the same list\")\n-            .primary(args.lambda.right, primary)\n+            .primary(args.lambda.body, primary)\n             .note(note)\n             .emit(ctx);\n         }"
+    },
+    {
+      "sha": "a0e8dbbd1c7c1480bef4a7607a14b973a38480b9",
+      "filename": "libtenzir/include/tenzir/tql2/ast.hpp",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 9,
+      "changes": 18,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/0ad166da7ee3548954c2776c97f78eb07e2ebb56/libtenzir%2Finclude%2Ftenzir%2Ftql2%2Fast.hpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/0ad166da7ee3548954c2776c97f78eb07e2ebb56/libtenzir%2Finclude%2Ftenzir%2Ftql2%2Fast.hpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Finclude%2Ftenzir%2Ftql2%2Fast.hpp?ref=0ad166da7ee3548954c2776c97f78eb07e2ebb56",
+      "patch": "@@ -381,22 +381,22 @@ struct unary_expr {\n struct lambda_expr {\n   lambda_expr() = default;\n \n-  lambda_expr(identifier left, location arrow, expression right)\n-    : params{std::move(left)}, arrow{arrow}, right{std::move(right)} {\n+  lambda_expr(identifier left, location arrow, expression body)\n+    : params{std::move(left)}, arrow{arrow}, body{std::move(body)} {\n   }\n \n-  lambda_expr(std::vector<identifier> params, location arrow, expression right)\n-    : params{std::move(params)}, arrow{arrow}, right{std::move(right)} {\n+  lambda_expr(std::vector<identifier> params, location arrow, expression body)\n+    : params{std::move(params)}, arrow{arrow}, body{std::move(body)} {\n   }\n \n   std::vector<identifier> params;\n   location arrow;\n-  expression right;\n+  expression body;\n \n   friend auto inspect(auto& f, lambda_expr& x) -> bool {\n     return f.object(x).fields(f.field(\"params\", x.params),\n                               f.field(\"arrow\", x.arrow),\n-                              f.field(\"right\", x.right));\n+                              f.field(\"body\", x.body));\n   }\n \n   auto is_unary() const -> bool {\n@@ -419,9 +419,9 @@ struct lambda_expr {\n \n   auto get_location() const -> location {\n     if (params.empty()) {\n-      return arrow.combine(right);\n+      return arrow.combine(body);\n     }\n-    return params.front().get_location().combine(right);\n+    return params.front().get_location().combine(body);\n   }\n };\n \n@@ -935,7 +935,7 @@ class visitor {\n \n   void enter(lambda_expr& x) {\n     go(x.params);\n-    go(x.right);\n+    go(x.body);\n   }\n \n   void enter(pipeline_expr& x) {"
+    },
+    {
+      "sha": "7742584d55bda4e5bdf8876be3beeeddb811d111",
+      "filename": "libtenzir/include/tenzir/tql2/plugin.hpp",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/0ad166da7ee3548954c2776c97f78eb07e2ebb56/libtenzir%2Finclude%2Ftenzir%2Ftql2%2Fplugin.hpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/0ad166da7ee3548954c2776c97f78eb07e2ebb56/libtenzir%2Finclude%2Ftenzir%2Ftql2%2Fplugin.hpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Finclude%2Ftenzir%2Ftql2%2Fplugin.hpp?ref=0ad166da7ee3548954c2776c97f78eb07e2ebb56",
+      "patch": "@@ -136,7 +136,7 @@ class function_use {\n \n     auto length() const -> int64_t;\n \n-    auto slice(int64_t begin, int64_t end) const -> std::optional<table_slice>;\n+    auto get_input() const -> std::optional<table_slice>;\n \n   private:\n     void* self_;"
+    },
+    {
+      "sha": "44c7923d59c3e1beff4cfd185c5eec0c1043ed8c",
+      "filename": "libtenzir/src/tql2/eval.cpp",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 3,
+      "changes": 6,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/0ad166da7ee3548954c2776c97f78eb07e2ebb56/libtenzir%2Fsrc%2Ftql2%2Feval.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/0ad166da7ee3548954c2776c97f78eb07e2ebb56/libtenzir%2Fsrc%2Ftql2%2Feval.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Fsrc%2Ftql2%2Feval.cpp?ref=0ad166da7ee3548954c2776c97f78eb07e2ebb56",
+      "patch": "@@ -199,7 +199,7 @@ auto eval(const ast::lambda_expr& lambda, const basic_series<list_type>& input,\n     ensure_unary_lambda(lambda);\n     TENZIR_ASSERT(std::cmp_equal(slice.rows(), input.length()));\n     auto visitor = capture_extractor{};\n-    visitor.visit(lambda.right);\n+    visitor.visit(lambda.body);\n     const auto captures = std::move(visitor).result();\n     const auto ty = input.type.value_type();\n     // The input list array may be a slice of a larger backing array (e.g.,\n@@ -238,7 +238,7 @@ auto eval(const ast::lambda_expr& lambda, const basic_series<list_type>& input,\n     };\n     repeated.import_time(slice.import_time());\n     const auto slice = assign(to, {ty, values}, repeated, dh);\n-    return eval(lambda.right, slice, dh);\n+    return eval(lambda.body, slice, dh);\n   });\n }\n \n@@ -266,7 +266,7 @@ auto eval(const ast::lambda_expr& lambda, const multi_series& input,\n                                  arrow::ArrayVector{part.array}),\n         std::move(schema),\n       };\n-      result.append(eval(lambda.right, slice, dh));\n+      result.append(eval(lambda.body, slice, dh));\n     }\n     return result;\n   });"
+    },
+    {
+      "sha": "a984244b6b82458a9234818f6cc732016cc5715d",
+      "filename": "libtenzir/src/tql2/parser.cpp",
+      "status": "modified",
+      "additions": 19,
+      "deletions": 15,
+      "changes": 34,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/0ad166da7ee3548954c2776c97f78eb07e2ebb56/libtenzir%2Fsrc%2Ftql2%2Fparser.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/0ad166da7ee3548954c2776c97f78eb07e2ebb56/libtenzir%2Fsrc%2Ftql2%2Fparser.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Fsrc%2Ftql2%2Fparser.cpp?ref=0ad166da7ee3548954c2776c97f78eb07e2ebb56",
+      "patch": "@@ -398,11 +398,11 @@ class parser {\n           if (not left or left->has_question_mark) {\n             diagnostic::error(\"expected identifier\").primary(expr).throw_();\n           }\n-          auto right = parse_expression();\n+          auto body = parse_expression();\n           expr = lambda_expr{\n             std::vector<identifier>{std::move(left->id)},\n             arrow.location,\n-            std::move(right),\n+            std::move(body),\n           };\n           continue;\n         }\n@@ -600,24 +600,29 @@ class parser {\n   auto parse_primary_expression() -> ast::expression {\n     if (accept(tk::lpar)) {\n       auto scope = ignore_newlines(true);\n-      auto stash = next_;\n-      if (silent_peek(tk::identifier)) {\n+      auto next_stash = next_;\n+      auto last_stash = last_;\n+      auto tries_stash = tries_;\n+      if (auto first_param = accept(tk::identifier)) {\n         auto params = std::vector<identifier>{};\n-        params.push_back(expect(tk::identifier).as_identifier());\n+        params.push_back(first_param.as_identifier());\n         while (accept(tk::comma)) {\n           params.push_back(expect(tk::identifier).as_identifier());\n         }\n-        if (accept(tk::rpar) and peek(tk::fat_arrow)) {\n-          auto arrow = expect(tk::fat_arrow);\n-          auto right = parse_expression();\n-          return lambda_expr{\n-            std::move(params),\n-            arrow.location,\n-            std::move(right),\n-          };\n+        if (accept(tk::rpar)) {\n+          if (auto arrow = accept(tk::fat_arrow)) {\n+            auto body = parse_expression();\n+            return lambda_expr{\n+              std::move(params),\n+              arrow.location,\n+              std::move(body),\n+            };\n+          }\n         }\n       }\n-      next_ = stash;\n+      next_ = next_stash;\n+      last_ = last_stash;\n+      tries_ = std::move(tries_stash);\n       auto result = parse_expression();\n       expect(tk::rpar);\n       return result;\n@@ -698,7 +703,6 @@ class parser {\n       static_cast<bool>(question_mark),\n     };\n   }\n-\n   auto parse_record_or_pipeline_expr() -> ast::expression {\n     auto begin = expect(tk::lbrace);\n     auto scope = ignore_newlines(true);"
+    },
+    {
+      "sha": "0219138efde29518960ae94db05569c58cc5ac14",
+      "filename": "libtenzir/src/tql2/plugin.cpp",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 3,
+      "changes": 5,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/0ad166da7ee3548954c2776c97f78eb07e2ebb56/libtenzir%2Fsrc%2Ftql2%2Fplugin.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/0ad166da7ee3548954c2776c97f78eb07e2ebb56/libtenzir%2Fsrc%2Ftql2%2Fplugin.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Fsrc%2Ftql2%2Fplugin.cpp?ref=0ad166da7ee3548954c2776c97f78eb07e2ebb56",
+      "patch": "@@ -19,14 +19,13 @@ auto function_use::evaluator::length() const -> int64_t {\n   return static_cast<tenzir::evaluator*>(self_)->length();\n }\n \n-auto function_use::evaluator::slice(int64_t begin, int64_t end) const\n-  -> std::optional<table_slice> {\n+auto function_use::evaluator::get_input() const -> std::optional<table_slice> {\n   auto* evaluator = static_cast<tenzir::evaluator*>(self_);\n   const auto* input = evaluator->get_input();\n   if (not input) {\n     return std::nullopt;\n   }\n-  return subslice(*input, begin, end);\n+  return *input;\n }\n \n auto function_use::evaluator::operator()(const ast::expression& expr) const"
+    },
+    {
+      "sha": "0cb3c98cca607821360c43931a4a7931cff6dba5",
+      "filename": "libtenzir/test/sort_function.cpp",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 13,
+      "changes": 24,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/0ad166da7ee3548954c2776c97f78eb07e2ebb56/libtenzir%2Ftest%2Fsort_function.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/0ad166da7ee3548954c2776c97f78eb07e2ebb56/libtenzir%2Ftest%2Fsort_function.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Ftest%2Fsort_function.cpp?ref=0ad166da7ee3548954c2776c97f78eb07e2ebb56",
+      "patch": "@@ -20,11 +20,7 @@ using namespace tenzir;\n \n namespace {\n \n-auto make_input_slice() -> table_slice {\n-  auto row = data{record{\n-    {\"pivot\", int64_t{10}},\n-    {\"xs\", list{int64_t{17}, int64_t{8}, int64_t{12}, int64_t{3}}},\n-  }};\n+auto make_input_slice(data row) -> table_slice {\n   auto row_series = data_to_series(row, int64_t{1});\n   auto schema = type{\"input\", as<record_type>(row_series.type)};\n   const auto& row_array = as<arrow::StructArray>(*row_series.array);\n@@ -37,23 +33,25 @@ auto make_input_slice() -> table_slice {\n \n } // namespace\n \n-TEST(\"sort cmp keeps captures from surrounding row context\") {\n+TEST(\"sort cmp deduplicates diagnostics from comparator evaluation\") {\n   auto dh = collecting_diagnostic_handler{};\n   auto provider = session_provider::make(dh);\n   auto ctx = provider.as_session();\n   auto expr = parse_expression_with_bad_diagnostics(\n-    \"sort(xs, cmp=(l, r) => (l - pivot) * (l - pivot) < (r - pivot) * (r - \"\n-    \"pivot))\",\n-    ctx);\n+    \"sort(xs, cmp=(l, r) => missing)\", ctx);\n   REQUIRE(expr);\n   auto resolved = resolve_entities(*expr, ctx);\n   REQUIRE(resolved);\n-  auto result = eval(*expr, make_input_slice(), dh);\n+  auto row = data{\n+    record{\n+      {\"xs\", list{int64_t{3}, int64_t{1}, int64_t{2}}},\n+    },\n+  };\n+  auto result = eval(*expr, make_input_slice(std::move(row)), dh);\n   REQUIRE_EQUAL(result.length(), int64_t{1});\n   auto value = materialize(result.value_at(0));\n   auto* sorted = try_as<list>(&value);\n   REQUIRE(sorted);\n-  CHECK_EQUAL(*sorted,\n-              (list{int64_t{8}, int64_t{12}, int64_t{17}, int64_t{3}}));\n-  CHECK_EQUAL(std::move(dh).collect().size(), size_t{0});\n+  CHECK_EQUAL(*sorted, (list{int64_t{3}, int64_t{1}, int64_t{2}}));\n+  CHECK_EQUAL(std::move(dh).collect().size(), size_t{2});\n }"
+    },
+    {
+      "sha": "41e2444373b3211378b77f24a7dbfb227602cc1f",
+      "filename": "test/tests/operators/sort/cmp_capture.tql",
+      "status": "added",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/0ad166da7ee3548954c2776c97f78eb07e2ebb56/test%2Ftests%2Foperators%2Fsort%2Fcmp_capture.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/0ad166da7ee3548954c2776c97f78eb07e2ebb56/test%2Ftests%2Foperators%2Fsort%2Fcmp_capture.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fsort%2Fcmp_capture.tql?ref=0ad166da7ee3548954c2776c97f78eb07e2ebb56",
+      "patch": "@@ -0,0 +1,2 @@\n+from {pivot: 10, xs: [17, 8, 12, 3]}\n+xs = sort(xs, cmp=(l, r) => (l - pivot) * (l - pivot) < (r - pivot) * (r - pivot))"
+    },
+    {
+      "sha": "b812513cf02d27b8e33a2c74bd98b8ebad2e73dc",
+      "filename": "test/tests/operators/sort/cmp_capture.txt",
+      "status": "added",
+      "additions": 9,
+      "deletions": 0,
+      "changes": 9,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/0ad166da7ee3548954c2776c97f78eb07e2ebb56/test%2Ftests%2Foperators%2Fsort%2Fcmp_capture.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/0ad166da7ee3548954c2776c97f78eb07e2ebb56/test%2Ftests%2Foperators%2Fsort%2Fcmp_capture.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fsort%2Fcmp_capture.txt?ref=0ad166da7ee3548954c2776c97f78eb07e2ebb56",
+      "patch": "@@ -0,0 +1,9 @@\n+{\n+  pivot: 10,\n+  xs: [\n+    8,\n+    12,\n+    17,\n+    3,\n+  ],\n+}"
+    }
+  ]
+}

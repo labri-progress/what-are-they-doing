@@ -1,0 +1,53 @@
+{
+  "message": "fix: frozen interpreter crash on Linux x86_64\n\nRoot cause: CompressedValue's 44-bit pointer compression uses a heap_base\nvariable to compute pointer offsets. Each frozen shard (733 for TSC) is\ncompiled as a separate Zig object file. LLVM inlined the heap_base variable\ninto each shard, constant-folding it to 0, so the arena compression path\nwas never taken and pointers above 44 bits were silently truncated.\n\nFix: Move compressed_heap_base to a C global in profile_counters.c (which\nis compiled once and linked into the native binary). Frozen shards access\nit via extern C functions (edgebox_get/set_compressed_heap_base), ensuring\na single shared instance.\n\nAlso: contiguous arena allocator using mmap virtual reservation (8GB) on\nLinux to keep all QuickJS heap allocations within a single address range.",
+  "files": [
+    {
+      "sha": "ef315162db614671888987f36056de05f836c360",
+      "filename": "src/freeze/frozen_dispatch_cli.c",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 3,
+      "changes": 14,
+      "blob_url": "https://github.com/teamchong/edgebox/blob/77bb07279db131eba279ffdf18c3b320e96e0d4a/src%2Ffreeze%2Ffrozen_dispatch_cli.c",
+      "raw_url": "https://github.com/teamchong/edgebox/raw/77bb07279db131eba279ffdf18c3b320e96e0d4a/src%2Ffreeze%2Ffrozen_dispatch_cli.c",
+      "contents_url": "https://api.github.com/repos/teamchong/edgebox/contents/src%2Ffreeze%2Ffrozen_dispatch_cli.c?ref=77bb07279db131eba279ffdf18c3b320e96e0d4a",
+      "patch": "@@ -6,9 +6,17 @@\n #include <stdint.h>\n \n // Compressed heap base for pointer compression - shared across all Zig compilation units.\n-// Frozen Zig shards declare this as 'extern var edgebox_compressed_heap_base' to reference\n-// this single global instance, preventing each shard from getting its own zero-initialized copy.\n-size_t edgebox_compressed_heap_base = 0;\n+// Frozen Zig shards call edgebox_get/set_compressed_heap_base() to access this,\n+// preventing each shard from getting its own zero-initialized copy that LLVM constant-folds.\n+static size_t edgebox_compressed_heap_base = 0;\n+\n+size_t edgebox_get_compressed_heap_base(void) {\n+    return edgebox_compressed_heap_base;\n+}\n+\n+void edgebox_set_compressed_heap_base(size_t base) {\n+    edgebox_compressed_heap_base = base;\n+}\n \n // Forward declaration of JSContext and JSValue (opaque types)\n typedef struct JSContext JSContext;"
+    },
+    {
+      "sha": "c5417cc4905e99e43c8180e3446c25b12ddf49a8",
+      "filename": "src/freeze/js_value.zig",
+      "status": "modified",
+      "additions": 24,
+      "deletions": 11,
+      "changes": 35,
+      "blob_url": "https://github.com/teamchong/edgebox/blob/77bb07279db131eba279ffdf18c3b320e96e0d4a/src%2Ffreeze%2Fjs_value.zig",
+      "raw_url": "https://github.com/teamchong/edgebox/raw/77bb07279db131eba279ffdf18c3b320e96e0d4a/src%2Ffreeze%2Fjs_value.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/edgebox/contents/src%2Ffreeze%2Fjs_value.zig?ref=77bb07279db131eba279ffdf18c3b320e96e0d4a",
+      "patch": "@@ -43,22 +43,30 @@ const JS_TAG_FLOAT64 = types.JS_TAG_FLOAT64;\n // CompressedValue - 8-byte NaN-boxed JSValue for frozen function stacks\n // ============================================================================\n \n-/// Heap base for pointer compression. Declared as C extern so all compilation units\n-/// (including separately-compiled frozen shards) reference the SAME global variable.\n-/// Without extern, each Zig compilation unit gets its own copy initialized to 0,\n-/// and LLVM constant-folds away the arena compression path on Linux x86_64.\n-extern var edgebox_compressed_heap_base: usize;\n+/// Heap base for pointer compression on native 64-bit platforms.\n+/// On Linux x86_64, CompressedValue uses 44-bit NaN-boxed pointers stored as\n+/// (address - heap_base). Without a shared heap base, pointers above 44 bits\n+/// get truncated, causing segfaults.\n+///\n+/// IMPORTANT: This is accessed from separately-compiled frozen shards via inline\n+/// functions (compressPtr/decompressPtr). The inline functions read this variable\n+/// through a pointer obtained from the zig_runtime module, which ensures all\n+/// compilation units share the same address. The variable itself lives in the\n+/// main binary's BSS, and the shards get a pointer to it at link time.\n+/// Heap base for pointer compression on native 64-bit.\n+/// Defined in frozen_dispatch_cli.c as a C global. All Zig compilation units\n+/// (including separately-compiled frozen shards) reference this single instance\n+/// via extern linkage. Without extern, each shard gets its own copy initialized\n+/// to 0, and LLVM inlines the zero, breaking pointer compression on Linux x86_64.\n+pub extern fn edgebox_get_compressed_heap_base() usize;\n+pub extern fn edgebox_set_compressed_heap_base(base: usize) void;\n \n-/// Legacy alias for code that references compressed_heap_base directly.\n-pub const compressed_heap_base_ptr = &edgebox_compressed_heap_base;\n-\n-/// Read the heap base. Uses the extern C variable shared across all compilation units.\n pub inline fn getCompressedHeapBase() usize {\n-    return edgebox_compressed_heap_base;\n+    return edgebox_get_compressed_heap_base();\n }\n \n pub fn initCompressedHeap(base: usize) void {\n-    edgebox_compressed_heap_base = base;\n+    edgebox_set_compressed_heap_base(base);\n }\n \n // Global return slots for WASM32 to avoid LLVM u64 return corruption\n@@ -1263,6 +1271,11 @@ pub const CompressedValue = if (is_wasm32) extern struct {\n                 return .{ .bits = QNAN | TAG_PTR | extra_tag | offset };\n             }\n         }\n+        // DEBUG: detect truncation on Linux x86_64\n+        if (addr > PTR_ADDR_MASK) {\n+            std.debug.print(\"[COMPRESS TRUNCATION] addr=0x{x} base=0x{x} mask=0x{x}\\n\", .{ addr, base, PTR_ADDR_MASK });\n+            @panic(\"compressPtr: pointer truncation detected - compressed_heap_base not set or pointer outside arena\");\n+        }\n         // Fallback: store low bits (works for most heap layouts)\n         return .{ .bits = QNAN | TAG_PTR | extra_tag | (addr & PTR_ADDR_MASK) };\n     }"
+    },
+    {
+      "sha": "24e403293afc7442e3f31c5733503a70f8d99a20",
+      "filename": "src/freeze/profile_counters.c",
+      "status": "modified",
+      "additions": 17,
+      "deletions": 0,
+      "changes": 17,
+      "blob_url": "https://github.com/teamchong/edgebox/blob/77bb07279db131eba279ffdf18c3b320e96e0d4a/src%2Ffreeze%2Fprofile_counters.c",
+      "raw_url": "https://github.com/teamchong/edgebox/raw/77bb07279db131eba279ffdf18c3b320e96e0d4a/src%2Ffreeze%2Fprofile_counters.c",
+      "contents_url": "https://api.github.com/repos/teamchong/edgebox/contents/src%2Ffreeze%2Fprofile_counters.c?ref=77bb07279db131eba279ffdf18c3b320e96e0d4a",
+      "patch": "@@ -6,11 +6,28 @@\n  * via extern linkage, ensuring they all share the same counters.\n  */\n \n+#include <stddef.h>\n #include <stdint.h>\n \n /* Counter array - indices must match profile.zig */\n uint64_t g_frozen_profile_counters[10] = {0};\n \n+/**\n+ * Compressed heap base for pointer compression on native 64-bit.\n+ * All frozen Zig shards call edgebox_get/set_compressed_heap_base() to access this.\n+ * Without a single C definition, each Zig compilation unit gets its own copy\n+ * initialized to 0, and LLVM constant-folds it, breaking Linux x86_64 pointers.\n+ */\n+static size_t _compressed_heap_base = 0;\n+\n+size_t edgebox_get_compressed_heap_base(void) {\n+    return _compressed_heap_base;\n+}\n+\n+void edgebox_set_compressed_heap_base(size_t base) {\n+    _compressed_heap_base = base;\n+}\n+\n /* Noinline increment to prevent optimizer elision in shard objects */\n __attribute__((noinline))\n void frozen_profile_vinc(uint64_t *ptr, uint64_t delta) {"
+    },
+    {
+      "sha": "9dc3f64d6ad03428d7560942342b094a6677ddb8",
+      "filename": "src/freeze/zig_runtime.zig",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/teamchong/edgebox/blob/77bb07279db131eba279ffdf18c3b320e96e0d4a/src%2Ffreeze%2Fzig_runtime.zig",
+      "raw_url": "https://github.com/teamchong/edgebox/raw/77bb07279db131eba279ffdf18c3b320e96e0d4a/src%2Ffreeze%2Fzig_runtime.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/edgebox/contents/src%2Ffreeze%2Fzig_runtime.zig?ref=77bb07279db131eba279ffdf18c3b320e96e0d4a",
+      "patch": "@@ -62,7 +62,7 @@ pub const JSVarRef = js_value.JSVarRef;\n pub const ListHead = js_value.ListHead;\n pub const CompressedValue = js_value.CompressedValue;\n pub const quickjs = js_value.quickjs;\n-pub const compressed_heap_base = js_value.compressed_heap_base_ptr;\n+pub const getCompressedHeapBase = js_value.getCompressedHeapBase;\n pub const initCompressedHeap = js_value.initCompressedHeap;\n // Promise helpers for async/await support\n pub const isThenable = js_value.isThenable;"
+    }
+  ]
+}

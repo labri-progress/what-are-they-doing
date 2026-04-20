@@ -1,0 +1,41 @@
+{
+  "message": "fix: avoid duplicate replies with block streaming",
+  "files": [
+    {
+      "sha": "087ebf6af3cf7df8b99d7f558b47511c89f653bf",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/3368fcf31ec0a819b3e08dc3c7bb14174be8dbf1/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/3368fcf31ec0a819b3e08dc3c7bb14174be8dbf1/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=3368fcf31ec0a819b3e08dc3c7bb14174be8dbf1",
+      "patch": "@@ -55,6 +55,7 @@\n ### Fixes\n - Chat UI: keep the chat scrolled to the latest message after switching sessions.\n - Auto-reply: stream completed reply blocks as soon as they finish (configurable default + break); skip empty tool-only blocks unless verbose.\n+- Discord: avoid duplicate sends when block streaming is enabled (race with typing hook).\n - Providers: make outbound text chunk limits configurable via `*.textChunkLimit` (defaults remain 4000/Discord 2000).\n - CLI onboarding: persist gateway token in config so local CLI auth works; recommend auth Off unless you need multi-machine access.\n - Control UI: accept a `?token=` URL param to auto-fill Gateway auth; onboarding now opens the dashboard with token auth when configured."
+    },
+    {
+      "sha": "ee9796748f3600f35543cd0ffaa7671066ae8178",
+      "filename": "src/auto-reply/reply.block-streaming.test.ts",
+      "status": "added",
+      "additions": 103,
+      "deletions": 0,
+      "changes": 103,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/3368fcf31ec0a819b3e08dc3c7bb14174be8dbf1/src%2Fauto-reply%2Freply.block-streaming.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/3368fcf31ec0a819b3e08dc3c7bb14174be8dbf1/src%2Fauto-reply%2Freply.block-streaming.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fauto-reply%2Freply.block-streaming.test.ts?ref=3368fcf31ec0a819b3e08dc3c7bb14174be8dbf1",
+      "patch": "@@ -0,0 +1,103 @@\n+import fs from \"node:fs/promises\";\n+import os from \"node:os\";\n+import path from \"node:path\";\n+\n+import { beforeEach, describe, expect, it, vi } from \"vitest\";\n+\n+import { loadModelCatalog } from \"../agents/model-catalog.js\";\n+import { runEmbeddedPiAgent } from \"../agents/pi-embedded.js\";\n+import { getReplyFromConfig } from \"./reply.js\";\n+\n+vi.mock(\"../agents/pi-embedded.js\", () => ({\n+  abortEmbeddedPiRun: vi.fn().mockReturnValue(false),\n+  runEmbeddedPiAgent: vi.fn(),\n+  queueEmbeddedPiMessage: vi.fn().mockReturnValue(false),\n+  resolveEmbeddedSessionLane: (key: string) =>\n+    `session:${key.trim() || \"main\"}`,\n+}));\n+vi.mock(\"../agents/model-catalog.js\", () => ({\n+  loadModelCatalog: vi.fn(),\n+}));\n+\n+async function withTempHome<T>(fn: (home: string) => Promise<T>): Promise<T> {\n+  const base = await fs.mkdtemp(path.join(os.tmpdir(), \"clawdis-stream-\"));\n+  const previousHome = process.env.HOME;\n+  process.env.HOME = base;\n+  try {\n+    return await fn(base);\n+  } finally {\n+    process.env.HOME = previousHome;\n+    await fs.rm(base, { recursive: true, force: true });\n+  }\n+}\n+\n+describe(\"block streaming\", () => {\n+  beforeEach(() => {\n+    vi.mocked(runEmbeddedPiAgent).mockReset();\n+    vi.mocked(loadModelCatalog).mockResolvedValue([\n+      { id: \"claude-opus-4-5\", name: \"Opus 4.5\", provider: \"anthropic\" },\n+      { id: \"gpt-4.1-mini\", name: \"GPT-4.1 Mini\", provider: \"openai\" },\n+    ]);\n+  });\n+\n+  async function waitForCalls(fn: () => number, calls: number) {\n+    const deadline = Date.now() + 1500;\n+    while (fn() < calls) {\n+      if (Date.now() > deadline) {\n+        throw new Error(`Expected ${calls} call(s), got ${fn()}`);\n+      }\n+      await new Promise((resolve) => setTimeout(resolve, 5));\n+    }\n+  }\n+\n+  it(\"waits for block replies before returning final payloads\", async () => {\n+    await withTempHome(async (home) => {\n+      let releaseTyping: (() => void) | undefined;\n+      const typingGate = new Promise<void>((resolve) => {\n+        releaseTyping = resolve;\n+      });\n+      const onReplyStart = vi.fn(() => typingGate);\n+      const onBlockReply = vi.fn().mockResolvedValue(undefined);\n+\n+      vi.mocked(runEmbeddedPiAgent).mockImplementation(async (params) => {\n+        void params.onBlockReply?.({ text: \"hello\" });\n+        return {\n+          payloads: [{ text: \"hello\" }],\n+          meta: {\n+            durationMs: 5,\n+            agentMeta: { sessionId: \"s\", provider: \"p\", model: \"m\" },\n+          },\n+        };\n+      });\n+\n+      const replyPromise = getReplyFromConfig(\n+        {\n+          Body: \"ping\",\n+          From: \"+1004\",\n+          To: \"+2000\",\n+          MessageSid: \"msg-123\",\n+          Surface: \"discord\",\n+        },\n+        {\n+          onReplyStart,\n+          onBlockReply,\n+        },\n+        {\n+          agent: {\n+            model: \"anthropic/claude-opus-4-5\",\n+            workspace: path.join(home, \"clawd\"),\n+          },\n+          whatsapp: { allowFrom: [\"*\"] },\n+          session: { store: path.join(home, \"sessions.json\") },\n+        },\n+      );\n+\n+      await waitForCalls(() => onReplyStart.mock.calls.length, 1);\n+      releaseTyping?.();\n+\n+      const res = await replyPromise;\n+      expect(res).toBeUndefined();\n+      expect(onBlockReply).toHaveBeenCalledTimes(1);\n+    });\n+  });\n+});"
+    },
+    {
+      "sha": "6a1428bea08bc52b6c85d9ccd9b3c73a93906cfb",
+      "filename": "src/auto-reply/reply.ts",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 3,
+      "changes": 9,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/3368fcf31ec0a819b3e08dc3c7bb14174be8dbf1/src%2Fauto-reply%2Freply.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/3368fcf31ec0a819b3e08dc3c7bb14174be8dbf1/src%2Fauto-reply%2Freply.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fauto-reply%2Freply.ts?ref=3368fcf31ec0a819b3e08dc3c7bb14174be8dbf1",
+      "patch": "@@ -1421,16 +1421,19 @@ export async function getReplyFromConfig(\n                 const hasMedia = (payload.mediaUrls?.length ?? 0) > 0;\n                 if (!cleaned && !hasMedia) return;\n                 if (cleaned?.trim() === SILENT_REPLY_TOKEN && !hasMedia) return;\n-                await startTypingOnText(cleaned);\n                 const blockPayload: ReplyPayload = {\n                   text: cleaned,\n                   mediaUrls: payload.mediaUrls,\n                   mediaUrl: payload.mediaUrls?.[0],\n                   replyToId: tagResult.replyToId,\n                 };\n-                const task = Promise.resolve(opts.onBlockReply?.(blockPayload))\n+                const payloadKey = buildPayloadKey(blockPayload);\n+                const task = (async () => {\n+                  await startTypingOnText(cleaned);\n+                  await opts.onBlockReply?.(blockPayload);\n+                })()\n                   .then(() => {\n-                    streamedPayloadKeys.add(buildPayloadKey(blockPayload));\n+                    streamedPayloadKeys.add(payloadKey);\n                   })\n                   .catch((err) => {\n                     logVerbose(`block reply delivery failed: ${String(err)}`);"
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "message": "fix(sync,net,scheduler): rwlock write fairness, UDP nonblocking, scheduler tuning\n\nThree independent correctness and performance fixes across the runtime:\n\nsync/rwlock.rs \u2014 Fix try_write() bypassing queued async writers:\n- try_write() previously only checked writer_active and readers, allowing\n  it to barge ahead of a queued async write() that was waiting for a read\n  lock to release. Now also checks writer_waiters > 0, preserving FIFO\n  queue ordering and preventing writer starvation.\n- Add test: try_write_does_not_bypass_waiting_writer_turn validates that\n  after a read guard is dropped, a queued writer gets priority over a\n  subsequent try_write() call.\n\nnet/udp.rs \u2014 Force nonblocking mode in UdpSocket::from(StdUdpSocket):\n- Callers passing a freshly-created std::net::UdpSocket (which defaults\n  to blocking mode) would cause async poll paths to block. Now explicitly\n  calls set_nonblocking(true) during conversion.\n- Add test: udp_from_std_forces_nonblocking_mode uses fcntl F_GETFL to\n  verify O_NONBLOCK is set after conversion (unix-only).\n\nruntime/scheduler/priority.rs \u2014 Reduce MIN_DENSE_LEN from 1024 to 256:\n- Lowers the threshold for the dense bitvector scheduling optimization,\n  allowing smaller task sets to benefit from O(1) membership checks\n  without the 8 KiB minimum allocation overhead.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "b2be0f5841b6bc1cc779ea5b3f1880cb6395bd58",
+      "filename": "src/net/udp.rs",
+      "status": "modified",
+      "additions": 21,
+      "deletions": 0,
+      "changes": 21,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/3fe83db494e11915b1a1828579e17b1df4b920c7/src%2Fnet%2Fudp.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/3fe83db494e11915b1a1828579e17b1df4b920c7/src%2Fnet%2Fudp.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fnet%2Fudp.rs?ref=3fe83db494e11915b1a1828579e17b1df4b920c7",
+      "patch": "@@ -329,6 +329,9 @@ impl UdpSocket {\n \n impl From<StdUdpSocket> for UdpSocket {\n     fn from(socket: StdUdpSocket) -> Self {\n+        // Ensure async poll paths never block even when callers pass a\n+        // freshly-created std socket in its default blocking mode.\n+        let _ = socket.set_nonblocking(true);\n         Self {\n             inner: Arc::new(socket),\n             registration: None,\n@@ -402,6 +405,10 @@ mod tests {\n     use crate::stream::StreamExt;\n     use crate::types::{Budget, RegionId, TaskId};\n     use futures_lite::future;\n+    #[cfg(unix)]\n+    use nix::fcntl::{fcntl, FcntlArg, OFlag};\n+    #[cfg(unix)]\n+    use std::os::fd::AsRawFd;\n     use std::sync::Arc;\n     use std::task::{Wake, Waker};\n \n@@ -537,6 +544,20 @@ mod tests {\n         });\n     }\n \n+    #[cfg(unix)]\n+    #[test]\n+    fn udp_from_std_forces_nonblocking_mode() {\n+        let std_socket = StdUdpSocket::bind(\"127.0.0.1:0\").expect(\"bind socket\");\n+        let socket = UdpSocket::from(std_socket);\n+        let flags =\n+            fcntl(socket.inner.as_ref().as_raw_fd(), FcntlArg::F_GETFL).expect(\"read socket flags\");\n+        let is_nonblocking = OFlag::from_bits_truncate(flags).contains(OFlag::O_NONBLOCK);\n+        assert!(\n+            is_nonblocking,\n+            \"UdpSocket::from should force nonblocking mode\"\n+        );\n+    }\n+\n     #[test]\n     fn udp_large_datagram() {\n         future::block_on(async {"
+    },
+    {
+      "sha": "e7492a51ae48198e51d4916bab7190753a3d4422",
+      "filename": "src/runtime/scheduler/priority.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/3fe83db494e11915b1a1828579e17b1df4b920c7/src%2Fruntime%2Fscheduler%2Fpriority.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/3fe83db494e11915b1a1828579e17b1df4b920c7/src%2Fruntime%2Fscheduler%2Fpriority.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Fscheduler%2Fpriority.rs?ref=3fe83db494e11915b1a1828579e17b1df4b920c7",
+      "patch": "@@ -92,7 +92,7 @@ impl ScheduledSet {\n     const DENSE_COLLISION: u64 = u64::MAX;\n     // Hard cap to avoid pathological allocations if someone schedules a very high-index TaskId.\n     const MAX_DENSE_LEN: usize = 1 << 20; // 1,048,576 slots => 8 MiB\n-    const MIN_DENSE_LEN: usize = 1024;\n+    const MIN_DENSE_LEN: usize = 256;\n \n     #[inline]\n     fn with_capacity(capacity: usize) -> Self {"
+    },
+    {
+      "sha": "e64de3abf37f259e811bf3e60541215edbe81352",
+      "filename": "src/sync/rwlock.rs",
+      "status": "modified",
+      "additions": 32,
+      "deletions": 1,
+      "changes": 33,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/3fe83db494e11915b1a1828579e17b1df4b920c7/src%2Fsync%2Frwlock.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/3fe83db494e11915b1a1828579e17b1df4b920c7/src%2Fsync%2Frwlock.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fsync%2Frwlock.rs?ref=3fe83db494e11915b1a1828579e17b1df4b920c7",
+      "patch": "@@ -294,7 +294,9 @@ impl<T> RwLock<T> {\n         }\n \n         let mut state = self.state.lock().expect(\"rwlock state poisoned\");\n-        if state.writer_active || state.readers > 0 {\n+        // Do not let try_write() bypass queued async writers. If there are\n+        // waiters, preserve queue order and report Locked.\n+        if state.writer_active || state.readers > 0 || state.writer_waiters > 0 {\n             return Err(TryWriteError::Locked);\n         }\n \n@@ -1208,6 +1210,35 @@ mod tests {\n         crate::test_complete!(\"writer_waiting_blocks_new_readers\");\n     }\n \n+    #[test]\n+    fn try_write_does_not_bypass_waiting_writer_turn() {\n+        init_test(\"try_write_does_not_bypass_waiting_writer_turn\");\n+        let cx = test_cx();\n+        let lock = RwLock::new(1_u32);\n+\n+        // Hold a read lock so the writer must queue first.\n+        let read_guard = read_blocking(&lock, &cx);\n+        let mut queued_writer = lock.write(&cx);\n+        let pending = poll_once(&mut queued_writer).is_none();\n+        crate::assert_with_log!(pending, \"writer queued while reader held\", true, pending);\n+\n+        // Releasing the reader wakes the queued writer, but before that writer\n+        // is polled again, try_write() must not barge ahead.\n+        drop(read_guard);\n+\n+        let try_write_locked = matches!(lock.try_write(), Err(TryWriteError::Locked));\n+        crate::assert_with_log!(\n+            try_write_locked,\n+            \"try_write must not bypass queued writer\",\n+            true,\n+            try_write_locked\n+        );\n+\n+        let queued_guard = poll_until_ready(queued_writer).expect(\"queued writer should acquire\");\n+        drop(queued_guard);\n+        crate::test_complete!(\"try_write_does_not_bypass_waiting_writer_turn\");\n+    }\n+\n     #[test]\n     fn cancel_during_read_wait() {\n         init_test(\"cancel_during_read_wait\");"
+    }
+  ]
+}

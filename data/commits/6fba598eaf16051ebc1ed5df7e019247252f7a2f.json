@@ -1,0 +1,101 @@
+{
+  "message": "fix: handle gateway slash command replies in TUI",
+  "files": [
+    {
+      "sha": "e49b37002350f543bf11c0c0f3e2671b24061a5c",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6fba598eaf16051ebc1ed5df7e019247252f7a2f/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6fba598eaf16051ebc1ed5df7e019247252f7a2f/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=6fba598eaf16051ebc1ed5df7e019247252f7a2f",
+      "patch": "@@ -14,6 +14,7 @@ Docs: https://docs.clawd.bot\n - TUI: include Gateway slash commands in autocomplete and `/help`.\n - CLI: skip usage lines in `clawdbot models status` when provider usage is unavailable.\n - Linux: include env-configured user bin roots in systemd PATH and align PATH audits. (#1512) Thanks @robbyczgw-cla.\n+- TUI: render Gateway slash-command replies as system output (for example, `/context`).\n - Media: preserve PNG alpha when possible; fall back to JPEG when still over size cap. (#1491) Thanks @robbyczgw-cla.\n - Agents: treat plugin-only tool allowlists as opt-ins; keep core tools enabled. (#1467)\n - Exec approvals: persist allowlist entry ids to keep macOS allowlist rows stable. (#1521) Thanks @ngutman."
+    },
+    {
+      "sha": "4d094dc6ba297c0000fc14ba5908cd8fe521e612",
+      "filename": "docs/tui.md",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6fba598eaf16051ebc1ed5df7e019247252f7a2f/docs%2Ftui.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6fba598eaf16051ebc1ed5df7e019247252f7a2f/docs%2Ftui.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/docs%2Ftui.md?ref=6fba598eaf16051ebc1ed5df7e019247252f7a2f",
+      "patch": "@@ -88,6 +88,8 @@ Session lifecycle:\n - `/settings`\n - `/exit`\n \n+Other Gateway slash commands (for example, `/context`) are forwarded to the Gateway and shown as system output. See [Slash commands](/tools/slash-commands).\n+\n ## Local shell commands\n - Prefix a line with `!` to run a local shell command on the TUI host.\n - The TUI prompts once per session to allow local execution; declining keeps `!` disabled for the session."
+    },
+    {
+      "sha": "0e55b45f513a0d95ad785c5672550f8cc5f59790",
+      "filename": "src/gateway/server-methods/chat.ts",
+      "status": "modified",
+      "additions": 153,
+      "deletions": 1,
+      "changes": 154,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6fba598eaf16051ebc1ed5df7e019247252f7a2f/src%2Fgateway%2Fserver-methods%2Fchat.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6fba598eaf16051ebc1ed5df7e019247252f7a2f/src%2Fgateway%2Fserver-methods%2Fchat.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fserver-methods%2Fchat.ts?ref=6fba598eaf16051ebc1ed5df7e019247252f7a2f",
+      "patch": "@@ -2,9 +2,25 @@ import { randomUUID } from \"node:crypto\";\n import fs from \"node:fs\";\n import path from \"node:path\";\n \n+import { resolveSessionAgentId, resolveAgentWorkspaceDir } from \"../../agents/agent-scope.js\";\n import { resolveThinkingDefault } from \"../../agents/model-selection.js\";\n import { resolveAgentTimeoutMs } from \"../../agents/timeout.js\";\n+import { ensureAgentWorkspace } from \"../../agents/workspace.js\";\n+import { isControlCommandMessage } from \"../../auto-reply/command-detection.js\";\n+import { normalizeCommandBody } from \"../../auto-reply/commands-registry.js\";\n import { formatInboundEnvelope, resolveEnvelopeFormatOptions } from \"../../auto-reply/envelope.js\";\n+import { buildCommandContext, handleCommands } from \"../../auto-reply/reply/commands.js\";\n+import { parseInlineDirectives } from \"../../auto-reply/reply/directive-handling.js\";\n+import { defaultGroupActivation } from \"../../auto-reply/reply/groups.js\";\n+import { resolveContextTokens } from \"../../auto-reply/reply/model-selection.js\";\n+import { resolveElevatedPermissions } from \"../../auto-reply/reply/reply-elevated.js\";\n+import {\n+  normalizeElevatedLevel,\n+  normalizeReasoningLevel,\n+  normalizeThinkLevel,\n+  normalizeVerboseLevel,\n+} from \"../../auto-reply/thinking.js\";\n+import type { MsgContext } from \"../../auto-reply/templating.js\";\n import { agentCommand } from \"../../commands/agent.js\";\n import { mergeSessionEntry, updateSessionStore } from \"../../config/sessions.js\";\n import { registerAgentRunContext } from \"../../infra/agent-events.js\";\n@@ -212,7 +228,7 @@ export const chatHandlers: GatewayRequestHandlers = {\n         return;\n       }\n     }\n-    const { cfg, storePath, entry, canonicalKey } = loadSessionEntry(p.sessionKey);\n+    const { cfg, storePath, entry, canonicalKey, store } = loadSessionEntry(p.sessionKey);\n     const timeoutMs = resolveAgentTimeoutMs({\n       cfg,\n       overrideMs: p.timeoutMs,\n@@ -223,6 +239,7 @@ export const chatHandlers: GatewayRequestHandlers = {\n       sessionId,\n       updatedAt: now,\n     });\n+    store[canonicalKey] = sessionEntry;\n     const clientRunId = p.idempotencyKey;\n     registerAgentRunContext(clientRunId, { sessionKey: p.sessionKey });\n \n@@ -303,6 +320,141 @@ export const chatHandlers: GatewayRequestHandlers = {\n       };\n       respond(true, ackPayload, undefined, { runId: clientRunId });\n \n+      if (isControlCommandMessage(parsedMessage, cfg)) {\n+        try {\n+          const isFastTestEnv = process.env.CLAWDBOT_TEST_FAST === \"1\";\n+          const agentId = resolveSessionAgentId({ sessionKey: p.sessionKey, config: cfg });\n+          const agentCfg = cfg.agents?.defaults;\n+          const workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);\n+          const workspace = await ensureAgentWorkspace({\n+            dir: workspaceDir,\n+            ensureBootstrapFiles: !agentCfg?.skipBootstrap && !isFastTestEnv,\n+          });\n+          const ctx: MsgContext = {\n+            Body: parsedMessage,\n+            CommandBody: parsedMessage,\n+            BodyForCommands: parsedMessage,\n+            CommandSource: \"text\",\n+            CommandAuthorized: true,\n+            Provider: INTERNAL_MESSAGE_CHANNEL,\n+            Surface: \"tui\",\n+            From: p.sessionKey,\n+            To: INTERNAL_MESSAGE_CHANNEL,\n+            SessionKey: p.sessionKey,\n+            ChatType: \"direct\",\n+          };\n+          const command = buildCommandContext({\n+            ctx,\n+            cfg,\n+            agentId,\n+            sessionKey: p.sessionKey,\n+            isGroup: false,\n+            triggerBodyNormalized: normalizeCommandBody(parsedMessage),\n+            commandAuthorized: true,\n+          });\n+          const directives = parseInlineDirectives(parsedMessage);\n+          const { provider, model } = resolveSessionModelRef(cfg, sessionEntry);\n+          const contextTokens = resolveContextTokens({ agentCfg, model });\n+          const resolveDefaultThinkingLevel = async () => {\n+            const configured = agentCfg?.thinkingDefault;\n+            if (configured) return configured;\n+            const catalog = await context.loadGatewayModelCatalog();\n+            return resolveThinkingDefault({ cfg, provider, model, catalog });\n+          };\n+          const resolvedThinkLevel =\n+            normalizeThinkLevel(sessionEntry?.thinkingLevel ?? agentCfg?.thinkingDefault) ??\n+            (await resolveDefaultThinkingLevel());\n+          const resolvedVerboseLevel =\n+            normalizeVerboseLevel(sessionEntry?.verboseLevel ?? agentCfg?.verboseDefault) ?? \"off\";\n+          const resolvedReasoningLevel =\n+            normalizeReasoningLevel(sessionEntry?.reasoningLevel) ?? \"off\";\n+          const resolvedElevatedLevel = normalizeElevatedLevel(\n+            sessionEntry?.elevatedLevel ?? agentCfg?.elevatedDefault,\n+          );\n+          const elevated = resolveElevatedPermissions({\n+            cfg,\n+            agentId,\n+            ctx,\n+            provider: INTERNAL_MESSAGE_CHANNEL,\n+          });\n+          const commandResult = await handleCommands({\n+            ctx,\n+            cfg,\n+            command,\n+            agentId,\n+            directives,\n+            elevated,\n+            sessionEntry,\n+            previousSessionEntry: entry,\n+            sessionStore: store,\n+            sessionKey: p.sessionKey,\n+            storePath,\n+            sessionScope: (cfg.session?.scope ?? \"per-sender\") as \"per-sender\" | \"global\",\n+            workspaceDir: workspace.dir,\n+            defaultGroupActivation: () => defaultGroupActivation(true),\n+            resolvedThinkLevel,\n+            resolvedVerboseLevel,\n+            resolvedReasoningLevel,\n+            resolvedElevatedLevel,\n+            resolveDefaultThinkingLevel,\n+            provider,\n+            model,\n+            contextTokens,\n+            isGroup: false,\n+          });\n+          if (!commandResult.shouldContinue) {\n+            const text = commandResult.reply?.text ?? \"\";\n+            const message = {\n+              role: \"assistant\",\n+              content: text.trim() ? [{ type: \"text\", text }] : [],\n+              timestamp: Date.now(),\n+              command: true,\n+            };\n+            const payload = {\n+              runId: clientRunId,\n+              sessionKey: p.sessionKey,\n+              seq: 0,\n+              state: \"final\" as const,\n+              message,\n+            };\n+            context.broadcast(\"chat\", payload);\n+            context.nodeSendToSession(p.sessionKey, \"chat\", payload);\n+            context.dedupe.set(`chat:${clientRunId}`, {\n+              ts: Date.now(),\n+              ok: true,\n+              payload: { runId: clientRunId, status: \"ok\" as const },\n+            });\n+            context.chatAbortControllers.delete(clientRunId);\n+            context.removeChatRun(clientRunId, clientRunId, p.sessionKey);\n+            return;\n+          }\n+        } catch (err) {\n+          const payload = {\n+            runId: clientRunId,\n+            sessionKey: p.sessionKey,\n+            seq: 0,\n+            state: \"error\" as const,\n+            errorMessage: formatForLog(err),\n+          };\n+          const error = errorShape(ErrorCodes.UNAVAILABLE, String(err));\n+          context.broadcast(\"chat\", payload);\n+          context.nodeSendToSession(p.sessionKey, \"chat\", payload);\n+          context.dedupe.set(`chat:${clientRunId}`, {\n+            ts: Date.now(),\n+            ok: false,\n+            payload: {\n+              runId: clientRunId,\n+              status: \"error\" as const,\n+              summary: String(err),\n+            },\n+            error,\n+          });\n+          context.chatAbortControllers.delete(clientRunId);\n+          context.removeChatRun(clientRunId, clientRunId, p.sessionKey);\n+          return;\n+        }\n+      }\n+\n       const envelopeOptions = resolveEnvelopeFormatOptions(cfg);\n       const envelopedMessage = formatInboundEnvelope({\n         channel: \"WebChat\","
+    },
+    {
+      "sha": "d4035037b4e16661a694de80cf99a6575a182f32",
+      "filename": "src/gateway/server.chat.gateway-server-chat.e2e.test.ts",
+      "status": "modified",
+      "additions": 39,
+      "deletions": 0,
+      "changes": 39,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6fba598eaf16051ebc1ed5df7e019247252f7a2f/src%2Fgateway%2Fserver.chat.gateway-server-chat.e2e.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6fba598eaf16051ebc1ed5df7e019247252f7a2f/src%2Fgateway%2Fserver.chat.gateway-server-chat.e2e.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fserver.chat.gateway-server-chat.e2e.test.ts?ref=6fba598eaf16051ebc1ed5df7e019247252f7a2f",
+      "patch": "@@ -259,6 +259,45 @@ describe(\"gateway server chat\", () => {\n     }\n   });\n \n+  test(\"routes chat.send slash commands without agent runs\", async () => {\n+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), \"clawdbot-gw-\"));\n+    try {\n+      testState.sessionStorePath = path.join(dir, \"sessions.json\");\n+      await writeSessionStore({\n+        entries: {\n+          main: {\n+            sessionId: \"sess-main\",\n+            updatedAt: Date.now(),\n+          },\n+        },\n+      });\n+\n+      const spy = vi.mocked(agentCommand);\n+      const callsBefore = spy.mock.calls.length;\n+      const eventPromise = onceMessage(\n+        ws,\n+        (o) =>\n+          o.type === \"event\" &&\n+          o.event === \"chat\" &&\n+          o.payload?.state === \"final\" &&\n+          o.payload?.runId === \"idem-command-1\",\n+        8000,\n+      );\n+      const res = await rpcReq(ws, \"chat.send\", {\n+        sessionKey: \"main\",\n+        message: \"/context list\",\n+        idempotencyKey: \"idem-command-1\",\n+      });\n+      expect(res.ok).toBe(true);\n+      const evt = await eventPromise;\n+      expect(evt.payload?.message?.command).toBe(true);\n+      expect(spy.mock.calls.length).toBe(callsBefore);\n+    } finally {\n+      testState.sessionStorePath = undefined;\n+      await fs.rm(dir, { recursive: true, force: true });\n+    }\n+  });\n+\n   test(\"agent events include sessionKey and agent.wait covers lifecycle flows\", async () => {\n     const dir = await fs.mkdtemp(path.join(os.tmpdir(), \"clawdbot-gw-\"));\n     testState.sessionStorePath = path.join(dir, \"sessions.json\");"
+    },
+    {
+      "sha": "148dca67aabb4ae86ed3c510472676ff175bb39d",
+      "filename": "src/tui/tui-event-handlers.ts",
+      "status": "modified",
+      "additions": 12,
+      "deletions": 1,
+      "changes": 13,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6fba598eaf16051ebc1ed5df7e019247252f7a2f/src%2Ftui%2Ftui-event-handlers.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6fba598eaf16051ebc1ed5df7e019247252f7a2f/src%2Ftui%2Ftui-event-handlers.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Ftui%2Ftui-event-handlers.ts?ref=6fba598eaf16051ebc1ed5df7e019247252f7a2f",
+      "patch": "@@ -1,6 +1,6 @@\n import type { TUI } from \"@mariozechner/pi-tui\";\n import type { ChatLog } from \"./components/chat-log.js\";\n-import { asString } from \"./tui-formatters.js\";\n+import { asString, extractTextFromMessage, isCommandMessage } from \"./tui-formatters.js\";\n import { TuiStreamAssembler } from \"./tui-stream-assembler.js\";\n import type { AgentEvent, ChatEvent, TuiStateAccess } from \"./tui-types.js\";\n \n@@ -49,6 +49,17 @@ export function createEventHandlers(context: EventHandlerContext) {\n       setActivityStatus(\"streaming\");\n     }\n     if (evt.state === \"final\") {\n+      if (isCommandMessage(evt.message)) {\n+        const text = extractTextFromMessage(evt.message);\n+        if (text) chatLog.addSystem(text);\n+        streamAssembler.drop(evt.runId);\n+        noteFinalizedRun(evt.runId);\n+        state.activeChatRunId = null;\n+        setActivityStatus(\"idle\");\n+        void refreshSessionInfo?.();\n+        tui.requestRender();\n+        return;\n+      }\n       const stopReason =\n         evt.message && typeof evt.message === \"object\" && !Array.isArray(evt.message)\n           ? typeof (evt.message as Record<string, unknown>).stopReason === \"string\""
+    },
+    {
+      "sha": "3200b237a2ce6e244e79649811f473f8f2d73f37",
+      "filename": "src/tui/tui-formatters.test.ts",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 0,
+      "changes": 9,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6fba598eaf16051ebc1ed5df7e019247252f7a2f/src%2Ftui%2Ftui-formatters.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6fba598eaf16051ebc1ed5df7e019247252f7a2f/src%2Ftui%2Ftui-formatters.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Ftui%2Ftui-formatters.test.ts?ref=6fba598eaf16051ebc1ed5df7e019247252f7a2f",
+      "patch": "@@ -4,6 +4,7 @@ import {\n   extractContentFromMessage,\n   extractTextFromMessage,\n   extractThinkingFromMessage,\n+  isCommandMessage,\n } from \"./tui-formatters.js\";\n \n describe(\"extractTextFromMessage\", () => {\n@@ -98,3 +99,11 @@ describe(\"extractContentFromMessage\", () => {\n     expect(text).toContain(\"HTTP 429\");\n   });\n });\n+\n+describe(\"isCommandMessage\", () => {\n+  it(\"detects command-marked messages\", () => {\n+    expect(isCommandMessage({ command: true })).toBe(true);\n+    expect(isCommandMessage({ command: false })).toBe(false);\n+    expect(isCommandMessage({})).toBe(false);\n+  });\n+});"
+    },
+    {
+      "sha": "f77eb9ff176a929c2d529bc06814d75bfb8743ff",
+      "filename": "src/tui/tui-formatters.ts",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6fba598eaf16051ebc1ed5df7e019247252f7a2f/src%2Ftui%2Ftui-formatters.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6fba598eaf16051ebc1ed5df7e019247252f7a2f/src%2Ftui%2Ftui-formatters.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Ftui%2Ftui-formatters.ts?ref=6fba598eaf16051ebc1ed5df7e019247252f7a2f",
+      "patch": "@@ -140,6 +140,11 @@ export function extractTextFromMessage(\n   return formatRawAssistantErrorForUi(errorMessage);\n }\n \n+export function isCommandMessage(message: unknown): boolean {\n+  if (!message || typeof message !== \"object\") return false;\n+  return (message as Record<string, unknown>).command === true;\n+}\n+\n export function formatTokens(total?: number | null, context?: number | null) {\n   if (total == null && context == null) return \"tokens ?\";\n   const totalLabel = total == null ? \"?\" : formatTokenCount(total);"
+    },
+    {
+      "sha": "5dc6696ad48f29f45c1886b35deea30710aebc88",
+      "filename": "src/tui/tui-session-actions.ts",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 1,
+      "changes": 7,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6fba598eaf16051ebc1ed5df7e019247252f7a2f/src%2Ftui%2Ftui-session-actions.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6fba598eaf16051ebc1ed5df7e019247252f7a2f/src%2Ftui%2Ftui-session-actions.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Ftui%2Ftui-session-actions.ts?ref=6fba598eaf16051ebc1ed5df7e019247252f7a2f",
+      "patch": "@@ -6,7 +6,7 @@ import {\n } from \"../routing/session-key.js\";\n import type { ChatLog } from \"./components/chat-log.js\";\n import type { GatewayAgentsList, GatewayChatClient } from \"./gateway-chat.js\";\n-import { asString, extractTextFromMessage } from \"./tui-formatters.js\";\n+import { asString, extractTextFromMessage, isCommandMessage } from \"./tui-formatters.js\";\n import type { TuiOptions, TuiStateAccess } from \"./tui-types.js\";\n \n type SessionActionContext = {\n@@ -161,6 +161,11 @@ export function createSessionActions(context: SessionActionContext) {\n       for (const entry of record.messages ?? []) {\n         if (!entry || typeof entry !== \"object\") continue;\n         const message = entry as Record<string, unknown>;\n+        if (isCommandMessage(message)) {\n+          const text = extractTextFromMessage(message);\n+          if (text) chatLog.addSystem(text);\n+          continue;\n+        }\n         if (message.role === \"user\") {\n           const text = extractTextFromMessage(message);\n           if (text) chatLog.addUser(text);"
+    }
+  ]
+}

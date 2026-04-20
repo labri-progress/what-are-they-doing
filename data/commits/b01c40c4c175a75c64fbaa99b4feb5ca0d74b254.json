@@ -1,0 +1,29 @@
+{
+  "message": "fix(reactor): adapt to polling 3.11 Events API",
+  "files": [
+    {
+      "sha": "9d7001ddf37eb82548d2e59f7ac60a22d5e9ead1",
+      "filename": "src/runtime/reactor/kqueue.rs",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 8,
+      "changes": 17,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/b01c40c4c175a75c64fbaa99b4feb5ca0d74b254/src%2Fruntime%2Freactor%2Fkqueue.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/b01c40c4c175a75c64fbaa99b4feb5ca0d74b254/src%2Fruntime%2Freactor%2Fkqueue.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Freactor%2Fkqueue.rs?ref=b01c40c4c175a75c64fbaa99b4feb5ca0d74b254",
+      "patch": "@@ -65,9 +65,10 @@\n \n use super::{Event, Events, Interest, Reactor, Source, Token};\n use parking_lot::Mutex;\n-use polling::{Event as PollEvent, Poller};\n+use polling::{Event as PollEvent, Events as PollingEvents, Poller};\n use std::collections::HashMap;\n use std::io;\n+use std::num::NonZeroUsize;\n use std::os::fd::BorrowedFd;\n use std::time::Duration;\n \n@@ -186,7 +187,9 @@ impl Reactor for KqueueReactor {\n         let borrowed_fd = unsafe { BorrowedFd::borrow_raw(raw_fd) };\n \n         // Add to kqueue via the polling crate\n-        self.poller.add(&borrowed_fd, event)?;\n+        // SAFETY: the caller must uphold the invariant that `source` remains valid\n+        // (and thus its raw fd remains open) until `deregister()` is called.\n+        unsafe { self.poller.add(&borrowed_fd, event)? };\n \n         // Track the registration for modify/deregister\n         regs.insert(token, RegistrationInfo { raw_fd, interest });\n@@ -235,18 +238,16 @@ impl Reactor for KqueueReactor {\n     fn poll(&self, events: &mut Events, timeout: Option<Duration>) -> io::Result<usize> {\n         events.clear();\n \n-        // Allocate buffer for polling events (polling 2.x uses Vec<Event>)\n-        let capacity = events.capacity().max(1);\n-        let mut poll_events: Vec<PollEvent> = Vec::with_capacity(capacity);\n-\n+        let capacity = NonZeroUsize::new(events.capacity().max(1)).expect(\"max(1)\");\n+        let mut poll_events = PollingEvents::with_capacity(capacity);\n         self.poller.wait(&mut poll_events, timeout)?;\n \n         // Convert polling events to our Event type.\n         // `Events` may drop entries when capacity is reached; report only\n         // the number of events actually stored in `events`.\n-        for poll_event in &poll_events {\n+        for poll_event in poll_events.iter() {\n             let token = Token(poll_event.key);\n-            let interest = Self::poll_event_to_interest(poll_event);\n+            let interest = Self::poll_event_to_interest(&poll_event);\n             events.push(Event::new(token, interest));\n         }\n "
+    },
+    {
+      "sha": "7a715d6f04c4d86763959c3f3ead19453a411802",
+      "filename": "src/runtime/reactor/windows.rs",
+      "status": "modified",
+      "additions": 17,
+      "deletions": 5,
+      "changes": 22,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/b01c40c4c175a75c64fbaa99b4feb5ca0d74b254/src%2Fruntime%2Freactor%2Fwindows.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/b01c40c4c175a75c64fbaa99b4feb5ca0d74b254/src%2Fruntime%2Freactor%2Fwindows.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Freactor%2Fwindows.rs?ref=b01c40c4c175a75c64fbaa99b4feb5ca0d74b254",
+      "patch": "@@ -11,11 +11,17 @@ use super::{Event, Events, Interest, Reactor, Source, Token};\n // Windows implementation.\n #[cfg(target_os = \"windows\")]\n mod iocp_impl {\n+    // Allow unsafe code for IOCP FFI operations via the polling crate.\n+    // The unsafe operations (add) are necessary because the compiler cannot\n+    // verify socket validity at compile time.\n+    #![allow(unsafe_code)]\n+\n     use super::{Event, Events, Interest, Reactor, Source, Token};\n     use parking_lot::Mutex;\n-    use polling::{Event as PollEvent, Poller};\n+    use polling::{Event as PollEvent, Events as PollEvents, Poller};\n     use std::collections::HashMap;\n     use std::io;\n+    use std::num::NonZeroUsize;\n     use std::os::windows::io::RawSocket;\n     use std::time::Duration;\n \n@@ -87,7 +93,11 @@ mod iocp_impl {\n             }\n \n             let event = Self::interest_to_poll_event(token, interest);\n-            self.poller.add(raw_socket, event)?;\n+            // SAFETY: the caller must uphold the invariant that `source` (and thus\n+            // its raw socket) remains valid until `deregister()` is called.\n+            unsafe {\n+                self.poller.add(raw_socket, event)?;\n+            }\n \n             regs.insert(\n                 token,\n@@ -125,14 +135,16 @@ mod iocp_impl {\n         fn poll(&self, events: &mut Events, timeout: Option<Duration>) -> io::Result<usize> {\n             events.clear();\n \n-            let mut poll_events = Vec::with_capacity(events.capacity());\n+            let requested_capacity =\n+                NonZeroUsize::new(events.capacity().max(1)).expect(\"capacity >= 1\");\n+            let mut poll_events = PollEvents::with_capacity(requested_capacity);\n             self.poller.wait(&mut poll_events, timeout)?;\n \n             // `Events` may drop entries when capacity is reached; report only\n             // the number of events actually stored in `events`.\n-            for poll_event in &poll_events {\n+            for poll_event in poll_events.iter() {\n                 let token = Token(poll_event.key);\n-                let interest = Self::poll_event_to_interest(poll_event);\n+                let interest = Self::poll_event_to_interest(&poll_event);\n                 events.push(Event::new(token, interest));\n             }\n "
+    }
+  ]
+}

@@ -1,0 +1,65 @@
+{
+  "message": "feat(storage): add atomic writes, file locking, and efficient scanning\n\nImprove storage reliability and performance for history and session\npersistence with proper concurrency control.\n\nHistory storage (internal/history/storage.go):\n- Rewrite ReadRecent() to scan backwards from end of file instead of\n  reading entire file then slicing; uses 4KB buffer chunks\n- Properly handle trailing newlines and edge cases in backwards scan\n- Set explicit 0644 permissions on temp file during Prune() before\n  atomic rename\n\nSession storage (internal/session/storage.go):\n- Wrap Save(), Delete(), and List() with acquireLock() for process\n  safety when multiple ntm instances access the same session data\n- Implement atomic writes: write to temp file, sync, close, then\n  rename to final path to prevent partial writes on crash\n- Clean up temp file on error\n\nNew lock files:\n- internal/session/lock_unix.go: Unix implementation using syscall.Flock\n  with both process-level (flock) and thread-level (sync.Mutex) locks\n- internal/session/lock_windows.go: Windows stub that uses mutex-only\n  locking (flock not available on Windows)\n\nThe backwards scanning optimization in ReadRecent() provides O(n) reads\nwhere n is the requested count, rather than O(total) for the previous\nimplementation that read all entries.\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "fca6f9650be1c04dded04f9f312b6f4b5633c633",
+      "filename": "internal/history/lock_unix.go",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/49bd65a6de7121914d0389ba1563ffbd69ad1d8b/internal%2Fhistory%2Flock_unix.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/49bd65a6de7121914d0389ba1563ffbd69ad1d8b/internal%2Fhistory%2Flock_unix.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fhistory%2Flock_unix.go?ref=49bd65a6de7121914d0389ba1563ffbd69ad1d8b",
+      "patch": "@@ -34,7 +34,7 @@ func acquireLock() (func(), error) {\n \t}\n \n \treturn func() {\n-\t\tsyscall.Flock(int(f.Fd()), syscall.LOCK_UN)\n+\t\t_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)\n \t\tf.Close()\n \t\tlocalMu.Unlock()\n \t}, nil"
+    },
+    {
+      "sha": "9cb2aef301cc0283142ad3cadcbaa9c71659bd60",
+      "filename": "internal/history/storage.go",
+      "status": "modified",
+      "additions": 94,
+      "deletions": 8,
+      "changes": 102,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/49bd65a6de7121914d0389ba1563ffbd69ad1d8b/internal%2Fhistory%2Fstorage.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/49bd65a6de7121914d0389ba1563ffbd69ad1d8b/internal%2Fhistory%2Fstorage.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fhistory%2Fstorage.go?ref=49bd65a6de7121914d0389ba1563ffbd69ad1d8b",
+      "patch": "@@ -119,27 +119,109 @@ func readAllLocked() ([]HistoryEntry, error) {\n \treturn entries, nil\n }\n \n-// ReadRecent reads the last n entries efficiently.\n-// Reads from end of file when possible.\n+// ReadRecent reads the last n entries efficiently by scanning backwards.\n func ReadRecent(n int) ([]HistoryEntry, error) {\n \tunlock, err := acquireLock()\n \tif err != nil {\n \t\treturn nil, err\n \t}\n \tdefer unlock()\n \n-\t// For simplicity, read all and return last n\n-\t// Could be optimized with tail-reading for large files\n-\tentries, err := readAllLocked()\n+\tif n <= 0 {\n+\t\treturn []HistoryEntry{}, nil\n+\t}\n+\n+\tpath := StoragePath()\n+\tf, err := os.Open(path)\n+\tif err != nil {\n+\t\tif os.IsNotExist(err) {\n+\t\t\treturn []HistoryEntry{}, nil\n+\t\t}\n+\t\treturn nil, err\n+\t}\n+\tdefer f.Close()\n+\n+\tstat, err := f.Stat()\n \tif err != nil {\n \t\treturn nil, err\n \t}\n+\tfileSize := stat.Size()\n+\n+\tif fileSize == 0 {\n+\t\treturn []HistoryEntry{}, nil\n+\t}\n+\n+\t// Scan backwards for newlines\n+\tconst bufferSize = 4096\n+\tbuf := make([]byte, bufferSize)\n+\toffset := fileSize\n+\tnewlinesFound := 0\n+\n+\t// If the file ends with a newline, we start counting from the one before it.\n+\t// But JSONL usually implies \"line separated\", so effectively we count line separators.\n+\t// Let's just count backward. If we find N+1 newlines, the read starts after the (N+1)th newline.\n+\t// If we don't find N+1 newlines, we read from start.\n+\n+\tfor offset > 0 {\n+\t\treadSize := int64(bufferSize)\n+\t\tif offset < readSize {\n+\t\t\treadSize = offset\n+\t\t}\n+\t\toffset -= readSize\n+\n+\t\t_, err := f.ReadAt(buf[:readSize], offset)\n+\t\tif err != nil && err != io.EOF {\n+\t\t\treturn nil, err\n+\t\t}\n \n-\tif len(entries) <= n {\n-\t\treturn entries, nil\n+\t\tfor i := int(readSize) - 1; i >= 0; i-- {\n+\t\t\tif buf[i] == '\\n' {\n+\t\t\t\t// Ignore newline at the very end of file\n+\t\t\t\tif offset+int64(i) == fileSize-1 {\n+\t\t\t\t\tcontinue\n+\t\t\t\t}\n+\t\t\t\tnewlinesFound++\n+\t\t\t\tif newlinesFound >= n {\n+\t\t\t\t\t// Found start of the Nth line (from end)\n+\t\t\t\t\toffset += int64(i) + 1\n+\t\t\t\t\tgoto ReadEntries\n+\t\t\t\t}\n+\t\t\t}\n+\t\t}\n \t}\n+\t// If we got here, we didn't find enough newlines, so we read from start\n+\toffset = 0\n \n-\treturn entries[len(entries)-n:], nil\n+ReadEntries:\n+\tif _, err := f.Seek(offset, io.SeekStart); err != nil {\n+\t\treturn nil, err\n+\t}\n+\n+\tvar entries []HistoryEntry\n+\tscanner := bufio.NewScanner(f)\n+\tscanner.Buffer(make([]byte, 1024*1024), 1024*1024)\n+\n+\tfor scanner.Scan() {\n+\t\tvar entry HistoryEntry\n+\t\tif err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {\n+\t\t\tcontinue\n+\t\t}\n+\t\tentries = append(entries, entry)\n+\t}\n+\n+\tif err := scanner.Err(); err != nil {\n+\t\treturn nil, err\n+\t}\n+\n+\t// We might have read slightly more if we landed in the middle of a line (unlikely with this logic)\n+\t// or if the file grew (we hold lock though).\n+\t// But scanner reads line by line.\n+\t// Just return what we got. If we got more than n, slice it.\n+\tif len(entries) > n {\n+\t\tentries = entries[len(entries)-n:]\n+\t}\n+\n+\treturn entries, nil\n }\n \n // ReadForSession reads entries for a specific session.\n@@ -253,6 +335,10 @@ func Prune(keep int) (int, error) {\n \t\treturn 0, err\n \t}\n \n+\tif err := os.Chmod(tmpFile.Name(), 0644); err != nil {\n+\t\treturn 0, err\n+\t}\n+\n \t// Atomic rename\n \tif err := os.Rename(tmpFile.Name(), path); err != nil {\n \t\treturn 0, err"
+    },
+    {
+      "sha": "5c8d615d237e5f2167c4716562a5458b12d71ba7",
+      "filename": "internal/session/lock_unix.go",
+      "status": "added",
+      "additions": 44,
+      "deletions": 0,
+      "changes": 44,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/49bd65a6de7121914d0389ba1563ffbd69ad1d8b/internal%2Fsession%2Flock_unix.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/49bd65a6de7121914d0389ba1563ffbd69ad1d8b/internal%2Fsession%2Flock_unix.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fsession%2Flock_unix.go?ref=49bd65a6de7121914d0389ba1563ffbd69ad1d8b",
+      "patch": "@@ -0,0 +1,44 @@\n+//go:build unix\n+\n+package session\n+\n+import (\n+\t\"os\"\n+\t\"path/filepath\"\n+\t\"sync\"\n+\t\"syscall\"\n+)\n+\n+var localMu sync.Mutex\n+\n+// acquireLock acquires both process-level (flock) and thread-level (mutex) locks.\n+// Returns an unlock function to release both.\n+func acquireLock() (func(), error) {\n+\tlocalMu.Lock()\n+\n+\t// Ensure directory exists for lock file\n+\tdir := StorageDir()\n+\tif err := os.MkdirAll(dir, 0755); err != nil {\n+\t\tlocalMu.Unlock()\n+\t\treturn nil, err\n+\t}\n+\n+\tlockPath := filepath.Join(dir, \"session.lock\")\n+\tf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0666)\n+\tif err != nil {\n+\t\tlocalMu.Unlock()\n+\t\treturn nil, err\n+\t}\n+\n+\tif err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {\n+\t\tf.Close()\n+\t\tlocalMu.Unlock()\n+\t\treturn nil, err\n+\t}\n+\n+\treturn func() {\n+\t\t_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)\n+\t\tf.Close()\n+\t\tlocalMu.Unlock()\n+\t}, nil\n+}"
+    },
+    {
+      "sha": "321024230d5a16b4dbb94657b93cd22b5166d32a",
+      "filename": "internal/session/lock_windows.go",
+      "status": "added",
+      "additions": 27,
+      "deletions": 0,
+      "changes": 27,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/49bd65a6de7121914d0389ba1563ffbd69ad1d8b/internal%2Fsession%2Flock_windows.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/49bd65a6de7121914d0389ba1563ffbd69ad1d8b/internal%2Fsession%2Flock_windows.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fsession%2Flock_windows.go?ref=49bd65a6de7121914d0389ba1563ffbd69ad1d8b",
+      "patch": "@@ -0,0 +1,27 @@\n+//go:build windows\n+\n+package session\n+\n+import (\n+\t\"os\"\n+\t\"sync\"\n+)\n+\n+var localMu sync.Mutex\n+\n+// acquireLock acquires thread-level (mutex) lock only.\n+// Windows file locking is complex, skipping for now (CLI usage is low concurrency).\n+func acquireLock() (func(), error) {\n+\tlocalMu.Lock()\n+\n+\t// Ensure directory exists\n+\tdir := StorageDir()\n+\tif err := os.MkdirAll(dir, 0755); err != nil {\n+\t\tlocalMu.Unlock()\n+\t\treturn nil, err\n+\t}\n+\n+\treturn func() {\n+\t\tlocalMu.Unlock()\n+\t}, nil\n+}"
+    },
+    {
+      "sha": "13cc2454fcfa7858f308b87064d807d870228e8d",
+      "filename": "internal/session/storage.go",
+      "status": "modified",
+      "additions": 46,
+      "deletions": 4,
+      "changes": 50,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/49bd65a6de7121914d0389ba1563ffbd69ad1d8b/internal%2Fsession%2Fstorage.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/49bd65a6de7121914d0389ba1563ffbd69ad1d8b/internal%2Fsession%2Fstorage.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fsession%2Fstorage.go?ref=49bd65a6de7121914d0389ba1563ffbd69ad1d8b",
+      "patch": "@@ -31,6 +31,12 @@ func StorageDir() string {\n \n // Save writes a session state to disk.\n func Save(state *SessionState, opts SaveOptions) (string, error) {\n+\tunlock, err := acquireLock()\n+\tif err != nil {\n+\t\treturn \"\", err\n+\t}\n+\tdefer unlock()\n+\n \tdir := StorageDir()\n \n \t// Ensure directory exists\n@@ -62,9 +68,33 @@ func Save(state *SessionState, opts SaveOptions) (string, error) {\n \t\treturn \"\", fmt.Errorf(\"failed to serialize session state: %w\", err)\n \t}\n \n-\t// Write file\n-\tif err := os.WriteFile(path, data, 0644); err != nil {\n-\t\treturn \"\", fmt.Errorf(\"failed to write session file: %w\", err)\n+\t// Atomic write: write to temp file then rename\n+\ttmpFile, err := os.CreateTemp(dir, \"session-*.tmp\")\n+\tif err != nil {\n+\t\treturn \"\", fmt.Errorf(\"creating temp file: %w\", err)\n+\t}\n+\ttmpPath := tmpFile.Name()\n+\n+\t// Ensure cleanup on error\n+\tdefer func() {\n+\t\t_ = tmpFile.Close()\n+\t\tif err != nil {\n+\t\t\t_ = os.Remove(tmpPath)\n+\t\t}\n+\t}()\n+\n+\tif _, err = tmpFile.Write(data); err != nil {\n+\t\treturn \"\", fmt.Errorf(\"writing to temp file: %w\", err)\n+\t}\n+\tif err = tmpFile.Sync(); err != nil {\n+\t\treturn \"\", fmt.Errorf(\"syncing temp file: %w\", err)\n+\t}\n+\tif err = tmpFile.Close(); err != nil {\n+\t\treturn \"\", fmt.Errorf(\"closing temp file: %w\", err)\n+\t}\n+\n+\tif err = os.Rename(tmpPath, path); err != nil {\n+\t\treturn \"\", fmt.Errorf(\"renaming session file: %w\", err)\n \t}\n \n \treturn path, nil\n@@ -93,10 +123,16 @@ func Load(name string) (*SessionState, error) {\n \n // Delete removes a saved session.\n func Delete(name string) error {\n+\tunlock, err := acquireLock()\n+\tif err != nil {\n+\t\treturn err\n+\t}\n+\tdefer unlock()\n+\n \tname = sanitizeFilename(name)\n \tpath := filepath.Join(StorageDir(), name+fileExtension)\n \n-\terr := os.Remove(path)\n+\terr = os.Remove(path)\n \tif os.IsNotExist(err) {\n \t\treturn fmt.Errorf(\"no saved session named '%s'\", name)\n \t}\n@@ -116,6 +152,12 @@ type SavedSession struct {\n \n // List returns all saved sessions.\n func List() ([]SavedSession, error) {\n+\tunlock, err := acquireLock()\n+\tif err != nil {\n+\t\treturn nil, err\n+\t}\n+\tdefer unlock()\n+\n \tdir := StorageDir()\n \n \tentries, err := os.ReadDir(dir)"
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "message": "feat: integrate vsock snapshot service into daemon\n\n- Add SnapshotService that handles snapshot requests from VMs\n- Add ListTaskSnapshots method for querying task snapshots\n- VM ID to task ID resolution (with TODO for CID mapping)\n- Snapshot service starts automatically with daemon\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "76c98a883242e027467b9f748ec5100b9e43a33b",
+      "filename": "pkg/daemon/daemon.go",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 5,
+      "changes": 19,
+      "blob_url": "https://github.com/prime-radiant-inc/stockyard/blob/fbc213bd6b35b77129439d97abed3718ac997ee0/pkg%2Fdaemon%2Fdaemon.go",
+      "raw_url": "https://github.com/prime-radiant-inc/stockyard/raw/fbc213bd6b35b77129439d97abed3718ac997ee0/pkg%2Fdaemon%2Fdaemon.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/stockyard/contents/pkg%2Fdaemon%2Fdaemon.go?ref=fbc213bd6b35b77129439d97abed3718ac997ee0",
+      "patch": "@@ -17,11 +17,12 @@ import (\n \n // Daemon is the core daemon process that manages workspaces and tasks.\n type Daemon struct {\n-\tcfg      *config.Config\n-\tsecrets  secrets.Provider\n-\tzfs      *zfs.Manager\n-\tstate    *State\n-\ttasks    *TaskManager\n+\tcfg       *config.Config\n+\tsecrets   secrets.Provider\n+\tzfs       *zfs.Manager\n+\tstate     *State\n+\ttasks     *TaskManager\n+\tsnapshots *SnapshotService\n \n \tlistener   net.Listener\n \tgrpcServer *grpc.Server\n@@ -86,6 +87,14 @@ func (d *Daemon) Start(ctx context.Context) error {\n \n \tfmt.Printf(\"gRPC server started on %s\\n\", d.cfg.Daemon.SocketPath)\n \n+\t// Start snapshot service\n+\td.snapshots = NewSnapshotService(d)\n+\tgo func() {\n+\t\tif err := d.snapshots.Start(ctx); err != nil {\n+\t\t\tfmt.Printf(\"Snapshot service error: %v\\n\", err)\n+\t\t}\n+\t}()\n+\n \t<-ctx.Done()\n \treturn d.Stop()\n }"
+    },
+    {
+      "sha": "d37424857aaa0f254d25b59e27099fb54470235c",
+      "filename": "pkg/daemon/snapshots.go",
+      "status": "added",
+      "additions": 89,
+      "deletions": 0,
+      "changes": 89,
+      "blob_url": "https://github.com/prime-radiant-inc/stockyard/blob/fbc213bd6b35b77129439d97abed3718ac997ee0/pkg%2Fdaemon%2Fsnapshots.go",
+      "raw_url": "https://github.com/prime-radiant-inc/stockyard/raw/fbc213bd6b35b77129439d97abed3718ac997ee0/pkg%2Fdaemon%2Fsnapshots.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/stockyard/contents/pkg%2Fdaemon%2Fsnapshots.go?ref=fbc213bd6b35b77129439d97abed3718ac997ee0",
+      "patch": "@@ -0,0 +1,89 @@\n+// Package daemon provides the snapshot service for handling VM snapshot requests.\n+package daemon\n+\n+import (\n+\t\"context\"\n+\t\"fmt\"\n+\t\"log\"\n+\t\"strings\"\n+\n+\t\"github.com/obra/stockyard/pkg/vsock\"\n+)\n+\n+// SnapshotService handles snapshot requests from VMs\n+type SnapshotService struct {\n+\tdaemon *Daemon\n+\tserver *vsock.SnapshotServer\n+}\n+\n+// NewSnapshotService creates a new snapshot service\n+func NewSnapshotService(d *Daemon) *SnapshotService {\n+\tss := &SnapshotService{daemon: d}\n+\tss.server = vsock.NewSnapshotServer(ss.handleSnapshot)\n+\treturn ss\n+}\n+\n+// Start starts the snapshot service\n+func (ss *SnapshotService) Start(ctx context.Context) error {\n+\treturn ss.server.Listen(ctx)\n+}\n+\n+// handleSnapshot handles a snapshot request from a VM\n+func (ss *SnapshotService) handleSnapshot(vmID, label string) error {\n+\t// Map VM ID (CID) to task ID\n+\ttaskID, err := ss.resolveTaskID(vmID)\n+\tif err != nil {\n+\t\treturn fmt.Errorf(\"unknown VM: %w\", err)\n+\t}\n+\n+\tlog.Printf(\"Creating snapshot for task %s: %s\", taskID, label)\n+\n+\t// Create ZFS snapshot\n+\tsnapName, err := ss.daemon.zfs.CreateSnapshot(context.Background(), taskID, label)\n+\tif err != nil {\n+\t\treturn fmt.Errorf(\"failed to create snapshot: %w\", err)\n+\t}\n+\n+\tlog.Printf(\"Created snapshot: %s\", snapName)\n+\n+\t// Record in database (snapshot name already encodes the label)\n+\tif err := ss.daemon.state.RecordSnapshot(taskID, snapName); err != nil {\n+\t\tlog.Printf(\"Warning: failed to record snapshot in database: %v\", err)\n+\t\t// Don't fail - snapshot was created\n+\t}\n+\n+\treturn nil\n+}\n+\n+// resolveTaskID maps a VM identifier to a task ID\n+func (ss *SnapshotService) resolveTaskID(vmID string) (string, error) {\n+\t// For vsock, vmID is like \"cid-123\"\n+\t// For unix fallback, vmID is \"unix-client\" (for testing)\n+\n+\tif vmID == \"unix-client\" {\n+\t\t// In testing, just use the first running task\n+\t\ttasks, err := ss.daemon.state.ListTasks(\"running\")\n+\t\tif err != nil || len(tasks) == 0 {\n+\t\t\treturn \"\", fmt.Errorf(\"no running tasks\")\n+\t\t}\n+\t\treturn tasks[0].ID, nil\n+\t}\n+\n+\t// Extract CID and look up in task table\n+\t// The VM CID is stored when we create the VM\n+\tif strings.HasPrefix(vmID, \"cid-\") {\n+\t\t// TODO: Implement CID to task ID mapping\n+\t\t// For now, scan running tasks\n+\t\ttasks, err := ss.daemon.state.ListTasks(\"running\")\n+\t\tif err != nil {\n+\t\t\treturn \"\", err\n+\t\t}\n+\t\tif len(tasks) == 0 {\n+\t\t\treturn \"\", fmt.Errorf(\"no running tasks\")\n+\t\t}\n+\t\t// TODO: Match by CID\n+\t\treturn tasks[0].ID, nil\n+\t}\n+\n+\treturn \"\", fmt.Errorf(\"unknown VM ID format: %s\", vmID)\n+}"
+    },
+    {
+      "sha": "00273e530327dc76a61d207bbdabc91cc56a8781",
+      "filename": "pkg/daemon/state.go",
+      "status": "modified",
+      "additions": 33,
+      "deletions": 0,
+      "changes": 33,
+      "blob_url": "https://github.com/prime-radiant-inc/stockyard/blob/fbc213bd6b35b77129439d97abed3718ac997ee0/pkg%2Fdaemon%2Fstate.go",
+      "raw_url": "https://github.com/prime-radiant-inc/stockyard/raw/fbc213bd6b35b77129439d97abed3718ac997ee0/pkg%2Fdaemon%2Fstate.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/stockyard/contents/pkg%2Fdaemon%2Fstate.go?ref=fbc213bd6b35b77129439d97abed3718ac997ee0",
+      "patch": "@@ -340,3 +340,36 @@ func (s *State) RecordSnapshot(taskID, snapshotName string) error {\n \t}\n \treturn nil\n }\n+\n+// SnapshotRecord represents a snapshot in the database\n+type SnapshotRecord struct {\n+\tName      string\n+\tCreatedAt time.Time\n+}\n+\n+// ListTaskSnapshots lists all snapshots for a task\n+func (s *State) ListTaskSnapshots(taskID string) ([]SnapshotRecord, error) {\n+\trows, err := s.db.Query(\n+\t\t`SELECT snapshot_name, created_at FROM snapshots WHERE task_id = ? ORDER BY created_at DESC`,\n+\t\ttaskID,\n+\t)\n+\tif err != nil {\n+\t\treturn nil, fmt.Errorf(\"failed to list snapshots: %w\", err)\n+\t}\n+\tdefer rows.Close()\n+\n+\tvar snapshots []SnapshotRecord\n+\tfor rows.Next() {\n+\t\tvar snap SnapshotRecord\n+\t\tif err := rows.Scan(&snap.Name, &snap.CreatedAt); err != nil {\n+\t\t\treturn nil, fmt.Errorf(\"failed to scan snapshot: %w\", err)\n+\t\t}\n+\t\tsnapshots = append(snapshots, snap)\n+\t}\n+\n+\tif err := rows.Err(); err != nil {\n+\t\treturn nil, fmt.Errorf(\"error iterating snapshots: %w\", err)\n+\t}\n+\n+\treturn snapshots, nil\n+}"
+    }
+  ]
+}

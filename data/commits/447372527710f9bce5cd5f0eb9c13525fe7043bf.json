@@ -1,0 +1,125 @@
+{
+  "message": "Add RFC 6587 octet-counting support to parse_syslog\n\nThe `parse_syslog` function now supports RFC 6587 octet-counted framing\nvia the new `octet_counting` parameter:\n\n- Not specified: auto-detect and strip length prefix if valid\n- `octet_counting=true`: require prefix, warn if missing\n- `octet_counting=false`: never strip prefix\n\nThe implementation introduces `octet_length_parser`, a shared parser\ncombinator used by both `parse_syslog` (single-value) and `read_syslog`\n(streaming) to ensure consistent behavior.\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "d708ec77444d79b5126889f2a78f61e55f451016",
+      "filename": "changelog/unreleased/rfc-6587-octet-counting-support-for-syslog-parsing.md",
+      "status": "added",
+      "additions": 18,
+      "deletions": 0,
+      "changes": 18,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/447372527710f9bce5cd5f0eb9c13525fe7043bf/changelog%2Funreleased%2Frfc-6587-octet-counting-support-for-syslog-parsing.md",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/447372527710f9bce5cd5f0eb9c13525fe7043bf/changelog%2Funreleased%2Frfc-6587-octet-counting-support-for-syslog-parsing.md",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/changelog%2Funreleased%2Frfc-6587-octet-counting-support-for-syslog-parsing.md?ref=447372527710f9bce5cd5f0eb9c13525fe7043bf",
+      "patch": "@@ -0,0 +1,18 @@\n+---\n+title: RFC 6587 octet-counting support for syslog parsing\n+type: feature\n+authors:\n+  - mavam\n+  - claude\n+created: 2026-01-21T07:41:37.394369Z\n+---\n+\n+The `parse_syslog` function and `read_syslog` operator now support RFC 6587 octet-counted framing, where syslog messages are prefixed with their byte length (for example, `65 <syslog-message>`). This framing is commonly used in TCP-based syslog transport to handle message boundaries.\n+\n+The new `octet_counting` parameter offers three modes:\n+\n+- **Not specified (default)**: Auto-detect. The parser strips a length prefix if present and valid, otherwise parses the input as-is. This prevents false positives where input coincidentally starts with digits and a space.\n+- **`octet_counting=true`**: Require a length prefix. Emits a warning and returns null if the input lacks a valid prefix.\n+- **`octet_counting=false`**: Never strip a length prefix. Parse the input as-is.\n+\n+The implementation uses a shared `octet_length_parser` combinator across both streaming (`read_syslog`) and single-value (`parse_syslog`) parsing paths, ensuring consistent behavior."
+    },
+    {
+      "sha": "c536d56936c7b5ded2a9336cf3e72d0164d02f46",
+      "filename": "libtenzir/builtins/formats/syslog.cpp",
+      "status": "modified",
+      "additions": 42,
+      "deletions": 18,
+      "changes": 60,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/447372527710f9bce5cd5f0eb9c13525fe7043bf/libtenzir%2Fbuiltins%2Fformats%2Fsyslog.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/447372527710f9bce5cd5f0eb9c13525fe7043bf/libtenzir%2Fbuiltins%2Fformats%2Fsyslog.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Fbuiltins%2Fformats%2Fsyslog.cpp?ref=447372527710f9bce5cd5f0eb9c13525fe7043bf",
+      "patch": "@@ -7,6 +7,7 @@\n // SPDX-License-Identifier: BSD-3-Clause\n \n #include \"tenzir/detail/assert.hpp\"\n+#include \"tenzir/detail/narrow.hpp\"\n #include \"tenzir/tql2/eval.hpp\"\n #include \"tenzir/tql2/plugin.hpp\"\n \n@@ -744,19 +745,24 @@ auto parse_loop(generator<std::optional<std::string_view>> lines,\n   }\n }\n \n+/// RFC 6587 octet-counting length prefix parser.\n+/// Parses: MSG-LEN SP\n+/// where MSG-LEN is a positive decimal (NONZERO-DIGIT *DIGIT per RFC 6587).\n+inline constexpr auto octet_length_parser = parsers::u32 >> ' ';\n+\n inline auto split_octet(generator<chunk_ptr> input, diagnostic_handler& dh)\n   -> generator<std::optional<std::string_view>> {\n   auto buffer = std::string{};\n-  auto remaining_message_length = std::ptrdiff_t{};\n+  auto remaining_message_length = size_t{};\n   for (auto&& chunk : input) {\n-    if (! chunk || chunk->size() == 0) {\n+    if (not chunk || chunk->size() == 0) {\n       co_yield std::nullopt;\n       continue;\n     }\n     auto* chunk_begin = reinterpret_cast<const char*>(chunk->data());\n     const auto chunk_end = chunk_begin + chunk->size();\n-    auto chunk_length = [&]() {\n-      return chunk_end - chunk_begin;\n+    auto chunk_length = [&]() -> size_t {\n+      return static_cast<size_t>(chunk_end - chunk_begin);\n     };\n     // We still need bytes to continue a previous message\n     if (remaining_message_length > 0) {\n@@ -772,20 +778,16 @@ inline auto split_octet(generator<chunk_ptr> input, diagnostic_handler& dh)\n     }\n     // A new message starts in (the remainder of) the chunk\n     while (chunk_begin != chunk_end) {\n-      auto [ptr, ec]\n-        = std::from_chars(chunk_begin, chunk_end, remaining_message_length);\n-      if (ec != std::errc{}) {\n-        TENZIR_WARN(\n-          \"`{}`\", std::string_view{reinterpret_cast<const char*>(chunk->data()),\n-                                   chunk_end});\n+      auto msg_len = uint32_t{};\n+      auto it = chunk_begin;\n+      if (not octet_length_parser(it, chunk_end, msg_len)) {\n         TENZIR_WARN(\"`{}`\", std::string_view{chunk_begin, chunk_end});\n-        diagnostic::error(\"failed to parse octet: `{}`\",\n-                          std::make_error_code(ec).message())\n+        diagnostic::error(\"failed to parse octet-counting length prefix\")\n           .emit(dh);\n         co_return;\n       }\n-      // Remove the size prefix and conditionally one whitespace\n-      chunk_begin = ptr + (ptr != chunk_end);\n+      remaining_message_length = msg_len;\n+      chunk_begin = it;\n       // The new message is fully within this chunk\n       if (remaining_message_length <= chunk_length()) {\n         const auto message_end = chunk_begin + remaining_message_length;\n@@ -1207,17 +1209,19 @@ class parse_syslog final : public virtual function_plugin {\n   auto make_function(invocation inv, session ctx) const\n     -> failure_or<function_ptr> override {\n     auto expr = ast::expression{};\n+    auto octet_counting = std::optional<bool>{}; // nullopt = auto-detect\n     // TODO: Consider adding a `many` option to expect multiple json values.\n     auto parser = argument_parser2::function(name());\n     parser.positional(\"input\", expr, \"string\");\n+    parser.named(\"octet_counting\", octet_counting);\n     auto msb_parser = multi_series_builder_argument_parser{};\n     msb_parser.add_policy_to_parser(parser);\n     msb_parser.add_settings_to_parser(parser, true, false);\n     TRY(parser.parse(inv, ctx));\n     TRY(auto msb_opts, msb_parser.get_options(ctx));\n     return function_use::make(\n       [call = inv.call.get_location(), msb_opts = std::move(msb_opts),\n-       expr = std::move(expr)](evaluator eval, session ctx) {\n+       octet_counting, expr = std::move(expr)](evaluator eval, session ctx) {\n         return map_series(eval(expr), [&](series arg) {\n           auto f = detail::overload{\n             [&](const arrow::NullArray&) -> multi_series {\n@@ -1270,11 +1274,31 @@ class parse_syslog final : public virtual function_plugin {\n                   null();\n                   continue;\n                 }\n+                auto v = arg.Value(i);\n+                auto input = std::string_view{v.data(), v.size()};\n+                // Handle octet counting (RFC 6587 framing)\n+                if (octet_counting.value_or(true)) { // true or auto-detect\n+                  auto length = uint32_t{};\n+                  auto it = input.begin();\n+                  // For auto-detection, we require the stated length to match\n+                  // the remaining content exactly. This prevents false positives\n+                  // where input coincidentally starts with \"<digits><space>\".\n+                  if (octet_length_parser(it, input.end(), length)\n+                      && detail::narrow<uint32_t>(input.end() - it) == length) {\n+                    input = std::string_view{it, length};\n+                  } else if (octet_counting.has_value() && *octet_counting) {\n+                    // Explicitly required but not found\n+                    diagnostic::warning(\"expected octet-counted input\")\n+                      .primary(expr.get_location())\n+                      .emit(ctx);\n+                    null();\n+                    continue;\n+                  }\n+                }\n                 auto msg = message{};\n                 auto legacy_msg = legacy_message{};\n-                auto v = arg.Value(i);\n-                auto f = v.begin();\n-                auto l = v.end();\n+                auto f = input.begin();\n+                auto l = input.end();\n                 if (auto parser = message_parser{}; parser(f, l, msg)) {\n                   maybe_flush(builder_tag::syslog_builder);\n                   builder.add_new({std::move(msg), 0});"
+    },
+    {
+      "sha": "802c4ced542cfc1f14f7fdaef1a9702928441b75",
+      "filename": "test/tests/functions/parse_syslog/octet_counting.tql",
+      "status": "added",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/447372527710f9bce5cd5f0eb9c13525fe7043bf/test%2Ftests%2Ffunctions%2Fparse_syslog%2Foctet_counting.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/447372527710f9bce5cd5f0eb9c13525fe7043bf/test%2Ftests%2Ffunctions%2Fparse_syslog%2Foctet_counting.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Ffunctions%2Fparse_syslog%2Foctet_counting.tql?ref=447372527710f9bce5cd5f0eb9c13525fe7043bf",
+      "patch": "@@ -0,0 +1,6 @@\n+// Test octet counting in parse_syslog\n+// - Auto-detect with octet-counted input (65 bytes after the space)\n+// - Auto-detect with regular syslog (no prefix)\n+from { x: \"65 <165>1 2023-10-11T22:14:15.003Z host app 1234 ID01 - Test message\" },\n+     { x: \"<165>1 2023-10-11T22:14:15.003Z host app 1234 ID01 - Test message\" }\n+x = x.parse_syslog()"
+    },
+    {
+      "sha": "2f09369e9bb73bf75561fd0cc25793ae78b57133",
+      "filename": "test/tests/functions/parse_syslog/octet_counting.txt",
+      "status": "added",
+      "additions": 28,
+      "deletions": 0,
+      "changes": 28,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/447372527710f9bce5cd5f0eb9c13525fe7043bf/test%2Ftests%2Ffunctions%2Fparse_syslog%2Foctet_counting.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/447372527710f9bce5cd5f0eb9c13525fe7043bf/test%2Ftests%2Ffunctions%2Fparse_syslog%2Foctet_counting.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Ffunctions%2Fparse_syslog%2Foctet_counting.txt?ref=447372527710f9bce5cd5f0eb9c13525fe7043bf",
+      "patch": "@@ -0,0 +1,28 @@\n+{\n+  x: {\n+    facility: 20,\n+    severity: 5,\n+    version: 1,\n+    timestamp: 2023-10-11T22:14:15.003Z,\n+    hostname: \"host\",\n+    app_name: \"app\",\n+    process_id: \"1234\",\n+    message_id: \"ID01\",\n+    structured_data: {},\n+    message: \"Test message\",\n+  },\n+}\n+{\n+  x: {\n+    facility: 20,\n+    severity: 5,\n+    version: 1,\n+    timestamp: 2023-10-11T22:14:15.003Z,\n+    hostname: \"host\",\n+    app_name: \"app\",\n+    process_id: \"1234\",\n+    message_id: \"ID01\",\n+    structured_data: {},\n+    message: \"Test message\",\n+  },\n+}"
+    },
+    {
+      "sha": "69dcbc136e8737b22536b6fd0269182ed985d4ac",
+      "filename": "test/tests/functions/parse_syslog/octet_counting_disabled.tql",
+      "status": "added",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/447372527710f9bce5cd5f0eb9c13525fe7043bf/test%2Ftests%2Ffunctions%2Fparse_syslog%2Foctet_counting_disabled.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/447372527710f9bce5cd5f0eb9c13525fe7043bf/test%2Ftests%2Ffunctions%2Fparse_syslog%2Foctet_counting_disabled.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Ffunctions%2Fparse_syslog%2Foctet_counting_disabled.tql?ref=447372527710f9bce5cd5f0eb9c13525fe7043bf",
+      "patch": "@@ -0,0 +1,3 @@\n+// Test explicit octet_counting=false (never strips prefix)\n+from { x: \"<165>1 2023-10-11T22:14:15.003Z host app 1234 ID01 - Test message\" }\n+x = x.parse_syslog(octet_counting=false)"
+    },
+    {
+      "sha": "676674b063e77b314cf859924959fb4fcb1fc4f2",
+      "filename": "test/tests/functions/parse_syslog/octet_counting_disabled.txt",
+      "status": "added",
+      "additions": 14,
+      "deletions": 0,
+      "changes": 14,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/447372527710f9bce5cd5f0eb9c13525fe7043bf/test%2Ftests%2Ffunctions%2Fparse_syslog%2Foctet_counting_disabled.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/447372527710f9bce5cd5f0eb9c13525fe7043bf/test%2Ftests%2Ffunctions%2Fparse_syslog%2Foctet_counting_disabled.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Ffunctions%2Fparse_syslog%2Foctet_counting_disabled.txt?ref=447372527710f9bce5cd5f0eb9c13525fe7043bf",
+      "patch": "@@ -0,0 +1,14 @@\n+{\n+  x: {\n+    facility: 20,\n+    severity: 5,\n+    version: 1,\n+    timestamp: 2023-10-11T22:14:15.003Z,\n+    hostname: \"host\",\n+    app_name: \"app\",\n+    process_id: \"1234\",\n+    message_id: \"ID01\",\n+    structured_data: {},\n+    message: \"Test message\",\n+  },\n+}"
+    },
+    {
+      "sha": "9b12f7300edb30f55aef5531b4f8b0bc8129e0a9",
+      "filename": "test/tests/functions/parse_syslog/octet_counting_explicit.tql",
+      "status": "added",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/447372527710f9bce5cd5f0eb9c13525fe7043bf/test%2Ftests%2Ffunctions%2Fparse_syslog%2Foctet_counting_explicit.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/447372527710f9bce5cd5f0eb9c13525fe7043bf/test%2Ftests%2Ffunctions%2Fparse_syslog%2Foctet_counting_explicit.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Ffunctions%2Fparse_syslog%2Foctet_counting_explicit.tql?ref=447372527710f9bce5cd5f0eb9c13525fe7043bf",
+      "patch": "@@ -0,0 +1,3 @@\n+// Test explicit octet_counting=true (expects prefix, warns if not found)\n+from { x: \"65 <165>1 2023-10-11T22:14:15.003Z host app 1234 ID01 - Test message\" }\n+x = x.parse_syslog(octet_counting=true)"
+    },
+    {
+      "sha": "676674b063e77b314cf859924959fb4fcb1fc4f2",
+      "filename": "test/tests/functions/parse_syslog/octet_counting_explicit.txt",
+      "status": "added",
+      "additions": 14,
+      "deletions": 0,
+      "changes": 14,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/447372527710f9bce5cd5f0eb9c13525fe7043bf/test%2Ftests%2Ffunctions%2Fparse_syslog%2Foctet_counting_explicit.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/447372527710f9bce5cd5f0eb9c13525fe7043bf/test%2Ftests%2Ffunctions%2Fparse_syslog%2Foctet_counting_explicit.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Ffunctions%2Fparse_syslog%2Foctet_counting_explicit.txt?ref=447372527710f9bce5cd5f0eb9c13525fe7043bf",
+      "patch": "@@ -0,0 +1,14 @@\n+{\n+  x: {\n+    facility: 20,\n+    severity: 5,\n+    version: 1,\n+    timestamp: 2023-10-11T22:14:15.003Z,\n+    hostname: \"host\",\n+    app_name: \"app\",\n+    process_id: \"1234\",\n+    message_id: \"ID01\",\n+    structured_data: {},\n+    message: \"Test message\",\n+  },\n+}"
+    },
+    {
+      "sha": "25c11839769b4760a11d948fbaaf5c21d5ea0036",
+      "filename": "test/tests/functions/parse_syslog/octet_counting_missing.tql",
+      "status": "added",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/447372527710f9bce5cd5f0eb9c13525fe7043bf/test%2Ftests%2Ffunctions%2Fparse_syslog%2Foctet_counting_missing.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/447372527710f9bce5cd5f0eb9c13525fe7043bf/test%2Ftests%2Ffunctions%2Fparse_syslog%2Foctet_counting_missing.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Ffunctions%2Fparse_syslog%2Foctet_counting_missing.tql?ref=447372527710f9bce5cd5f0eb9c13525fe7043bf",
+      "patch": "@@ -0,0 +1,3 @@\n+// Test octet_counting=true with input missing the octet prefix (should warn)\n+from { x: \"<165>1 2023-10-11T22:14:15.003Z host app 1234 ID01 - Test message\" }\n+x = x.parse_syslog(octet_counting=true)"
+    },
+    {
+      "sha": "3817e6d256d622ba2893aae01a2cb186d9fcb8e9",
+      "filename": "test/tests/functions/parse_syslog/octet_counting_missing.txt",
+      "status": "added",
+      "additions": 9,
+      "deletions": 0,
+      "changes": 9,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/447372527710f9bce5cd5f0eb9c13525fe7043bf/test%2Ftests%2Ffunctions%2Fparse_syslog%2Foctet_counting_missing.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/447372527710f9bce5cd5f0eb9c13525fe7043bf/test%2Ftests%2Ffunctions%2Fparse_syslog%2Foctet_counting_missing.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Ffunctions%2Fparse_syslog%2Foctet_counting_missing.txt?ref=447372527710f9bce5cd5f0eb9c13525fe7043bf",
+      "patch": "@@ -0,0 +1,9 @@\n+{\n+  x: null,\n+}\n+warning: expected octet-counted input\n+ --> tests/functions/parse_syslog/octet_counting_missing.tql:3:5\n+  |\n+3 | x = x.parse_syslog(octet_counting=true)\n+  |     ~ \n+  |"
+    }
+  ]
+}

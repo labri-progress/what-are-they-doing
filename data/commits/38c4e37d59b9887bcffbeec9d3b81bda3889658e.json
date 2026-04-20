@@ -1,0 +1,41 @@
+{
+  "message": "fix(distributed): widen ESI acceptance range for high-loss recovery scenarios\n\nrecovery.rs:\n- Increase the ESI range guard from max_expected + 100 to max_expected + 50_000\n  in add_collected_with_verify. The previous +100 buffer was too tight for\n  high-loss network scenarios where receivers legitimately need thousands of\n  repair symbols beyond the source block count. RaptorQ supports up to ~16M\n  ESIs, so 50k repair symbols is a safe upper bound that still catches obvious\n  garbage (random/corrupt ESI values) while accommodating realistic repair\n  overhead in degraded network conditions\n\nbridge.rs:\n- Add TODO(Phase 4) comment in apply_snapshot documenting that the current\n  implementation only acknowledges the snapshot sequence number, making the\n  bridge effectively write-only. Recovery and follower replica use cases will\n  need full local state application\n\ntests/repro_recovery_high_esi.rs:\n- New integration test that creates a symbol with ESI 200 (K=10, old limit was\n  110) and verifies it is NOT rejected as CorruptedSymbol. The test provides\n  9 low-ESI source symbols plus 1 high-ESI repair symbol and confirms that\n  any failure is a decoding error (expected with zero-filled test data), not\n  a range-check rejection\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "7a0d2ed11165beb35261264f095f3291de296104",
+      "filename": "src/distributed/bridge.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/38c4e37d59b9887bcffbeec9d3b81bda3889658e/src%2Fdistributed%2Fbridge.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/38c4e37d59b9887bcffbeec9d3b81bda3889658e/src%2Fdistributed%2Fbridge.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fdistributed%2Fbridge.rs?ref=38c4e37d59b9887bcffbeec9d3b81bda3889658e",
+      "patch": "@@ -708,6 +708,9 @@ impl RegionBridge {\n         // Apply state from snapshot.\n         // Note: we can only set the local state if the snapshot state maps\n         // to a valid transition. For simplicity, we just update sync state.\n+        // TODO(Phase 4): Implement full state application. Currently this only acknowledges\n+        // the snapshot sequence, effectively making the bridge write-only (pushing to replicas).\n+        // For recovery or follower replicas, we need to update self.local state here.\n         self.sync_state.last_synced_sequence = snapshot.sequence;\n         self.sync_state.sync_pending = false;\n "
+    },
+    {
+      "sha": "8cd5a1458192b6907c8dd51aa65c2df2df944e1d",
+      "filename": "src/distributed/recovery.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 1,
+      "changes": 5,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/38c4e37d59b9887bcffbeec9d3b81bda3889658e/src%2Fdistributed%2Frecovery.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/38c4e37d59b9887bcffbeec9d3b81bda3889658e/src%2Fdistributed%2Frecovery.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fdistributed%2Frecovery.rs?ref=38c4e37d59b9887bcffbeec9d3b81bda3889658e",
+      "patch": "@@ -320,7 +320,10 @@ impl RecoveryCollector {\n             let max_expected = params\n                 .total_source_symbols()\n                 .saturating_add(self.config.min_symbols);\n-            if cs.symbol.esi() > max_expected.saturating_add(100) {\n+            // Allow a large buffer for additional repair symbols (e.g. high loss scenarios).\n+            // RaptorQ supports up to 16M ESIs; 50k repair symbols is a safe upper bound\n+            // that still catches obvious garbage.\n+            if cs.symbol.esi() > max_expected.saturating_add(50_000) {\n                 self.metrics.symbols_corrupt += 1;\n                 return Err(Error::new(ErrorKind::CorruptedSymbol).with_message(format!(\n                     \"ESI {} exceeds expected range for object\","
+    },
+    {
+      "sha": "ddd84018cbe95e4ae4c4388cf424fefc4013c1f9",
+      "filename": "tests/repro_recovery_high_esi.rs",
+      "status": "added",
+      "additions": 77,
+      "deletions": 0,
+      "changes": 77,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/38c4e37d59b9887bcffbeec9d3b81bda3889658e/tests%2Frepro_recovery_high_esi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/38c4e37d59b9887bcffbeec9d3b81bda3889658e/tests%2Frepro_recovery_high_esi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/tests%2Frepro_recovery_high_esi.rs?ref=38c4e37d59b9887bcffbeec9d3b81bda3889658e",
+      "patch": "@@ -0,0 +1,77 @@\n+use asupersync::distributed::{\n+    CollectedSymbol, RecoveryConfig, RecoveryDecodingConfig, RecoveryOrchestrator, RecoveryTrigger,\n+};\n+use asupersync::security::tag::AuthenticationTag;\n+use asupersync::types::symbol::{ObjectId, ObjectParams, Symbol};\n+use asupersync::types::{RegionId, Time};\n+use std::time::Duration;\n+\n+#[test]\n+fn repro_recovery_high_esi_accepted() {\n+    let mut orchestrator =\n+        RecoveryOrchestrator::new(RecoveryConfig::default(), RecoveryDecodingConfig::default());\n+\n+    let trigger = RecoveryTrigger::ManualTrigger {\n+        region_id: RegionId::new_for_test(1, 0),\n+        initiator: \"test\".to_string(),\n+        reason: None,\n+    };\n+\n+    // Parameters: K=10.\n+    // Max expected source = 10.\n+    // Old limit = 10 + 100 = 110.\n+    // New limit = 10 + 50_000 = 50_010.\n+    let params = ObjectParams::new(ObjectId::new_for_test(1), 1000, 128, 1, 10);\n+\n+    // Create a symbol with ESI 200 (would fail before fix).\n+    let high_esi_symbol = CollectedSymbol {\n+        symbol: Symbol::new_for_test(1, 0, 200, &[0u8; 128]),\n+        tag: AuthenticationTag::zero(),\n+        source_replica: \"r1\".to_string(),\n+        collected_at: Time::ZERO,\n+        verified: false,\n+    };\n+\n+    // We need 10 symbols to decode.\n+    // Provide 9 low ESI symbols + 1 high ESI symbol.\n+    let mut symbols = Vec::new();\n+    for i in 0..9 {\n+        symbols.push(CollectedSymbol {\n+            symbol: Symbol::new_for_test(1, 0, i, &[0u8; 128]),\n+            tag: AuthenticationTag::zero(),\n+            source_replica: \"r1\".to_string(),\n+            collected_at: Time::ZERO,\n+            verified: false,\n+        });\n+    }\n+    symbols.push(high_esi_symbol);\n+\n+    // Attempt recovery.\n+    // Note: Decoding will fail because the data is just zeroes and doesn't match a real snapshot.\n+    // BUT, we want to check that it doesn't fail with \"CorruptedSymbol\" (ESI out of range).\n+    // It should fail with \"DecodingFailed\" or similar, or succeed if we disable integrity checks and provide consistent zero data (which RaptorQ might decode to zeroes).\n+    // Actually, RaptorQ decoding of all-zero symbols results in all-zero output.\n+    // The `decode_snapshot` step will fail deserialization if it's garbage.\n+    // So we expect `DecodingFailed` (deserialization error), NOT `CorruptedSymbol`.\n+\n+    let result =\n+        orchestrator.recover_from_symbols(&trigger, &symbols, params, Duration::from_millis(10));\n+\n+    match result {\n+        Ok(_) => {\n+            // Surprise success (zeroes decoded to valid snapshot? unlikely but possible if 0 is valid proto)\n+            // Ideally we check if `metrics.symbols_corrupt` is 0.\n+            assert_eq!(orchestrator.progress().symbols_collected, 10);\n+        }\n+        Err(e) => {\n+            // Assert it is NOT CorruptedSymbol\n+            assert_ne!(\n+                e.kind(),\n+                asupersync::error::ErrorKind::CorruptedSymbol,\n+                \"High ESI symbol was rejected as corrupt: {}\",\n+                e\n+            );\n+            // It might fail decoding, which is fine for this test.\n+        }\n+    }\n+}"
+    }
+  ]
+}

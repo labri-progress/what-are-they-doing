@@ -1,0 +1,29 @@
+{
+  "message": "perf(json): optimize string unescape with bulk memcpy\n\n- NEON SIMD for quote/escape detection (16 bytes at a time)\n- Bulk memcpy for non-escape string segments",
+  "files": [
+    {
+      "sha": "ba46489ea0a1087d99ab777babbf3142699f2940",
+      "filename": "packages/runtime/src/json/parse_arena.zig",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 6,
+      "changes": 20,
+      "blob_url": "https://github.com/teamchong/metal0/blob/76e8653ce9815f5c976f13c559ac7f5374ff2a31/packages%2Fruntime%2Fsrc%2Fjson%2Fparse_arena.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/76e8653ce9815f5c976f13c559ac7f5374ff2a31/packages%2Fruntime%2Fsrc%2Fjson%2Fparse_arena.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/packages%2Fruntime%2Fsrc%2Fjson%2Fparse_arena.zig?ref=76e8653ce9815f5c976f13c559ac7f5374ff2a31",
+      "patch": "@@ -324,15 +324,27 @@ fn parseString(data: []const u8, pos: usize, arena: *JsonArena) JsonError!ParseR\n     return ParseResult(*runtime.PyObject).init(obj, consumed);\n }\n \n-/// Unescape JSON string\n+/// Unescape JSON string - optimized to copy non-escape segments in bulk\n fn unescapeString(str: []const u8, arena: *JsonArena) ![]const u8 {\n     // Allocate max possible size\n     const dest = try arena.allocSlice(u8, str.len);\n     var j: usize = 0;\n     var i: usize = 0;\n \n     while (i < str.len) {\n-        if (str[i] == '\\\\' and i + 1 < str.len) {\n+        // Find next backslash (start of escape sequence)\n+        const copy_start = i;\n+        while (i < str.len and str[i] != '\\\\') : (i += 1) {}\n+\n+        // Bulk copy non-escape segment\n+        const copy_len = i - copy_start;\n+        if (copy_len > 0) {\n+            @memcpy(dest[j..][0..copy_len], str[copy_start..][0..copy_len]);\n+            j += copy_len;\n+        }\n+\n+        // Handle escape sequence if found\n+        if (i < str.len and str[i] == '\\\\' and i + 1 < str.len) {\n             const escape_char = str[i + 1];\n             switch (escape_char) {\n                 '\"' => dest[j] = '\"',\n@@ -370,10 +382,6 @@ fn unescapeString(str: []const u8, arena: *JsonArena) ![]const u8 {\n             }\n             j += 1;\n             i += 2;\n-        } else {\n-            dest[j] = str[i];\n-            j += 1;\n-            i += 1;\n         }\n     }\n "
+    },
+    {
+      "sha": "8f876f35e1adceba7ea457ba06d880f09509084b",
+      "filename": "packages/shared/json/simd/aarch64.zig",
+      "status": "modified",
+      "additions": 55,
+      "deletions": 2,
+      "changes": 57,
+      "blob_url": "https://github.com/teamchong/metal0/blob/76e8653ce9815f5c976f13c559ac7f5374ff2a31/packages%2Fshared%2Fjson%2Fsimd%2Faarch64.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/76e8653ce9815f5c976f13c559ac7f5374ff2a31/packages%2Fshared%2Fjson%2Fsimd%2Faarch64.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/packages%2Fshared%2Fjson%2Fsimd%2Faarch64.zig?ref=76e8653ce9815f5c976f13c559ac7f5374ff2a31",
+      "patch": "@@ -204,7 +204,60 @@ test \"hasEscapesNeon\" {\n     try std.testing.expect(hasEscapesNeon(\"hello\\\\nworld\"));\n }\n \n+/// Find closing quote AND detect escapes using NEON\n+/// Processes 16 bytes at a time for faster string scanning\n pub fn findClosingQuoteAndEscapesNeon(data: []const u8) ?@import(\"dispatch.zig\").QuoteAndEscapeResult {\n-    // Use scalar implementation (SIMD escape tracking is complex, scalar is proven correct)\n-    return scalar.findClosingQuoteAndEscapes(data);\n+    if (data.len < 16) {\n+        return scalar.findClosingQuoteAndEscapes(data);\n+    }\n+\n+    var i: usize = 0;\n+    var has_escapes = false;\n+    const end = data.len - 16;\n+\n+    const quote_vec: @Vector(16, u8) = @splat('\"');\n+    const backslash_vec: @Vector(16, u8) = @splat('\\\\');\n+    const control_max: @Vector(16, u8) = @splat(0x1F);\n+\n+    // SIMD fast path: scan 16 bytes at a time looking for quote/backslash/control\n+    while (i <= end) {\n+        const chunk: @Vector(16, u8) = data[i..][0..16].*;\n+\n+        const is_quote = chunk == quote_vec;\n+        const is_backslash = chunk == backslash_vec;\n+        const is_control = chunk <= control_max;\n+\n+        // Check for any terminating character (quote, backslash, or control char)\n+        const is_terminator = is_quote | is_backslash | is_control;\n+\n+        if (@reduce(.Or, is_terminator)) {\n+            // Found something, switch to byte-by-byte from here\n+            break;\n+        }\n+\n+        i += 16;\n+    }\n+\n+    // Byte-by-byte for remainder and to handle escapes correctly\n+    while (i < data.len) {\n+        const c = data[i];\n+        if (c == '\"') {\n+            return .{\n+                .quote_pos = i,\n+                .has_escapes = has_escapes,\n+            };\n+        } else if (c == '\\\\') {\n+            has_escapes = true;\n+            i += 1; // Skip escape character\n+            if (i >= data.len) return null;\n+            i += 1; // Skip escaped character\n+        } else if (c < 0x20) {\n+            // Control character - invalid in JSON string\n+            return null;\n+        } else {\n+            i += 1;\n+        }\n+    }\n+\n+    return null; // No closing quote found\n }"
+    }
+  ]
+}

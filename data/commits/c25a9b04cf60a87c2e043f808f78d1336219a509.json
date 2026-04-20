@@ -1,0 +1,29 @@
+{
+  "message": "Add message-based error classification for ambiguous HTTP status codes\n\nFor 400/422 responses, check message text for classification signals before\ndefaulting to InvalidRequestError. Maps \"content filter\"/\"safety\" to\nContentFilterError, \"context length\"/\"too many tokens\" to ContextLengthError,\n\"quota\"/\"billing\" to QuotaExceededError, \"not found\"/\"does not exist\" to\nNotFoundError. Unambiguous status codes (401, 429, etc.) are not affected.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "9b6771ad147882e38242dc9bc80471d2b144109f",
+      "filename": "internal/llm/errors.go",
+      "status": "modified",
+      "additions": 23,
+      "deletions": 0,
+      "changes": 23,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/c25a9b04cf60a87c2e043f808f78d1336219a509/internal%2Fllm%2Ferrors.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/c25a9b04cf60a87c2e043f808f78d1336219a509/internal%2Fllm%2Ferrors.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/internal%2Fllm%2Ferrors.go?ref=c25a9b04cf60a87c2e043f808f78d1336219a509",
+      "patch": "@@ -73,7 +73,11 @@ func ErrorFromHTTPStatus(provider string, statusCode int, message string, raw an\n \t}\n \tswitch statusCode {\n \tcase 400, 422:\n+\t\t// Ambiguous status codes: check message for more specific classification.\n \t\tbase.retryable = false\n+\t\tif err := classifyByMessage(base); err != nil {\n+\t\t\treturn err\n+\t\t}\n \t\treturn &InvalidRequestError{base}\n \tcase 401:\n \t\tbase.retryable = false\n@@ -103,6 +107,25 @@ func ErrorFromHTTPStatus(provider string, statusCode int, message string, raw an\n \t}\n }\n \n+// classifyByMessage checks the error message for classification signals when\n+// the HTTP status code is ambiguous (e.g., 400/422). Returns nil if no match.\n+func classifyByMessage(base httpErrorBase) error {\n+\tlower := strings.ToLower(base.message)\n+\tswitch {\n+\tcase strings.Contains(lower, \"content filter\") || strings.Contains(lower, \"safety\"):\n+\t\treturn &ContentFilterError{base}\n+\tcase strings.Contains(lower, \"context length\") || strings.Contains(lower, \"too many tokens\"):\n+\t\treturn &ContextLengthError{base}\n+\tcase strings.Contains(lower, \"quota\") || strings.Contains(lower, \"billing\"):\n+\t\treturn &QuotaExceededError{base}\n+\tcase strings.Contains(lower, \"not found\") || strings.Contains(lower, \"does not exist\"):\n+\t\treturn &NotFoundError{base}\n+\tcase strings.Contains(lower, \"unauthorized\") || strings.Contains(lower, \"invalid key\"):\n+\t\treturn &AuthenticationError{base}\n+\t}\n+\treturn nil\n+}\n+\n // NewRequestTimeoutError constructs a non-HTTP timeout error (e.g., context deadline\n // exceeded) that matches the unified error hierarchy. These timeouts are not retried\n // by default (spec)."
+    },
+    {
+      "sha": "ce63fc532d0175549f7d950263ddaec051fd6748",
+      "filename": "internal/llm/errors_test.go",
+      "status": "modified",
+      "additions": 38,
+      "deletions": 0,
+      "changes": 38,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/c25a9b04cf60a87c2e043f808f78d1336219a509/internal%2Fllm%2Ferrors_test.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/c25a9b04cf60a87c2e043f808f78d1336219a509/internal%2Fllm%2Ferrors_test.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/internal%2Fllm%2Ferrors_test.go?ref=c25a9b04cf60a87c2e043f808f78d1336219a509",
+      "patch": "@@ -2,6 +2,7 @@ package llm\n \n import (\n \t\"errors\"\n+\t\"fmt\"\n \t\"testing\"\n \t\"time\"\n )\n@@ -118,3 +119,40 @@ func TestQuotaExceededError_ImplementsErrorInterface(t *testing.T) {\n \t}\n }\n \n+func TestErrorFromHTTPStatus_MessageBasedClassification(t *testing.T) {\n+\tcases := []struct {\n+\t\tname    string\n+\t\tstatus  int\n+\t\tmessage string\n+\t\twant    string // expected error type name\n+\t}{\n+\t\t// Ambiguous 400 classified by message.\n+\t\t{\"400 content filter\", 400, \"content filter policy violated\", \"*llm.ContentFilterError\"},\n+\t\t{\"400 safety\", 400, \"blocked by safety settings\", \"*llm.ContentFilterError\"},\n+\t\t{\"400 context length\", 400, \"context length exceeded\", \"*llm.ContextLengthError\"},\n+\t\t{\"400 too many tokens\", 400, \"too many tokens in request\", \"*llm.ContextLengthError\"},\n+\t\t{\"400 quota\", 400, \"quota exceeded for billing account\", \"*llm.QuotaExceededError\"},\n+\t\t{\"400 billing\", 400, \"billing issue on account\", \"*llm.QuotaExceededError\"},\n+\t\t{\"400 not found\", 400, \"model does not exist\", \"*llm.NotFoundError\"},\n+\t\t{\"400 plain\", 400, \"bad request\", \"*llm.InvalidRequestError\"},\n+\n+\t\t// Unambiguous status codes should NOT be overridden by message.\n+\t\t{\"401 always auth\", 401, \"content filter something\", \"*llm.AuthenticationError\"},\n+\t\t{\"429 always rate\", 429, \"quota exceeded\", \"*llm.RateLimitError\"},\n+\t\t{\"404 always notfound\", 404, \"quota exceeded\", \"*llm.NotFoundError\"},\n+\n+\t\t// 422 is ambiguous like 400.\n+\t\t{\"422 content filter\", 422, \"this violates safety policy\", \"*llm.ContentFilterError\"},\n+\t\t{\"422 plain\", 422, \"invalid field\", \"*llm.InvalidRequestError\"},\n+\t}\n+\tfor _, tc := range cases {\n+\t\tt.Run(tc.name, func(t *testing.T) {\n+\t\t\terr := ErrorFromHTTPStatus(\"p\", tc.status, tc.message, nil, nil)\n+\t\t\tgot := fmt.Sprintf(\"%T\", err)\n+\t\t\tif got != tc.want {\n+\t\t\t\tt.Fatalf(\"ErrorFromHTTPStatus(%d, %q) = %s, want %s\", tc.status, tc.message, got, tc.want)\n+\t\t\t}\n+\t\t})\n+\t}\n+}\n+"
+    }
+  ]
+}

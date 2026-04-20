@@ -1,0 +1,173 @@
+{
+  "message": "Integrate poltergeist watch mode",
+  "files": [
+    {
+      "sha": "8a6ffcfc0662ea6e81566f13f5893cfe0f685f45",
+      "filename": "README.md",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 1,
+      "changes": 4,
+      "blob_url": "https://github.com/steipete/tmuxwatch/blob/4d6727f045b3a2142c8681023e415289400edb22/README.md",
+      "raw_url": "https://github.com/steipete/tmuxwatch/raw/4d6727f045b3a2142c8681023e415289400edb22/README.md",
+      "contents_url": "https://api.github.com/repos/steipete/tmuxwatch/contents/README.md?ref=4d6727f045b3a2142c8681023e415289400edb22",
+      "patch": "@@ -28,7 +28,9 @@ tmux new-session -d -s watch './gorunfresh --trace-mouse'\n tmux attach -t watch\n \n # prefer to run outside tmux?\n-./gorunfresh --dump  # runs directly unless TMUXWATCH_FORCE_TMUX=1 is set\n+./gorunfresh --dump   # runs directly unless TMUXWATCH_FORCE_TMUX=1 is set\n+./gorunfresh --watch  # starts poltergeist + polter --watch to auto-restart after successful builds\n+./scripts/run-hot.sh  # single command that starts daemon in the background and launches tmuxwatch with hot reload\n ```\n Press `q` (or double `ctrl+c`) to exit. Prefer running tmuxwatch in its own tmux session to keep the UI isolated from your workspaces. For local development you can substitute `./gorunfresh --debug-click 30,10 --trace-mouse` inside the session to replay a mouse event while inspecting BubbleZone logs.\n "
+    },
+    {
+      "sha": "e76e73fba144eae7beb6c011ced6dc3c2c9ba3d5",
+      "filename": "docs/hotreload.md",
+      "status": "added",
+      "additions": 134,
+      "deletions": 0,
+      "changes": 134,
+      "blob_url": "https://github.com/steipete/tmuxwatch/blob/4d6727f045b3a2142c8681023e415289400edb22/docs%2Fhotreload.md",
+      "raw_url": "https://github.com/steipete/tmuxwatch/raw/4d6727f045b3a2142c8681023e415289400edb22/docs%2Fhotreload.md",
+      "contents_url": "https://api.github.com/repos/steipete/tmuxwatch/contents/docs%2Fhotreload.md?ref=4d6727f045b3a2142c8681023e415289400edb22",
+      "patch": "@@ -0,0 +1,134 @@\n+# Hot Reload & Auto-Run Support\n+\n+> Draft specification outlining the new \u201cwatch and rerun\u201d workflows for Poltergeist and the `polter` CLI.\n+\n+## Goals\n+\n+- **Watch-mode for `polter`**: add a first-class `--watch` flag that keeps a target executable running and restarts it whenever Poltergeist completes a *successful* rebuild.\n+- **Config-driven auto-run**: allow `executable` targets to opt into automatic launch/relaunch directly from the Poltergeist daemon without needing the `polter` wrapper.\n+- **Event-friendly architecture**: surface build-success notifications in-process so both the new runner and third-party tooling can subscribe without polling state files.\n+- **tmux-friendly dev loop**: tmuxwatch will rely on this feature to keep its TUI session fresh while `poltergeist` handles background builds.\n+\n+## Scope & Non-Goals\n+\n+- \u2705 Add CLI flags, configuration schema, runtime glue, docs, and regression tests.\n+- \u2705 Ensure graceful shutdown/restart semantics (default `SIGINT`, configurable).\n+- \u2705 Update `dist/` output (polter, poltergeist) once TypeScript changes land.\n+- \u274c Do not ship GUI integration yet (mac app changes postponed).\n+- \u274c No attempt to support multiple simultaneous auto-run processes per target; one runner per target is enough.\n+\n+## High-Level Design\n+\n+### 1. `polter --watch`\n+\n+- Extend shared CLI options (`src/cli-shared/polter-command.ts`) with:\n+  - `-w, --watch` (boolean, default `false`)\n+  - `--restart-signal <sig>` (default `SIGINT`)\n+  - `--restart-delay <ms>` (default `250`)\n+- `ParsedPolterOptions` grows `watch`, `restartSignal`, `restartDelay`.\n+- `runWrapper` (`src/polter.ts`) branches:\n+  ```ts\n+  if (options.watch) {\n+    await runWithWatchMode({ target, projectRoot, options, args });\n+    return;\n+  }\n+  ```\n+- New helper `runWithWatchMode`:\n+  - Ensures daemon is running / build succeeded first (reuse existing checks).\n+  - Launch binary via extracted `launchTargetProcess(target, projectRoot, args, options)` (refactor from `executeTarget` so both call sites share code).\n+  - Watches the target\u2019s state file using `fs.watchFile` (portable) and throttled JSON parsing:\n+    - On change, reload state.\n+    - If `lastBuild.status === \"success\"` and timestamp differs from last seen, restart child process (send configured signal, wait for exit, relaunch).\n+    - Ignore failures (show toast/log once, continue running the previous build).\n+  - Handles teardown on `SIGINT/SIGTERM` and when user presses `Ctrl+C`.\n+  - Optional enhancement: `--no-restart-on-failure` (default true).\n+\n+### 2. Config-Driven Auto-Run\n+\n+- Extend `ExecutableTarget` & schema (`src/types.ts`) with:\n+  ```ts\n+  autoRun?: {\n+    enabled?: boolean;          // default false\n+    command?: string;           // default: built binary\n+    args?: string[];\n+    restartSignal?: NodeJS.Signals;// default SIGINT\n+    restartDelayMs?: number;    // default 250\n+    env?: Record<string, string>;\n+  };\n+  ```\n+- Update `ExecutableTargetSchema` accordingly.\n+- `Poltergeist` target state adds optional `runner`.\n+  ```ts\n+  interface TargetState {\n+    ...\n+    runner?: ExecutableRunner;\n+  }\n+  ```\n+- Create `src/runners/executable-runner.ts`:\n+  - Accepts target metadata, manages a child process.\n+  - Methods: `start(initialBuildStatus)`, `stop()`, `onBuildStarted()`, `onBuildSucceeded(status)`, `onBuildFailed()`.\n+  - Maintains last-success timestamp to avoid duplicate relaunches.\n+  - Uses `spawn` with inherited stdio and optional env overrides.\n+- In `Poltergeist.start`:\n+  - If `target.autoRun?.enabled`, instantiate runner after builder validation (`state.runner = new ExecutableRunner(...)`).\n+  - After successful build inside `buildTarget`, `state.runner?.onBuildSucceeded(status)`.\n+  - On build failure, optionally surface message, keep previous process alive.\n+  - On daemon stop, `state.runner?.stop()`.\n+\n+### 3. Event Hooks\n+\n+- `StateManager` grows an `EventEmitter`.\n+  - `this.events.emit('status', targetName, buildStatus);` inside `updateBuildStatus`.\n+  - Expose `onStatus(listener)` and `offStatus`.\n+- `Poltergeist` runner can subscribe instead of reading files, but we still update the file for compatibility.\n+- Re-export emitter (or subscribe via `poltergeist.getStateManager()`).\n+\n+### 4. Shared Launch Helpers\n+\n+- Extract process launch logic (`executeTarget` / `executeStaleWithWarning`) into `launchBinary(options)`.\n+- Ensures both CLI watch mode and daemon runner use identical spawn semantics and error messages.\n+\n+## Implementation Steps\n+\n+1. **CLI plumbing**\n+   - Update `POLTER_OPTIONS` + parser + TypeScript types.\n+   - Refactor execute helpers; add `runWithWatchMode`.\n+   - Unit tests for option parsing & watch helper (using Vitest mocks).\n+\n+2. **StateManager events**\n+   - Introduce emitter, add tests verifying emissions.\n+\n+3. **ExecutableRunner**\n+   - New module with start/stop/restart logic & tests (mock child process via `child_process.spawn` stub).\n+   - Wire into Poltergeist core (start, buildTarget, stop).\n+\n+4. **Schema & config**\n+   - Extend types & schemas (update `docs/API.md`, `docs/EXAMPLES.md`).\n+   - Provide default values & validation messages when misconfigured (e.g., autoRun without outputPath).\n+\n+5. **Documentation**\n+   - `README` quick-start snippet for `polter target --watch`.\n+   - New section in docs about auto-run config & CLI flags.\n+   - Update CHANGELOG with feature summary.\n+\n+6. **Distribution**\n+   - Run `pnpm build` (or `bun scripts/build-bun.js`) to refresh `dist`.\n+   - For tmuxwatch integration: add `poltergeist.config.json`, helper script, README notes.\n+\n+7. **End-to-End test (manual)**\n+   - In tmux session:\n+     1. `pnpm build` (ensure poltergeist CLI uses new code).\n+     2. `poltergeist haunt --target tmuxwatch-cli` (new config).\n+     3. `polter tmuxwatch-cli --watch`.\n+     4. Edit Go file \u2192 confirm auto rebuild & tmuxwatch restart without manual intervention.\n+\n+## Open Questions\n+\n+- Do we auto-start the daemon if `polter --watch` detects it\u2019s offline? (Initial plan: warn & exit; optional enhancement later).\n+- Should watch mode restart on *any* rebuild completion vs only success? (Current spec: success only; maybe add `--restart-on-failure` flag if needed).\n+- How do we surface build failures during watch mode? (Proposal: print summary + keep previous process alive; optionally tail logs on demand).\n+- For auto-run, do we allow multiple concurrently running commands per target? (Out of scope; only one runner per target).\n+\n+---\n+\n+This document will evolve as implementation progresses. Update the \u201cSteps\u201d checklist above as features land."
+    },
+    {
+      "sha": "f17293ab1180c8aba7257087bca5cb824385d722",
+      "filename": "gorunfresh",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 5,
+      "changes": 15,
+      "blob_url": "https://github.com/steipete/tmuxwatch/blob/4d6727f045b3a2142c8681023e415289400edb22/gorunfresh",
+      "raw_url": "https://github.com/steipete/tmuxwatch/raw/4d6727f045b3a2142c8681023e415289400edb22/gorunfresh",
+      "contents_url": "https://api.github.com/repos/steipete/tmuxwatch/contents/gorunfresh?ref=4d6727f045b3a2142c8681023e415289400edb22",
+      "patch": "@@ -6,11 +6,16 @@ SCRIPT_DIR=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd)\"\n REPO_ROOT=\"$SCRIPT_DIR\"\n \n if [[ -z \"${TMUX:-}\" ]]; then\n-  if [[ \"${TMUXWATCH_FORCE_TMUX:-0}\" == \"1\" ]]; then\n-    echo \"tmuxwatch must run inside tmux. Try: tmux new-session -s watch './gorunfresh'\" >&2\n-    exit 1\n-  fi\n-  echo \"[tmuxwatch] TMUX not detected; running directly. Set TMUXWATCH_FORCE_TMUX=1 to require tmux.\" >&2\n+\tif [[ \"${TMUXWATCH_FORCE_TMUX:-0}\" == \"1\" ]]; then\n+\t\techo \"tmuxwatch must run inside tmux. Try: tmux new-session -s watch './gorunfresh'\" >&2\n+\t\texit 1\n+\tfi\n+\techo \"[tmuxwatch] TMUX not detected; running directly. Set TMUXWATCH_FORCE_TMUX=1 to require tmux.\" >&2\n+fi\n+\n+if [[ \"${1:-}\" == \"--watch\" ]]; then\n+\tshift\n+\texec \"$REPO_ROOT/scripts/run-watch.sh\" \"$@\"\n fi\n \n exec \"$REPO_ROOT/scripts/run-fresh.sh\" \"$@\""
+    },
+    {
+      "sha": "2970eff2f494f1e3c3d2bd35022fb358421050aa",
+      "filename": "internal/ui/cards.go",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 10,
+      "changes": 25,
+      "blob_url": "https://github.com/steipete/tmuxwatch/blob/4d6727f045b3a2142c8681023e415289400edb22/internal%2Fui%2Fcards.go",
+      "raw_url": "https://github.com/steipete/tmuxwatch/raw/4d6727f045b3a2142c8681023e415289400edb22/internal%2Fui%2Fcards.go",
+      "contents_url": "https://api.github.com/repos/steipete/tmuxwatch/contents/internal%2Fui%2Fcards.go?ref=4d6727f045b3a2142c8681023e415289400edb22",
+      "patch": "@@ -28,21 +28,22 @@ func (m *Model) renderSessionPreviews(offset int) string {\n \t\treturn \"\"\n \t}\n \n-\tcols := 1\n-\tif m.viewMode != viewModeDetail && len(sessions) > 1 && m.width >= 70 {\n-\t\tcols = 2\n-\t}\n-\tm.cardCols = cols\n+\tcols := max(1, m.cardCols)\n \tm.ensureCursor(sessions)\n \tbaseStyle := lipgloss.NewStyle().\n \t\tBorder(lipgloss.RoundedBorder()).\n \t\tBorderForeground(lipgloss.Color(borderColorBase)).\n \t\tPadding(0, cardPadding)\n \n-\tinnerWidth := max(20, (m.width/cols)-(cardPadding*2+2))\n+\tinnerWidth := m.cardInnerWidth\n+\tif innerWidth < 1 {\n+\t\tinnerWidth = max(20, (m.width/cols)-(cardPadding*2+2))\n+\t}\n \tcellWidth := innerWidth + cardPadding*2 + 2\n-\trows := (len(sessions) + cols - 1) / cols\n-\tinnerHeight := max(minPreviewHeight, (m.height-offset-3)/max(1, rows))\n+\tinnerHeight := m.cardInnerHeight\n+\tif innerHeight < 0 {\n+\t\tinnerHeight = 0\n+\t}\n \n \tgrid := make([][]string, 0)\n \tnow := time.Now()\n@@ -61,8 +62,12 @@ func (m *Model) renderSessionPreviews(offset int) string {\n \t\t\tcontinue\n \t\t}\n \n-\t\tpreview.viewport.SetWidth(innerWidth)\n-\t\tpreview.viewport.SetHeight(innerHeight)\n+\t\tif preview.viewport.Width() != innerWidth {\n+\t\t\tpreview.viewport.SetWidth(innerWidth)\n+\t\t}\n+\t\tif preview.viewport.Height() != innerHeight {\n+\t\t\tpreview.viewport.SetHeight(innerHeight)\n+\t\t}\n \n \t\tpulsing := now.Sub(preview.lastChanged) < pulseDuration\n \t\tstale := m.isStale(session.ID)"
+    },
+    {
+      "sha": "b99fce325f64c831c2440debbce7b23755fe1624",
+      "filename": "internal/ui/layout.go",
+      "status": "modified",
+      "additions": 83,
+      "deletions": 19,
+      "changes": 102,
+      "blob_url": "https://github.com/steipete/tmuxwatch/blob/4d6727f045b3a2142c8681023e415289400edb22/internal%2Fui%2Flayout.go",
+      "raw_url": "https://github.com/steipete/tmuxwatch/raw/4d6727f045b3a2142c8681023e415289400edb22/internal%2Fui%2Flayout.go",
+      "contents_url": "https://api.github.com/repos/steipete/tmuxwatch/contents/internal%2Fui%2Flayout.go?ref=4d6727f045b3a2142c8681023e415289400edb22",
+      "patch": "@@ -39,36 +39,100 @@ func (m *Model) updatePreviewDimensions(count int) {\n \tif count <= 0 || m.width <= 0 || m.height <= 0 {\n \t\treturn\n \t}\n-\tcols := 1\n-\tif m.viewMode != viewModeDetail && count > 1 && m.width >= 70 {\n-\t\tcols = 2\n-\t}\n-\trows := (count + cols - 1) / cols\n \toffset := m.previewOffset\n \tif offset <= 0 || offset >= m.height {\n \t\toffset = topPaddingLines\n \t}\n \tfooterHeight := max(1, m.footerHeight)\n \tavailableHeight := m.height - offset - footerHeight - gridSpacing\n-\tif availableHeight < minPreviewHeight {\n-\t\tavailableHeight = minPreviewHeight\n+\tif availableHeight < 1 {\n+\t\tavailableHeight = 1\n+\t}\n+\tconst (\n+\t\tframeHeight     = 3\n+\t\tminInnerWidth   = 20\n+\t\tcolumnOverhead  = cardPadding*2 + 2\n+\t\tminColumnStride = minInnerWidth + columnOverhead\n+\t)\n+\n+\tmaxCols := 1\n+\tif m.viewMode != viewModeDetail && count > 1 {\n+\t\tmaxCols = min(count, max(1, m.width/minColumnStride))\n \t}\n-\tframeHeight := 3 // header + top/bottom border\n-\tbodyBudget := availableHeight - rows*frameHeight\n-\tif bodyBudget < rows {\n-\t\tbodyBudget = rows\n+\n+\tselectedCols := 1\n+\tselectedHeight := 0\n+\tselectedWidth := max(1, m.width-columnOverhead)\n+\tfoundFit := false\n+\n+\tfor cols := maxCols; cols >= 1; cols-- {\n+\t\tcolumnWidth := m.width / cols\n+\t\tif columnWidth < minColumnStride && cols > 1 {\n+\t\t\tcontinue\n+\t\t}\n+\t\tinnerWidth := columnWidth - columnOverhead\n+\t\tif innerWidth < 1 {\n+\t\t\tinnerWidth = 1\n+\t\t}\n+\t\trows := (count + cols - 1) / cols\n+\t\tif rows < 1 {\n+\t\t\trows = 1\n+\t\t}\n+\t\tbodyBudget := availableHeight - rows*frameHeight\n+\t\tif bodyBudget < 0 {\n+\t\t\tbodyBudget = 0\n+\t\t}\n+\t\tcellBody := 0\n+\t\tif rows > 0 {\n+\t\t\tcellBody = bodyBudget / rows\n+\t\t}\n+\t\tcandidateHeight := 0\n+\t\tswitch {\n+\t\tcase cellBody > 2:\n+\t\t\tcandidateHeight = cellBody - 2\n+\t\tcase cellBody > 0:\n+\t\t\tcandidateHeight = 1\n+\t\tdefault:\n+\t\t\tcandidateHeight = 0\n+\t\t}\n+\n+\t\tpredicted := rows * (frameHeight + candidateHeight)\n+\t\tif !foundFit {\n+\t\t\tselectedCols = cols\n+\t\t\tselectedWidth = innerWidth\n+\t\t\tselectedHeight = candidateHeight\n+\t\t}\n+\t\tif predicted <= availableHeight {\n+\t\t\t// distribute leftover height evenly if possible\n+\t\t\tslack := availableHeight - predicted\n+\t\t\tif slack > 0 && rows > 0 {\n+\t\t\t\tcandidateHeight += slack / rows\n+\t\t\t\tif candidateHeight < 0 {\n+\t\t\t\t\tcandidateHeight = 0\n+\t\t\t\t}\n+\t\t\t}\n+\t\t\tselectedCols = cols\n+\t\t\tselectedWidth = innerWidth\n+\t\t\tselectedHeight = candidateHeight\n+\t\t\tfoundFit = true\n+\t\t\tbreak\n+\t\t}\n+\t}\n+\n+\tif selectedWidth < 1 {\n+\t\tselectedWidth = 1\n \t}\n-\tinnerHeight := max(1, bodyBudget/max(1, rows))\n-\tif innerHeight > 2 {\n-\t\tinnerHeight -= 2\n-\t} else if innerHeight > 1 {\n-\t\tinnerHeight = 1\n+\tif selectedHeight < 0 {\n+\t\tselectedHeight = 0\n \t}\n-\tinnerWidth := max(20, (m.width/cols)-(cardPadding*2+2))\n+\n+\tm.cardCols = selectedCols\n+\tm.cardInnerWidth = selectedWidth\n+\tm.cardInnerHeight = selectedHeight\n \tfor _, preview := range m.previews {\n \t\tif preview.viewport != nil {\n-\t\t\tpreview.viewport.SetWidth(innerWidth)\n-\t\t\tpreview.viewport.SetHeight(innerHeight)\n+\t\t\tpreview.viewport.SetWidth(m.cardInnerWidth)\n+\t\t\tpreview.viewport.SetHeight(m.cardInnerHeight)\n \t\t}\n \t}\n }"
+    },
+    {
+      "sha": "4b7b9cd58cfd9467b9637ee4a028599fdb623b69",
+      "filename": "internal/ui/layout_test.go",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 3,
+      "changes": 6,
+      "blob_url": "https://github.com/steipete/tmuxwatch/blob/4d6727f045b3a2142c8681023e415289400edb22/internal%2Fui%2Flayout_test.go",
+      "raw_url": "https://github.com/steipete/tmuxwatch/raw/4d6727f045b3a2142c8681023e415289400edb22/internal%2Fui%2Flayout_test.go",
+      "contents_url": "https://api.github.com/repos/steipete/tmuxwatch/contents/internal%2Fui%2Flayout_test.go?ref=4d6727f045b3a2142c8681023e415289400edb22",
+      "patch": "@@ -100,8 +100,8 @@ func TestUpdatePreviewDimensionsKeepsReserve(t *testing.T) {\n \n \tpreview := m.previews[\"s\"].viewport\n \tavailable := m.height - m.previewOffset - max(1, m.footerHeight) - gridSpacing\n-\t// Each card adds a 3-line chrome; viewport keeps two lines slack for padding.\n-\tif preview.Height()+5 > available {\n-\t\tt.Fatalf(\"card footprint %d exceeds available grid height %d\", preview.Height()+5, available)\n+\t// Each card adds a 3-line chrome (border + header).\n+\tif preview.Height()+3 > available {\n+\t\tt.Fatalf(\"card footprint %d exceeds available grid height %d\", preview.Height()+3, available)\n \t}\n }"
+    },
+    {
+      "sha": "e3f4358baa035b0c439351e307afc4f94cf71bec",
+      "filename": "internal/ui/model.go",
+      "status": "modified",
+      "additions": 32,
+      "deletions": 28,
+      "changes": 60,
+      "blob_url": "https://github.com/steipete/tmuxwatch/blob/4d6727f045b3a2142c8681023e415289400edb22/internal%2Fui%2Fmodel.go",
+      "raw_url": "https://github.com/steipete/tmuxwatch/raw/4d6727f045b3a2142c8681023e415289400edb22/internal%2Fui%2Fmodel.go",
+      "contents_url": "https://api.github.com/repos/steipete/tmuxwatch/contents/internal%2Fui%2Fmodel.go?ref=4d6727f045b3a2142c8681023e415289400edb22",
+      "patch": "@@ -129,14 +129,16 @@ type Model struct {\n \thoveredSession string\n \thoveredControl string\n \n-\tviewMode      viewMode\n-\tdetailSession string\n-\tactiveTab     int\n-\tcardCols      int\n-\tpreviewOffset int\n-\ttabSessionIDs []string\n-\tfooter        *viewport.Model\n-\tfooterHeight  int\n+\tviewMode        viewMode\n+\tdetailSession   string\n+\tactiveTab       int\n+\tcardCols        int\n+\tcardInnerWidth  int\n+\tcardInnerHeight int\n+\tpreviewOffset   int\n+\ttabSessionIDs   []string\n+\tfooter          *viewport.Model\n+\tfooterHeight    int\n \n \tdebugMsgs  []tea.Msg\n \ttraceMouse bool\n@@ -170,26 +172,28 @@ func NewModel(client *tmux.Client, poll time.Duration, debugMsgs []tea.Msg, trac\n \tti.CharLimit = 256\n \tti.Prompt = \"/ \"\n \treturn &Model{\n-\t\tclient:        client,\n-\t\tpollInterval:  poll,\n-\t\tzonePrefix:    zone.NewPrefix(),\n-\t\tpreviews:      make(map[string]*sessionPreview),\n-\t\thidden:        make(map[string]struct{}),\n-\t\tstale:         make(map[string]struct{}),\n-\t\tcollapsed:     make(map[string]struct{}),\n-\t\tsearchInput:   ti,\n-\t\tcardLayout:    make([]cardBounds, 0),\n-\t\tcardCols:      1,\n-\t\tinflight:      true,\n-\t\tpreviewOffset: topPaddingLines,\n-\t\tdebugMsgs:     append([]tea.Msg(nil), debugMsgs...),\n-\t\ttraceMouse:    traceMouse,\n-\t\ttoast:         &toastState{},\n-\t\tviewMode:      viewModeOverview,\n-\t\ttabSessionIDs: make([]string, 0),\n-\t\tfooter:        footerViewport(),\n-\t\tfooterHeight:  3,\n-\t\thostname:      lookupHostname(),\n+\t\tclient:          client,\n+\t\tpollInterval:    poll,\n+\t\tzonePrefix:      zone.NewPrefix(),\n+\t\tpreviews:        make(map[string]*sessionPreview),\n+\t\thidden:          make(map[string]struct{}),\n+\t\tstale:           make(map[string]struct{}),\n+\t\tcollapsed:       make(map[string]struct{}),\n+\t\tsearchInput:     ti,\n+\t\tcardLayout:      make([]cardBounds, 0),\n+\t\tcardCols:        1,\n+\t\tcardInnerWidth:  20,\n+\t\tcardInnerHeight: minPreviewHeight,\n+\t\tinflight:        true,\n+\t\tpreviewOffset:   topPaddingLines,\n+\t\tdebugMsgs:       append([]tea.Msg(nil), debugMsgs...),\n+\t\ttraceMouse:      traceMouse,\n+\t\ttoast:           &toastState{},\n+\t\tviewMode:        viewModeOverview,\n+\t\ttabSessionIDs:   make([]string, 0),\n+\t\tfooter:          footerViewport(),\n+\t\tfooterHeight:    3,\n+\t\thostname:        lookupHostname(),\n \t}\n }\n "
+    },
+    {
+      "sha": "b1ec3fdf83dff39143b04075c86a9b53d6a40148",
+      "filename": "internal/ui/state.go",
+      "status": "modified",
+      "additions": 34,
+      "deletions": 4,
+      "changes": 38,
+      "blob_url": "https://github.com/steipete/tmuxwatch/blob/4d6727f045b3a2142c8681023e415289400edb22/internal%2Fui%2Fstate.go",
+      "raw_url": "https://github.com/steipete/tmuxwatch/raw/4d6727f045b3a2142c8681023e415289400edb22/internal%2Fui%2Fstate.go",
+      "contents_url": "https://api.github.com/repos/steipete/tmuxwatch/contents/internal%2Fui%2Fstate.go?ref=4d6727f045b3a2142c8681023e415289400edb22",
+      "patch": "@@ -48,17 +48,47 @@ func (m *Model) renderTabBar(width int) string {\n \tif len(titles) == 0 {\n \t\treturn \"\"\n \t}\n-\tsegments := make([]string, 0, len(titles))\n+\ttype tabSegment struct {\n+\t\trendered string\n+\t\twidth    int\n+\t\tzoneID   string\n+\t}\n+\tsegments := make([]tabSegment, 0, len(titles))\n \tfor i, title := range titles {\n \t\tstyle := tabInactiveStyle\n \t\tif i == m.activeTab {\n \t\t\tstyle = tabActiveStyle\n \t\t}\n \t\tzoneID := fmt.Sprintf(\"%s###tab:%d\", m.zonePrefix, i)\n-\t\tsegments = append(segments, zone.Mark(zoneID, style.Render(title)))\n+\t\trendered := style.Render(title)\n+\t\tsegments = append(segments, tabSegment{\n+\t\t\trendered: rendered,\n+\t\t\twidth:    lipgloss.Width(rendered),\n+\t\t\tzoneID:   zoneID,\n+\t\t})\n+\t}\n+\ttargetWidth := max(1, width)\n+\trows := make([]string, 0, len(segments))\n+\tcurrent := make([]string, 0, len(segments))\n+\tcurrentWidth := 0\n+\tfor _, seg := range segments {\n+\t\tmarked := zone.Mark(seg.zoneID, seg.rendered)\n+\t\tif currentWidth > 0 && currentWidth+seg.width > targetWidth {\n+\t\t\trow := lipgloss.JoinHorizontal(lipgloss.Left, current...)\n+\t\t\trowWidth := max(targetWidth, lipgloss.Width(row))\n+\t\t\trows = append(rows, lipgloss.NewStyle().Width(rowWidth).Render(row))\n+\t\t\tcurrent = current[:0]\n+\t\t\tcurrentWidth = 0\n+\t\t}\n+\t\tcurrent = append(current, marked)\n+\t\tcurrentWidth += seg.width\n+\t}\n+\tif len(current) > 0 {\n+\t\trow := lipgloss.JoinHorizontal(lipgloss.Left, current...)\n+\t\trowWidth := max(targetWidth, lipgloss.Width(row))\n+\t\trows = append(rows, lipgloss.NewStyle().Width(rowWidth).Render(row))\n \t}\n-\tbar := lipgloss.JoinHorizontal(lipgloss.Left, segments...)\n-\treturn lipgloss.PlaceHorizontal(max(width, lipgloss.Width(bar)), lipgloss.Left, bar)\n+\treturn lipgloss.JoinVertical(lipgloss.Left, rows...)\n }\n \n // shiftActiveTab moves the active tab by the provided delta, clamping to range."
+    },
+    {
+      "sha": "ab8e3bae0ae3bcf3f60d179a57e3f45c11203456",
+      "filename": "internal/ui/state_test.go",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 0,
+      "changes": 20,
+      "blob_url": "https://github.com/steipete/tmuxwatch/blob/4d6727f045b3a2142c8681023e415289400edb22/internal%2Fui%2Fstate_test.go",
+      "raw_url": "https://github.com/steipete/tmuxwatch/raw/4d6727f045b3a2142c8681023e415289400edb22/internal%2Fui%2Fstate_test.go",
+      "contents_url": "https://api.github.com/repos/steipete/tmuxwatch/contents/internal%2Fui%2Fstate_test.go?ref=4d6727f045b3a2142c8681023e415289400edb22",
+      "patch": "@@ -2,6 +2,7 @@\n package ui\n \n import (\n+\t\"strings\"\n \t\"testing\"\n \n \t\"github.com/steipete/tmuxwatch/internal/tmux\"\n@@ -27,6 +28,25 @@ func TestTabTitles(t *testing.T) {\n \t}\n }\n \n+// TestRenderTabBarWrapsWhenNarrow ensures the tab bar flows into multiple lines when constrained.\n+func TestRenderTabBarWrapsWhenNarrow(t *testing.T) {\n+\tt.Parallel()\n+\n+\tm := &Model{\n+\t\tsessions: []tmux.Session{\n+\t\t\t{ID: \"s1\", Name: \"alpha\"},\n+\t\t\t{ID: \"s2\", Name: \"beta\"},\n+\t\t\t{ID: \"s3\", Name: \"gamma\"},\n+\t\t\t{ID: \"s4\", Name: \"delta\"},\n+\t\t},\n+\t\tzonePrefix: \"component\",\n+\t}\n+\trendered := m.renderTabBar(12)\n+\tif strings.Count(rendered, \"\\n\") < 1 {\n+\t\tt.Fatalf(\"expected multiline tab bar, got %q\", rendered)\n+\t}\n+}\n+\n // TestSetActiveTabUpdatesViewMode confirms view mode tracks the active tab.\n func TestSetActiveTabUpdatesViewMode(t *testing.T) {\n \tt.Parallel()"
+    },
+    {
+      "sha": "b3d760286c1b0d07061d05a46037572b079fd8b0",
+      "filename": "internal/ui/update.go",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 1,
+      "changes": 5,
+      "blob_url": "https://github.com/steipete/tmuxwatch/blob/4d6727f045b3a2142c8681023e415289400edb22/internal%2Fui%2Fupdate.go",
+      "raw_url": "https://github.com/steipete/tmuxwatch/raw/4d6727f045b3a2142c8681023e415289400edb22/internal%2Fui%2Fupdate.go",
+      "contents_url": "https://api.github.com/repos/steipete/tmuxwatch/contents/internal%2Fui%2Fupdate.go?ref=4d6727f045b3a2142c8681023e415289400edb22",
+      "patch": "@@ -69,10 +69,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {\n \t\t\t\tcontent = \"Pane capture error: \" + msg.err.Error()\n \t\t\t}\n \t\t\tif content != preview.lastContent {\n+\t\t\t\twasAtBottom := preview.viewport.AtBottom()\n \t\t\t\tpreview.viewport.SetContent(content)\n \t\t\t\tpreview.lastContent = content\n \t\t\t\tpreview.lastChanged = time.Now()\n-\t\t\t\tpreview.viewport.GotoBottom()\n+\t\t\t\tif wasAtBottom {\n+\t\t\t\t\tpreview.viewport.GotoBottom()\n+\t\t\t\t}\n \t\t\t\tm.updateStaleSessions()\n \t\t\t}\n \t\t}"
+    },
+    {
+      "sha": "47c1df98705d8aef5c970ab91fe55d6b8f4855a5",
+      "filename": "internal/ui/update_test.go",
+      "status": "modified",
+      "additions": 96,
+      "deletions": 0,
+      "changes": 96,
+      "blob_url": "https://github.com/steipete/tmuxwatch/blob/4d6727f045b3a2142c8681023e415289400edb22/internal%2Fui%2Fupdate_test.go",
+      "raw_url": "https://github.com/steipete/tmuxwatch/raw/4d6727f045b3a2142c8681023e415289400edb22/internal%2Fui%2Fupdate_test.go",
+      "contents_url": "https://api.github.com/repos/steipete/tmuxwatch/contents/internal%2Fui%2Fupdate_test.go?ref=4d6727f045b3a2142c8681023e415289400edb22",
+      "patch": "@@ -2,6 +2,8 @@\n package ui\n \n import (\n+\t\"fmt\"\n+\t\"strings\"\n \t\"testing\"\n \t\"time\"\n \n@@ -84,3 +86,97 @@ func TestEnsurePreviewsCapturesDetailSessions(t *testing.T) {\n \t\tt.Fatalf(\"expected capture command for detail session\")\n \t}\n }\n+\n+// TestPaneContentRespectsManualScroll keeps manual offsets when the user scrolls away from the bottom.\n+func TestPaneContentRespectsManualScroll(t *testing.T) {\n+\tt.Parallel()\n+\n+\tlines := make([]string, 16)\n+\tfor i := range lines {\n+\t\tlines[i] = fmt.Sprintf(\"line%02d\", i)\n+\t}\n+\tcontent := strings.Join(lines, \"\\n\")\n+\tvp := viewportFor(innerDimension{width: 80, height: 6})\n+\tvp.SetContent(content)\n+\tvp.GotoBottom()\n+\tvp.ScrollUp(3)\n+\tif vp.AtBottom() {\n+\t\tt.Fatalf(\"expected viewport not at bottom after scrolling up\")\n+\t}\n+\tpreview := &sessionPreview{\n+\t\tviewport:    &vp,\n+\t\tpaneID:      \"%1\",\n+\t\tlastContent: content,\n+\t\tlastChanged: time.Now(),\n+\t}\n+\tm := &Model{\n+\t\tpreviews: map[string]*sessionPreview{\n+\t\t\t\"$1\": preview,\n+\t\t},\n+\t\tstale: make(map[string]struct{}),\n+\t}\n+\toriginalOffset := preview.viewport.YOffset()\n+\n+\tmsg := paneContentMsg{\n+\t\tsessionID: \"$1\",\n+\t\tpaneID:    \"%1\",\n+\t\ttext:      content + \"\\nextra-line\",\n+\t}\n+\tm.Update(msg)\n+\n+\tif got := preview.viewport.YOffset(); got != originalOffset {\n+\t\tt.Fatalf(\"unexpected YOffset, got %d want %d\", got, originalOffset)\n+\t}\n+\tif preview.viewport.AtBottom() {\n+\t\tt.Fatalf(\"viewport jumped to bottom after manual scroll\")\n+\t}\n+\twantContent := strings.TrimRight(msg.text, \"\\n\")\n+\tif got := preview.lastContent; got != wantContent {\n+\t\tt.Fatalf(\"lastContent = %q, want %q\", got, wantContent)\n+\t}\n+}\n+\n+// TestPaneContentFollowsBottom continues auto-follow when the viewport was already at the bottom.\n+func TestPaneContentFollowsBottom(t *testing.T) {\n+\tt.Parallel()\n+\n+\tlines := make([]string, 12)\n+\tfor i := range lines {\n+\t\tlines[i] = fmt.Sprintf(\"line%02d\", i)\n+\t}\n+\tcontent := strings.Join(lines, \"\\n\")\n+\tvp := viewportFor(innerDimension{width: 80, height: 6})\n+\tvp.SetContent(content)\n+\tvp.GotoBottom()\n+\tif !vp.AtBottom() {\n+\t\tt.Fatalf(\"expected viewport to be at bottom initially\")\n+\t}\n+\n+\tpreview := &sessionPreview{\n+\t\tviewport:    &vp,\n+\t\tpaneID:      \"%1\",\n+\t\tlastContent: content,\n+\t\tlastChanged: time.Now(),\n+\t}\n+\tm := &Model{\n+\t\tpreviews: map[string]*sessionPreview{\n+\t\t\t\"$1\": preview,\n+\t\t},\n+\t\tstale: make(map[string]struct{}),\n+\t}\n+\n+\tmsg := paneContentMsg{\n+\t\tsessionID: \"$1\",\n+\t\tpaneID:    \"%1\",\n+\t\ttext:      content + \"\\nextra-line\",\n+\t}\n+\tm.Update(msg)\n+\n+\tif !preview.viewport.AtBottom() {\n+\t\tt.Fatalf(\"expected viewport to remain at bottom when already there\")\n+\t}\n+\twantContent := strings.TrimRight(msg.text, \"\\n\")\n+\tif got := preview.lastContent; got != wantContent {\n+\t\tt.Fatalf(\"lastContent = %q, want %q\", got, wantContent)\n+\t}\n+}"
+    },
+    {
+      "sha": "6f69cb4fea43c4a8ab3b0f79951881e922d66e15",
+      "filename": "poltergeist.config.json",
+      "status": "added",
+      "additions": 21,
+      "deletions": 0,
+      "changes": 21,
+      "blob_url": "https://github.com/steipete/tmuxwatch/blob/4d6727f045b3a2142c8681023e415289400edb22/poltergeist.config.json",
+      "raw_url": "https://github.com/steipete/tmuxwatch/raw/4d6727f045b3a2142c8681023e415289400edb22/poltergeist.config.json",
+      "contents_url": "https://api.github.com/repos/steipete/tmuxwatch/contents/poltergeist.config.json?ref=4d6727f045b3a2142c8681023e415289400edb22",
+      "patch": "@@ -0,0 +1,21 @@\n+{\n+  \"version\": \"1.0\",\n+  \"projectType\": \"mixed\",\n+  \"targets\": [\n+    {\n+      \"name\": \"tmuxwatch-cli\",\n+      \"type\": \"executable\",\n+      \"buildCommand\": \"mkdir -p ./dist/dev && go build -o ./dist/dev/tmuxwatch ./cmd/tmuxwatch\",\n+      \"outputPath\": \"./dist/dev/tmuxwatch\",\n+      \"watchPaths\": [\n+        \"cmd/**/*.go\",\n+        \"internal/**/*.go\",\n+        \"go.mod\",\n+        \"go.sum\"\n+      ],\n+      \"environment\": {\n+        \"CGO_ENABLED\": \"0\"\n+      }\n+    }\n+  ]\n+}"
+    },
+    {
+      "sha": "98be002dbaea07c7b082015a391859a0e1b69f02",
+      "filename": "scripts/run-hot.sh",
+      "status": "added",
+      "additions": 22,
+      "deletions": 0,
+      "changes": 22,
+      "blob_url": "https://github.com/steipete/tmuxwatch/blob/4d6727f045b3a2142c8681023e415289400edb22/scripts%2Frun-hot.sh",
+      "raw_url": "https://github.com/steipete/tmuxwatch/raw/4d6727f045b3a2142c8681023e415289400edb22/scripts%2Frun-hot.sh",
+      "contents_url": "https://api.github.com/repos/steipete/tmuxwatch/contents/scripts%2Frun-hot.sh?ref=4d6727f045b3a2142c8681023e415289400edb22",
+      "patch": "@@ -0,0 +1,22 @@\n+#!/usr/bin/env bash\n+\n+set -euo pipefail\n+\n+ROOT=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")/..\" && pwd)\"\n+LOG_PATH=\"${TMUXWATCH_DAEMON_LOG:-/tmp/tmuxwatch-daemon.log}\"\n+\n+# Allow running outside tmux unless explicitly forced\n+export TMUXWATCH_FORCE_TMUX=\"${TMUXWATCH_FORCE_TMUX:-0}\"\n+\n+cd \"$ROOT\"\n+\n+if ! poltergeist status --target tmuxwatch-cli >/dev/null 2>&1; then\n+  echo \"[tmuxwatch] Starting poltergeist daemon (logs -> $LOG_PATH)...\"\n+  nohup poltergeist haunt --target tmuxwatch-cli >/dev/null 2>>\"$LOG_PATH\" &\n+  sleep 1\n+else\n+  echo \"[tmuxwatch] poltergeist daemon already running.\"\n+fi\n+\n+echo \"[tmuxwatch] Launching tmuxwatch with hot reload...\"\n+exec polter tmuxwatch-cli --watch \"$@\""
+    },
+    {
+      "sha": "a470ffa2a657a00c50740c1a4badb033369607c9",
+      "filename": "scripts/run-watch.sh",
+      "status": "added",
+      "additions": 30,
+      "deletions": 0,
+      "changes": 30,
+      "blob_url": "https://github.com/steipete/tmuxwatch/blob/4d6727f045b3a2142c8681023e415289400edb22/scripts%2Frun-watch.sh",
+      "raw_url": "https://github.com/steipete/tmuxwatch/raw/4d6727f045b3a2142c8681023e415289400edb22/scripts%2Frun-watch.sh",
+      "contents_url": "https://api.github.com/repos/steipete/tmuxwatch/contents/scripts%2Frun-watch.sh?ref=4d6727f045b3a2142c8681023e415289400edb22",
+      "patch": "@@ -0,0 +1,30 @@\n+#!/usr/bin/env bash\n+\n+set -euo pipefail\n+\n+ROOT=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")/..\" && pwd)\"\n+\n+if [[ -z \"${TMUX:-}\" ]]; then\n+  if [[ \"${TMUXWATCH_FORCE_TMUX:-0}\" == \"1\" ]]; then\n+    echo \"tmuxwatch must run inside tmux. Launch via: tmux new-session -s watch './scripts/run-watch.sh'\" >&2\n+    exit 1\n+  fi\n+  echo \"[tmuxwatch] TMUX not detected; watch mode works best inside tmux. Set TMUXWATCH_FORCE_TMUX=1 to require tmux.\" >&2\n+fi\n+\n+if ! command -v poltergeist >/dev/null 2>&1 || ! command -v polter >/dev/null 2>&1; then\n+  echo \"[tmuxwatch] poltergeist CLI not found. Install via 'pnpm install' in ~/Projects/poltergeist or npm install -g @steipete/poltergeist.\" >&2\n+  exit 1\n+fi\n+\n+mkdir -p \"$ROOT/dist/dev\"\n+\n+cd \"$ROOT\"\n+\n+echo \"[tmuxwatch] Ensuring poltergeist daemon is running (target: tmuxwatch-cli)...\"\n+if ! poltergeist haunt --target tmuxwatch-cli >/dev/null 2>&1; then\n+  echo \"[tmuxwatch] poltergeist daemon already running or failed to launch; continuing...\" >&2\n+fi\n+\n+echo \"[tmuxwatch] Starting tmuxwatch in watch mode (auto-restart on successful builds)...\"\n+exec polter tmuxwatch-cli --watch \"$@\""
+    }
+  ]
+}

@@ -1,0 +1,53 @@
+{
+  "message": "feat: mic index, partial flushing, device retry, transcripts toggle for partial",
+  "files": [
+    {
+      "sha": "70297ea6882a442070763f184b1aae35cf49bcd0",
+      "filename": "internal/asr/asr.go",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/steipete/brabble/blob/d60d4379331e65d3c264bd2b12d4eef63ea7b732/internal%2Fasr%2Fasr.go",
+      "raw_url": "https://github.com/steipete/brabble/raw/d60d4379331e65d3c264bd2b12d4eef63ea7b732/internal%2Fasr%2Fasr.go",
+      "contents_url": "https://api.github.com/repos/steipete/brabble/contents/internal%2Fasr%2Fasr.go?ref=d60d4379331e65d3c264bd2b12d4eef63ea7b732",
+      "patch": "@@ -19,6 +19,7 @@ type Segment struct {\n \tStart     time.Time\n \tEnd       time.Time\n \tConfidence float64\n+\tPartial    bool\n }\n \n // Recognizer converts audio into segments.\n@@ -52,7 +53,7 @@ func (s *stdinRecognizer) Run(ctx context.Context, out chan<- Segment) error {\n \t\tdefault:\n \t\t}\n \t\ttext := strings.TrimSpace(reader.Text())\n-\t\tout <- Segment{Text: text, Start: time.Now(), End: time.Now(), Confidence: 1.0}\n+\t\tout <- Segment{Text: text, Start: time.Now(), End: time.Now(), Confidence: 1.0, Partial: false}\n \t}\n \tif err := reader.Err(); err != nil {\n \t\treturn fmt.Errorf(\"stdin read: %w\", err)"
+    },
+    {
+      "sha": "92864a39bc7860587f2438a82cb2adf8c7c1abe6",
+      "filename": "internal/asr/live_whisper.go",
+      "status": "modified",
+      "additions": 69,
+      "deletions": 32,
+      "changes": 101,
+      "blob_url": "https://github.com/steipete/brabble/blob/d60d4379331e65d3c264bd2b12d4eef63ea7b732/internal%2Fasr%2Flive_whisper.go",
+      "raw_url": "https://github.com/steipete/brabble/raw/d60d4379331e65d3c264bd2b12d4eef63ea7b732/internal%2Fasr%2Flive_whisper.go",
+      "contents_url": "https://api.github.com/repos/steipete/brabble/contents/internal%2Fasr%2Flive_whisper.go?ref=d60d4379331e65d3c264bd2b12d4eef63ea7b732",
+      "patch": "@@ -68,50 +68,69 @@ func (r *whisperRecognizer) Run(ctx context.Context, out chan<- Segment) error {\n \tdefer r.model.Close()\n \tdefer portaudio.Terminate()\n \n-\tdev, err := selectDevice(r.cfg.Audio.DeviceName)\n-\tif err != nil {\n-\t\treturn err\n-\t}\n-\n \tframeSamples := r.cfg.Audio.SampleRate * r.cfg.Audio.FrameMS / 1000\n \tif ok := vad.ValidRateAndFrameLength(r.cfg.Audio.SampleRate, frameSamples); !ok {\n \t\treturn fmt.Errorf(\"invalid frame_ms %d for sample_rate %d\", r.cfg.Audio.FrameMS, r.cfg.Audio.SampleRate)\n \t}\n \n-\tbuf := make([]int16, frameSamples)\n-\tstream, err := portaudio.OpenStream(portaudio.StreamParameters{\n-\t\tInput: portaudio.StreamDeviceParameters{\n-\t\t\tDevice:   dev,\n-\t\t\tChannels: r.cfg.Audio.Channels,\n-\t\t\tLatency:  dev.DefaultLowInputLatency,\n-\t\t},\n-\t\tSampleRate:      float64(r.cfg.Audio.SampleRate),\n-\t\tFramesPerBuffer: frameSamples,\n-\t}, &buf)\n-\tif err != nil {\n-\t\treturn fmt.Errorf(\"open stream: %w\", err)\n+\tsegments := make(chan []int16, 8)\n+\tgo r.transcribeWorker(ctx, segments, out)\n+\n+\t// retry loop for device/stream failures\n+\tfor {\n+\t\tif ctx.Err() != nil {\n+\t\t\treturn ctx.Err()\n+\t\t}\n+\t\tdev, err := selectDevice(r.cfg.Audio.DeviceName, r.cfg.Audio.DeviceIndex)\n+\t\tif err != nil {\n+\t\t\tr.logger.Warnf(\"select device: %v; retrying in 2s\", err)\n+\t\t\ttime.Sleep(2 * time.Second)\n+\t\t\tcontinue\n+\t\t}\n+\t\tbuf := make([]int16, frameSamples)\n+\t\tstream, err := portaudio.OpenStream(portaudio.StreamParameters{\n+\t\t\tInput: portaudio.StreamDeviceParameters{\n+\t\t\t\tDevice:   dev,\n+\t\t\t\tChannels: r.cfg.Audio.Channels,\n+\t\t\t\tLatency:  dev.DefaultLowInputLatency,\n+\t\t\t},\n+\t\t\tSampleRate:      float64(r.cfg.Audio.SampleRate),\n+\t\t\tFramesPerBuffer: frameSamples,\n+\t\t}, &buf)\n+\t\tif err != nil {\n+\t\t\tr.logger.Warnf(\"open stream: %v; retrying in 2s\", err)\n+\t\t\ttime.Sleep(2 * time.Second)\n+\t\t\tcontinue\n+\t\t}\n+\t\tr.logger.Infof(\"listening on mic: %s @ %d Hz\", dev.Name, r.cfg.Audio.SampleRate)\n+\t\tif err := r.captureLoop(ctx, stream, buf, segments); err != nil && !errors.Is(err, context.Canceled) {\n+\t\t\tr.logger.Warnf(\"stream ended: %v; restarting in 2s\", err)\n+\t\t\t_ = stream.Close()\n+\t\t\ttime.Sleep(2 * time.Second)\n+\t\t\tcontinue\n+\t\t}\n+\t\t_ = stream.Close()\n+\t\treturn nil\n \t}\n-\tdefer stream.Close()\n+}\n \n+func (r *whisperRecognizer) captureLoop(ctx context.Context, stream *portaudio.Stream, buf []int16, segments chan<- []int16) error {\n \tif err := stream.Start(); err != nil {\n \t\treturn fmt.Errorf(\"start stream: %w\", err)\n \t}\n \tdefer stream.Stop()\n \n-\tsegments := make(chan []int16, 8)\n-\tgo r.transcribeWorker(ctx, segments, out)\n-\n \tvar (\n-\t\tchunk       []int16\n-\t\tinSpeech    bool\n-\t\tlastVoice   time.Time\n-\t\tspeechBegan time.Time\n-\t\tsilenceDur  = time.Duration(r.cfg.VAD.SilenceMS) * time.Millisecond\n-\t\tmaxSegDur   = time.Duration(r.cfg.VAD.MaxSegmentMS) * time.Millisecond\n+\t\tchunk           []int16\n+\t\tinSpeech        bool\n+\t\tlastVoice       time.Time\n+\t\tspeechBegan     time.Time\n+\t\tlastPartialSent time.Time\n+\t\tsilenceDur      = time.Duration(r.cfg.VAD.SilenceMS) * time.Millisecond\n+\t\tmaxSegDur       = time.Duration(r.cfg.VAD.MaxSegmentMS) * time.Millisecond\n+\t\tpartialFlush    = time.Duration(r.cfg.VAD.PartialFlushMS) * time.Millisecond\n \t)\n \n-\tr.logger.Infof(\"listening on mic: %s @ %d Hz\", dev.Name, r.cfg.Audio.SampleRate)\n-\n \tfor {\n \t\tselect {\n \t\tcase <-ctx.Done():\n@@ -131,16 +150,28 @@ func (r *whisperRecognizer) Run(ctx context.Context, out chan<- Segment) error {\n \t\t\tif !inSpeech {\n \t\t\t\tinSpeech = true\n \t\t\t\tspeechBegan = time.Now()\n+\t\t\t\tlastPartialSent = time.Now()\n \t\t\t\tchunk = chunk[:0]\n \t\t\t}\n \t\t\tchunk = append(chunk, buf...)\n \t\t\tlastVoice = time.Now()\n+\n+\t\t\tif partialFlush > 0 && time.Since(lastPartialSent) >= partialFlush && len(chunk) > 0 {\n+\t\t\t\tcpy := make([]int16, len(chunk))\n+\t\t\t\tcopy(cpy, chunk)\n+\t\t\t\tselect {\n+\t\t\t\tcase segments <- cpy:\n+\t\t\t\t\tlastPartialSent = time.Now()\n+\t\t\t\t\tchunk = chunk[:0]\n+\t\t\t\t\tspeechBegan = time.Now()\n+\t\t\t\tdefault:\n+\t\t\t\t\tr.logger.Warn(\"segment queue full, dropping partial\")\n+\t\t\t\t}\n+\t\t\t}\n \t\t} else if inSpeech {\n-\t\t\t// check if silence long enough or max segment exceeded\n \t\t\tnow := time.Now()\n \t\t\tif (now.Sub(lastVoice) >= silenceDur && len(chunk) > 0) ||\n \t\t\t\t(maxSegDur > 0 && now.Sub(speechBegan) >= maxSegDur) {\n-\t\t\t\t// finalize\n \t\t\t\tcpy := make([]int16, len(chunk))\n \t\t\t\tcopy(cpy, chunk)\n \t\t\t\tselect {\n@@ -244,11 +275,17 @@ func warmup(model whisper.Model, cfg *config.Config, logger *logrus.Logger) erro\n \treturn nil\n }\n \n-func selectDevice(preferred string) (*portaudio.DeviceInfo, error) {\n+func selectDevice(preferred string, index int) (*portaudio.DeviceInfo, error) {\n \tdevs, err := portaudio.Devices()\n \tif err != nil {\n \t\treturn nil, fmt.Errorf(\"list devices: %w\", err)\n \t}\n+\tif index >= 0 && index < len(devs) {\n+\t\td := devs[index]\n+\t\tif d.MaxInputChannels > 0 {\n+\t\t\treturn d, nil\n+\t\t}\n+\t}\n \tif preferred != \"\" {\n \t\tfor _, d := range devs {\n \t\t\tif d.MaxInputChannels > 0 && strings.Contains(strings.ToLower(d.Name), strings.ToLower(preferred)) {"
+    },
+    {
+      "sha": "705fdebed307402214a93fd3893a02bf4436ec07",
+      "filename": "internal/config/config.go",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 4,
+      "changes": 11,
+      "blob_url": "https://github.com/steipete/brabble/blob/d60d4379331e65d3c264bd2b12d4eef63ea7b732/internal%2Fconfig%2Fconfig.go",
+      "raw_url": "https://github.com/steipete/brabble/raw/d60d4379331e65d3c264bd2b12d4eef63ea7b732/internal%2Fconfig%2Fconfig.go",
+      "contents_url": "https://api.github.com/repos/steipete/brabble/contents/internal%2Fconfig%2Fconfig.go?ref=d60d4379331e65d3c264bd2b12d4eef63ea7b732",
+      "patch": "@@ -25,10 +25,11 @@ const (\n // Config holds user configuration loaded from TOML.\n type Config struct {\n \tAudio struct {\n-\t\tDeviceName string `toml:\"device_name\"`\n-\t\tSampleRate int    `toml:\"sample_rate\"`\n-\t\tChannels   int    `toml:\"channels\"`\n-\t\tFrameMS    int    `toml:\"frame_ms\"`\n+\t\tDeviceName  string `toml:\"device_name\"`\n+\t\tDeviceIndex int    `toml:\"device_index\"`\n+\t\tSampleRate  int    `toml:\"sample_rate\"`\n+\t\tChannels    int    `toml:\"channels\"`\n+\t\tFrameMS     int    `toml:\"frame_ms\"`\n \t} `toml:\"audio\"`\n \n \tVAD struct {\n@@ -38,6 +39,7 @@ type Config struct {\n \t\tEnergyThresh   float64 `toml:\"energy_threshold\"`\n \t\tMinSpeechMS    int     `toml:\"min_speech_ms\"`\n \t\tMaxSegmentMS   int     `toml:\"max_segment_ms\"`\n+\t\tPartialFlushMS int     `toml:\"partial_flush_ms\"`\n \t} `toml:\"vad\"`\n \n \tASR struct {\n@@ -119,6 +121,7 @@ func Default() (*Config, error) {\n \tcfg.VAD.MinSpeechMS = 300\n \tcfg.VAD.MaxSegmentMS = 10000\n \tcfg.VAD.EnergyThresh = 0.0\n+\tcfg.VAD.PartialFlushMS = 4000\n \n \tcfg.ASR.ModelPath = filepath.Join(stateDir, \"models\", \"ggml-medium-q5_1.bin\")\n \tcfg.ASR.Language = \"auto\""
+    },
+    {
+      "sha": "369afb25dbba63a412f04a81127285c4ea7051e3",
+      "filename": "internal/run/server.go",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 2,
+      "changes": 6,
+      "blob_url": "https://github.com/steipete/brabble/blob/d60d4379331e65d3c264bd2b12d4eef63ea7b732/internal%2Frun%2Fserver.go",
+      "raw_url": "https://github.com/steipete/brabble/raw/d60d4379331e65d3c264bd2b12d4eef63ea7b732/internal%2Frun%2Fserver.go",
+      "contents_url": "https://api.github.com/repos/steipete/brabble/contents/internal%2Frun%2Fserver.go?ref=d60d4379331e65d3c264bd2b12d4eef63ea7b732",
+      "patch": "@@ -127,15 +127,17 @@ func (s *Server) handleSegment(ctx context.Context, seg asr.Segment) {\n \ts.lastHeard.Store(time.Now().UnixNano())\n \ts.metrics.incHeard()\n \ts.logger.Infof(\"heard: %q\", text)\n-\ts.recordTranscript(text)\n+\tif !seg.Partial {\n+\t\ts.recordTranscript(text)\n+\t}\n \tif s.cfg.Wake.Enabled && !strings.Contains(strings.ToLower(text), strings.ToLower(s.cfg.Wake.Word)) {\n \t\treturn\n \t}\n \t// strip wake word\n \tif s.cfg.Wake.Enabled {\n \t\ttext = removeWakeWord(text, s.cfg.Wake.Word)\n \t}\n-\tif len(text) < s.cfg.Hook.MinChars {\n+\tif len(text) < s.cfg.Hook.MinChars || seg.Partial {\n \t\treturn\n \t}\n \tif !s.hook.ShouldRun() {"
+    }
+  ]
+}

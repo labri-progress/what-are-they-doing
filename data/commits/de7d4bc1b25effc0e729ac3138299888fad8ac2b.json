@@ -1,0 +1,29 @@
+{
+  "message": "fix(sync): improve exception safety in barrier/notify primitives\n\nFix subtle invariant violations in barrier waiter insertion and broadcast\nnotification filtering that could corrupt state under allocation failure\nor cancellation.\n\nBarrier changes:\n- Reorder BarrierWaitFuture::poll() to read waker before acquiring\n  mutable state\n- Perform fallible push() before committing counter updates (arrived,\n  next_waiter_id) so OOM leaves state consistent without partial\n  increments\n\nNotify changes:\n- Fix WaiterSlab::insert() to perform allocation before incrementing\n  active counter, preventing counter mismatch on allocation failure\n- Fix Notify::notify_all() to check generation before processing\n  waiters: was processing all waiters regardless of generation, causing\n  double-notification; now only processes waiters with generation <\n  new_generation, preventing cancelled broadcast waiters from being\n  incorrectly converted to notify_one tokens\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "3e4b711239ce2f05d30336947b80cb65e3eb9d1f",
+      "filename": "src/sync/barrier.rs",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 3,
+      "changes": 12,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/de7d4bc1b25effc0e729ac3138299888fad8ac2b/src%2Fsync%2Fbarrier.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/de7d4bc1b25effc0e729ac3138299888fad8ac2b/src%2Fsync%2Fbarrier.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fsync%2Fbarrier.rs?ref=de7d4bc1b25effc0e729ac3138299888fad8ac2b",
+      "patch": "@@ -174,12 +174,18 @@ impl Future for BarrierWaitFuture<'_> {\n                     Poll::Ready(Ok(BarrierWaitResult { is_leader: true }))\n                 } else {\n                     // Not full yet. Arrive and wait.\n-                    state.arrived += 1;\n+                    let waker = cx.waker().clone();\n                     let generation = state.generation;\n                     let id = state.next_waiter_id;\n-                    state.next_waiter_id = state.next_waiter_id.wrapping_add(1);\n                     let slot = state.waiters.len();\n-                    state.waiters.push((id, cx.waker().clone()));\n+\n+                    // Do fallible operations first to ensure exception safety\n+                    state.waiters.push((id, waker));\n+\n+                    // Now commit infallible state changes\n+                    state.next_waiter_id = state.next_waiter_id.wrapping_add(1);\n+                    state.arrived += 1;\n+\n                     drop(state);\n                     self.state = WaitState::Waiting {\n                         generation,"
+    },
+    {
+      "sha": "6d4eac60b5878ea18347b72d1fa7e98f1ea6d0bf",
+      "filename": "src/sync/notify.rs",
+      "status": "modified",
+      "additions": 19,
+      "deletions": 16,
+      "changes": 35,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/de7d4bc1b25effc0e729ac3138299888fad8ac2b/src%2Fsync%2Fnotify.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/de7d4bc1b25effc0e729ac3138299888fad8ac2b/src%2Fsync%2Fnotify.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fsync%2Fnotify.rs?ref=de7d4bc1b25effc0e729ac3138299888fad8ac2b",
+      "patch": "@@ -82,17 +82,19 @@ impl WaiterSlab {\n     /// Insert a waiter entry, reusing a free slot if available.\n     #[inline]\n     fn insert(&mut self, entry: WaiterEntry) -> usize {\n-        if entry.waker.is_some() {\n-            self.active += 1;\n-        }\n-        if let Some(index) = self.free_slots.pop() {\n-            self.entries[index] = entry;\n-            index\n+        let is_active = entry.waker.is_some();\n+        let index = if let Some(idx) = self.free_slots.pop() {\n+            self.entries[idx] = entry;\n+            idx\n         } else {\n-            let index = self.entries.len();\n+            let idx = self.entries.len();\n             self.entries.push(entry);\n-            index\n+            idx\n+        };\n+        if is_active {\n+            self.active += 1;\n         }\n+        index\n     }\n \n     /// Remove a waiter entry by index, returning its slot to the free list.\n@@ -205,15 +207,16 @@ impl Notify {\n                 .filter_map(|entry| {\n                     // Only mark active waiters as notified. Marking free slab slots\n                     // (`waker == None`) can pin tail entries and prevent shrinking.\n-                    if let Some(waker) = entry.waker.take() {\n-                        entry.notified = true;\n-                        // Mark this waiter as broadcast-notified to avoid turning\n-                        // a cancelled broadcast waiter into a stored notify_one token.\n-                        entry.generation = new_generation;\n-                        Some(waker)\n-                    } else {\n-                        None\n+                    if entry.generation < new_generation {\n+                        if let Some(waker) = entry.waker.take() {\n+                            entry.notified = true;\n+                            // Mark this waiter as broadcast-notified to avoid turning\n+                            // a cancelled broadcast waiter into a stored notify_one token.\n+                            entry.generation = new_generation;\n+                            return Some(waker);\n+                        }\n                     }\n+                    None\n                 })\n                 .collect();\n             waiters.active -= wakers.len();"
+    }
+  ]
+}

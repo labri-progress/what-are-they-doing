@@ -1,0 +1,124 @@
+{
+  "message": "Fix protocol edge cases and enforce TLS ciphers",
+  "files": [
+    {
+      "sha": "642324df7caf272c49c91c48576fcaf30e5808ad",
+      "filename": "libtenzir/builtins/operators/from_mysql.cpp",
+      "status": "modified",
+      "additions": 36,
+      "deletions": 15,
+      "changes": 51,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/cc3d9a1ee33289bbba401f0e7045e691087a7c49/libtenzir%2Fbuiltins%2Foperators%2Ffrom_mysql.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/cc3d9a1ee33289bbba401f0e7045e691087a7c49/libtenzir%2Fbuiltins%2Foperators%2Ffrom_mysql.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Fbuiltins%2Foperators%2Ffrom_mysql.cpp?ref=cc3d9a1ee33289bbba401f0e7045e691087a7c49",
+      "patch": "@@ -682,20 +682,28 @@ class async_connection {\n \n   /// Read a MySQL packet asynchronously.\n   auto read_packet() -> Task<MysqlResult<std::vector<std::byte>>> {\n-    // Read 4-byte header: 3 bytes length + 1 byte sequence.\n-    auto header = std::array<unsigned char, 4>{};\n-    CO_TRY(co_await read_exact(\n-      folly::MutableByteRange{header.data(), header.size()}, \"header\"));\n-    auto len = uint32_t{header[0]} | (uint32_t{header[1]} << 8)\n-               | (uint32_t{header[2]} << 16);\n-    sequence_id_ = header[3];\n-    // Read payload.\n-    auto payload = std::vector<std::byte>(len);\n-    if (not payload.empty()) {\n+    auto payload = std::vector<std::byte>{};\n+    while (true) {\n+      // Read 4-byte header: 3 bytes length + 1 byte sequence.\n+      auto header = std::array<unsigned char, 4>{};\n       CO_TRY(co_await read_exact(\n-        folly::MutableByteRange{\n-          reinterpret_cast<unsigned char*>(payload.data()), payload.size()},\n-        \"payload\"));\n+        folly::MutableByteRange{header.data(), header.size()}, \"header\"));\n+      auto len = uint32_t{header[0]} | (uint32_t{header[1]} << 8)\n+                 | (uint32_t{header[2]} << 16);\n+      sequence_id_ = header[3];\n+      // MySQL can split logical packets across continuation frames of\n+      // exactly max_packet_size bytes.\n+      auto offset = payload.size();\n+      payload.resize(payload.size() + len);\n+      if (len > 0) {\n+        CO_TRY(co_await read_exact(\n+          folly::MutableByteRange{\n+            reinterpret_cast<unsigned char*>(payload.data()) + offset, len},\n+          \"payload\"));\n+      }\n+      if (len < max_packet_size) {\n+        break;\n+      }\n     }\n     co_return payload;\n   }\n@@ -1047,6 +1055,12 @@ auto read_result_set_meta(async_connection& conn)\n   if (auto err = as_error(response)) {\n     co_return Err{std::move(*err)};\n   }\n+  if (response.empty()) {\n+    co_return Err{mysql_error::protocol(\"empty COM_QUERY response\")};\n+  }\n+  if (response[0] == packet::ok) {\n+    co_return result_set_meta{};\n+  }\n   auto reader = packet_reader{response};\n   CO_TRY(auto column_count, reader.read_lenenc_int());\n   auto meta = result_set_meta{};\n@@ -1206,6 +1220,9 @@ class async_client {\n       co_return;\n     }\n     auto columns = std::move(meta).unwrap().columns;\n+    if (columns.empty()) {\n+      co_return;\n+    }\n     // Stream rows, building table_slices.\n     auto builder = series_builder{};\n     auto row_count = int64_t{0};\n@@ -1226,13 +1243,17 @@ class async_client {\n       parse_row_into_builder(row_packet.unwrap(), columns, builder);\n       ++row_count;\n       if (row_count >= cfg.batch_size) {\n-        co_yield builder.finish_assert_one_slice(cfg.schema_name);\n+        for (auto&& slice : builder.finish_as_table_slice(cfg.schema_name)) {\n+          co_yield std::move(slice);\n+        }\n         builder = series_builder{};\n         row_count = 0;\n       }\n     }\n     if (row_count > 0) {\n-      co_yield builder.finish_assert_one_slice(cfg.schema_name);\n+      for (auto&& slice : builder.finish_as_table_slice(cfg.schema_name)) {\n+        co_yield std::move(slice);\n+      }\n     }\n   }\n "
+    },
+    {
+      "sha": "758184b571cdffdbbd12f8994d11a7c8d7531a8d",
+      "filename": "libtenzir/src/tls_options.cpp",
+      "status": "modified",
+      "additions": 25,
+      "deletions": 2,
+      "changes": 27,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/cc3d9a1ee33289bbba401f0e7045e691087a7c49/libtenzir%2Fsrc%2Ftls_options.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/cc3d9a1ee33289bbba401f0e7045e691087a7c49/libtenzir%2Fsrc%2Ftls_options.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Fsrc%2Ftls_options.cpp?ref=cc3d9a1ee33289bbba401f0e7045e691087a7c49",
+      "patch": "@@ -721,11 +721,19 @@ auto tls_options::make_caf_context(operator_control_plane& ctrl,\n     }\n   }\n   if (auto ciphers = get_tls_ciphers(&ctrl)) {\n+    auto cipher_loc = ciphers->source;\n+    if (tls_ and cipher_loc == tls_->source) {\n+      // `located<data>` for `tls={...}` only carries the whole record span.\n+      // Clamp to a tiny span to avoid misleading multi-line highlights.\n+      cipher_loc = cipher_loc.subloc(0, 1);\n+    }\n     if (auto* native = static_cast<SSL_CTX*>(concrete.native_handle())) {\n       if (SSL_CTX_set_cipher_list(native, ciphers->inner.c_str()) != 1) {\n-        diagnostic::warning(\"failed to set TLS cipher list\")\n-          .primary(*ciphers)\n+        diagnostic::error(\"invalid TLS cipher list\")\n+          .primary(cipher_loc, \"`tls.ciphers`\")\n           .emit(dh);\n+        return caf::make_error(ec::invalid_configuration,\n+                               \"invalid TLS cipher list\");\n       }\n     }\n   }\n@@ -807,6 +815,21 @@ auto tls_options::make_folly_ssl_context(diagnostic_handler& dh) const\n       return failure::promise();\n     }\n   }\n+  if (auto ciphers = get_tls_ciphers(nullptr)) {\n+    auto cipher_loc = ciphers->source;\n+    if (tls_ and cipher_loc == tls_->source) {\n+      // `located<data>` for `tls={...}` only carries the whole record span.\n+      // Clamp to a tiny span to avoid misleading multi-line highlights.\n+      cipher_loc = cipher_loc.subloc(0, 1);\n+    }\n+    if (SSL_CTX_set_cipher_list(ctx->getSSLCtx(), ciphers->inner.c_str())\n+        != 1) {\n+      diagnostic::error(\"invalid TLS cipher list\")\n+        .primary(cipher_loc, \"`tls.ciphers`\")\n+        .emit(dh);\n+      return failure::promise();\n+    }\n+  }\n   // Set verification mode.\n   auto skip_verify = get_skip_peer_verification(nullptr).inner;\n   if (skip_verify) {"
+    },
+    {
+      "sha": "b832fd3f5d78f69e99f1ba2130d786922c877aea",
+      "filename": "test/fixtures/mysql.py",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 0,
+      "changes": 7,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/cc3d9a1ee33289bbba401f0e7045e691087a7c49/test%2Ffixtures%2Fmysql.py",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/cc3d9a1ee33289bbba401f0e7045e691087a7c49/test%2Ffixtures%2Fmysql.py",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ffixtures%2Fmysql.py?ref=cc3d9a1ee33289bbba401f0e7045e691087a7c49",
+      "patch": "@@ -208,6 +208,13 @@ def _create_test_data(runtime: str, container_id: str) -> None:\n          '{{\"key\":\"value\"}}', 'b', 'not null'),\n         (2, 127, 0, 0.0, 0.00, '', '', X'',\n          '1970-01-01', '1970-01-01 00:00:00', '[]', 'a', NULL);\n+    CREATE TABLE IF NOT EXISTS large_packets (\n+        id INT PRIMARY KEY,\n+        payload LONGTEXT NOT NULL\n+    );\n+    INSERT INTO large_packets (id, payload) VALUES\n+        (1, REPEAT('x', 17000000)),\n+        (2, 'tail');\n     \"\"\"\n     logger.info(\"Creating test tables and data\")\n     # Use root to create tables and grant privileges"
+    },
+    {
+      "sha": "e1807c9d8f53e962e0ea28164685cff0dcff850c",
+      "filename": "test/tests/operators/from_mysql/fragmented_packet.tql",
+      "status": "added",
+      "additions": 9,
+      "deletions": 0,
+      "changes": 9,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/cc3d9a1ee33289bbba401f0e7045e691087a7c49/test%2Ftests%2Foperators%2Ffrom_mysql%2Ffragmented_packet.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/cc3d9a1ee33289bbba401f0e7045e691087a7c49/test%2Ftests%2Foperators%2Ffrom_mysql%2Ffragmented_packet.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Ffrom_mysql%2Ffragmented_packet.tql?ref=cc3d9a1ee33289bbba401f0e7045e691087a7c49",
+      "patch": "@@ -0,0 +1,9 @@\n+// Exercise MySQL packet continuation (> 0xFFFFFF payload) without bloating\n+// reference output: tail keeps only the final small row.\n+from_mysql sql=\"SELECT id, payload FROM large_packets ORDER BY id\",\n+           host=env(\"MYSQL_HOST\"),\n+           port=int(env(\"MYSQL_PORT\")),\n+           user=env(\"MYSQL_USER\"),\n+           password=env(\"MYSQL_PASSWORD\"),\n+           database=env(\"MYSQL_DATABASE\")\n+tail 1"
+    },
+    {
+      "sha": "9593ccab5d24225a47b190087ad81096f7418a4c",
+      "filename": "test/tests/operators/from_mysql/fragmented_packet.txt",
+      "status": "added",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/cc3d9a1ee33289bbba401f0e7045e691087a7c49/test%2Ftests%2Foperators%2Ffrom_mysql%2Ffragmented_packet.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/cc3d9a1ee33289bbba401f0e7045e691087a7c49/test%2Ftests%2Foperators%2Ffrom_mysql%2Ffragmented_packet.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Ffrom_mysql%2Ffragmented_packet.txt?ref=cc3d9a1ee33289bbba401f0e7045e691087a7c49",
+      "patch": "@@ -0,0 +1,4 @@\n+{\n+  id: 2,\n+  payload: \"tail\",\n+}"
+    },
+    {
+      "sha": "cf0baa0fc1b187eb6f885f69f5898d8b5f5e46d4",
+      "filename": "test/tests/operators/from_mysql/ok_packet_update.tql",
+      "status": "added",
+      "additions": 7,
+      "deletions": 0,
+      "changes": 7,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/cc3d9a1ee33289bbba401f0e7045e691087a7c49/test%2Ftests%2Foperators%2Ffrom_mysql%2Fok_packet_update.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/cc3d9a1ee33289bbba401f0e7045e691087a7c49/test%2Ftests%2Foperators%2Ffrom_mysql%2Fok_packet_update.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Ffrom_mysql%2Fok_packet_update.tql?ref=cc3d9a1ee33289bbba401f0e7045e691087a7c49",
+      "patch": "@@ -0,0 +1,7 @@\n+// COM_QUERY response for UPDATE is an OK packet, not a result set.\n+from_mysql sql=\"UPDATE users SET age = age WHERE id = 1\",\n+           host=env(\"MYSQL_HOST\"),\n+           port=int(env(\"MYSQL_PORT\")),\n+           user=env(\"MYSQL_USER\"),\n+           password=env(\"MYSQL_PASSWORD\"),\n+           database=env(\"MYSQL_DATABASE\")"
+    },
+    {
+      "sha": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "filename": "test/tests/operators/from_mysql/ok_packet_update.txt",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/cc3d9a1ee33289bbba401f0e7045e691087a7c49/test%2Ftests%2Foperators%2Ffrom_mysql%2Fok_packet_update.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/cc3d9a1ee33289bbba401f0e7045e691087a7c49/test%2Ftests%2Foperators%2Ffrom_mysql%2Fok_packet_update.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Ffrom_mysql%2Fok_packet_update.txt?ref=cc3d9a1ee33289bbba401f0e7045e691087a7c49"
+    },
+    {
+      "sha": "c83e449cee6fd120a1be38c1fa03d0a42d26297e",
+      "filename": "test/tests/operators/from_mysql/show_tables.txt",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/cc3d9a1ee33289bbba401f0e7045e691087a7c49/test%2Ftests%2Foperators%2Ffrom_mysql%2Fshow_tables.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/cc3d9a1ee33289bbba401f0e7045e691087a7c49/test%2Ftests%2Foperators%2Ffrom_mysql%2Fshow_tables.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Ffrom_mysql%2Fshow_tables.txt?ref=cc3d9a1ee33289bbba401f0e7045e691087a7c49",
+      "patch": "@@ -1,6 +1,9 @@\n {\n   Tables_in_tenzir_test: \"events\",\n }\n+{\n+  Tables_in_tenzir_test: \"large_packets\",\n+}\n {\n   Tables_in_tenzir_test: \"numbers\",\n }"
+    },
+    {
+      "sha": "3e53fc8c0ddae29778c77ac4a92b5ca36f744ad3",
+      "filename": "test/tests/operators/from_mysql/tls_ciphers_warning.tql",
+      "status": "added",
+      "additions": 9,
+      "deletions": 0,
+      "changes": 9,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/cc3d9a1ee33289bbba401f0e7045e691087a7c49/test%2Ftests%2Foperators%2Ffrom_mysql%2Ftls_ciphers_warning.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/cc3d9a1ee33289bbba401f0e7045e691087a7c49/test%2Ftests%2Foperators%2Ffrom_mysql%2Ftls_ciphers_warning.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Ffrom_mysql%2Ftls_ciphers_warning.tql?ref=cc3d9a1ee33289bbba401f0e7045e691087a7c49",
+      "patch": "@@ -0,0 +1,9 @@\n+// Invalid cipher list must be a hard pipeline error.\n+from_mysql sql=\"SELECT id, name FROM users ORDER BY id\",\n+           host=env(\"MYSQL_HOST\"),\n+           port=int(env(\"MYSQL_PORT\")),\n+           user=env(\"MYSQL_USER\"),\n+           password=env(\"MYSQL_PASSWORD\"),\n+           database=env(\"MYSQL_DATABASE\"),\n+           tls={skip_peer_verification: true,\n+                ciphers: \"THIS_CIPHER_DOES_NOT_EXIST\"}"
+    },
+    {
+      "sha": "8b572a93384ba93cc22c5eef5986ec64b968d7a5",
+      "filename": "test/tests/operators/from_mysql/tls_ciphers_warning.txt",
+      "status": "added",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/cc3d9a1ee33289bbba401f0e7045e691087a7c49/test%2Ftests%2Foperators%2Ffrom_mysql%2Ftls_ciphers_warning.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/cc3d9a1ee33289bbba401f0e7045e691087a7c49/test%2Ftests%2Foperators%2Ffrom_mysql%2Ftls_ciphers_warning.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Ffrom_mysql%2Ftls_ciphers_warning.txt?ref=cc3d9a1ee33289bbba401f0e7045e691087a7c49",
+      "patch": "@@ -0,0 +1,6 @@\n+error: invalid TLS cipher list\n+ --> tests/operators/from_mysql/tls_ciphers_warning.tql:8:16\n+  |\n+8 |            tls={skip_peer_verification: true,\n+  |                ^ `tls.ciphers`\n+  |"
+    }
+  ]
+}

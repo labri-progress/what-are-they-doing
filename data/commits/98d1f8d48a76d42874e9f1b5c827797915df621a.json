@@ -1,0 +1,53 @@
+{
+  "message": "fix(core): DST-safe backup scheduling, dataflow cycle detection, and search cleanup\n\nbackup.rs \u2014 Fix DST transition failures in schedule computation:\n- next_hourly: perform arithmetic in UTC then convert back to Local,\n  avoiding chrono panics when local-time minute manipulation hits a\n  DST gap (spring-forward) or ambiguous fold (fall-back).\n- next_daily: try today first; if the target local time doesn't exist\n  (DST gap), fall through to tomorrow instead of returning an error.\n- next_weekly: use .earliest() instead of .single() when localizing\n  the computed NaiveDateTime, so fall-back ambiguity resolves to the\n  first occurrence rather than failing.\n\ndataflow.rs \u2014 Fix incorrect BFS direction in cycle detection:\n- would_create_cycle was BFS-ing from `from` looking for `to` via\n  outputs, but the correct check for adding edge from->to is to BFS\n  from `to` following outputs looking for `from`. The old direction\n  could miss real cycles and false-positive on non-cycles.\n- Also: replace i[0].clone() with i.first().cloned().unwrap_or(Value::None)\n  in test map closures to avoid potential panics on empty input slices.\n\nsearch/chunk_vector_store.rs:\n- Derive Eq on ChunkVectorDriftReport (was PartialEq only; all fields\n  are Eq-compatible, and clippy::derive_partial_eq_without_eq fires).\n- Use std::mem::size_of_val(vector) instead of manual len * size_of::<f32>()\n  for embedding blob allocation.\n\nsearch/chunking.rs:\n- Remove dead assignment to allow_overlap_on_next_start after soft split;\n  the variable was written but never read before being overwritten.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "9d228674df4001dfaa0027e3235447907d64b0fb",
+      "filename": "crates/frankenterm-core/src/backup.rs",
+      "status": "modified",
+      "additions": 23,
+      "deletions": 13,
+      "changes": 36,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/98d1f8d48a76d42874e9f1b5c827797915df621a/crates%2Ffrankenterm-core%2Fsrc%2Fbackup.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/98d1f8d48a76d42874e9f1b5c827797915df621a/crates%2Ffrankenterm-core%2Fsrc%2Fbackup.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Ffrankenterm-core%2Fsrc%2Fbackup.rs?ref=98d1f8d48a76d42874e9f1b5c827797915df621a",
+      "patch": "@@ -196,16 +196,18 @@ fn next_hourly(now: DateTime<Local>, minute: u32) -> Result<DateTime<Local>> {\n             \"hourly minute must be 0-59\".to_string(),\n         )));\n     }\n-    let mut candidate = now\n+    // Use UTC arithmetic to avoid DST transition failures, then convert back.\n+    let now_utc = now.with_timezone(&chrono::Utc);\n+    let mut candidate_utc = now_utc\n         .with_minute(minute)\n         .and_then(|t| t.with_second(0))\n         .and_then(|t| t.with_nanosecond(0))\n         .ok_or_else(|| Error::Runtime(\"Failed to compute hourly schedule time\".to_string()))?;\n \n-    if candidate <= now {\n-        candidate += ChronoDuration::hours(1);\n+    if candidate_utc <= now_utc {\n+        candidate_utc += ChronoDuration::hours(1);\n     }\n-    Ok(candidate)\n+    Ok(candidate_utc.with_timezone(&Local))\n }\n \n fn next_daily(now: DateTime<Local>, hour: u32, minute: u32) -> Result<DateTime<Local>> {\n@@ -214,16 +216,23 @@ fn next_daily(now: DateTime<Local>, hour: u32, minute: u32) -> Result<DateTime<L\n             \"daily schedule time must be in 24h range\".to_string(),\n         )));\n     }\n-    let mut candidate = now\n-        .with_hour(hour)\n-        .and_then(|t| t.with_minute(minute))\n-        .and_then(|t| t.with_second(0))\n-        .and_then(|t| t.with_nanosecond(0))\n-        .ok_or_else(|| Error::Runtime(\"Failed to compute daily schedule time\".to_string()))?;\n+    // Try today first; if the local time doesn't exist (DST gap), try tomorrow.\n+    let try_date = |base: DateTime<Local>| -> Option<DateTime<Local>> {\n+        base.with_hour(hour)\n+            .and_then(|t| t.with_minute(minute))\n+            .and_then(|t| t.with_second(0))\n+            .and_then(|t| t.with_nanosecond(0))\n+    };\n \n-    if candidate <= now {\n-        candidate += ChronoDuration::days(1);\n+    if let Some(candidate) = try_date(now) {\n+        if candidate > now {\n+            return Ok(candidate);\n+        }\n     }\n+    // Try tomorrow.\n+    let tomorrow = now + ChronoDuration::days(1);\n+    let candidate = try_date(tomorrow)\n+        .ok_or_else(|| Error::Runtime(\"Failed to compute daily schedule time\".to_string()))?;\n     Ok(candidate)\n }\n \n@@ -251,9 +260,10 @@ fn next_weekly(\n         .and_hms_opt(hour, minute, 0)\n         .ok_or_else(|| Error::Runtime(\"Failed to compute weekly schedule time\".to_string()))?;\n     candidate += ChronoDuration::days(days_ahead);\n+    // Use `earliest()` to handle ambiguous DST fall-back times (picks first occurrence).\n     let candidate = Local\n         .from_local_datetime(&candidate)\n-        .single()\n+        .earliest()\n         .ok_or_else(|| Error::Runtime(\"Failed to localize weekly schedule time\".to_string()))?;\n \n     if candidate <= now {"
+    },
+    {
+      "sha": "f60dab918a989713ee4cbb7c696a8c972a75a9a9",
+      "filename": "crates/frankenterm-core/src/dataflow.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 11,
+      "changes": 18,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/98d1f8d48a76d42874e9f1b5c827797915df621a/crates%2Ffrankenterm-core%2Fsrc%2Fdataflow.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/98d1f8d48a76d42874e9f1b5c827797915df621a/crates%2Ffrankenterm-core%2Fsrc%2Fdataflow.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Ffrankenterm-core%2Fsrc%2Fdataflow.rs?ref=98d1f8d48a76d42874e9f1b5c827797915df621a",
+      "patch": "@@ -868,18 +868,14 @@ impl DataflowGraph {\n         if from == to {\n             return true;\n         }\n-        // BFS from `from` following reverse edges (inputs): can we reach `to`?\n-        // Actually, we need: is `from` reachable from `to` via outputs?\n-        // If so, adding to->from direction (from is output of to) creates a cycle.\n-        // Wait: we're adding from->to, meaning `to` gets `from` as input.\n-        // Cycle exists if `from` is already reachable from `to` via outputs.\n+        // We're adding from->to, meaning `to` gets `from` as input.\n+        // A cycle exists if `from` is already reachable from `to` via outputs.\n+        // BFS from `to` following outputs: can we reach `from`?\n         let mut visited = HashSet::new();\n         let mut queue = VecDeque::new();\n-        queue.push_back(from);\n+        queue.push_back(to);\n         while let Some(current) = queue.pop_front() {\n-            if current == to {\n-                // We can reach `to` from `from` via outputs, so adding\n-                // from->to (to has from as input) would close the cycle.\n+            if current == from {\n                 return true;\n             }\n             if !visited.insert(current) {\n@@ -1125,8 +1121,8 @@ mod tests {\n     fn remove_node_cleans_edges() {\n         let mut g = DataflowGraph::new();\n         let a = g.add_source(\"a\", Value::Int(1));\n-        let b = g.add_map(\"b\", vec![a], |i| i[0].clone());\n-        let c = g.add_map(\"c\", vec![b], |i| i[0].clone());\n+        let b = g.add_map(\"b\", vec![a], |i| i.first().cloned().unwrap_or(Value::None));\n+        let c = g.add_map(\"c\", vec![b], |i| i.first().cloned().unwrap_or(Value::None));\n \n         g.remove_node(b).unwrap();\n         assert_eq!(g.node_count(), 2);"
+    },
+    {
+      "sha": "195154c2578d84da970c4ad9e27c562db66fdaa3",
+      "filename": "crates/frankenterm-core/src/search/chunk_vector_store.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/98d1f8d48a76d42874e9f1b5c827797915df621a/crates%2Ffrankenterm-core%2Fsrc%2Fsearch%2Fchunk_vector_store.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/98d1f8d48a76d42874e9f1b5c827797915df621a/crates%2Ffrankenterm-core%2Fsrc%2Fsearch%2Fchunk_vector_store.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Ffrankenterm-core%2Fsrc%2Fsearch%2Fchunk_vector_store.rs?ref=98d1f8d48a76d42874e9f1b5c827797915df621a",
+      "patch": "@@ -93,7 +93,7 @@ pub struct ChunkVectorHit {\n }\n \n /// Drift report comparing vector lifecycle state with lexical progress.\n-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]\n+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]\n pub struct ChunkVectorDriftReport {\n     pub profile_id: String,\n     pub generation_id: String,\n@@ -669,7 +669,7 @@ fn direction_from_str(value: &str) -> Result<ChunkDirection> {\n }\n \n fn encode_f32_embedding_blob(vector: &[f32]) -> Vec<u8> {\n-    let mut bytes = Vec::with_capacity(vector.len() * std::mem::size_of::<f32>());\n+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(vector));\n     for &value in vector {\n         bytes.extend_from_slice(&value.to_le_bytes());\n     }"
+    },
+    {
+      "sha": "1fb1ec8b9e6da6af941b964f9b6bda2f0252d5f6",
+      "filename": "crates/frankenterm-core/src/search/chunking.rs",
+      "status": "modified",
+      "additions": 0,
+      "deletions": 1,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/98d1f8d48a76d42874e9f1b5c827797915df621a/crates%2Ffrankenterm-core%2Fsrc%2Fsearch%2Fchunking.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/98d1f8d48a76d42874e9f1b5c827797915df621a/crates%2Ffrankenterm-core%2Fsrc%2Fsearch%2Fchunking.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Ffrankenterm-core%2Fsrc%2Fsearch%2Fchunking.rs?ref=98d1f8d48a76d42874e9f1b5c827797915df621a",
+      "patch": "@@ -310,7 +310,6 @@ pub fn build_semantic_chunks(\n \n             if should_soft_split {\n                 flush_current(&mut current, &mut chunks, &mut previous_finalized);\n-                allow_overlap_on_next_start = true;\n                 let overlap = previous_finalized.as_ref().and_then(|previous| {\n                     overlap_from_previous(previous, &contribution, config.overlap_chars)\n                 });"
+    }
+  ]
+}

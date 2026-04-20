@@ -1,0 +1,53 @@
+{
+  "message": "Merge pull request #1213 from andrew-kurin/fix/voicecall-tailscale-path\n\nVoice-call: fix tailscale tunnel, Twilio signatures, and callbacks",
+  "files": [
+    {
+      "sha": "06115d6622040fb4a0910c03d0a4a192f178b776",
+      "filename": "extensions/voice-call/src/providers/twilio.ts",
+      "status": "modified",
+      "additions": 19,
+      "deletions": 4,
+      "changes": 23,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/e071493bb34b34e8cdc196c25733bd116a40de01/extensions%2Fvoice-call%2Fsrc%2Fproviders%2Ftwilio.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/e071493bb34b34e8cdc196c25733bd116a40de01/extensions%2Fvoice-call%2Fsrc%2Fproviders%2Ftwilio.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fvoice-call%2Fsrc%2Fproviders%2Ftwilio.ts?ref=e071493bb34b34e8cdc196c25733bd116a40de01",
+      "patch": "@@ -64,6 +64,8 @@ export class TwilioProvider implements VoiceCallProvider {\n \n   /** Storage for TwiML content (for notify mode with URL-based TwiML) */\n   private readonly twimlStorage = new Map<string, string>();\n+  /** Track notify-mode calls to avoid streaming on follow-up callbacks */\n+  private readonly notifyCalls = new Set<string>();\n \n   /**\n    * Delete stored TwiML for a given `callId`.\n@@ -73,6 +75,7 @@ export class TwilioProvider implements VoiceCallProvider {\n    */\n   private deleteStoredTwiml(callId: string): void {\n     this.twimlStorage.delete(callId);\n+    this.notifyCalls.delete(callId);\n   }\n \n   /**\n@@ -137,7 +140,7 @@ export class TwilioProvider implements VoiceCallProvider {\n    */\n   private async apiRequest<T = unknown>(\n     endpoint: string,\n-    params: Record<string, string>,\n+    params: Record<string, string | string[]>,\n     options?: { allowNotFound?: boolean },\n   ): Promise<T> {\n     return await twilioApiRequest<T>({\n@@ -286,6 +289,9 @@ export class TwilioProvider implements VoiceCallProvider {\n     if (!ctx) return TwilioProvider.EMPTY_TWIML;\n \n     const params = new URLSearchParams(ctx.rawBody);\n+    const type =\n+      typeof ctx.query?.type === \"string\" ? ctx.query.type.trim() : undefined;\n+    const isStatusCallback = type === \"status\";\n     const callStatus = params.get(\"CallStatus\");\n     const direction = params.get(\"Direction\");\n     const callIdFromQuery =\n@@ -297,13 +303,21 @@ export class TwilioProvider implements VoiceCallProvider {\n \n     // Handle initial TwiML request (when Twilio first initiates the call)\n     // Check if we have stored TwiML for this call (notify mode)\n-    if (callIdFromQuery) {\n+    if (callIdFromQuery && !isStatusCallback) {\n       const storedTwiml = this.twimlStorage.get(callIdFromQuery);\n       if (storedTwiml) {\n         // Clean up after serving (one-time use)\n         this.deleteStoredTwiml(callIdFromQuery);\n         return storedTwiml;\n       }\n+      if (this.notifyCalls.has(callIdFromQuery)) {\n+        return TwilioProvider.EMPTY_TWIML;\n+      }\n+    }\n+\n+    // Status callbacks should not receive TwiML.\n+    if (isStatusCallback) {\n+      return TwilioProvider.EMPTY_TWIML;\n     }\n \n     // Handle subsequent webhook requests (status callbacks, etc.)\n@@ -385,16 +399,17 @@ export class TwilioProvider implements VoiceCallProvider {\n     // We now serve it from the webhook endpoint instead of sending inline\n     if (input.inlineTwiml) {\n       this.twimlStorage.set(input.callId, input.inlineTwiml);\n+      this.notifyCalls.add(input.callId);\n     }\n \n     // Build request params - always use URL-based TwiML.\n     // Twilio silently ignores `StatusCallback` when using the inline `Twiml` parameter.\n-    const params: Record<string, string> = {\n+    const params: Record<string, string | string[]> = {\n       To: input.to,\n       From: input.from,\n       Url: url.toString(), // TwiML serving endpoint\n       StatusCallback: statusUrl.toString(), // Separate status callback endpoint\n-      StatusCallbackEvent: \"initiated ringing answered completed\",\n+      StatusCallbackEvent: [\"initiated\", \"ringing\", \"answered\", \"completed\"],\n       Timeout: \"30\",\n     };\n "
+    },
+    {
+      "sha": "9fcb202a8be95fb33fc98550e3d2a7fa79fb21f0",
+      "filename": "extensions/voice-call/src/providers/twilio/api.ts",
+      "status": "modified",
+      "additions": 19,
+      "deletions": 3,
+      "changes": 22,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/e071493bb34b34e8cdc196c25733bd116a40de01/extensions%2Fvoice-call%2Fsrc%2Fproviders%2Ftwilio%2Fapi.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/e071493bb34b34e8cdc196c25733bd116a40de01/extensions%2Fvoice-call%2Fsrc%2Fproviders%2Ftwilio%2Fapi.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fvoice-call%2Fsrc%2Fproviders%2Ftwilio%2Fapi.ts?ref=e071493bb34b34e8cdc196c25733bd116a40de01",
+      "patch": "@@ -3,16 +3,33 @@ export async function twilioApiRequest<T = unknown>(params: {\n   accountSid: string;\n   authToken: string;\n   endpoint: string;\n-  body: Record<string, string>;\n+  body: URLSearchParams | Record<string, string | string[]>;\n   allowNotFound?: boolean;\n }): Promise<T> {\n+  const bodyParams =\n+    params.body instanceof URLSearchParams\n+      ? params.body\n+      : Object.entries(params.body).reduce<URLSearchParams>(\n+          (acc, [key, value]) => {\n+            if (Array.isArray(value)) {\n+              for (const entry of value) {\n+                acc.append(key, entry);\n+              }\n+            } else if (typeof value === \"string\") {\n+              acc.append(key, value);\n+            }\n+            return acc;\n+          },\n+          new URLSearchParams(),\n+        );\n+\n   const response = await fetch(`${params.baseUrl}${params.endpoint}`, {\n     method: \"POST\",\n     headers: {\n       Authorization: `Basic ${Buffer.from(`${params.accountSid}:${params.authToken}`).toString(\"base64\")}`,\n       \"Content-Type\": \"application/x-www-form-urlencoded\",\n     },\n-    body: new URLSearchParams(params.body),\n+    body: bodyParams,\n   });\n \n   if (!response.ok) {\n@@ -26,4 +43,3 @@ export async function twilioApiRequest<T = unknown>(params: {\n   const text = await response.text();\n   return text ? (JSON.parse(text) as T) : (undefined as T);\n }\n-"
+    },
+    {
+      "sha": "973c7b70feb0d93122436e6b2bdaa43d2130f81e",
+      "filename": "extensions/voice-call/src/tunnel.ts",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 4,
+      "changes": 9,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/e071493bb34b34e8cdc196c25733bd116a40de01/extensions%2Fvoice-call%2Fsrc%2Ftunnel.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/e071493bb34b34e8cdc196c25733bd116a40de01/extensions%2Fvoice-call%2Fsrc%2Ftunnel.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fvoice-call%2Fsrc%2Ftunnel.ts?ref=e071493bb34b34e8cdc196c25733bd116a40de01",
+      "patch": "@@ -230,12 +230,13 @@ export async function startTailscaleTunnel(config: {\n     throw new Error(\"Could not get Tailscale DNS name. Is Tailscale running?\");\n   }\n \n-  const localUrl = `http://127.0.0.1:${config.port}`;\n+  const path = config.path.startsWith(\"/\") ? config.path : `/${config.path}`;\n+  const localUrl = `http://127.0.0.1:${config.port}${path}`;\n \n   return new Promise((resolve, reject) => {\n     const proc = spawn(\n       \"tailscale\",\n-      [config.mode, \"--bg\", \"--yes\", \"--set-path\", config.path, localUrl],\n+      [config.mode, \"--bg\", \"--yes\", \"--set-path\", path, localUrl],\n       { stdio: [\"ignore\", \"pipe\", \"pipe\"] },\n     );\n \n@@ -247,7 +248,7 @@ export async function startTailscaleTunnel(config: {\n     proc.on(\"close\", (code) => {\n       clearTimeout(timeout);\n       if (code === 0) {\n-        const publicUrl = `https://${dnsName}${config.path}`;\n+        const publicUrl = `https://${dnsName}${path}`;\n         console.log(\n           `[voice-call] Tailscale ${config.mode} active: ${publicUrl}`,\n         );\n@@ -256,7 +257,7 @@ export async function startTailscaleTunnel(config: {\n           publicUrl,\n           provider: `tailscale-${config.mode}`,\n           stop: async () => {\n-            await stopTailscaleTunnel(config.mode, config.path);\n+            await stopTailscaleTunnel(config.mode, path);\n           },\n         });\n       } else {"
+    },
+    {
+      "sha": "79bd96099e19721b899ad252fa734ceaeaca0361",
+      "filename": "extensions/voice-call/src/webhook-security.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/e071493bb34b34e8cdc196c25733bd116a40de01/extensions%2Fvoice-call%2Fsrc%2Fwebhook-security.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/e071493bb34b34e8cdc196c25733bd116a40de01/extensions%2Fvoice-call%2Fsrc%2Fwebhook-security.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fvoice-call%2Fsrc%2Fwebhook-security.ts?ref=e071493bb34b34e8cdc196c25733bd116a40de01",
+      "patch": "@@ -25,7 +25,7 @@ export function validateTwilioSignature(\n \n   // Sort params alphabetically and append key+value\n   const sortedParams = Array.from(params.entries()).sort((a, b) =>\n-    a[0].localeCompare(b[0]),\n+    a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0,\n   );\n \n   for (const [key, value] of sortedParams) {"
+    }
+  ]
+}

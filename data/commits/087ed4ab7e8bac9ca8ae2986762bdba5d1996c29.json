@@ -1,0 +1,149 @@
+{
+  "message": "fix(cli,server,tools,guard,storage,db): harden edge cases across multiple subsystems\n\nCLI:\n- Setup command output now renders as a styled box-drawing table in TTY\n  mode with per-outcome icons and colors, falling back to plain text for\n  non-TTY (pipelines, CI)\n- Robot mode: use try_into().unwrap_or(i64::MAX) for limit casts instead\n  of bare `as i64` to prevent silent truncation of large usize values\n\nServer:\n- Cleanup filesystem activity check now uses `git ls-files` fast path\n  for glob patterns, avoiding catastrophic O(n) directory traversal\n  through target/ and node_modules/; fallback glob capped at 5000 entries\n- TUI toast focus index clamped on tick so dismissing the last toast\n  doesn't leave a stale index pointing past visible notifications\n- Message browser: handle empty `to` field by falling back to cc\n  recipients or \"undisclosed\" in send confirmation summary\n\nDatabase:\n- mark_message_read / acknowledge_message: properly rollback and return\n  error on Err outcome instead of silently using `now` timestamp (was\n  swallowing the error and proceeding with stale data)\n\nGuard:\n- parse_name_status_z: unknown git status codes now capture their\n  associated path and advance the parser by 2, maintaining alignment\n  with subsequent entries (previously skipped the status but left the\n  path dangling, causing offset drift)\n\nStorage:\n- FileLock retry backoff: center jitter around base_ms instead of\n  always adding to it, producing more uniform spread and preventing\n  consistently overshooting the intended delay\n\nTools:\n- Build slots: clean up malformed lease files on discovery instead of\n  silently skipping them; renew_build_slot skips already-released\n  leases; release_build_slot is idempotent for already-released leases\n- Contact parsing: trim whitespace from project slug in URI format\n- Inbox fetch: allow limit=0 to reach the explicit error path instead\n  of silently defaulting to 20\n- Search: raise planner limit cap from 1000 to 10000 for large mailboxes\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "a47d3dbfd91f1adafb0622d98bfd6f921551c9d1",
+      "filename": "crates/mcp-agent-mail-cli/src/lib.rs",
+      "status": "modified",
+      "additions": 92,
+      "deletions": 14,
+      "changes": 106,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/087ed4ab7e8bac9ca8ae2986762bdba5d1996c29/crates%2Fmcp-agent-mail-cli%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/087ed4ab7e8bac9ca8ae2986762bdba5d1996c29/crates%2Fmcp-agent-mail-cli%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-cli%2Fsrc%2Flib.rs?ref=087ed4ab7e8bac9ca8ae2986762bdba5d1996c29",
+      "patch": "@@ -3823,20 +3823,7 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {\n             let results = setup::run_setup(&params);\n \n             output::emit_output(&results, fmt, || {\n-                if dry_run {\n-                    output::section(\"Dry run \u2014 no files will be modified\");\n-                    ftui_runtime::ftui_println!(\"\");\n-                }\n-\n-                for result in &results {\n-                    output::section(&result.platform.to_string());\n-                    for action in &result.actions {\n-                        ftui_runtime::ftui_println!(\"  {} \u2014 {}\", action.file_path, action.outcome);\n-                        if !action.description.is_empty() {\n-                            ftui_runtime::ftui_println!(\"    {}\", action.description);\n-                        }\n-                    }\n-                }\n+                render_setup_actions_table(&results, dry_run);\n \n                 let total_actions: usize = results.iter().map(|r| r.actions.len()).sum();\n                 let created = results\n@@ -3954,6 +3941,97 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {\n     }\n }\n \n+fn setup_action_style(\n+    outcome: &mcp_agent_mail_core::setup::ActionOutcome,\n+) -> (&'static str, String) {\n+    match outcome {\n+        mcp_agent_mail_core::setup::ActionOutcome::Created => {\n+            (\"\u2713\", mcp_agent_mail_server::theme::success_bold())\n+        }\n+        mcp_agent_mail_core::setup::ActionOutcome::Updated => {\n+            (\"\u21bb\", mcp_agent_mail_server::theme::primary_bold())\n+        }\n+        mcp_agent_mail_core::setup::ActionOutcome::Unchanged => {\n+            (\"\u2022\", mcp_agent_mail_server::theme::muted())\n+        }\n+        mcp_agent_mail_core::setup::ActionOutcome::Skipped => {\n+            (\"\u25cc\", mcp_agent_mail_server::theme::warning_bold())\n+        }\n+        mcp_agent_mail_core::setup::ActionOutcome::BackedUp(_) => {\n+            (\"\ud83d\udcbe\", mcp_agent_mail_server::theme::accent())\n+        }\n+        mcp_agent_mail_core::setup::ActionOutcome::Failed(_) => {\n+            (\"\u2717\", mcp_agent_mail_server::theme::error_bold())\n+        }\n+    }\n+}\n+\n+fn render_setup_actions_table(results: &[mcp_agent_mail_core::setup::SetupResult], dry_run: bool) {\n+    if !output::is_tty() {\n+        if dry_run {\n+            output::section(\"Dry run \u2014 no files will be modified\");\n+            ftui_runtime::ftui_println!(\"\");\n+        }\n+        for result in results {\n+            output::section(&result.platform);\n+            for action in &result.actions {\n+                ftui_runtime::ftui_println!(\"  {} \u2014 {}\", action.file_path, action.outcome);\n+                if !action.description.is_empty() {\n+                    ftui_runtime::ftui_println!(\"    {}\", action.description);\n+                }\n+            }\n+        }\n+        return;\n+    }\n+\n+    let _ = mcp_agent_mail_server::theme::init_console_theme();\n+    let reset = mcp_agent_mail_server::theme::RESET;\n+    let dim = mcp_agent_mail_server::theme::DIM;\n+    let border = mcp_agent_mail_server::theme::secondary_bold();\n+    let heading = mcp_agent_mail_server::theme::primary_bold();\n+    let label = mcp_agent_mail_server::theme::text_bold();\n+    let path = mcp_agent_mail_server::theme::accent();\n+    let note = mcp_agent_mail_server::theme::warning_bold();\n+    let muted = mcp_agent_mail_server::theme::muted();\n+\n+    ftui_runtime::ftui_println!(\n+        \"{border}\u256d\u2500 \ud83e\uddf0 Agent MCP Configuration Sync \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e{reset}\"\n+    );\n+    if dry_run {\n+        ftui_runtime::ftui_println!(\n+            \"{border}\u2502{reset} {note}Dry run{reset} {dim}\u2014 no files will be modified{reset}\"\n+        );\n+        ftui_runtime::ftui_println!(\"{border}\u2502{reset}\");\n+    }\n+\n+    for (platform_index, result) in results.iter().enumerate() {\n+        ftui_runtime::ftui_println!(\n+            \"{border}\u2502{reset} {heading}\u25c8{reset} {label}{}{reset}\",\n+            result.platform\n+        );\n+        for action in &result.actions {\n+            let (icon, icon_color) = setup_action_style(&action.outcome);\n+            ftui_runtime::ftui_println!(\n+                \"{border}\u2502{reset}   {icon_color}{icon}{reset} {dim}{:<14}{reset} {path}{}{reset}\",\n+                action.outcome,\n+                action.file_path\n+            );\n+            if !action.description.is_empty() {\n+                ftui_runtime::ftui_println!(\n+                    \"{border}\u2502{reset}      {muted}{}{reset}\",\n+                    action.description\n+                );\n+            }\n+        }\n+        if platform_index + 1 < results.len() {\n+            ftui_runtime::ftui_println!(\"{border}\u2502{reset}\");\n+        }\n+    }\n+    ftui_runtime::ftui_println!(\n+        \"{border}\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f{reset}\"\n+    );\n+}\n+\n #[derive(Debug, Clone, serde::Serialize)]\n struct GoldenRow {\n     filename: String,"
+    },
+    {
+      "sha": "1dff2d07e720a9324f86749fed2db17ae48b9796",
+      "filename": "crates/mcp-agent-mail-cli/src/robot.rs",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 5,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/087ed4ab7e8bac9ca8ae2986762bdba5d1996c29/crates%2Fmcp-agent-mail-cli%2Fsrc%2Frobot.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/087ed4ab7e8bac9ca8ae2986762bdba5d1996c29/crates%2Fmcp-agent-mail-cli%2Fsrc%2Frobot.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-cli%2Fsrc%2Frobot.rs?ref=087ed4ab7e8bac9ca8ae2986762bdba5d1996c29",
+      "patch": "@@ -1160,7 +1160,7 @@ fn build_inbox(\n                 Value::BigInt(ack_threshold),\n                 Value::BigInt(agent_id),\n                 Value::BigInt(project_id),\n-                Value::BigInt(limit as i64),\n+                Value::BigInt(limit.try_into().unwrap_or(i64::MAX)),\n             ],\n         )\n         .map_err(|e| CliError::Other(format!(\"inbox query failed: {e}\")))?;\n@@ -1283,7 +1283,7 @@ fn build_outbox_entries(\n             &[\n                 Value::BigInt(agent_id),\n                 Value::BigInt(project_id),\n-                Value::BigInt(limit as i64),\n+                Value::BigInt(limit.try_into().unwrap_or(i64::MAX)),\n             ],\n         )\n         .map_err(|e| CliError::Other(format!(\"outbox query failed: {e}\")))?;\n@@ -1455,7 +1455,7 @@ fn build_thread(\n     }\n \n     let limit_val = limit.unwrap_or(200);\n-    params.push(Value::BigInt(limit_val as i64));\n+    params.push(Value::BigInt(limit_val.try_into().unwrap_or(i64::MAX)));\n \n     let where_clause = conditions.join(\" AND \");\n     let sql = format!(\n@@ -1882,7 +1882,7 @@ fn build_search(\n     fts_params.push(Value::Text(sanitized.clone()));\n     fts_params.push(Value::BigInt(project_id));\n     fts_params.extend(filter_params.iter().cloned());\n-    fts_params.push(Value::BigInt(limit as i64));\n+    fts_params.push(Value::BigInt(limit.try_into().unwrap_or(i64::MAX)));\n \n     let rows = match conn.query_sync(&fts_sql, &fts_params) {\n         Ok(rows) => rows,\n@@ -1907,7 +1907,7 @@ fn build_search(\n                     like_params.push(Value::Text(escaped.clone()));\n                     like_params.push(Value::Text(escaped));\n                 }\n-                like_params.push(Value::BigInt(limit as i64));\n+                like_params.push(Value::BigInt(limit.try_into().unwrap_or(i64::MAX)));\n                 let like_clause = like_parts.join(\" OR \");\n \n                 let like_sql = format!("
+    },
+    {
+      "sha": "ec251bf35833d57e305fefa8865f194491522dba",
+      "filename": "crates/mcp-agent-mail-db/src/queries.rs",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 2,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/087ed4ab7e8bac9ca8ae2986762bdba5d1996c29/crates%2Fmcp-agent-mail-db%2Fsrc%2Fqueries.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/087ed4ab7e8bac9ca8ae2986762bdba5d1996c29/crates%2Fmcp-agent-mail-db%2Fsrc%2Fqueries.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-db%2Fsrc%2Fqueries.rs?ref=087ed4ab7e8bac9ca8ae2986762bdba5d1996c29",
+      "patch": "@@ -3542,7 +3542,10 @@ pub async fn mark_message_read(\n                 _ => None,\n             })\n             .unwrap_or(now),\n-        Outcome::Err(_) => now,\n+        Outcome::Err(e) => {\n+            rollback_tx(cx, &tracked).await;\n+            return Outcome::Err(e);\n+        }\n         Outcome::Cancelled(r) => {\n             rollback_tx(cx, &tracked).await;\n             return Outcome::Cancelled(r);\n@@ -3633,7 +3636,10 @@ pub async fn acknowledge_message(\n                     .unwrap_or(now);\n                 (read_ts, ack_ts)\n             }\n-            Outcome::Err(_) => (now, now),\n+            Outcome::Err(e) => {\n+                rollback_tx(cx, &tracked).await;\n+                return Outcome::Err(e);\n+            }\n             Outcome::Cancelled(r) => {\n                 rollback_tx(cx, &tracked).await;\n                 return Outcome::Cancelled(r);"
+    },
+    {
+      "sha": "27b10c8711feedc5f093a52102e50abe6660dae2",
+      "filename": "crates/mcp-agent-mail-guard/src/lib.rs",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 2,
+      "changes": 12,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/087ed4ab7e8bac9ca8ae2986762bdba5d1996c29/crates%2Fmcp-agent-mail-guard%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/087ed4ab7e8bac9ca8ae2986762bdba5d1996c29/crates%2Fmcp-agent-mail-guard%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-guard%2Fsrc%2Flib.rs?ref=087ed4ab7e8bac9ca8ae2986762bdba5d1996c29",
+      "patch": "@@ -1284,8 +1284,16 @@ fn parse_name_status_z(raw: &[u8]) -> GuardResult<Vec<String>> {\n                 }\n             }\n             _ => {\n-                // Unknown status, skip\n-                i += 1;\n+                // Unknown status, assume 1 path and capture it to maintain alignment\n+                if i + 1 < parts.len() {\n+                    let p = parts[i + 1];\n+                    if !p.is_empty() {\n+                        paths.push(p.to_string());\n+                    }\n+                    i += 2;\n+                } else {\n+                    i += 1;\n+                }\n             }\n         }\n     }"
+    },
+    {
+      "sha": "45a2f8356903083c7763bce28f08fab4d101b64c",
+      "filename": "crates/mcp-agent-mail-server/src/cleanup.rs",
+      "status": "modified",
+      "additions": 39,
+      "deletions": 1,
+      "changes": 40,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/087ed4ab7e8bac9ca8ae2986762bdba5d1996c29/crates%2Fmcp-agent-mail-server%2Fsrc%2Fcleanup.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/087ed4ab7e8bac9ca8ae2986762bdba5d1996c29/crates%2Fmcp-agent-mail-server%2Fsrc%2Fcleanup.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-server%2Fsrc%2Fcleanup.rs?ref=087ed4ab7e8bac9ca8ae2986762bdba5d1996c29",
+      "patch": "@@ -283,6 +283,43 @@ fn check_filesystem_activity(\n     let has_glob = pattern.contains('*') || pattern.contains('?') || pattern.contains('[');\n \n     if has_glob {\n+        // Fast path: use `git ls-files -c -o --exclude-standard -- pattern` to get matching files.\n+        // This leverages git's index and ignores `.gitignore`d folders like `target/` which would\n+        // otherwise cause insane CPU usage during synchronous directory traversal.\n+        let git_ls = std::process::Command::new(\"git\")\n+            .args([\n+                \"-C\",\n+                &workspace.to_string_lossy(),\n+                \"ls-files\",\n+                \"-c\",\n+                \"-o\",\n+                \"--exclude-standard\",\n+                \"--\",\n+                pattern,\n+            ])\n+            .output();\n+\n+        if let Ok(output) = git_ls {\n+            if output.status.success() {\n+                let stdout = String::from_utf8_lossy(&output.stdout);\n+                for line in stdout.lines() {\n+                    let file_path = workspace.join(line);\n+                    if let Ok(metadata) = file_path.metadata()\n+                        && let Ok(modified) = metadata.modified()\n+                    {\n+                        let mtime_us = modified\n+                            .duration_since(std::time::UNIX_EPOCH)\n+                            .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(0));\n+                        if now_us.saturating_sub(mtime_us) <= grace_us {\n+                            return true;\n+                        }\n+                    }\n+                }\n+                return false;\n+            }\n+        }\n+\n+        // Fallback: unbounded glob (slow, but works outside git repos)\n         let base_str = workspace.to_string_lossy();\n         let base_escaped = glob::Pattern::escape(&base_str);\n         // We use format! instead of Path::join because base_escaped is a string\n@@ -294,7 +331,8 @@ fn check_filesystem_activity(\n         };\n \n         if let Ok(paths) = glob::glob(&full_pattern) {\n-            for entry in paths.flatten() {\n+            // Cap the fallback traversal so it doesn't freeze the server completely.\n+            for entry in paths.flatten().take(5000) {\n                 if let Ok(metadata) = entry.metadata()\n                     && let Ok(modified) = metadata.modified()\n                 {"
+    },
+    {
+      "sha": "70a6d40a256ab59bfb6355a1c151d23e2128fddd",
+      "filename": "crates/mcp-agent-mail-server/src/tui_app.rs",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 0,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/087ed4ab7e8bac9ca8ae2986762bdba5d1996c29/crates%2Fmcp-agent-mail-server%2Fsrc%2Ftui_app.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/087ed4ab7e8bac9ca8ae2986762bdba5d1996c29/crates%2Fmcp-agent-mail-server%2Fsrc%2Ftui_app.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-server%2Fsrc%2Ftui_app.rs?ref=087ed4ab7e8bac9ca8ae2986762bdba5d1996c29",
+      "patch": "@@ -3455,6 +3455,15 @@ impl MailAppModel {\n         self.notifications.tick(elapsed_tick);\n         self.tick_toast_animation_state();\n \n+        if let Some(idx) = self.toast_focus_index {\n+            let count = self.notifications.visible_count();\n+            if count == 0 {\n+                self.toast_focus_index = None;\n+            } else if idx >= count {\n+                self.toast_focus_index = Some(count - 1);\n+            }\n+        }\n+\n         // Drain deferred confirmed actions (from modal callbacks).\n         // Side-effects (toast, navigation) are applied inside\n         // `dispatch_execute_operation`."
+    },
+    {
+      "sha": "3abb6a91ebb6e01d76665ae3f2fa4b555a352f31",
+      "filename": "crates/mcp-agent-mail-server/src/tui_screens/messages.rs",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 1,
+      "changes": 12,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/087ed4ab7e8bac9ca8ae2986762bdba5d1996c29/crates%2Fmcp-agent-mail-server%2Fsrc%2Ftui_screens%2Fmessages.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/087ed4ab7e8bac9ca8ae2986762bdba5d1996c29/crates%2Fmcp-agent-mail-server%2Fsrc%2Ftui_screens%2Fmessages.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-server%2Fsrc%2Ftui_screens%2Fmessages.rs?ref=087ed4ab7e8bac9ca8ae2986762bdba5d1996c29",
+      "patch": "@@ -1379,7 +1379,17 @@ impl MessageBrowserScreen {\n \n         match result {\n             Ok(_) => {\n-                let to_summary = if payload.to.len() == 1 {\n+                let to_summary = if payload.to.is_empty() {\n+                    if let Some(first) = payload.cc.first() {\n+                        if payload.cc.len() == 1 {\n+                            format!(\"cc: {}\", first)\n+                        } else {\n+                            format!(\"cc: {} (+{})\", first, payload.cc.len() - 1)\n+                        }\n+                    } else {\n+                        \"undisclosed\".to_string()\n+                    }\n+                } else if payload.to.len() == 1 {\n                     payload.to[0].clone()\n                 } else {\n                     format!(\"{} (+{})\", payload.to[0], payload.to.len() - 1)"
+    },
+    {
+      "sha": "ee4cc7f52722a082a0014995f57204b5df23a3c6",
+      "filename": "crates/mcp-agent-mail-storage/src/lib.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/087ed4ab7e8bac9ca8ae2986762bdba5d1996c29/crates%2Fmcp-agent-mail-storage%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/087ed4ab7e8bac9ca8ae2986762bdba5d1996c29/crates%2Fmcp-agent-mail-storage%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-storage%2Fsrc%2Flib.rs?ref=087ed4ab7e8bac9ca8ae2986762bdba5d1996c29",
+      "patch": "@@ -830,9 +830,9 @@ impl FileLock {\n                     } else {\n                         50 * (1u64 << attempt.min(4))\n                     };\n-                    let jitter_range = base_ms / 2 + 1; // \u00b125% of base\n+                    let jitter_range = base_ms / 2 + 1; // 50% range for \u00b125%\n                     let jitter = thread_jitter_ms(jitter_range);\n-                    let sleep_ms = base_ms.saturating_add(jitter).max(10);\n+                    let sleep_ms = base_ms.saturating_sub(base_ms / 4).saturating_add(jitter).max(10);\n                     std::thread::sleep(Duration::from_millis(sleep_ms));\n                 }\n             }"
+    },
+    {
+      "sha": "4b08be2dace70a78fce1a0b828cca6fb51d83c31",
+      "filename": "crates/mcp-agent-mail-tools/src/build_slots.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 1,
+      "changes": 8,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/087ed4ab7e8bac9ca8ae2986762bdba5d1996c29/crates%2Fmcp-agent-mail-tools%2Fsrc%2Fbuild_slots.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/087ed4ab7e8bac9ca8ae2986762bdba5d1996c29/crates%2Fmcp-agent-mail-tools%2Fsrc%2Fbuild_slots.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-tools%2Fsrc%2Fbuild_slots.rs?ref=087ed4ab7e8bac9ca8ae2986762bdba5d1996c29",
+      "patch": "@@ -88,6 +88,8 @@ fn read_active_leases(slot_path: &Path, now: chrono::DateTime<chrono::Utc>) -> V\n         };\n         let Ok(exp) = chrono::DateTime::parse_from_rfc3339(&lease.expires_ts) else {\n             // Ignore malformed leases: invalid expiration should not block slots forever.\n+            // Clean it up to prevent unlimited file accumulation.\n+            let _ = std::fs::remove_file(&path);\n             continue;\n         };\n         if exp.with_timezone(&chrono::Utc) <= now {\n@@ -240,7 +242,7 @@ pub async fn renew_build_slot(\n     let active = read_active_leases(&slot_path, now);\n \n     for mut current in active {\n-        if current.agent == agent_name {\n+        if current.agent == agent_name && current.released_ts.is_none() {\n             let holder_id = safe_component(&format!(\n                 \"{}__{}\",\n                 current.agent,\n@@ -303,6 +305,10 @@ pub async fn release_build_slot(\n \n     for mut lease in active {\n         if lease.agent == agent_name {\n+            if lease.released_ts.is_some() {\n+                released = true;\n+                continue;\n+            }\n             let holder_id = safe_component(&format!(\n                 \"{}__{}\",\n                 lease.agent,"
+    },
+    {
+      "sha": "b8ee55c55355ae04c09774ba35102e6449ca0bd7",
+      "filename": "crates/mcp-agent-mail-tools/src/contacts.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/087ed4ab7e8bac9ca8ae2986762bdba5d1996c29/crates%2Fmcp-agent-mail-tools%2Fsrc%2Fcontacts.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/087ed4ab7e8bac9ca8ae2986762bdba5d1996c29/crates%2Fmcp-agent-mail-tools%2Fsrc%2Fcontacts.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-tools%2Fsrc%2Fcontacts.rs?ref=087ed4ab7e8bac9ca8ae2986762bdba5d1996c29",
+      "patch": "@@ -185,6 +185,7 @@ fn parse_contact_target(\n         && to_agent.contains('#')\n         && let Some((slug, agent)) = to_agent.split_once(':').and_then(|(_, rest)| {\n             let (slug, agent) = rest.split_once('#')?;\n+            let slug = slug.trim();\n             let agent = agent.trim();\n             if slug.is_empty() || agent.is_empty() {\n                 None"
+    },
+    {
+      "sha": "1ae5f09af57131a58f6932387f38f9318972be4a",
+      "filename": "crates/mcp-agent-mail-tools/src/messaging.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/087ed4ab7e8bac9ca8ae2986762bdba5d1996c29/crates%2Fmcp-agent-mail-tools%2Fsrc%2Fmessaging.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/087ed4ab7e8bac9ca8ae2986762bdba5d1996c29/crates%2Fmcp-agent-mail-tools%2Fsrc%2Fmessaging.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-tools%2Fsrc%2Fmessaging.rs?ref=087ed4ab7e8bac9ca8ae2986762bdba5d1996c29",
+      "patch": "@@ -2581,8 +2581,8 @@ pub async fn fetch_inbox(\n     topic: Option<String>,\n ) -> McpResult<String> {\n     let mut msg_limit = match limit {\n-        Some(l) if l > 0 => l,\n-        _ => 20,\n+        Some(l) => l,\n+        None => 20,\n     };\n     if msg_limit < 1 {\n         return Err(legacy_tool_error("
+    },
+    {
+      "sha": "6ce692fbda7a71a67748d89c44fa0f1ee15e8175",
+      "filename": "crates/mcp-agent-mail-tools/src/search.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/087ed4ab7e8bac9ca8ae2986762bdba5d1996c29/crates%2Fmcp-agent-mail-tools%2Fsrc%2Fsearch.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/087ed4ab7e8bac9ca8ae2986762bdba5d1996c29/crates%2Fmcp-agent-mail-tools%2Fsrc%2Fsearch.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-tools%2Fsrc%2Fsearch.rs?ref=087ed4ab7e8bac9ca8ae2986762bdba5d1996c29",
+      "patch": "@@ -673,7 +673,7 @@ pub async fn search_messages(\n     } else {\n         offset.unwrap_or(0).max(0).unsigned_abs() as usize\n     };\n-    let planner_limit = max_results.saturating_add(offset_val).min(1000);\n+    let planner_limit = max_results.saturating_add(offset_val).min(10_000);\n     let want_explain = explain.unwrap_or(false);\n \n     // Legacy parity: empty query returns an empty result set (no DB call)."
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "message": "feat(tailer): global streaming health surface and chaos module visibility\n\ntailer.rs:\n- Add global StreamingHealth snapshot surface via OnceLock<StdRwLock>\n  (same pattern as runtime lock/memory telemetry). StreamingBridge now\n  auto-publishes a health snapshot after each process_event() and\n  record_fallback() call.\n- StreamingHealth::update_global() / get_global(): write/read the\n  latest streaming health snapshot from any thread. Enables the IPC\n  status endpoint and diagnostic surfaces to report streaming capture\n  health without holding a reference to the bridge.\n- StreamingHealth: add serde Serialize/Deserialize derives for JSON\n  status payloads.\n- TailerMode: add serde Serialize/Deserialize derives with\n  rename_all=\"snake_case\" for consistent JSON representation.\n- snapshot_health(): new private method on StreamingBridge that\n  constructs a StreamingHealth from current bridge state.\n\nchaos.rs:\n- Remove #[cfg(test)] gate from chaos module so it can be used in\n  integration tests and benchmarks, not just unit tests. The module\n  provides fault injection scenarios that are valuable for resilience\n  testing outside the crate's own test harness.\n- Fix wildcard import in scenarios submodule: replace `use super::*`\n  with explicit `use super::{ChaosAssertion, ChaosScenario, FaultMode,\n  FaultPoint}` to satisfy clippy::wildcard_imports.\n\nlib.rs:\n- Remove #[cfg(test)] attribute from `pub mod chaos` to match the\n  chaos.rs visibility change above.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "ce3c594870599d620fa49a7acaa8e2ec8e6d7809",
+      "filename": "crates/frankenterm-core/src/chaos.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/87d0d720df253a59127a9ee6fbaedbdd120688f6/crates%2Ffrankenterm-core%2Fsrc%2Fchaos.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/87d0d720df253a59127a9ee6fbaedbdd120688f6/crates%2Ffrankenterm-core%2Fsrc%2Fchaos.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Ffrankenterm-core%2Fsrc%2Fchaos.rs?ref=87d0d720df253a59127a9ee6fbaedbdd120688f6",
+      "patch": "@@ -526,7 +526,7 @@ fn epoch_ms() -> u64 {\n \n /// Pre-built chaos scenarios for common resilience tests.\n pub mod scenarios {\n-    use super::*;\n+    use super::{ChaosAssertion, ChaosScenario, FaultMode, FaultPoint};\n \n     /// Scenario 1: Database writes fail repeatedly.\n     ///"
+    },
+    {
+      "sha": "54af478e70ff67fcd62709c7b4e7cf4182983fef",
+      "filename": "crates/frankenterm-core/src/lib.rs",
+      "status": "modified",
+      "additions": 0,
+      "deletions": 1,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/87d0d720df253a59127a9ee6fbaedbdd120688f6/crates%2Ffrankenterm-core%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/87d0d720df253a59127a9ee6fbaedbdd120688f6/crates%2Ffrankenterm-core%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Ffrankenterm-core%2Fsrc%2Flib.rs?ref=87d0d720df253a59127a9ee6fbaedbdd120688f6",
+      "patch": "@@ -60,7 +60,6 @@ pub mod build_coord;\n pub mod cass;\n pub mod causal_dag;\n pub mod caut;\n-#[cfg(test)]\n pub mod chaos;\n pub mod circuit_breaker;\n pub mod cleanup;"
+    },
+    {
+      "sha": "7cc64542dad0539249cefddcf5907abebda92dec",
+      "filename": "crates/frankenterm-core/src/tailer.rs",
+      "status": "modified",
+      "additions": 39,
+      "deletions": 4,
+      "changes": 43,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/87d0d720df253a59127a9ee6fbaedbdd120688f6/crates%2Ffrankenterm-core%2Fsrc%2Ftailer.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/87d0d720df253a59127a9ee6fbaedbdd120688f6/crates%2Ffrankenterm-core%2Fsrc%2Ftailer.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Ffrankenterm-core%2Fsrc%2Ftailer.rs?ref=87d0d720df253a59127a9ee6fbaedbdd120688f6",
+      "patch": "@@ -6,7 +6,7 @@\n \n use std::collections::{HashMap, HashSet};\n use std::sync::atomic::{AtomicBool, Ordering};\n-use std::sync::{Arc, Mutex};\n+use std::sync::{Arc, Mutex, OnceLock, RwLock as StdRwLock};\n use std::time::{Duration, Instant};\n \n use crate::runtime_compat::mpsc;\n@@ -946,7 +946,8 @@ pub enum PollOutcome {\n // ---------------------------------------------------------------------------\n \n /// Capture mode for a pane \u2014 either polling-based or streaming-based.\n-#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]\n+#[serde(rename_all = \"snake_case\")]\n pub enum TailerMode {\n     /// Traditional get_text polling with adaptive intervals.\n     Polling,\n@@ -1007,6 +1008,8 @@ pub struct StreamingBridge {\n     dirty_row_total: u64,\n }\n \n+static GLOBAL_STREAMING_HEALTH: OnceLock<StdRwLock<Option<StreamingHealth>>> = OnceLock::new();\n+\n impl StreamingBridge {\n     /// Create a new streaming bridge.\n     #[must_use]\n@@ -1071,12 +1074,15 @@ impl StreamingBridge {\n             }\n         };\n \n-        self.ingester.process(event)\n+        let segments = self.ingester.process(event);\n+        StreamingHealth::update_global(self.snapshot_health());\n+        segments\n     }\n \n     /// Record that a fallback to polling occurred.\n     pub fn record_fallback(&mut self) {\n         self.fallback_count += 1;\n+        StreamingHealth::update_global(self.snapshot_health());\n     }\n \n     /// Number of events processed.\n@@ -1108,6 +1114,18 @@ impl StreamingBridge {\n     pub fn ingester(&self) -> &crate::ingest::StreamIngester {\n         &self.ingester\n     }\n+\n+    fn snapshot_health(&self) -> StreamingHealth {\n+        StreamingHealth {\n+            mode: TailerMode::Streaming,\n+            events_processed: self.events_processed,\n+            dirty_ranges_total: self.dirty_range_total,\n+            dirty_rows_total: self.dirty_row_total,\n+            gaps_emitted: self.ingester.total_gaps(),\n+            fallback_count: self.fallback_count,\n+            active_panes: self.ingester.active_panes(),\n+        }\n+    }\n }\n \n impl Default for StreamingBridge {\n@@ -1117,7 +1135,7 @@ impl Default for StreamingBridge {\n }\n \n /// Health snapshot for streaming diagnostics.\n-#[derive(Debug, Clone)]\n+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]\n pub struct StreamingHealth {\n     /// Current capture mode.\n     pub mode: TailerMode,\n@@ -1135,6 +1153,23 @@ pub struct StreamingHealth {\n     pub active_panes: usize,\n }\n \n+impl StreamingHealth {\n+    /// Update the latest global streaming health snapshot.\n+    pub fn update_global(snapshot: Self) {\n+        let lock = GLOBAL_STREAMING_HEALTH.get_or_init(|| StdRwLock::new(None));\n+        if let Ok(mut guard) = lock.write() {\n+            *guard = Some(snapshot);\n+        }\n+    }\n+\n+    /// Get the latest global streaming health snapshot.\n+    #[must_use]\n+    pub fn get_global() -> Option<Self> {\n+        let lock = GLOBAL_STREAMING_HEALTH.get_or_init(|| StdRwLock::new(None));\n+        lock.read().ok().and_then(|guard| guard.clone())\n+    }\n+}\n+\n #[cfg(test)]\n mod tests {\n     use super::*;"
+    }
+  ]
+}

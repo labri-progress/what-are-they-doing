@@ -1,0 +1,41 @@
+{
+  "message": "fix(http): correct Content-Length handling and idle timeout for HTTP/1.1\n\nThree protocol correctness fixes:\n\nClient: Empty-body POST/PUT requests now emit Content-Length: 0 as\nrequired by HTTP/1.1. Previously only non-empty bodies got the header.\n\nCodec: 1xx, 204, and 304 responses no longer emit Content-Length.\nRFC 7230 says these status codes MUST NOT include a message body, so\nContent-Length is inappropriate. Update 204 response test to assert\nabsence of Content-Length.\n\nServer: Apply idle timeout starting from the first request. Previously,\nthe requests_served > 0 gate meant the first request could block the\nconnection indefinitely if the client was slow to send data. Remove the\ngate from both read_next and serve_connection.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "462b98591ea64eafebd5bea1f81c44e1aa1c63bc",
+      "filename": "src/http/h1/client.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 2,
+      "changes": 8,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/703411f1036170e3fa8fcb7674f168b5bef590f5/src%2Fhttp%2Fh1%2Fclient.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/703411f1036170e3fa8fcb7674f168b5bef590f5/src%2Fhttp%2Fh1%2Fclient.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fhttp%2Fh1%2Fclient.rs?ref=703411f1036170e3fa8fcb7674f168b5bef590f5",
+      "patch": "@@ -489,8 +489,12 @@ impl crate::codec::Encoder<Request> for Http1ClientCodec {\n             return Ok(());\n         }\n \n-        if !has_content_length && !req.body.is_empty() {\n-            let _ = write!(head, \"Content-Length: {}\\r\\n\", req.body.len());\n+        if !has_content_length {\n+            if !req.body.is_empty() {\n+                let _ = write!(head, \"Content-Length: {}\\r\\n\", req.body.len());\n+            } else if req.method == Method::Post || req.method == Method::Put {\n+                let _ = write!(head, \"Content-Length: 0\\r\\n\");\n+            }\n         }\n \n         head.push_str(\"\\r\\n\");"
+    },
+    {
+      "sha": "746d1f0088856f234ab9cc0b7e318a51e1ca6049",
+      "filename": "src/http/h1/codec.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 2,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/703411f1036170e3fa8fcb7674f168b5bef590f5/src%2Fhttp%2Fh1%2Fcodec.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/703411f1036170e3fa8fcb7674f168b5bef590f5/src%2Fhttp%2Fh1%2Fcodec.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fhttp%2Fh1%2Fcodec.rs?ref=703411f1036170e3fa8fcb7674f168b5bef590f5",
+      "patch": "@@ -944,7 +944,9 @@ impl Encoder<Response> for Http1Codec {\n                 return Ok(());\n             }\n \n-            if !has_content_length {\n+            let suppress_content_length =\n+                (100..=199).contains(&resp.status) || resp.status == 204 || resp.status == 304;\n+            if !has_content_length && !suppress_content_length {\n                 let _ = fmt::Write::write_fmt(\n                     &mut w,\n                     format_args!(\"Content-Length: {}\\r\\n\", resp.body.len()),\n@@ -1206,7 +1208,7 @@ mod tests {\n         let resp = Response::new(204, \"No Content\", Vec::new());\n         let bytes = encode_one(&mut codec, resp);\n         let s = String::from_utf8(bytes).unwrap();\n-        assert!(s.contains(\"Content-Length: 0\\r\\n\"));\n+        assert!(!s.contains(\"Content-Length\"));\n         assert!(s.ends_with(\"\\r\\n\\r\\n\"));\n     }\n "
+    },
+    {
+      "sha": "8d137f0934ba49f39f4dddfa88f26baeb399c45f",
+      "filename": "src/http/h1/server.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 13,
+      "changes": 20,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/703411f1036170e3fa8fcb7674f168b5bef590f5/src%2Fhttp%2Fh1%2Fserver.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/703411f1036170e3fa8fcb7674f168b5bef590f5/src%2Fhttp%2Fh1%2Fserver.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fhttp%2Fh1%2Fserver.rs?ref=703411f1036170e3fa8fcb7674f168b5bef590f5",
+      "patch": "@@ -208,7 +208,7 @@ where\n     async fn read_next<T>(\n         &self,\n         framed: &mut Framed<T, Http1Codec>,\n-        state: &ConnectionState,\n+        _state: &ConnectionState,\n     ) -> Option<ReadOutcome>\n     where\n         T: AsyncRead + AsyncWrite + Unpin,\n@@ -240,15 +240,11 @@ where\n             }\n         });\n \n-        if state.requests_served > 0 {\n-            if let Some(idle_timeout) = self.config.idle_timeout {\n-                let now = Cx::current()\n-                    .and_then(|cx| cx.timer_driver())\n-                    .map_or_else(wall_now, |timer| timer.now());\n-                timeout(now, idle_timeout, read_future).await.ok()\n-            } else {\n-                Some(read_future.await)\n-            }\n+        if let Some(idle_timeout) = self.config.idle_timeout {\n+            let now = Cx::current()\n+                .and_then(|cx| cx.timer_driver())\n+                .map_or_else(wall_now, |timer| timer.now());\n+            timeout(now, idle_timeout, read_future).await.ok()\n         } else {\n             Some(read_future.await)\n         }\n@@ -309,9 +305,7 @@ where\n                 .map_or_else(wall_now, |timer| timer.now());\n \n             // Check idle timeout\n-            if state.requests_served > 0\n-                && state.exceeded_idle_timeout(self.config.idle_timeout, now)\n-            {\n+            if state.exceeded_idle_timeout(self.config.idle_timeout, now) {\n                 state.phase = ConnectionPhase::Closing;\n                 break;\n             }"
+    }
+  ]
+}

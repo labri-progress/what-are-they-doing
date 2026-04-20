@@ -1,0 +1,65 @@
+{
+  "message": "fix(sqlite,snapshot,wheel,raptorq): synchronous rollback, OOM cap, wrapping IDs, clippy\n\n- sqlite: replace fire-and-forget background ROLLBACK in transaction Drop\n  with synchronous inline ROLLBACK to prevent race with subsequent BEGIN\n- snapshot: cap Vec::with_capacity to remaining cursor bytes to prevent\n  OOM from crafted payloads with inflated task/children counts\n- wheel: use wrapping_add instead of saturating_add for timer next_id and\n  next_generation to prevent duplicate handles at u64::MAX\n- oneshot: update doc examples to reflect mut rx receiver API\n- raptorq: replace .expect(&format!()) with .unwrap_or_else(|_| panic!())\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "d02ecf42962826b78474674563c85d3f804034d7",
+      "filename": "src/channel/oneshot.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 3,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/c433946430069699592fbebdd9b2e9ef63f19083/src%2Fchannel%2Foneshot.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/c433946430069699592fbebdd9b2e9ef63f19083/src%2Fchannel%2Foneshot.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fchannel%2Foneshot.rs?ref=c433946430069699592fbebdd9b2e9ef63f19083",
+      "patch": "@@ -32,7 +32,7 @@\n //! use asupersync::channel::oneshot;\n //!\n //! // Create a oneshot channel\n-//! let (tx, rx) = oneshot::channel::<i32>();\n+//! let (tx, mut rx) = oneshot::channel::<i32>();\n //!\n //! // Two-phase send pattern (explicit reserve)\n //! let permit = tx.reserve(&cx);\n@@ -175,8 +175,8 @@ impl<T> OneShotInner<T> {\n /// # Example\n ///\n /// ```ignore\n-/// let (tx, rx) = oneshot::channel::<i32>();\n-/// tx.send(42);\n+/// let (tx, mut rx) = oneshot::channel::<i32>();\n+/// tx.send(&cx, 42);\n /// let value = rx.recv(&cx).await?;\n /// ```\n #[must_use]"
+    },
+    {
+      "sha": "b9d42169cc9b4b519b9bee9ffe930410c97f63a3",
+      "filename": "src/database/sqlite.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 13,
+      "changes": 20,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/c433946430069699592fbebdd9b2e9ef63f19083/src%2Fdatabase%2Fsqlite.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/c433946430069699592fbebdd9b2e9ef63f19083/src%2Fdatabase%2Fsqlite.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fdatabase%2Fsqlite.rs?ref=c433946430069699592fbebdd9b2e9ef63f19083",
+      "patch": "@@ -782,19 +782,13 @@ impl<'a> SqliteTransaction<'a> {\n impl Drop for SqliteTransaction<'_> {\n     fn drop(&mut self) {\n         if !self.finished {\n-            // Best-effort rollback on drop\n-            // We can't await here, so we do a blocking operation\n-            let inner = Arc::clone(&self.conn.inner);\n-            let pool = self.conn.pool.clone();\n-\n-            let _rollback_handle = pool.spawn(move || {\n-                let guard = inner.lock();\n-                if let Ok(conn) = guard.get() {\n-                    let _ = conn.execute(\"ROLLBACK\", []);\n-                }\n-            });\n-\n-            // Fire and forget best-effort rollback\n+            // Synchronous best-effort rollback on drop.\n+            // This must complete before the connection is reusable to prevent\n+            // a race where a subsequent BEGIN arrives before the ROLLBACK.\n+            let guard = self.conn.inner.lock();\n+            if let Ok(conn) = guard.get() {\n+                let _ = conn.execute(\"ROLLBACK\", []);\n+            }\n         }\n     }\n }"
+    },
+    {
+      "sha": "0d54f64c8eba2a64c3ee7baae977deb84704ae8c",
+      "filename": "src/distributed/snapshot.rs",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 2,
+      "changes": 13,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/c433946430069699592fbebdd9b2e9ef63f19083/src%2Fdistributed%2Fsnapshot.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/c433946430069699592fbebdd9b2e9ef63f19083/src%2Fdistributed%2Fsnapshot.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fdistributed%2Fsnapshot.rs?ref=c433946430069699592fbebdd9b2e9ef63f19083",
+      "patch": "@@ -261,7 +261,10 @@ impl RegionSnapshot {\n \n         // Tasks\n         let task_count = cursor.read_u32()?;\n-        let mut tasks = Vec::with_capacity(task_count as usize);\n+        // Each task reads at least 10 bytes (8 id + 1 state + 1 priority).\n+        // Cap pre-allocation to remaining data to prevent OOM from crafted payloads.\n+        let max_tasks = cursor.remaining() / 10;\n+        let mut tasks = Vec::with_capacity((task_count as usize).min(max_tasks));\n         for _ in 0..task_count {\n             let task_id = cursor.read_task_id()?;\n             let task_state_byte = cursor.read_u8()?;\n@@ -277,7 +280,9 @@ impl RegionSnapshot {\n \n         // Children\n         let children_count = cursor.read_u32()?;\n-        let mut children = Vec::with_capacity(children_count as usize);\n+        // Each child reads 8 bytes (4 index + 4 generation).\n+        let max_children = cursor.remaining() / 8;\n+        let mut children = Vec::with_capacity((children_count as usize).min(max_children));\n         for _ in 0..children_count {\n             children.push(cursor.read_region_id()?);\n         }\n@@ -473,6 +478,10 @@ impl<'a> Cursor<'a> {\n         Self { data, pos: 0 }\n     }\n \n+    fn remaining(&self) -> usize {\n+        self.data.len() - self.pos\n+    }\n+\n     fn read_exact(&mut self, n: usize) -> Result<&'a [u8], SnapshotError> {\n         let end = self\n             .pos"
+    },
+    {
+      "sha": "feb5369b911058430db4bb1b80659785a74db4b5",
+      "filename": "src/raptorq/decoder.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/c433946430069699592fbebdd9b2e9ef63f19083/src%2Fraptorq%2Fdecoder.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/c433946430069699592fbebdd9b2e9ef63f19083/src%2Fraptorq%2Fdecoder.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fraptorq%2Fdecoder.rs?ref=c433946430069699592fbebdd9b2e9ef63f19083",
+      "patch": "@@ -4486,7 +4486,7 @@ mod tests {\n         for batch_size in [1, 2, 4, 8, 16, 0] {\n             let wavefront = decoder\n                 .decode_wavefront(&received, batch_size)\n-                .expect(&format!(\"wavefront decode batch_size={batch_size}\"));\n+                .unwrap_or_else(|_| panic!(\"wavefront decode batch_size={batch_size}\"));\n \n             for (i, (seq_sym, wf_sym)) in sequential\n                 .source\n@@ -4538,7 +4538,7 @@ mod tests {\n         for batch_size in [1, 4, 8] {\n             let wavefront = decoder\n                 .decode_wavefront(&received, batch_size)\n-                .expect(&format!(\"wavefront batch_size={batch_size}\"));\n+                .unwrap_or_else(|_| panic!(\"wavefront batch_size={batch_size}\"));\n \n             for (i, (seq_sym, wf_sym)) in sequential\n                 .source"
+    },
+    {
+      "sha": "81663df10990b74ad848a36e4ed975811d976654",
+      "filename": "src/time/wheel.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/c433946430069699592fbebdd9b2e9ef63f19083/src%2Ftime%2Fwheel.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/c433946430069699592fbebdd9b2e9ef63f19083/src%2Ftime%2Fwheel.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Ftime%2Fwheel.rs?ref=c433946430069699592fbebdd9b2e9ef63f19083",
+      "patch": "@@ -493,9 +493,9 @@ impl TimerWheel {\n         }\n \n         let id = self.next_id;\n-        self.next_id = self.next_id.saturating_add(1);\n+        self.next_id = self.next_id.wrapping_add(1);\n         let generation = self.next_generation;\n-        self.next_generation = self.next_generation.saturating_add(1);\n+        self.next_generation = self.next_generation.wrapping_add(1);\n \n         self.active.insert(id, generation);\n "
+    }
+  ]
+}

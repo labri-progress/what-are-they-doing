@@ -1,0 +1,41 @@
+{
+  "message": "fix(core): improve robustness of hawkes inference, network collection, and deep scan",
+  "files": [
+    {
+      "sha": "a919f6697d860a30accb82dc9a717e468af01db9",
+      "filename": "crates/pt-core/src/collect/deep_scan.rs",
+      "status": "modified",
+      "additions": 17,
+      "deletions": 11,
+      "changes": 28,
+      "blob_url": "https://github.com/Dicklesworthstone/process_triage/blob/ae39cc295af8a73e8af0c347ccda462d0c992192/crates%2Fpt-core%2Fsrc%2Fcollect%2Fdeep_scan.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/process_triage/raw/ae39cc295af8a73e8af0c347ccda462d0c992192/crates%2Fpt-core%2Fsrc%2Fcollect%2Fdeep_scan.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/process_triage/contents/crates%2Fpt-core%2Fsrc%2Fcollect%2Fdeep_scan.rs?ref=ae39cc295af8a73e8af0c347ccda462d0c992192",
+      "patch": "@@ -24,7 +24,6 @@ use crate::events::{event_names, Phase, ProgressEmitter, ProgressEvent};\n use pt_common::{IdentityQuality, ProcessId, ProcessIdentity, StartId};\n use serde::{Deserialize, Serialize};\n use std::fs;\n-use std::path::Path;\n use std::sync::{\n     atomic::{AtomicUsize, Ordering},\n     Arc,\n@@ -430,17 +429,24 @@ fn scan_process(\n ) -> Result<DeepScanRecord, DeepScanError> {\n     let proc_path = format!(\"/proc/{}\", pid);\n \n-    // Check if process exists\n-    if !Path::new(&proc_path).exists() {\n-        return Err(DeepScanError::ParseError {\n-            pid,\n-            message: \"Process does not exist\".to_string(),\n-        });\n-    }\n-\n     // Parse /proc/[pid]/stat for core info\n-    let stat_content = fs::read_to_string(format!(\"{}/stat\", proc_path))\n-        .map_err(|_| DeepScanError::PermissionDenied(pid))?;\n+    // We read this first; if it fails, the process likely doesn't exist or is inaccessible.\n+    let stat_content = match fs::read_to_string(format!(\"{}/stat\", proc_path)) {\n+        Ok(c) => c,\n+        Err(e) => {\n+            if e.kind() == std::io::ErrorKind::NotFound {\n+                return Err(DeepScanError::ParseError {\n+                    pid,\n+                    message: \"Process does not exist\".to_string(),\n+                });\n+            } else if e.kind() == std::io::ErrorKind::PermissionDenied {\n+                return Err(DeepScanError::PermissionDenied(pid));\n+            } else {\n+                return Err(DeepScanError::IoError(e));\n+            }\n+        }\n+    };\n+    \n     let stat_info = parse_stat(&stat_content, pid)?;\n \n     // Parse /proc/[pid]/status for UID and username"
+    },
+    {
+      "sha": "d1e672f05bb48e1c716098165a8fe71412fa37aa",
+      "filename": "crates/pt-core/src/collect/network.rs",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 0,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/process_triage/blob/ae39cc295af8a73e8af0c347ccda462d0c992192/crates%2Fpt-core%2Fsrc%2Fcollect%2Fnetwork.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/process_triage/raw/ae39cc295af8a73e8af0c347ccda462d0c992192/crates%2Fpt-core%2Fsrc%2Fcollect%2Fnetwork.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/process_triage/contents/crates%2Fpt-core%2Fsrc%2Fcollect%2Fnetwork.rs?ref=ae39cc295af8a73e8af0c347ccda462d0c992192",
+      "patch": "@@ -356,7 +356,16 @@ fn get_process_socket_inodes(pid: u32) -> Option<HashSet<u64>> {\n     let mut inodes = HashSet::new();\n \n     let entries = fs::read_dir(&fd_path).ok()?;\n+    let mut inspected_count = 0;\n+    // Limit inspection to prevent stall on processes with massive FD counts\n+    const MAX_INSPECT: usize = 50_000;\n+\n     for entry in entries.flatten() {\n+        if inspected_count >= MAX_INSPECT {\n+            break;\n+        }\n+        inspected_count += 1;\n+\n         if let Ok(target) = fs::read_link(entry.path()) {\n             let target_str = target.to_string_lossy();\n             // Socket links look like \"socket:[12345]\""
+    },
+    {
+      "sha": "a67471cc1a9e80922268bdb692130cf29a82d354",
+      "filename": "crates/pt-core/src/inference/hawkes.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/process_triage/blob/ae39cc295af8a73e8af0c347ccda462d0c992192/crates%2Fpt-core%2Fsrc%2Finference%2Fhawkes.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/process_triage/raw/ae39cc295af8a73e8af0c347ccda462d0c992192/crates%2Fpt-core%2Fsrc%2Finference%2Fhawkes.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/process_triage/contents/crates%2Fpt-core%2Fsrc%2Finference%2Fhawkes.rs?ref=ae39cc295af8a73e8af0c347ccda462d0c992192",
+      "patch": "@@ -310,13 +310,13 @@ impl HawkesDetector {\n \n         // Recursive computation of intensity at each event\n         // A(t_i) = \u03a3_{j<i} exp(-\u03b2(t_i - t_j)) can be computed recursively:\n-        // A(t_i) = A(t_{i-1}) * exp(-\u03b2(t_i - t_{i-1})) + 1\n+        // A(t_i) = (A(t_{i-1}) + 1) * exp(-\u03b2(t_i - t_{i-1}))\n         let mut a_recursive = 0.0; // \u03a3 exp(-\u03b2(t_i - t_j)) for j < i\n \n         for i in 0..n {\n             if i > 0 {\n                 let dt = events[i] - events[i - 1];\n-                a_recursive = a_recursive * (-beta * dt).exp() + 1.0;\n+                a_recursive = (a_recursive + 1.0) * (-beta * dt).exp();\n             }\n \n             // Intensity at event i (just before)"
+    }
+  ]
+}

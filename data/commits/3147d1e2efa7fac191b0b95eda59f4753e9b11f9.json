@@ -1,0 +1,41 @@
+{
+  "message": "Fix SPARQL parser backtrack, executor memory leak, and add catch_unwind (#180)\n\nFix SPARQL parser backtrack, executor memory leak, and add catch_unwind",
+  "files": [
+    {
+      "sha": "9103c834fd21abd8bd1ad5b05632073bf9405038",
+      "filename": "crates/ruvector-postgres/src/graph/operators.rs",
+      "status": "modified",
+      "additions": 31,
+      "deletions": 13,
+      "changes": 44,
+      "blob_url": "https://github.com/ruvnet/ruvector/blob/3147d1e2efa7fac191b0b95eda59f4753e9b11f9/crates%2Fruvector-postgres%2Fsrc%2Fgraph%2Foperators.rs",
+      "raw_url": "https://github.com/ruvnet/ruvector/raw/3147d1e2efa7fac191b0b95eda59f4753e9b11f9/crates%2Fruvector-postgres%2Fsrc%2Fgraph%2Foperators.rs",
+      "contents_url": "https://api.github.com/repos/ruvnet/ruvector/contents/crates%2Fruvector-postgres%2Fsrc%2Fgraph%2Foperators.rs?ref=3147d1e2efa7fac191b0b95eda59f4753e9b11f9",
+      "patch": "@@ -332,19 +332,37 @@ fn ruvector_sparql(store_name: &str, query: &str, format: &str) -> Result<String\n     let store = get_store(store_name)\n         .ok_or_else(|| format!(\"Triple store '{}' does not exist\", store_name))?;\n \n-    let parsed = parse_sparql(query).map_err(|e| format!(\"Parse error: {}\", e))?;\n-\n-    let result = execute_sparql(&store, &parsed).map_err(|e| format!(\"Execution error: {}\", e))?;\n-\n-    let result_format = match format.to_lowercase().as_str() {\n-        \"json\" => ResultFormat::Json,\n-        \"xml\" => ResultFormat::Xml,\n-        \"csv\" => ResultFormat::Csv,\n-        \"tsv\" => ResultFormat::Tsv,\n-        _ => ResultFormat::Json,\n-    };\n-\n-    Ok(format_results(&result, result_format))\n+    let format_lower = format.to_lowercase();\n+\n+    // Wrap parse/execute/format in catch_unwind to convert any remaining\n+    // panics into PostgreSQL errors instead of crashing the backend\n+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {\n+        let parsed = parse_sparql(query).map_err(|e| format!(\"Parse error: {}\", e))?;\n+        let result =\n+            execute_sparql(&store, &parsed).map_err(|e| format!(\"Execution error: {}\", e))?;\n+        let result_format = match format_lower.as_str() {\n+            \"json\" => ResultFormat::Json,\n+            \"xml\" => ResultFormat::Xml,\n+            \"csv\" => ResultFormat::Csv,\n+            \"tsv\" => ResultFormat::Tsv,\n+            _ => ResultFormat::Json,\n+        };\n+        Ok(format_results(&result, result_format))\n+    }));\n+\n+    match result {\n+        Ok(inner) => inner,\n+        Err(panic_info) => {\n+            let msg = if let Some(s) = panic_info.downcast_ref::<String>() {\n+                s.clone()\n+            } else if let Some(s) = panic_info.downcast_ref::<&str>() {\n+                s.to_string()\n+            } else {\n+                \"Unknown internal error\".to_string()\n+            };\n+            Err(format!(\"Internal error: {}\", msg))\n+        }\n+    }\n }\n \n /// Execute a SPARQL query and return results as JSONB"
+    },
+    {
+      "sha": "42c6074ab99315d99d51bfb32f7ca930be86236c",
+      "filename": "crates/ruvector-postgres/src/graph/sparql/executor.rs",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 6,
+      "changes": 11,
+      "blob_url": "https://github.com/ruvnet/ruvector/blob/3147d1e2efa7fac191b0b95eda59f4753e9b11f9/crates%2Fruvector-postgres%2Fsrc%2Fgraph%2Fsparql%2Fexecutor.rs",
+      "raw_url": "https://github.com/ruvnet/ruvector/raw/3147d1e2efa7fac191b0b95eda59f4753e9b11f9/crates%2Fruvector-postgres%2Fsrc%2Fgraph%2Fsparql%2Fexecutor.rs",
+      "contents_url": "https://api.github.com/repos/ruvnet/ruvector/contents/crates%2Fruvector-postgres%2Fsrc%2Fgraph%2Fsparql%2Fexecutor.rs?ref=3147d1e2efa7fac191b0b95eda59f4753e9b11f9",
+      "patch": "@@ -21,7 +21,7 @@ static EMPTY_PREFIXES: Lazy<HashMap<String, Iri>> = Lazy::new(HashMap::new);\n /// Execution context for SPARQL queries\n pub struct SparqlContext<'a> {\n     pub store: &'a TripleStore,\n-    pub default_graph: Option<&'a str>,\n+    pub default_graph: Option<String>,\n     pub named_graphs: Vec<&'a str>,\n     pub base: Option<&'a Iri>,\n     pub prefixes: &'a HashMap<String, Iri>,\n@@ -260,23 +260,22 @@ fn evaluate_graph_pattern(\n \n             if let Some(graph) = graph_iri {\n                 // Temporarily set the graph context\n-                let old_default = ctx.default_graph;\n-                ctx.default_graph = Some(Box::leak(graph.into_boxed_str()));\n+                let old_default = ctx.default_graph.clone();\n+                ctx.default_graph = Some(graph);\n                 let result = evaluate_graph_pattern(ctx, inner);\n                 ctx.default_graph = old_default;\n                 result\n             } else {\n                 // Union over all named graphs\n                 let mut all_solutions = Vec::new();\n                 for graph in ctx.store.list_graphs() {\n-                    let graph_str: &'static str = Box::leak(graph.into_boxed_str());\n-                    ctx.default_graph = Some(graph_str);\n+                    ctx.default_graph = Some(graph.clone());\n                     let solutions = evaluate_graph_pattern(ctx, inner)?;\n \n                     // Add graph variable binding\n                     if let VarOrIri::Variable(var) = graph_name {\n                         for mut sol in solutions {\n-                            sol.insert(var.clone(), RdfTerm::Iri(Iri::new(graph_str)));\n+                            sol.insert(var.clone(), RdfTerm::Iri(Iri::new(&graph)));\n                             all_solutions.push(sol);\n                         }\n                     } else {"
+    },
+    {
+      "sha": "5f1331304498f973e2848d7d73522a2f7de9a8b0",
+      "filename": "crates/ruvector-postgres/src/graph/sparql/parser.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/ruvnet/ruvector/blob/3147d1e2efa7fac191b0b95eda59f4753e9b11f9/crates%2Fruvector-postgres%2Fsrc%2Fgraph%2Fsparql%2Fparser.rs",
+      "raw_url": "https://github.com/ruvnet/ruvector/raw/3147d1e2efa7fac191b0b95eda59f4753e9b11f9/crates%2Fruvector-postgres%2Fsrc%2Fgraph%2Fsparql%2Fparser.rs",
+      "contents_url": "https://api.github.com/repos/ruvnet/ruvector/contents/crates%2Fruvector-postgres%2Fsrc%2Fgraph%2Fsparql%2Fparser.rs?ref=3147d1e2efa7fac191b0b95eda59f4753e9b11f9",
+      "patch": "@@ -71,6 +71,7 @@ impl<'a> SparqlParser<'a> {\n \n     fn parse_query_body(&mut self) -> Result<QueryBody, SparqlError> {\n         self.skip_whitespace();\n+        let saved_pos = self.pos;\n \n         if self.match_keyword(\"SELECT\") {\n             Ok(QueryBody::Select(self.parse_select_query()?))\n@@ -87,7 +88,7 @@ impl<'a> SparqlParser<'a> {\n             || self.match_keyword(\"CREATE\")\n             || self.match_keyword(\"DROP\")\n         {\n-            self.pos = self.pos.saturating_sub(6); // Backtrack\n+            self.pos = saved_pos; // Backtrack to before the matched keyword\n             Ok(QueryBody::Update(self.parse_update()?))\n         } else {\n             Err(SparqlError::ParseError(format!("
+    }
+  ]
+}

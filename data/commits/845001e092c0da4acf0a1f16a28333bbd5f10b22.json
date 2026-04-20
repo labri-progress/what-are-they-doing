@@ -1,0 +1,41 @@
+{
+  "message": "feat(jax): add Switch primitive with VJP support and fori_loop evaluator\n\nAdd multi-branch conditional (Switch) primitive across the JAX pipeline:\n\n- fj-core: Add Switch variant to Primitive enum with \"switch\" display name\n- fj-ad: Implement Switch VJP \u2014 gradient flows through selected branch only,\n  zero gradient for all non-selected branches and the index input\n- fj-lax: Add eval_switch() that selects branch output by integer index,\n  with bounds checking and num_branches parameter support. Also add\n  eval_fori_loop() helper that desugars to a simple counted loop\n  (lower..upper) calling body_fn(counter, carry) each iteration\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "56e953b848d00209d75c8c17bf9d5075a606ae35",
+      "filename": "crates/fj-ad/src/lib.rs",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 0,
+      "changes": 16,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenjax/blob/845001e092c0da4acf0a1f16a28333bbd5f10b22/crates%2Ffj-ad%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenjax/raw/845001e092c0da4acf0a1f16a28333bbd5f10b22/crates%2Ffj-ad%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenjax/contents/crates%2Ffj-ad%2Fsrc%2Flib.rs?ref=845001e092c0da4acf0a1f16a28333bbd5f10b22",
+      "patch": "@@ -1503,6 +1503,22 @@ fn vjp(\n             while_vjp(inputs, g, params)\n         }\n \n+        Primitive::Switch => {\n+            // Switch VJP: gradient flows through the selected branch only.\n+            // Index has no gradient; gradient for selected branch equals g,\n+            // all other branches get zero gradient.\n+            let mut grads = vec![zeros_like(&inputs[0])]; // index: no grad\n+            for (i, inp) in inputs[1..].iter().enumerate() {\n+                let idx = inputs[0].as_i64_scalar().unwrap_or(0) as usize;\n+                if i == idx {\n+                    grads.push(g.clone());\n+                } else {\n+                    grads.push(zeros_like(inp));\n+                }\n+            }\n+            Ok(grads)\n+        }\n+\n         // Bitwise ops are not differentiable \u2014 gradient is zero.\n         Primitive::BitwiseAnd | Primitive::BitwiseOr | Primitive::BitwiseXor => {\n             Ok(vec![zeros_like(&inputs[0]), zeros_like(&inputs[1])])"
+    },
+    {
+      "sha": "dbab801c73bf9b9d53704a9f181725eed5534589",
+      "filename": "crates/fj-core/src/lib.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenjax/blob/845001e092c0da4acf0a1f16a28333bbd5f10b22/crates%2Ffj-core%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenjax/raw/845001e092c0da4acf0a1f16a28333bbd5f10b22/crates%2Ffj-core%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenjax/contents/crates%2Ffj-core%2Fsrc%2Flib.rs?ref=845001e092c0da4acf0a1f16a28333bbd5f10b22",
+      "patch": "@@ -147,6 +147,7 @@ pub enum Primitive {\n     Cond,\n     Scan,\n     While,\n+    Switch,\n     // Bitwise\n     BitwiseAnd,\n     BitwiseOr,\n@@ -233,6 +234,7 @@ impl Primitive {\n             Self::Cond => \"cond\",\n             Self::Scan => \"scan\",\n             Self::While => \"while_loop\",\n+            Self::Switch => \"switch\",\n             Self::BitwiseAnd => \"bitwise_and\",\n             Self::BitwiseOr => \"bitwise_or\",\n             Self::BitwiseXor => \"bitwise_xor\","
+    },
+    {
+      "sha": "2ce01f1a7bd07d60108ecf17a35319390c655264",
+      "filename": "crates/fj-lax/src/lib.rs",
+      "status": "modified",
+      "additions": 91,
+      "deletions": 0,
+      "changes": 91,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenjax/blob/845001e092c0da4acf0a1f16a28333bbd5f10b22/crates%2Ffj-lax%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenjax/raw/845001e092c0da4acf0a1f16a28333bbd5f10b22/crates%2Ffj-lax%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenjax/contents/crates%2Ffj-lax%2Fsrc%2Flib.rs?ref=845001e092c0da4acf0a1f16a28333bbd5f10b22",
+      "patch": "@@ -298,6 +298,7 @@ pub fn eval_primitive(\n         Primitive::Cond => eval_cond(primitive, inputs),\n         Primitive::Scan => eval_scan(primitive, inputs, params),\n         Primitive::While => eval_while_loop(primitive, inputs, params),\n+        Primitive::Switch => eval_switch(primitive, inputs, params),\n         // Bitwise\n         Primitive::BitwiseAnd => eval_bitwise_binary(primitive, inputs, |a, b| a & b),\n         Primitive::BitwiseOr => eval_bitwise_binary(primitive, inputs, |a, b| a | b),\n@@ -736,6 +737,96 @@ fn value_shape_fingerprint(v: &Value) -> String {\n     }\n }\n \n+/// Evaluate Switch: multi-branch conditional.\n+///\n+/// inputs: [index, operand, branch0_result, branch1_result, ...]\n+///   - index: integer selecting which branch to take\n+///   - operand: passed to the selected branch (unused in primitive form)\n+///   - branch results: pre-computed results for each branch\n+///\n+/// In primitive form (no sub_jaxprs), the branches are pre-evaluated and\n+/// switch simply selects the correct output by index. With sub_jaxprs,\n+/// only the selected branch would be evaluated.\n+///\n+/// params:\n+///   - \"num_branches\": number of branches (required)\n+fn eval_switch(\n+    primitive: Primitive,\n+    inputs: &[Value],\n+    params: &BTreeMap<String, String>,\n+) -> Result<Value, EvalError> {\n+    if inputs.len() < 2 {\n+        return Err(EvalError::ArityMismatch {\n+            primitive,\n+            expected: 2,\n+            actual: inputs.len(),\n+        });\n+    }\n+\n+    let index_val = match &inputs[0] {\n+        Value::Scalar(Literal::I64(i)) => *i,\n+        Value::Scalar(Literal::Bool(b)) => i64::from(*b),\n+        other => {\n+            return Err(EvalError::Unsupported {\n+                primitive,\n+                detail: format!(\"switch index must be integer, got {:?}\", other.dtype()),\n+            });\n+        }\n+    };\n+\n+    let num_branches = params\n+        .get(\"num_branches\")\n+        .and_then(|s| s.parse::<usize>().ok())\n+        .unwrap_or(inputs.len().saturating_sub(1));\n+\n+    if index_val < 0 || index_val as usize >= num_branches {\n+        return Err(EvalError::Unsupported {\n+            primitive,\n+            detail: format!(\n+                \"switch index {index_val} out of bounds for {num_branches} branches\"\n+            ),\n+        });\n+    }\n+\n+    // Branch values start at inputs[1]\n+    let branch_idx = index_val as usize;\n+    if branch_idx + 1 >= inputs.len() {\n+        return Err(EvalError::Unsupported {\n+            primitive,\n+            detail: format!(\n+                \"switch index {branch_idx} but only {} branch values provided\",\n+                inputs.len() - 1\n+            ),\n+        });\n+    }\n+\n+    Ok(inputs[branch_idx + 1].clone())\n+}\n+\n+/// Evaluate fori_loop: `fori_loop(lower, upper, body_fn, init_val) -> final_val`.\n+///\n+/// Desugars to a while_loop with an explicit counter:\n+///   carry = (counter=lower, val=init_val)\n+///   while counter < upper:\n+///     val = body_fn(counter, val)\n+///     counter += 1\n+///   return val\n+pub fn eval_fori_loop<B>(\n+    lower: i64,\n+    upper: i64,\n+    init_val: Value,\n+    mut body_fn: B,\n+) -> Result<Value, EvalError>\n+where\n+    B: FnMut(i64, Value) -> Result<Value, EvalError>,\n+{\n+    let mut val = init_val;\n+    for i in lower..upper {\n+        val = body_fn(i, val)?;\n+    }\n+    Ok(val)\n+}\n+\n /// Evaluate a binary bitwise operation on integer values.\n fn eval_bitwise_binary(\n     primitive: Primitive,"
+    }
+  ]
+}

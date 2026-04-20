@@ -1,0 +1,77 @@
+{
+  "message": "Merge pull request #577 from clawdbot/fix/node-bridge-keepalive\n\nfix: harden node bridge keepalive",
+  "files": [
+    {
+      "sha": "938e39cc6384d6baf7f015b45c6d59cfd61fe43a",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/2679768447e4b0fe886fcc76dc87e44f3c04c301/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/2679768447e4b0fe886fcc76dc87e44f3c04c301/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=2679768447e4b0fe886fcc76dc87e44f3c04c301",
+      "patch": "@@ -3,6 +3,7 @@\n ## Unreleased\n \n - macOS: add node bridge heartbeat pings to detect half-open sockets and reconnect cleanly. (#572) \u2014 thanks @ngutman\n+- Node bridge: harden keepalive + heartbeat handling (TCP keepalive, better disconnects, and keepalive config tests). (#577) \u2014 thanks @steipete\n - CLI: add `sandbox list` and `sandbox recreate` commands for managing Docker sandbox containers after image/config updates. (#563) \u2014 thanks @pasogott\n - Providers: add Microsoft Teams provider with polling, attachments, and CLI send support. (#404) \u2014 thanks @onutc\n - Commands: accept /models as an alias for /model."
+    },
+    {
+      "sha": "c33aa12a366dc1f3c84d656642aa171f60df439e",
+      "filename": "apps/macos/Sources/Clawdbot/NodeMode/MacNodeBridgeSession.swift",
+      "status": "modified",
+      "additions": 41,
+      "deletions": 18,
+      "changes": 59,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/2679768447e4b0fe886fcc76dc87e44f3c04c301/apps%2Fmacos%2FSources%2FClawdbot%2FNodeMode%2FMacNodeBridgeSession.swift",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/2679768447e4b0fe886fcc76dc87e44f3c04c301/apps%2Fmacos%2FSources%2FClawdbot%2FNodeMode%2FMacNodeBridgeSession.swift",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/apps%2Fmacos%2FSources%2FClawdbot%2FNodeMode%2FMacNodeBridgeSession.swift?ref=2679768447e4b0fe886fcc76dc87e44f3c04c301",
+      "patch": "@@ -1,6 +1,7 @@\n import ClawdbotKit\n import Foundation\n import Network\n+import OSLog\n \n actor MacNodeBridgeSession {\n     private struct TimeoutError: LocalizedError {\n@@ -15,17 +16,18 @@ actor MacNodeBridgeSession {\n         case failed(message: String)\n     }\n \n+    private let logger = Logger(subsystem: \"com.clawdbot\", category: \"node.bridge-session\")\n     private let encoder = JSONEncoder()\n     private let decoder = JSONDecoder()\n+    private let clock = ContinuousClock()\n \n     private var connection: NWConnection?\n     private var queue: DispatchQueue?\n     private var buffer = Data()\n     private var pendingRPC: [String: CheckedContinuation<BridgeRPCResponse, Error>] = [:]\n     private var serverEventSubscribers: [UUID: AsyncStream<BridgeEventFrame>.Continuation] = [:]\n     private var pingTask: Task<Void, Never>?\n-    private var lastPongAt: Date?\n-    private var lastPingId: String?\n+    private var lastPongAt: ContinuousClock.Instant?\n \n     private(set) var state: State = .idle\n \n@@ -41,6 +43,12 @@ actor MacNodeBridgeSession {\n \n         let params = NWParameters.tcp\n         params.includePeerToPeer = true\n+        let tcpOptions = NWProtocolTCP.Options()\n+        tcpOptions.enableKeepalive = true\n+        tcpOptions.keepaliveIdle = 30\n+        tcpOptions.keepaliveInterval = 15\n+        tcpOptions.keepaliveCount = 3\n+        params.defaultProtocolStack.transportProtocol = tcpOptions\n         let connection = NWConnection(to: endpoint, using: params)\n         let queue = DispatchQueue(label: \"com.clawdbot.macos.bridge-session\")\n         self.connection = connection\n@@ -50,6 +58,10 @@ actor MacNodeBridgeSession {\n         connection.start(queue: queue)\n \n         try await Self.waitForReady(stateStream, timeoutSeconds: 6)\n+        connection.stateUpdateHandler = { [weak self] state in\n+            guard let self else { return }\n+            Task { await self.handleConnectionState(state) }\n+        }\n \n         try await AsyncTimeout.withTimeout(\n             seconds: 6,\n@@ -193,7 +205,6 @@ actor MacNodeBridgeSession {\n         self.pingTask?.cancel()\n         self.pingTask = nil\n         self.lastPongAt = nil\n-        self.lastPingId = nil\n \n         self.connection?.cancel()\n         self.connection = nil\n@@ -300,38 +311,37 @@ actor MacNodeBridgeSession {\n \n     private func startPingLoop() {\n         self.pingTask?.cancel()\n-        self.lastPongAt = Date()\n+        self.lastPongAt = self.clock.now\n         self.pingTask = Task { [weak self] in\n             guard let self else { return }\n             await self.runPingLoop()\n         }\n     }\n \n     private func runPingLoop() async {\n-        let intervalSeconds = 15.0\n-        let timeoutSeconds = 45.0\n+        let interval: Duration = .seconds(15)\n+        let timeout: Duration = .seconds(45)\n \n         while !Task.isCancelled {\n-            do {\n-                try await Task.sleep(nanoseconds: UInt64(intervalSeconds * 1_000_000_000))\n-            } catch {\n-                return\n-            }\n+            try? await Task.sleep(for: interval)\n \n             guard self.connection != nil else { return }\n \n-            if let last = self.lastPongAt,\n-               Date().timeIntervalSince(last) > timeoutSeconds\n-            {\n-                await self.disconnect()\n-                return\n+            if let last = self.lastPongAt {\n+                let now = self.clock.now\n+                if now > last.advanced(by: timeout) {\n+                    let age = last.duration(to: now)\n+                    self.logger.warning(\"Node bridge heartbeat timed out; disconnecting (age: \\(String(describing: age), privacy: .public)).\")\n+                    await self.disconnect()\n+                    return\n+                }\n             }\n \n             let id = UUID().uuidString\n-            self.lastPingId = id\n             do {\n                 try await self.send(BridgePing(type: \"ping\", id: id))\n             } catch {\n+                self.logger.warning(\"Node bridge ping send failed; disconnecting (error: \\(String(describing: error), privacy: .public)).\")\n                 await self.disconnect()\n                 return\n             }\n@@ -340,7 +350,20 @@ actor MacNodeBridgeSession {\n \n     private func notePong(_ pong: BridgePong) {\n         _ = pong\n-        self.lastPongAt = Date()\n+        self.lastPongAt = self.clock.now\n+    }\n+\n+    private func handleConnectionState(_ state: NWConnection.State) async {\n+        switch state {\n+        case let .failed(error):\n+            self.logger.warning(\"Node bridge connection failed; disconnecting (error: \\(String(describing: error), privacy: .public)).\")\n+            await self.disconnect()\n+        case .cancelled:\n+            self.logger.warning(\"Node bridge connection cancelled; disconnecting.\")\n+            await self.disconnect()\n+        default:\n+            break\n+        }\n     }\n \n     private static func makeStateStream("
+    },
+    {
+      "sha": "fb2ae76ea3382387d480fa4e502f839135e8146f",
+      "filename": "src/agents/sandbox-agent-config.test.ts",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 16,
+      "changes": 32,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/2679768447e4b0fe886fcc76dc87e44f3c04c301/src%2Fagents%2Fsandbox-agent-config.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/2679768447e4b0fe886fcc76dc87e44f3c04c301/src%2Fagents%2Fsandbox-agent-config.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fagents%2Fsandbox-agent-config.test.ts?ref=2679768447e4b0fe886fcc76dc87e44f3c04c301",
+      "patch": "@@ -52,11 +52,11 @@ describe(\"Agent-specific sandbox config\", () => {\n     spawnCalls.length = 0;\n   });\n \n-  it(\n-    \"should use global sandbox config when no agent-specific config exists\",\n-    { timeout: 15_000 },\n-    async () => {\n-      const { resolveSandboxContext } = await import(\"./sandbox.js\");\n+\t  it(\n+\t    \"should use global sandbox config when no agent-specific config exists\",\n+\t    { timeout: 15_000 },\n+\t    async () => {\n+\t      const { resolveSandboxContext } = await import(\"./sandbox.js\");\n \n       const cfg: ClawdbotConfig = {\n         agents: {\n@@ -75,19 +75,19 @@ describe(\"Agent-specific sandbox config\", () => {\n         },\n       };\n \n-      const context = await resolveSandboxContext({\n-        config: cfg,\n-        sessionKey: \"agent:main:main\",\n-        workspaceDir: \"/tmp/test\",\n-      });\n+\t      const context = await resolveSandboxContext({\n+\t        config: cfg,\n+\t        sessionKey: \"agent:main:main\",\n+\t        workspaceDir: \"/tmp/test\",\n+\t      });\n \n-      expect(context).toBeDefined();\n-      expect(context?.enabled).toBe(true);\n-    },\n-  );\n+\t      expect(context).toBeDefined();\n+\t      expect(context?.enabled).toBe(true);\n+\t    },\n+\t  );\n \n-  it(\"should allow agent-specific docker setupCommand overrides\", async () => {\n-    const { resolveSandboxContext } = await import(\"./sandbox.js\");\n+\t  it(\"should allow agent-specific docker setupCommand overrides\", async () => {\n+\t    const { resolveSandboxContext } = await import(\"./sandbox.js\");\n \n     const cfg: ClawdbotConfig = {\n       agents: {"
+    },
+    {
+      "sha": "ba61c0bcd9e1be701acb15e5a24b96d4adc78f9e",
+      "filename": "src/commands/doctor.test.ts",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 22,
+      "changes": 44,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/2679768447e4b0fe886fcc76dc87e44f3c04c301/src%2Fcommands%2Fdoctor.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/2679768447e4b0fe886fcc76dc87e44f3c04c301/src%2Fcommands%2Fdoctor.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fcommands%2Fdoctor.test.ts?ref=2679768447e4b0fe886fcc76dc87e44f3c04c301",
+      "patch": "@@ -276,28 +276,28 @@ describe(\"doctor\", () => {\n         exit: vi.fn(),\n       };\n \n-      migrateLegacyConfig.mockReturnValue({\n-        config: { whatsapp: { allowFrom: [\"+15555550123\"] } },\n-        changes: [\"Moved routing.allowFrom \u2192 whatsapp.allowFrom.\"],\n-      });\n-\n-      await doctorCommand(runtime, { nonInteractive: true });\n-\n-      expect(writeConfigFile).toHaveBeenCalledTimes(1);\n-      const written = writeConfigFile.mock.calls[0]?.[0] as Record<\n-        string,\n-        unknown\n-      >;\n-      expect((written.whatsapp as Record<string, unknown>)?.allowFrom).toEqual([\n-        \"+15555550123\",\n-      ]);\n-      expect(written.routing).toBeUndefined();\n-    },\n-  );\n-\n-  it(\"migrates legacy Clawdis services\", async () => {\n-    readConfigFileSnapshot.mockResolvedValue({\n-      path: \"/tmp/clawdbot.json\",\n+\t      migrateLegacyConfig.mockReturnValue({\n+\t        config: { whatsapp: { allowFrom: [\"+15555550123\"] } },\n+\t        changes: [\"Moved routing.allowFrom \u2192 whatsapp.allowFrom.\"],\n+\t      });\n+\n+\t      await doctorCommand(runtime, { nonInteractive: true });\n+\n+\t      expect(writeConfigFile).toHaveBeenCalledTimes(1);\n+\t      const written = writeConfigFile.mock.calls[0]?.[0] as Record<\n+\t        string,\n+\t        unknown\n+\t      >;\n+\t      expect((written.whatsapp as Record<string, unknown>)?.allowFrom).toEqual([\n+\t        \"+15555550123\",\n+\t      ]);\n+\t      expect(written.routing).toBeUndefined();\n+\t    },\n+\t  );\n+\n+\t  it(\"migrates legacy Clawdis services\", async () => {\n+\t    readConfigFileSnapshot.mockResolvedValue({\n+\t      path: \"/tmp/clawdbot.json\",\n       exists: true,\n       raw: \"{}\",\n       parsed: {},"
+    },
+    {
+      "sha": "c60de4ca5cb3e49b3216f8a7621d857461c29c63",
+      "filename": "src/infra/bridge/server.test.ts",
+      "status": "modified",
+      "additions": 12,
+      "deletions": 2,
+      "changes": 14,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/2679768447e4b0fe886fcc76dc87e44f3c04c301/src%2Finfra%2Fbridge%2Fserver.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/2679768447e4b0fe886fcc76dc87e44f3c04c301/src%2Finfra%2Fbridge%2Fserver.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Fbridge%2Fserver.test.ts?ref=2679768447e4b0fe886fcc76dc87e44f3c04c301",
+      "patch": "@@ -3,10 +3,10 @@ import net from \"node:net\";\n import os from \"node:os\";\n import path from \"node:path\";\n \n-import { afterAll, beforeAll, describe, expect, it } from \"vitest\";\n+import { afterAll, beforeAll, describe, expect, it, vi } from \"vitest\";\n \n import { approveNodePairing, listNodePairing } from \"../node-pairing.js\";\n-import { startNodeBridgeServer } from \"./server.js\";\n+import { configureNodeBridgeSocket, startNodeBridgeServer } from \"./server.js\";\n \n function createLineReader(socket: net.Socket) {\n   let buffer = \"\";\n@@ -70,6 +70,16 @@ describe(\"node bridge server\", () => {\n     delete process.env.CLAWDBOT_ENABLE_BRIDGE_IN_TESTS;\n   });\n \n+  it(\"enables keepalive on sockets\", () => {\n+    const socket = {\n+      setNoDelay: vi.fn(),\n+      setKeepAlive: vi.fn(),\n+    };\n+    configureNodeBridgeSocket(socket);\n+    expect(socket.setNoDelay).toHaveBeenCalledWith(true);\n+    expect(socket.setKeepAlive).toHaveBeenCalledWith(true, 15_000);\n+  });\n+\n   it(\"rejects hello when not paired\", async () => {\n     const server = await startNodeBridgeServer({\n       host: \"127.0.0.1\","
+    },
+    {
+      "sha": "10c5e7db96eab841d7fc587d9931469be22ad499",
+      "filename": "src/infra/bridge/server.ts",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 1,
+      "changes": 10,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/2679768447e4b0fe886fcc76dc87e44f3c04c301/src%2Finfra%2Fbridge%2Fserver.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/2679768447e4b0fe886fcc76dc87e44f3c04c301/src%2Finfra%2Fbridge%2Fserver.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Fbridge%2Fserver.ts?ref=2679768447e4b0fe886fcc76dc87e44f3c04c301",
+      "patch": "@@ -160,6 +160,14 @@ function isTestEnv() {\n   return process.env.NODE_ENV === \"test\" || Boolean(process.env.VITEST);\n }\n \n+export function configureNodeBridgeSocket(socket: {\n+  setNoDelay: (noDelay?: boolean) => void;\n+  setKeepAlive: (enable?: boolean, initialDelay?: number) => void;\n+}) {\n+  socket.setNoDelay(true);\n+  socket.setKeepAlive(true, 15_000);\n+}\n+\n function encodeLine(frame: AnyBridgeFrame) {\n   return `${JSON.stringify(frame)}\\n`;\n }\n@@ -228,7 +236,7 @@ export async function startNodeBridgeServer(\n   const loopbackHost = \"127.0.0.1\";\n \n   const onConnection = (socket: net.Socket) => {\n-    socket.setNoDelay(true);\n+    configureNodeBridgeSocket(socket);\n \n     let buffer = \"\";\n     let isAuthenticated = false;"
+    }
+  ]
+}

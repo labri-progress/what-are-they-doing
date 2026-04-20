@@ -1,0 +1,53 @@
+{
+  "message": "harness/mvcc: fix witness-model races; tighten sizing math",
+  "files": [
+    {
+      "sha": "5072a6d387a96771b6be724ca100064ae1978597",
+      "filename": "crates/fsqlite-error/src/lib.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/73b627cafa446986e15cb09621c34f17abafa4e3/crates%2Ffsqlite-error%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/73b627cafa446986e15cb09621c34f17abafa4e3/crates%2Ffsqlite-error%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-error%2Fsrc%2Flib.rs?ref=73b627cafa446986e15cb09621c34f17abafa4e3",
+      "patch": "@@ -298,7 +298,7 @@ impl FrankenError {\n     pub const fn error_code(&self) -> ErrorCode {\n         match self {\n             Self::DatabaseNotFound { .. } | Self::CannotOpen { .. } => ErrorCode::CantOpen,\n-            Self::DatabaseLocked { .. } => ErrorCode::Locked,\n+            Self::DatabaseLocked { .. } => ErrorCode::Busy,\n             Self::DatabaseCorrupt { .. } | Self::WalCorrupt { .. } => ErrorCode::Corrupt,\n             Self::NotADatabase { .. } => ErrorCode::NotADb,\n             Self::DatabaseFull => ErrorCode::Full,"
+    },
+    {
+      "sha": "a3c4029effe0518090613b929bdef4930d269813",
+      "filename": "crates/fsqlite-harness/tests/mvcc_alien_verification.rs",
+      "status": "modified",
+      "additions": 33,
+      "deletions": 23,
+      "changes": 56,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/73b627cafa446986e15cb09621c34f17abafa4e3/crates%2Ffsqlite-harness%2Ftests%2Fmvcc_alien_verification.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/73b627cafa446986e15cb09621c34f17abafa4e3/crates%2Ffsqlite-harness%2Ftests%2Fmvcc_alien_verification.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-harness%2Ftests%2Fmvcc_alien_verification.rs?ref=73b627cafa446986e15cb09621c34f17abafa4e3",
+      "patch": "@@ -164,7 +164,7 @@ impl HotBucket {\n         for (word_idx, w) in readers.iter().enumerate() {\n             let mut bits = w.load(Ordering::Acquire);\n             while bits != 0 {\n-                let lsb = bits & (!bits + 1);\n+                let lsb = bits & bits.wrapping_neg();\n                 let bit = lsb.trailing_zeros();\n                 let Ok(word) = u64::try_from(word_idx) else {\n                     continue;\n@@ -286,7 +286,7 @@ impl HotBucket {\n         for (word_idx, w) in readers.iter().enumerate() {\n             let mut bits = w.load(Ordering::Acquire);\n             while bits != 0 {\n-                let lsb = bits & (!bits + 1);\n+                let lsb = bits & bits.wrapping_neg();\n                 let bit = lsb.trailing_zeros();\n                 let Ok(word) = u32::try_from(word_idx) else {\n                     continue;\n@@ -432,16 +432,19 @@ fn dpor_outgoing_edges_cover_committed_and_freed_writers() {\n \n                 // Commit-time outgoing edge discovery:\n                 yield_now().await;\n-                let out_edges = {\n+                let (out_edges, w_commit_seq_at_check) = {\n                     let s = state_t.lock();\n-                    discover_outgoing_edges(begin_seq, &read_pages, &s.commit_index)\n+                    let out_edges =\n+                        discover_outgoing_edges(begin_seq, &read_pages, &s.commit_index);\n+                    let w_commit_seq = s.commit_index.get(&1).copied();\n+                    drop(s);\n+                    (out_edges, w_commit_seq)\n                 };\n-                let mut s = state_t.lock();\n-                s.snapshot(\"T commit\", &bucket_t);\n+                state_t.lock().snapshot(\"T commit\", &bucket_t);\n \n                 // If a writer committed after our begin and touched page 1 before we committed,\n                 // out_edges must be non-empty (no false negatives).\n-                if let Some(w_commit_seq) = s.commit_index.get(&1).copied() {\n+                if let Some(w_commit_seq) = w_commit_seq_at_check {\n                     if w_commit_seq > begin_seq {\n                         assert!(\n                             out_edges.contains(&w_commit_seq),\n@@ -600,9 +603,17 @@ fn dpor_incoming_edges_cover_committed_pivots_via_committed_readers_index() {\n \n                 // Commit-time incoming edge discovery:\n                 yield_now().await;\n-                let in_edges = {\n+                let (in_edges, r_committed_after_snapshot) = {\n                     let s = state_t.lock();\n-                    discover_incoming_edges(begin_seq, &write_pages, &s.committed_readers)\n+                    let in_edges =\n+                        discover_incoming_edges(begin_seq, &write_pages, &s.committed_readers);\n+                    let r_after = s\n+                        .committed_readers\n+                        .iter()\n+                        .find(|e| e.txn_id == 1)\n+                        .is_some_and(|r| r.commit_seq > begin_seq);\n+                    drop(s);\n+                    (in_edges, r_after)\n                 };\n \n                 // Apply the committed-pivot T3 rule: if any committed edge source has has_in_rw,\n@@ -614,23 +625,22 @@ fn dpor_incoming_edges_cover_committed_pivots_via_committed_readers_index() {\n                     }\n                 }\n \n-                let mut s = state_t.lock();\n-                s.snapshot(format!(\"T outcome {outcome:?}\"), &bucket_t);\n+                state_t\n+                    .lock()\n+                    .snapshot(format!(\"T outcome {outcome:?}\"), &bucket_t);\n \n                 // If R committed after our snapshot and read a page we wrote, T must abort\n                 // because R is a committed pivot (X -rw-> R -rw-> T).\n-                if let Some(r) = s.committed_readers.iter().find(|e| e.txn_id == 1) {\n-                    if r.commit_seq > begin_seq {\n-                        assert!(\n-                            in_edges.iter().any(|c| c.txn_id == 1),\n-                            \"missing incoming edge source txn_id=1\"\n-                        );\n-                        assert_eq!(\n-                            outcome,\n-                            TxnOutcome::Aborted,\n-                            \"committed pivot must force abort\"\n-                        );\n-                    }\n+                if r_committed_after_snapshot {\n+                    assert!(\n+                        in_edges.iter().any(|c| c.txn_id == 1),\n+                        \"missing incoming edge source txn_id=1\"\n+                    );\n+                    assert_eq!(\n+                        outcome,\n+                        TxnOutcome::Aborted,\n+                        \"committed pivot must force abort\"\n+                    );\n                 }\n             })\n             .expect(\"spawn T\");"
+    },
+    {
+      "sha": "3bab04d60dfbe7e0dade5f469f8f2cfc700e5e4d",
+      "filename": "crates/fsqlite-mvcc/src/witness_hierarchy.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 1,
+      "changes": 8,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/73b627cafa446986e15cb09621c34f17abafa4e3/crates%2Ffsqlite-mvcc%2Fsrc%2Fwitness_hierarchy.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/73b627cafa446986e15cb09621c34f17abafa4e3/crates%2Ffsqlite-mvcc%2Fsrc%2Fwitness_hierarchy.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-mvcc%2Fsrc%2Fwitness_hierarchy.rs?ref=73b627cafa446986e15cb09621c34f17abafa4e3",
+      "patch": "@@ -170,8 +170,14 @@ impl WitnessHotIndexManifestV1 {\n             }\n         })?;\n \n+        let entries_plus_overflow = u64::from(capacity)\n+            .checked_add(1)\n+            .ok_or(WitnessSizingError::ArithmeticOverflow)?;\n+        let entries_bytes = bytes_per_entry\n+            .checked_mul(entries_plus_overflow)\n+            .ok_or(WitnessSizingError::ArithmeticOverflow)?;\n         let total_bytes = HotWitnessIndexSizingV1::HEADER_BYTES_ALIGNED\n-            .checked_add(bytes_per_entry.saturating_mul(u64::from(capacity) + 1))\n+            .checked_add(entries_bytes)\n             .ok_or(WitnessSizingError::ArithmeticOverflow)?;\n \n         Ok(Self {"
+    },
+    {
+      "sha": "d43351445dfd73f74822ed2b0b2ed41ef6bee7f8",
+      "filename": "crates/fsqlite-vfs/src/traits.rs",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 2,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/73b627cafa446986e15cb09621c34f17abafa4e3/crates%2Ffsqlite-vfs%2Fsrc%2Ftraits.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/73b627cafa446986e15cb09621c34f17abafa4e3/crates%2Ffsqlite-vfs%2Fsrc%2Ftraits.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-vfs%2Fsrc%2Ftraits.rs?ref=73b627cafa446986e15cb09621c34f17abafa4e3",
+      "patch": "@@ -50,8 +50,11 @@ pub trait Vfs: Send + Sync {\n \n     /// Generate a random byte sequence for temporary file naming.\n     ///\n-    /// Fills `buf` with random bytes. The default implementation uses the\n-    /// system random number generator.\n+    /// Fills `buf` with bytes suitable for temporary file naming.\n+    ///\n+    /// The default implementation is deterministic (xorshift) for reproducible\n+    /// tests; real VFS implementations should override this and use OS-provided\n+    /// randomness to avoid collisions.\n     fn randomness(&self, cx: &Cx, buf: &mut [u8]) {\n         // Default: fill with pseudo-random bytes using a simple xorshift.\n         // Real VFS implementations should use OS-provided randomness."
+    }
+  ]
+}

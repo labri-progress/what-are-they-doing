@@ -1,0 +1,41 @@
+{
+  "message": "fix(mac): stop monitoring cleanly and dispatch file events",
+  "files": [
+    {
+      "sha": "d84e33ecaddfed6cd5de503ee70ad55a3bda34fe",
+      "filename": "apps/mac/Poltergeist/PoltergeistApp.swift",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/steipete/poltergeist/blob/00ddfb1feb5103f5b67af50b7af632fe48293c52/apps%2Fmac%2FPoltergeist%2FPoltergeistApp.swift",
+      "raw_url": "https://github.com/steipete/poltergeist/raw/00ddfb1feb5103f5b67af50b7af632fe48293c52/apps%2Fmac%2FPoltergeist%2FPoltergeistApp.swift",
+      "contents_url": "https://api.github.com/repos/steipete/poltergeist/contents/apps%2Fmac%2FPoltergeist%2FPoltergeistApp.swift?ref=00ddfb1feb5103f5b67af50b7af632fe48293c52",
+      "patch": "@@ -81,6 +81,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {\n     nonisolated func applicationWillTerminate(_ notification: Notification) {\n         Task { @MainActor in\n             logger.info(\"\ud83d\uded1 Poltergeist Monitor shutting down...\")\n+            ProjectMonitor.shared.stopMonitoring()\n             statusBarController = nil\n         }\n     }"
+    },
+    {
+      "sha": "6ca257471e2e5246ff200e1f6e0f75e13906d116",
+      "filename": "apps/mac/Poltergeist/Services/FileWatcher.swift",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 7,
+      "changes": 18,
+      "blob_url": "https://github.com/steipete/poltergeist/blob/00ddfb1feb5103f5b67af50b7af632fe48293c52/apps%2Fmac%2FPoltergeist%2FServices%2FFileWatcher.swift",
+      "raw_url": "https://github.com/steipete/poltergeist/raw/00ddfb1feb5103f5b67af50b7af632fe48293c52/apps%2Fmac%2FPoltergeist%2FServices%2FFileWatcher.swift",
+      "contents_url": "https://api.github.com/repos/steipete/poltergeist/contents/apps%2Fmac%2FPoltergeist%2FServices%2FFileWatcher.swift?ref=00ddfb1feb5103f5b67af50b7af632fe48293c52",
+      "patch": "@@ -14,14 +14,18 @@ import os.log\n final class FileWatcher: @unchecked Sendable {\n     private let logger = Logger(subsystem: \"com.poltergeist.monitor\", category: \"FileWatcher\")\n     private let path: String\n-    private let callback: @MainActor @Sendable () -> Void\n+    private let callback: @Sendable () -> Void\n+    private let eventQueue = DispatchQueue(\n+        label: \"com.poltergeist.monitor.filewatcher\",\n+        qos: .utility\n+    )\n \n     private var directoryFileDescriptor: CInt = -1\n     private var directorySource: DispatchSourceFileSystemObject?\n     private let lock = NSLock()\n \n     /// - Parameter callback: Called on main queue when file system changes are detected\n-    init(path: String, callback: @escaping @MainActor @Sendable () -> Void) {\n+    init(path: String, callback: @escaping @Sendable () -> Void) {\n         self.path = path\n         self.callback = callback\n     }\n@@ -45,14 +49,14 @@ final class FileWatcher: @unchecked Sendable {\n         let source = DispatchSource.makeFileSystemObjectSource(\n             fileDescriptor: directoryFileDescriptor,\n             eventMask: [.write, .delete],\n-            queue: DispatchQueue.main\n+            queue: eventQueue\n         )\n \n         source.setEventHandler { [weak self] in\n-            guard let self = self else { return }\n-            // Call @MainActor callback using Task with @MainActor context\n-            Task { @MainActor in\n-                self.callback()\n+            guard let callback = self?.callback else { return }\n+            // Forward to the main queue explicitly to satisfy @MainActor callers\n+            DispatchQueue.main.async {\n+                callback()\n             }\n         }\n "
+    },
+    {
+      "sha": "68a867aa9f70e81af15082cd34c76647f46ecf9f",
+      "filename": "apps/mac/Poltergeist/Services/ProjectMonitor.swift",
+      "status": "modified",
+      "additions": 32,
+      "deletions": 3,
+      "changes": 35,
+      "blob_url": "https://github.com/steipete/poltergeist/blob/00ddfb1feb5103f5b67af50b7af632fe48293c52/apps%2Fmac%2FPoltergeist%2FServices%2FProjectMonitor.swift",
+      "raw_url": "https://github.com/steipete/poltergeist/raw/00ddfb1feb5103f5b67af50b7af632fe48293c52/apps%2Fmac%2FPoltergeist%2FServices%2FProjectMonitor.swift",
+      "contents_url": "https://api.github.com/repos/steipete/poltergeist/contents/apps%2Fmac%2FPoltergeist%2FServices%2FProjectMonitor.swift?ref=00ddfb1feb5103f5b67af50b7af632fe48293c52",
+      "patch": "@@ -47,6 +47,12 @@ final class ProjectMonitor {\n     static let shared = ProjectMonitor()\n     static let projectsDidUpdateNotification = Notification.Name(\"ProjectsDidUpdate\")\n \n+    private static let iso8601Formatter: ISO8601DateFormatter = {\n+        let formatter = ISO8601DateFormatter()\n+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]\n+        return formatter\n+    }()\n+\n     private let logger = Logger(subsystem: \"com.poltergeist.monitor\", category: \"ProjectMonitor\")\n     private let poltergeistDirectory: String = {\n         if let customDir = ProcessInfo.processInfo.environment[\"POLTERGEIST_STATE_DIR\"] {\n@@ -65,6 +71,7 @@ final class ProjectMonitor {\n     private var fileWatcher: FileWatcher?\n     private var updateTimer: Timer?\n     private var debounceTimer: Timer?\n+    private var isMonitoring = false\n \n     // Track build history for enhanced features\n     private var buildHistory: [CompletedBuild] = []\n@@ -84,6 +91,11 @@ final class ProjectMonitor {\n     private init() {}\n \n     func startMonitoring() {\n+        guard !isMonitoring else {\n+            logger.debug(\"Project monitoring already active\")\n+            return\n+        }\n+        isMonitoring = true\n         logger.info(\"Starting project monitoring...\")\n \n         // Create directory if it doesn't exist\n@@ -98,11 +110,24 @@ final class ProjectMonitor {\n         // Set up periodic updates for heartbeat checks\n         updateTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { _ in\n             Task { @MainActor in\n+                guard self.isMonitoring else { return }\n                 self.scanForProjects()\n             }\n         }\n     }\n \n+    func stopMonitoring() {\n+        guard isMonitoring else { return }\n+        logger.info(\"Stopping project monitoring...\")\n+        debounceTimer?.invalidate()\n+        debounceTimer = nil\n+        updateTimer?.invalidate()\n+        updateTimer = nil\n+        fileWatcher?.stop()\n+        fileWatcher = nil\n+        isMonitoring = false\n+    }\n+\n     private func createPoltergeistDirectory() {\n         do {\n             try FileManager.default.createDirectory(\n@@ -262,7 +287,7 @@ final class ProjectMonitor {\n     }\n \n     private func createTargetState(from state: PoltergeistState) -> TargetState {\n-        let heartbeat = ISO8601DateFormatter().date(from: state.process.lastHeartbeat)\n+        let heartbeat = Self.iso8601Formatter.date(from: state.process.lastHeartbeat)\n         let isStale = isProcessStale(heartbeat: heartbeat)\n         if isStale {\n             logger.warning(\"\u26a0\ufe0f Process is stale for \\(state.projectName):\\(state.target)\")\n@@ -275,9 +300,9 @@ final class ProjectMonitor {\n             isActive: state.process.isActive && !isProcessStale(heartbeat: heartbeat),\n             lastHeartbeat: heartbeat,\n             lastBuild: state.lastBuild.map { build in\n-                let buildTimestamp = ISO8601DateFormatter().date(from: build.timestamp)\n+                let buildTimestamp = Self.iso8601Formatter.date(from: build.timestamp)\n                 let buildStartTime = build.startTime.flatMap {\n-                    ISO8601DateFormatter().date(from: $0)\n+                    Self.iso8601Formatter.date(from: $0)\n                 }\n \n                 return BuildInfo(\n@@ -653,6 +678,10 @@ final class ProjectMonitor {\n             queueLength: buildQueue.totalQueueLength\n         )\n     }\n+\n+    deinit {\n+        stopMonitoring()\n+    }\n }\n \n // Build statistics for dashboard display"
+    }
+  ]
+}

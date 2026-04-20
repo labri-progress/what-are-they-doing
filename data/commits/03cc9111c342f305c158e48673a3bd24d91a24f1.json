@@ -1,0 +1,29 @@
+{
+  "message": "fix: properly switch CDP session when changing tabs\n\nWhen switching tabs, the old code would try to attach to the new target\nbut fail if already attached. This left the old session_id in use,\ncausing screencast to continue showing the old tab.\n\nFix:\n- Detach from current session before attaching to new target\n- Stop screencast before switching targets\n- Require successful attach (no silent fallback to old session)\n- This ensures screencast always starts on the correct session",
+  "files": [
+    {
+      "sha": "dbefd984414cae16a8f4209847dcab1e03921c7d",
+      "filename": "src/chrome/cdp_client.zig",
+      "status": "modified",
+      "additions": 28,
+      "deletions": 20,
+      "changes": 48,
+      "blob_url": "https://github.com/teamchong/termweb/blob/03cc9111c342f305c158e48673a3bd24d91a24f1/src%2Fchrome%2Fcdp_client.zig",
+      "raw_url": "https://github.com/teamchong/termweb/raw/03cc9111c342f305c158e48673a3bd24d91a24f1/src%2Fchrome%2Fcdp_client.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/termweb/contents/src%2Fchrome%2Fcdp_client.zig?ref=03cc9111c342f305c158e48673a3bd24d91a24f1",
+      "patch": "@@ -594,10 +594,19 @@ pub const CdpClient = struct {\n     }\n \n     /// Switch to a different target (for tab switching)\n-    /// Attaches to the target and updates the session ID\n+    /// Detaches from current session and attaches to new target\n     pub fn switchToTarget(self: *CdpClient, target_id: []const u8) !void {\n         logToFile(\"[CDP] Switching to target: {s}\\n\", .{target_id});\n \n+        // Detach from current session first (if any) to allow clean re-attach\n+        if (self.session_id) |old_sid| {\n+            var detach_buf: [256]u8 = undefined;\n+            const detach_params = std.fmt.bufPrint(&detach_buf, \"{{\\\"sessionId\\\":\\\"{s}\\\"}}\", .{old_sid}) catch \"\";\n+            if (detach_params.len > 0) {\n+                _ = self.pipe_client.?.sendCommand(\"Target.detachFromTarget\", detach_params) catch {};\n+            }\n+        }\n+\n         // Activate the target in Chrome (brings it to focus)\n         var activate_buf: [256]u8 = undefined;\n         const activate_params = std.fmt.bufPrint(&activate_buf, \"{{\\\"targetId\\\":\\\"{s}\\\"}}\", .{target_id}) catch return error.OutOfMemory;\n@@ -617,27 +626,26 @@ pub const CdpClient = struct {\n         );\n         defer self.allocator.free(params);\n \n-        // Try to attach - may fail if already attached, that's OK\n-        if (self.pipe_client.?.sendCommand(\"Target.attachToTarget\", params)) |attach_response| {\n-            defer self.allocator.free(attach_response);\n-\n-            // Extract and update session ID\n-            if (self.extractSessionId(attach_response)) |new_session_id| {\n-                // Free old session ID and set new one\n-                if (self.session_id) |old_sid| {\n-                    self.allocator.free(old_sid);\n-                }\n-                self.session_id = new_session_id;\n-                logToFile(\"[CDP] Switched to target, new session: {s}\\n\", .{new_session_id});\n-            } else |_| {\n-                logToFile(\"[CDP] Could not extract session ID, keeping current session\\n\", .{});\n-            }\n-        } else |err| {\n-            // Already attached or other error - just continue with current session\n-            logToFile(\"[CDP] Target.attachToTarget failed (may be already attached): {}\\n\", .{err});\n+        const attach_response = self.pipe_client.?.sendCommand(\"Target.attachToTarget\", params) catch |err| {\n+            logToFile(\"[CDP] Target.attachToTarget failed: {}\\n\", .{err});\n+            return err;\n+        };\n+        defer self.allocator.free(attach_response);\n+\n+        // Extract and update session ID\n+        const new_session_id = self.extractSessionId(attach_response) catch |err| {\n+            logToFile(\"[CDP] Could not extract session ID: {}\\n\", .{err});\n+            return error.InvalidResponse;\n+        };\n+\n+        // Free old session ID and set new one\n+        if (self.session_id) |old_sid| {\n+            self.allocator.free(old_sid);\n         }\n+        self.session_id = new_session_id;\n+        logToFile(\"[CDP] Switched to target, new session: {s}\\n\", .{new_session_id});\n \n-        // Re-enable Page domain on the session (for events)\n+        // Re-enable Page domain on the new session\n         const page_result = self.sendCommand(\"Page.enable\", null) catch |err| {\n             logToFile(\"[CDP] Page.enable failed: {}\\n\", .{err});\n             return err;"
+    },
+    {
+      "sha": "c319b052307c0b6675ec460ce154cb08801cf1a5",
+      "filename": "src/viewer/tabs.zig",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/teamchong/termweb/blob/03cc9111c342f305c158e48673a3bd24d91a24f1/src%2Fviewer%2Ftabs.zig",
+      "raw_url": "https://github.com/teamchong/termweb/raw/03cc9111c342f305c158e48673a3bd24d91a24f1/src%2Fviewer%2Ftabs.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/termweb/contents/src%2Fviewer%2Ftabs.zig?ref=03cc9111c342f305c158e48673a3bd24d91a24f1",
+      "patch": "@@ -67,6 +67,11 @@ pub fn switchToTab(viewer: anytype, index: usize) !void {\n \n     viewer.log(\"[TABS] Switching to tab {}: {s} (target={s})\\n\", .{ index, tab.url, tab.target_id });\n \n+    // Stop current screencast before switching\n+    screenshot_api.stopScreencast(viewer.cdp_client, viewer.allocator) catch |err| {\n+        viewer.log(\"[TABS] stopScreencast failed: {}\\n\", .{err});\n+    };\n+\n     viewer.cdp_client.switchToTarget(tab.target_id) catch |err| {\n         viewer.log(\"[TABS] switchToTarget failed: {}, falling back to navigation\\n\", .{err});\n         _ = try screenshot_api.navigateToUrl(viewer.cdp_client, viewer.allocator, tab.url);"
+    }
+  ]
+}

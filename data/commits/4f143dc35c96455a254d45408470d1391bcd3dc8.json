@@ -1,0 +1,77 @@
+{
+  "message": "refactor: add menu snapshot and prefetch",
+  "files": [
+    {
+      "sha": "c1eb0a6514bb89045dd00172b81a772f2bb9a619",
+      "filename": "Sources/RepoBar/App/MenuSnapshot.swift",
+      "status": "added",
+      "additions": 11,
+      "deletions": 0,
+      "changes": 11,
+      "blob_url": "https://github.com/steipete/RepoBar/blob/4f143dc35c96455a254d45408470d1391bcd3dc8/Sources%2FRepoBar%2FApp%2FMenuSnapshot.swift",
+      "raw_url": "https://github.com/steipete/RepoBar/raw/4f143dc35c96455a254d45408470d1391bcd3dc8/Sources%2FRepoBar%2FApp%2FMenuSnapshot.swift",
+      "contents_url": "https://api.github.com/repos/steipete/RepoBar/contents/Sources%2FRepoBar%2FApp%2FMenuSnapshot.swift?ref=4f143dc35c96455a254d45408470d1391bcd3dc8",
+      "patch": "@@ -0,0 +1,11 @@\n+import Foundation\n+import RepoBarCore\n+\n+struct MenuSnapshot: Equatable {\n+    let repositories: [Repository]\n+    let capturedAt: Date\n+\n+    func isStale(now: Date, interval: TimeInterval) -> Bool {\n+        now.timeIntervalSince(self.capturedAt) >= interval\n+    }\n+}"
+    },
+    {
+      "sha": "e9c2c75d9e470e385716d26093f6e29e7985f6ba",
+      "filename": "Sources/RepoBar/App/RepoBarApp.swift",
+      "status": "modified",
+      "additions": 41,
+      "deletions": 5,
+      "changes": 46,
+      "blob_url": "https://github.com/steipete/RepoBar/blob/4f143dc35c96455a254d45408470d1391bcd3dc8/Sources%2FRepoBar%2FApp%2FRepoBarApp.swift",
+      "raw_url": "https://github.com/steipete/RepoBar/raw/4f143dc35c96455a254d45408470d1391bcd3dc8/Sources%2FRepoBar%2FApp%2FRepoBarApp.swift",
+      "contents_url": "https://api.github.com/repos/steipete/RepoBar/contents/Sources%2FRepoBar%2FApp%2FRepoBarApp.swift?ref=4f143dc35c96455a254d45408470d1391bcd3dc8",
+      "patch": "@@ -86,11 +86,11 @@ final class AppState {\n     let github = GitHubClient()\n     let refreshScheduler = RefreshScheduler()\n     private let settingsStore = SettingsStore()\n-    private var lastMenuRefresh: Date?\n     private let menuRefreshInterval: TimeInterval = 30\n     private var refreshTask: Task<Void, Never>?\n     private var refreshTaskToken = UUID()\n     private let hydrateConcurrencyLimit = 4\n+    private var prefetchTask: Task<Void, Never>?\n \n     // Default GitHub App values for convenience login from the main window.\n     private let defaultClientID = RepoBarAuthDefaults.clientID\n@@ -114,16 +114,18 @@ final class AppState {\n \n     func refreshIfNeededForMenu() {\n         let now = Date()\n-        if let lastMenuRefresh, now.timeIntervalSince(lastMenuRefresh) < self.menuRefreshInterval {\n+        if let snapshot = self.session.menuSnapshot,\n+           snapshot.isStale(now: now, interval: self.menuRefreshInterval) == false\n+        {\n             return\n         }\n-        self.lastMenuRefresh = now\n         self.requestRefresh(cancelInFlight: true)\n     }\n \n     func requestRefresh(cancelInFlight: Bool = false) {\n         if cancelInFlight {\n             self.refreshTask?.cancel()\n+            self.prefetchTask?.cancel()\n         }\n         guard cancelInFlight || self.refreshTask == nil else { return }\n         let token = UUID()\n@@ -173,6 +175,8 @@ final class AppState {\n             if self.auth.loadTokens() == nil {\n                 await MainActor.run {\n                     self.session.repositories = []\n+                    self.session.menuSnapshot = nil\n+                    self.session.hasLoadedRepositories = false\n                     self.session.lastError = nil\n                 }\n                 return\n@@ -192,7 +196,8 @@ final class AppState {\n             try Task.checkCancellation()\n             let merged = self.mergeHydrated(hydrated, into: ordered)\n             let final = self.applyPinnedOrder(to: merged)\n-            await self.updateSession(with: final)\n+            await self.updateSession(with: final, now: now)\n+            self.prefetchMenuTargets(from: final, visibleCount: targets.count, token: self.refreshTaskToken)\n             let reset = await self.github.rateLimitReset(now: now)\n             let message = await self.github.rateLimitMessage(now: now)\n             await MainActor.run {\n@@ -291,15 +296,45 @@ final class AppState {\n         }\n     }\n \n-    private func updateSession(with repos: [Repository]) async {\n+    private func updateSession(with repos: [Repository], now: Date) async {\n         await MainActor.run {\n             self.session.repositories = repos\n+            self.session.menuSnapshot = MenuSnapshot(repositories: repos, capturedAt: now)\n             self.session.hasLoadedRepositories = true\n             self.session.rateLimitReset = nil\n             self.session.lastError = nil\n         }\n     }\n \n+    private func prefetchMenuTargets(\n+        from repos: [Repository],\n+        visibleCount: Int,\n+        token: UUID\n+    ) {\n+        guard let limit = self.session.settings.repoList.displayLimit, limit > 0 else { return }\n+        let startIndex = min(visibleCount, repos.count)\n+        let prefetchTargets = Array(repos.dropFirst(startIndex).prefix(limit))\n+        guard prefetchTargets.isEmpty == false else { return }\n+\n+        self.prefetchTask?.cancel()\n+        self.prefetchTask = Task(priority: .utility) { [weak self] in\n+            guard let self else { return }\n+            let hydrated = await self.hydrateMenuTargets(prefetchTargets)\n+            guard Task.isCancelled == false, hydrated.isEmpty == false else { return }\n+            await MainActor.run {\n+                guard self.refreshTaskToken == token else { return }\n+                let merged = self.mergeHydrated(hydrated, into: self.session.repositories)\n+                self.session.repositories = merged\n+                if let snapshot = self.session.menuSnapshot {\n+                    self.session.menuSnapshot = MenuSnapshot(\n+                        repositories: merged,\n+                        capturedAt: snapshot.capturedAt\n+                    )\n+                }\n+            }\n+        }\n+    }\n+\n     func addPinned(_ fullName: String) async {\n         guard !self.session.settings.repoList.pinnedRepositories.contains(fullName) else { return }\n         self.session.settings.repoList.pinnedRepositories.append(fullName)\n@@ -442,6 +477,7 @@ final class AppState {\n final class Session {\n     var account: AccountState = .loggedOut\n     var repositories: [Repository] = []\n+    var menuSnapshot: MenuSnapshot?\n     var hasLoadedRepositories = false\n     var settings = UserSettings()\n     var rateLimitReset: Date?"
+    },
+    {
+      "sha": "cf76cec8458470bc6772c33645b19fd1056d2c1a",
+      "filename": "Sources/RepoBar/StatusBar/StatusBarMenuBuilder.swift",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 1,
+      "changes": 5,
+      "blob_url": "https://github.com/steipete/RepoBar/blob/4f143dc35c96455a254d45408470d1391bcd3dc8/Sources%2FRepoBar%2FStatusBar%2FStatusBarMenuBuilder.swift",
+      "raw_url": "https://github.com/steipete/RepoBar/raw/4f143dc35c96455a254d45408470d1391bcd3dc8/Sources%2FRepoBar%2FStatusBar%2FStatusBarMenuBuilder.swift",
+      "contents_url": "https://api.github.com/repos/steipete/RepoBar/contents/Sources%2FRepoBar%2FStatusBar%2FStatusBarMenuBuilder.swift?ref=4f143dc35c96455a254d45408470d1391bcd3dc8",
+      "patch": "@@ -403,7 +403,10 @@ final class StatusBarMenuBuilder {\n             hidden: Set(settings.repoList.hiddenRepositories),\n             pinPriority: true\n         )\n-        let sorted = RepositoryPipeline.apply(session.repositories, query: query)\n+        let baseRepos = session.repositories.isEmpty\n+            ? (session.menuSnapshot?.repositories ?? [])\n+            : session.repositories\n+        let sorted = RepositoryPipeline.apply(baseRepos, query: query)\n         return sorted.map { RepositoryDisplayModel(repo: $0) }\n     }\n "
+    },
+    {
+      "sha": "63580702ca6f17d290218a90ff955e041e20246f",
+      "filename": "Sources/RepoBar/StatusBar/StatusBarMenuManager.swift",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 12,
+      "changes": 13,
+      "blob_url": "https://github.com/steipete/RepoBar/blob/4f143dc35c96455a254d45408470d1391bcd3dc8/Sources%2FRepoBar%2FStatusBar%2FStatusBarMenuManager.swift",
+      "raw_url": "https://github.com/steipete/RepoBar/raw/4f143dc35c96455a254d45408470d1391bcd3dc8/Sources%2FRepoBar%2FStatusBar%2FStatusBarMenuManager.swift",
+      "contents_url": "https://api.github.com/repos/steipete/RepoBar/contents/Sources%2FRepoBar%2FStatusBar%2FStatusBarMenuManager.swift?ref=4f143dc35c96455a254d45408470d1391bcd3dc8",
+      "patch": "@@ -7,8 +7,6 @@ import SwiftUI\n final class StatusBarMenuManager: NSObject, NSMenuDelegate {\n     private let appState: AppState\n     private var mainMenu: NSMenu?\n-    private var lastMenuRefresh: Date?\n-    private let menuRefreshInterval: TimeInterval = 30\n     private lazy var menuBuilder = StatusBarMenuBuilder(appState: self.appState, target: self)\n \n     init(appState: AppState) {\n@@ -168,7 +166,7 @@ final class StatusBarMenuManager: NSObject, NSMenuDelegate {\n     func menuWillOpen(_ menu: NSMenu) {\n         menu.appearance = NSApp.effectiveAppearance\n         if menu === self.mainMenu {\n-            self.refreshIfNeededOnOpen()\n+            self.appState.refreshIfNeededForMenu()\n             self.menuBuilder.populateMainMenu(menu)\n             self.menuBuilder.refreshMenuViewHeights(in: menu)\n             DispatchQueue.main.async { [weak self] in\n@@ -225,13 +223,4 @@ final class StatusBarMenuManager: NSObject, NSMenuDelegate {\n \n     @objc func menuItemNoOp(_: NSMenuItem) {}\n \n-    private func refreshIfNeededOnOpen() {\n-        let now = Date()\n-        if let lastMenuRefresh, now.timeIntervalSince(lastMenuRefresh) < self.menuRefreshInterval {\n-            return\n-        }\n-        self.lastMenuRefresh = now\n-        self.refreshNow()\n-    }\n-\n }"
+    },
+    {
+      "sha": "079a7d1291c2d1e40accb2bee60e7824bd36dd6d",
+      "filename": "Tests/RepoBarTests/MenuSnapshotTests.swift",
+      "status": "added",
+      "additions": 29,
+      "deletions": 0,
+      "changes": 29,
+      "blob_url": "https://github.com/steipete/RepoBar/blob/4f143dc35c96455a254d45408470d1391bcd3dc8/Tests%2FRepoBarTests%2FMenuSnapshotTests.swift",
+      "raw_url": "https://github.com/steipete/RepoBar/raw/4f143dc35c96455a254d45408470d1391bcd3dc8/Tests%2FRepoBarTests%2FMenuSnapshotTests.swift",
+      "contents_url": "https://api.github.com/repos/steipete/RepoBar/contents/Tests%2FRepoBarTests%2FMenuSnapshotTests.swift?ref=4f143dc35c96455a254d45408470d1391bcd3dc8",
+      "patch": "@@ -0,0 +1,29 @@\n+import Foundation\n+@testable import RepoBar\n+import RepoBarCore\n+import Testing\n+\n+struct MenuSnapshotTests {\n+    @Test\n+    func staleChecksUseInterval() {\n+        let repo = Repository(\n+            id: \"1\",\n+            name: \"Repo\",\n+            owner: \"me\",\n+            sortOrder: nil,\n+            error: nil,\n+            rateLimitedUntil: nil,\n+            ciStatus: .unknown,\n+            openIssues: 0,\n+            openPulls: 0,\n+            latestRelease: nil,\n+            latestActivity: nil,\n+            traffic: nil,\n+            heatmap: []\n+        )\n+        let now = Date()\n+        let snapshot = MenuSnapshot(repositories: [repo], capturedAt: now)\n+        #expect(snapshot.isStale(now: now.addingTimeInterval(10), interval: 30) == false)\n+        #expect(snapshot.isStale(now: now.addingTimeInterval(31), interval: 30))\n+    }\n+}"
+    },
+    {
+      "sha": "e66a4277ae83231b4336e8d0c1830a0434ef2e90",
+      "filename": "docs/refactor/refactor-opportunities.md",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/steipete/RepoBar/blob/4f143dc35c96455a254d45408470d1391bcd3dc8/docs%2Frefactor%2Frefactor-opportunities.md",
+      "raw_url": "https://github.com/steipete/RepoBar/raw/4f143dc35c96455a254d45408470d1391bcd3dc8/docs%2Frefactor%2Frefactor-opportunities.md",
+      "contents_url": "https://api.github.com/repos/steipete/RepoBar/contents/docs%2Frefactor%2Frefactor-opportunities.md?ref=4f143dc35c96455a254d45408470d1391bcd3dc8",
+      "patch": "@@ -139,11 +139,11 @@ Last updated: 2025-12-28\n \n ## Performance\n \n-### [ ] 21) Preload strategy\n+### [x] 21) Preload strategy\n - Cache last menu snapshot and reuse on reopen.\n - Only refresh in background if stale.\n \n-### [ ] 22) Lazy hydration\n+### [x] 22) Lazy hydration\n - Hydrate only visible rows, then opportunistically hydrate next page.\n \n ## Incremental Plan Ideas"
+    }
+  ]
+}

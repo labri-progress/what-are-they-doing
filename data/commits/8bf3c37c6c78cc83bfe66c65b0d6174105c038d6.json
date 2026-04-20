@@ -1,0 +1,41 @@
+{
+  "message": "fix(cron): keep watchdog timer armed during ticks",
+  "files": [
+    {
+      "sha": "11ff315cd66ebd4bf4df638cb9a11829461daf8f",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/8bf3c37c6c78cc83bfe66c65b0d6174105c038d6/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/8bf3c37c6c78cc83bfe66c65b0d6174105c038d6/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=8bf3c37c6c78cc83bfe66c65b0d6174105c038d6",
+      "patch": "@@ -43,6 +43,7 @@ Docs: https://docs.openclaw.ai\n - Cron: honor `cron.maxConcurrentRuns` in the timer loop so due jobs can execute up to the configured parallelism instead of always running serially. (#11595) Thanks @Takhoffman.\n - Cron/Isolation: force fresh session IDs for isolated cron runs so `sessionTarget=\"isolated\"` executions never reuse prior run context. (#23470) Thanks @echoVic.\n - Cron/Service: execute manual `cron.run` jobs outside the cron lock (while still persisting started/finished state atomically) so `cron.list` and `cron.status` remain responsive during long forced runs. (#23628) Thanks @dsgraves.\n+- Cron/Timer: keep a watchdog recheck timer armed while `onTimer` is actively executing so the scheduler continues polling even if a due-run tick stalls for an extended period. (#23628) Thanks @dsgraves.\n - Agents/Compaction: restore embedded compaction safeguard/context-pruning extension loading in production by wiring bundled extension factories into the resource loader instead of runtime file-path resolution. (#22349) Thanks @Glucksberg.\n - Feishu/Media: for inbound video messages that include both `file_key` (video) and `image_key` (thumbnail), prefer `file_key` when downloading media so video attachments are saved instead of silently failing on thumbnail keys. (#23633)\n - Hooks/Cron: suppress duplicate main-session events for delivered hook turns and mark `SILENT_REPLY_TOKEN` (`NO_REPLY`) early exits as delivered to prevent hook context pollution. (#20678) Thanks @JonathanWorks."
+    },
+    {
+      "sha": "aac531d85f562902ab2b3c759398958b7118c6e4",
+      "filename": "src/cron/service.rearm-timer-when-running.test.ts",
+      "status": "modified",
+      "additions": 72,
+      "deletions": 1,
+      "changes": 73,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/8bf3c37c6c78cc83bfe66c65b0d6174105c038d6/src%2Fcron%2Fservice.rearm-timer-when-running.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/8bf3c37c6c78cc83bfe66c65b0d6174105c038d6/src%2Fcron%2Fservice.rearm-timer-when-running.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fcron%2Fservice.rearm-timer-when-running.test.ts?ref=8bf3c37c6c78cc83bfe66c65b0d6174105c038d6",
+      "patch": "@@ -1,9 +1,12 @@\n+import fs from \"node:fs/promises\";\n+import path from \"node:path\";\n import { afterEach, beforeEach, describe, expect, it, vi } from \"vitest\";\n import {\n-  createCronStoreHarness,\n   createNoopLogger,\n+  createCronStoreHarness,\n   createRunningCronServiceState,\n } from \"./service.test-harness.js\";\n+import { createCronServiceState } from \"./service/state.js\";\n import { onTimer } from \"./service/timer.js\";\n import type { CronJob } from \"./types.js\";\n \n@@ -31,6 +34,14 @@ function createDueRecurringJob(params: {\n   };\n }\n \n+function createDeferred<T>() {\n+  let resolve!: (value: T) => void;\n+  const promise = new Promise<T>((res) => {\n+    resolve = res;\n+  });\n+  return { promise, resolve };\n+}\n+\n describe(\"CronService - timer re-arm when running (#12025)\", () => {\n   beforeEach(() => {\n     noopLogger.debug.mockClear();\n@@ -81,4 +92,64 @@ describe(\"CronService - timer re-arm when running (#12025)\", () => {\n     timeoutSpy.mockRestore();\n     await store.cleanup();\n   });\n+\n+  it(\"arms a watchdog timer while a timer tick is still executing\", async () => {\n+    const timeoutSpy = vi.spyOn(globalThis, \"setTimeout\");\n+    const store = await makeStorePath();\n+    const now = Date.parse(\"2026-02-06T10:05:00.000Z\");\n+    const deferredRun = createDeferred<{ status: \"ok\"; summary: string }>();\n+\n+    await fs.mkdir(path.dirname(store.storePath), { recursive: true });\n+    await fs.writeFile(\n+      store.storePath,\n+      JSON.stringify(\n+        {\n+          version: 1,\n+          jobs: [\n+            createDueRecurringJob({\n+              id: \"long-running-job\",\n+              nowMs: now,\n+              nextRunAtMs: now,\n+            }),\n+          ],\n+        },\n+        null,\n+        2,\n+      ),\n+      \"utf-8\",\n+    );\n+\n+    const state = createCronServiceState({\n+      storePath: store.storePath,\n+      cronEnabled: true,\n+      log: noopLogger,\n+      nowMs: () => now,\n+      enqueueSystemEvent: vi.fn(),\n+      requestHeartbeatNow: vi.fn(),\n+      runIsolatedAgentJob: vi.fn(async () => await deferredRun.promise),\n+    });\n+\n+    let settled = false;\n+    const timerPromise = onTimer(state);\n+    void timerPromise.finally(() => {\n+      settled = true;\n+    });\n+\n+    await Promise.resolve();\n+    expect(settled).toBe(false);\n+    expect(state.running).toBe(true);\n+    expect(state.timer).not.toBeNull();\n+\n+    const delays = timeoutSpy.mock.calls\n+      .map(([, delay]) => delay)\n+      .filter((d): d is number => typeof d === \"number\");\n+    expect(delays).toContain(60_000);\n+\n+    deferredRun.resolve({ status: \"ok\", summary: \"done\" });\n+    await timerPromise;\n+    expect(state.running).toBe(false);\n+\n+    timeoutSpy.mockRestore();\n+    await store.cleanup();\n+  });\n });"
+    },
+    {
+      "sha": "a99d2acec65de3bcaf1c48df4933af75b219f343",
+      "filename": "src/cron/service/timer.ts",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 8,
+      "changes": 23,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/8bf3c37c6c78cc83bfe66c65b0d6174105c038d6/src%2Fcron%2Fservice%2Ftimer.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/8bf3c37c6c78cc83bfe66c65b0d6174105c038d6/src%2Fcron%2Fservice%2Ftimer.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fcron%2Fservice%2Ftimer.ts?ref=8bf3c37c6c78cc83bfe66c65b0d6174105c038d6",
+      "patch": "@@ -221,6 +221,17 @@ export function armTimer(state: CronServiceState) {\n   );\n }\n \n+function armRunningRecheckTimer(state: CronServiceState) {\n+  if (state.timer) {\n+    clearTimeout(state.timer);\n+  }\n+  state.timer = setTimeout(() => {\n+    void onTimer(state).catch((err) => {\n+      state.deps.log.error({ err: String(err) }, \"cron: timer tick failed\");\n+    });\n+  }, MAX_TIMER_DELAY_MS);\n+}\n+\n export async function onTimer(state: CronServiceState) {\n   if (state.running) {\n     // Re-arm the timer so the scheduler keeps ticking even when a job is\n@@ -233,17 +244,13 @@ export async function onTimer(state: CronServiceState) {\n     // zero-delay hot-loop when past-due jobs are waiting for the current\n     // execution to finish.\n     // See: https://github.com/openclaw/openclaw/issues/12025\n-    if (state.timer) {\n-      clearTimeout(state.timer);\n-    }\n-    state.timer = setTimeout(() => {\n-      void onTimer(state).catch((err) => {\n-        state.deps.log.error({ err: String(err) }, \"cron: timer tick failed\");\n-      });\n-    }, MAX_TIMER_DELAY_MS);\n+    armRunningRecheckTimer(state);\n     return;\n   }\n   state.running = true;\n+  // Keep a watchdog timer armed while a tick is executing. If execution hangs\n+  // (for example in a provider call), the scheduler still wakes to re-check.\n+  armRunningRecheckTimer(state);\n   try {\n     const dueJobs = await locked(state, async () => {\n       await ensureLoaded(state, { forceReload: true, skipRecompute: true });"
+    }
+  ]
+}

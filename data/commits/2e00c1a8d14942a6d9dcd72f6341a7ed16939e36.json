@@ -1,0 +1,41 @@
+{
+  "message": "fix(ballast,scheduler): CoW filesystem fallocate bypass + VOI budget=1 fix\n\n1. Ballast on CoW filesystems (btrfs/zfs/bcachefs): fallocate allocates\n   zero-filled blocks that are trivially deduplicated, defeating the\n   purpose of ballast. Added skip_fallocate flag to BallastManager;\n   coordinator sets it when ProvisionStrategy::RandomData is selected.\n\n2. VOI scheduler budget=1: ceil() on exploration_quota_fraction stole\n   the entire budget for exploration, leaving zero exploitation slots.\n   Changed .min(budget) to .min(budget.saturating_sub(1)) to guarantee\n   at least one exploitation slot under pressure.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "3cb9d9b265b7c7eff95c8d169e8d1925ff9a8b38",
+      "filename": "src/ballast/coordinator.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 1,
+      "changes": 8,
+      "blob_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/blob/2e00c1a8d14942a6d9dcd72f6341a7ed16939e36/src%2Fballast%2Fcoordinator.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/raw/2e00c1a8d14942a6d9dcd72f6341a7ed16939e36/src%2Fballast%2Fcoordinator.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/storage_ballast_helper/contents/src%2Fballast%2Fcoordinator.rs?ref=2e00c1a8d14942a6d9dcd72f6341a7ed16939e36",
+      "patch": "@@ -225,14 +225,20 @@ impl BallastPoolCoordinator {\n                 overrides: BTreeMap::new(),\n             };\n \n-            let manager = match BallastManager::new(ballast_dir.clone(), pool_config) {\n+            let mut manager = match BallastManager::new(ballast_dir.clone(), pool_config) {\n                 Ok(manager) => manager,\n                 Err(err) => {\n                     skip_with(format!(\"failed to initialize ballast manager: {err}\"));\n                     continue;\n                 }\n             };\n \n+            // On CoW filesystems, force random-data writes (fallocate zeros are\n+            // trivially deduplicated, defeating the purpose of ballast).\n+            if strategy == ProvisionStrategy::RandomData {\n+                manager.set_skip_fallocate(true);\n+            }\n+\n             pools.insert(\n                 mount_path.clone(),\n                 BallastPool {"
+    },
+    {
+      "sha": "2a395ec3a8009ca33aab2cf1d8ce6643a9a74c17",
+      "filename": "src/ballast/manager.rs",
+      "status": "modified",
+      "additions": 17,
+      "deletions": 5,
+      "changes": 22,
+      "blob_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/blob/2e00c1a8d14942a6d9dcd72f6341a7ed16939e36/src%2Fballast%2Fmanager.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/raw/2e00c1a8d14942a6d9dcd72f6341a7ed16939e36/src%2Fballast%2Fmanager.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/storage_ballast_helper/contents/src%2Fballast%2Fmanager.rs?ref=2e00c1a8d14942a6d9dcd72f6341a7ed16939e36",
+      "patch": "@@ -109,6 +109,10 @@ pub struct BallastManager {\n     ballast_dir: PathBuf,\n     config: BallastConfig,\n     inventory: Vec<BallastFile>,\n+    /// When true, skip `fallocate` and always write random data.\n+    /// Set for CoW filesystems (btrfs, zfs) where fallocate-allocated zeros\n+    /// are trivially deduplicated, defeating the purpose of ballast.\n+    skip_fallocate: bool,\n }\n \n impl BallastManager {\n@@ -120,6 +124,7 @@ impl BallastManager {\n             ballast_dir,\n             config,\n             inventory: Vec::new(),\n+            skip_fallocate: false,\n         };\n         mgr.scan_existing();\n         Ok(mgr)\n@@ -157,6 +162,14 @@ impl BallastManager {\n         self.scan_existing();\n     }\n \n+    /// Force random-data provisioning, skipping `fallocate`.\n+    ///\n+    /// Required on CoW filesystems (btrfs, zfs, bcachefs) where fallocate\n+    /// allocates zero-filled blocks that are trivially deduplicated.\n+    pub fn set_skip_fallocate(&mut self, skip: bool) {\n+        self.skip_fallocate = skip;\n+    }\n+\n     // \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 locking \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n \n     #[cfg(unix)]\n@@ -518,12 +531,11 @@ impl BallastManager {\n         let data_size = size - HEADER_SIZE as u64;\n \n         // Try fallocate CLI first (instant on ext4/xfs, no unsafe needed).\n+        // Skipped on CoW filesystems where zero-filled blocks defeat dedup.\n         #[cfg(target_os = \"linux\")]\n-        {\n-            if try_fallocate_cli(path, size) {\n-                file.sync_all().map_err(|e| SbhError::io(path, e))?;\n-                return Ok(());\n-            }\n+        if !self.skip_fallocate && try_fallocate_cli(path, size) {\n+            file.sync_all().map_err(|e| SbhError::io(path, e))?;\n+            return Ok(());\n         }\n \n         // Fallback: write random data in chunks (works on all FS including CoW)."
+    },
+    {
+      "sha": "f9cff0dde16b8f222265022551891c0e07822fc5",
+      "filename": "src/monitor/voi_scheduler.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 2,
+      "changes": 8,
+      "blob_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/blob/2e00c1a8d14942a6d9dcd72f6341a7ed16939e36/src%2Fmonitor%2Fvoi_scheduler.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/raw/2e00c1a8d14942a6d9dcd72f6341a7ed16939e36/src%2Fmonitor%2Fvoi_scheduler.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/storage_ballast_helper/contents/src%2Fmonitor%2Fvoi_scheduler.rs?ref=2e00c1a8d14942a6d9dcd72f6341a7ed16939e36",
+      "patch": "@@ -362,9 +362,13 @@ impl VoiScheduler {\n     /// VOI-prioritized scheduler with exploration quota.\n     fn schedule_voi(&self, paths: &[&PathBuf], budget: usize, now: Instant) -> ScanPlan {\n         // Split budget: exploration vs exploitation.\n+        // Guarantee at least 1 exploitation slot when budget >= 1: under pressure,\n+        // the scheduler must scan the highest-yield path, not waste the single\n+        // slot on exploration.\n         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]\n-        let exploration_budget =\n-            ((budget as f64 * self.config.exploration_quota_fraction).ceil() as usize).min(budget);\n+        let exploration_budget = ((budget as f64 * self.config.exploration_quota_fraction).ceil()\n+            as usize)\n+            .min(budget.saturating_sub(1));\n         let exploitation_budget = budget.saturating_sub(exploration_budget);\n \n         // 1. Score all paths by utility."
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "message": "fix: add WriteZero retry to Anthropic provider and reduce idle worker threads\n\nPort the same WriteZero retry logic from openai.rs/openai_responses.rs\nto anthropic.rs: tolerate up to 5 consecutive transient WriteZero errors\nin the SSE stream before treating as fatal. This prevents auto-continue\nfailures when TLS buffers cause spurious Ok(0) writes.\n\nAlso reduce blocking_threads from (1,8) to (1,2) in main.rs and\npi_debug.rs to mitigate high idle CPU from asupersync worker polling\nuntil the upstream park_timeout fix propagates.\n\nCloses #15, closes #16\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "ea8aaf21b6ef8237c48a064210ed780cebe150ad",
+      "filename": "src/bin/pi_debug.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/pi_agent_rust/blob/012f0f67e36a1037816c8f220d253c76bb0a5b52/src%2Fbin%2Fpi_debug.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/pi_agent_rust/raw/012f0f67e36a1037816c8f220d253c76bb0a5b52/src%2Fbin%2Fpi_debug.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/pi_agent_rust/contents/src%2Fbin%2Fpi_debug.rs?ref=012f0f67e36a1037816c8f220d253c76bb0a5b52",
+      "patch": "@@ -45,7 +45,7 @@ fn main_impl() -> Result<()> {\n \n     let reactor = create_reactor()?;\n     let runtime = RuntimeBuilder::multi_thread()\n-        .blocking_threads(1, 8)\n+        .blocking_threads(1, 2)\n         .with_reactor(reactor)\n         .build()\n         .map_err(|e| anyhow::anyhow!(e.to_string()))?;"
+    },
+    {
+      "sha": "d0adb4d87d61799de5881af295f5f0fe8ffee163",
+      "filename": "src/main.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/pi_agent_rust/blob/012f0f67e36a1037816c8f220d253c76bb0a5b52/src%2Fmain.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/pi_agent_rust/raw/012f0f67e36a1037816c8f220d253c76bb0a5b52/src%2Fmain.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/pi_agent_rust/contents/src%2Fmain.rs?ref=012f0f67e36a1037816c8f220d253c76bb0a5b52",
+      "patch": "@@ -285,7 +285,7 @@ fn main_impl() -> Result<()> {\n     // Run the application\n     let reactor = create_reactor()?;\n     let runtime = RuntimeBuilder::multi_thread()\n-        .blocking_threads(1, 8)\n+        .blocking_threads(1, 2)\n         .with_reactor(reactor)\n         .build()\n         .map_err(|e| anyhow::anyhow!(e.to_string()))?;"
+    },
+    {
+      "sha": "e43957238bdb1e7f2af39f468b55e96838a83e2c",
+      "filename": "src/providers/anthropic.rs",
+      "status": "modified",
+      "additions": 23,
+      "deletions": 0,
+      "changes": 23,
+      "blob_url": "https://github.com/Dicklesworthstone/pi_agent_rust/blob/012f0f67e36a1037816c8f220d253c76bb0a5b52/src%2Fproviders%2Fanthropic.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/pi_agent_rust/raw/012f0f67e36a1037816c8f220d253c76bb0a5b52/src%2Fproviders%2Fanthropic.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/pi_agent_rust/contents/src%2Fproviders%2Fanthropic.rs?ref=012f0f67e36a1037816c8f220d253c76bb0a5b52",
+      "patch": "@@ -478,6 +478,7 @@ impl Provider for AnthropicProvider {\n                 loop {\n                     match state.event_source.next().await {\n                         Some(Ok(msg)) => {\n+                            state.write_zero_count = 0;\n                             if msg.event == \"ping\" {\n                                 // Skip ping events\n                             } else {\n@@ -500,6 +501,25 @@ impl Provider for AnthropicProvider {\n                             }\n                         }\n                         Some(Err(e)) => {\n+                            // WriteZero errors are transient (e.g. empty SSE\n+                            // frames when TLS buffers are full). Skip them and\n+                            // keep reading, but cap consecutive occurrences to\n+                            // avoid infinite loops.\n+                            const MAX_CONSECUTIVE_WRITE_ZERO: usize = 5;\n+                            if e.kind() == std::io::ErrorKind::WriteZero {\n+                                state.write_zero_count += 1;\n+                                if state.write_zero_count <= MAX_CONSECUTIVE_WRITE_ZERO {\n+                                    tracing::warn!(\n+                                        count = state.write_zero_count,\n+                                        \"Transient WriteZero error in SSE stream, continuing\"\n+                                    );\n+                                    continue;\n+                                }\n+                                tracing::warn!(\n+                                    \"WriteZero error persisted after {MAX_CONSECUTIVE_WRITE_ZERO} \\\n+                                     consecutive attempts, treating as fatal\"\n+                                );\n+                            }\n                             state.done = true;\n                             let err = Error::api(format!(\"SSE error: {e}\"));\n                             return Some((Err(err), state));\n@@ -536,6 +556,8 @@ where\n     current_tool_id: Option<String>,\n     current_tool_name: Option<String>,\n     done: bool,\n+    /// Consecutive WriteZero errors seen without a successful event in between.\n+    write_zero_count: usize,\n }\n \n impl<S> StreamState<S>\n@@ -569,6 +591,7 @@ where\n             current_tool_id: None,\n             current_tool_name: None,\n             done: false,\n+            write_zero_count: 0,\n         }\n     }\n "
+    }
+  ]
+}

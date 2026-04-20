@@ -1,0 +1,53 @@
+{
+  "message": "fix: stream markdown line-by-line",
+  "files": [
+    {
+      "sha": "2e91c0cd34520d94939c2db51854bba68560d0bb",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/steipete/summarize/blob/a505ca3c799e018ed1bc25e2decd651804762a1f/CHANGELOG.md",
+      "raw_url": "https://github.com/steipete/summarize/raw/a505ca3c799e018ed1bc25e2decd651804762a1f/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/steipete/summarize/contents/CHANGELOG.md?ref=a505ca3c799e018ed1bc25e2decd651804762a1f",
+      "patch": "@@ -5,6 +5,7 @@\n ### Fixed\n \n - Streaming: render streamed Markdown append-only (newline-bounded) to avoid line loss from in-place redraw.\n+- Streaming: render Markdown line-by-line (no full-frame reflows) to prevent duplicated sections in scrollback.\n - Streaming: flush newline-bounded output in `--plain` mode to avoid duplication with cumulative stream chunks.\n - Website extraction: strip inline CSS before Readability to avoid extremely slow jsdom stylesheet parsing on some pages.\n - Twitter/X: rotate Nitter hosts and skip Anubis PoW pages during tweet fallback."
+    },
+    {
+      "sha": "2292ec1715ecfb3e09b95313b2a00b3fcaba0cd8",
+      "filename": "src/run/markdown.ts",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 0,
+      "changes": 9,
+      "blob_url": "https://github.com/steipete/summarize/blob/a505ca3c799e018ed1bc25e2decd651804762a1f/src%2Frun%2Fmarkdown.ts",
+      "raw_url": "https://github.com/steipete/summarize/raw/a505ca3c799e018ed1bc25e2decd651804762a1f/src%2Frun%2Fmarkdown.ts",
+      "contents_url": "https://api.github.com/repos/steipete/summarize/contents/src%2Frun%2Fmarkdown.ts?ref=a505ca3c799e018ed1bc25e2decd651804762a1f",
+      "patch": "@@ -28,6 +28,15 @@ function materializeInlineMarkdownLinks(markdown: string): string {\n   return out.join('\\n')\n }\n \n+export function prepareMarkdownLineForTerminal(line: string): string {\n+  return line.replace(/(?<!!)\\[([^\\]]+)\\]\\((\\S+?)\\)/g, (_full, label, url) => {\n+    const safeLabel = String(label ?? '').trim()\n+    const safeUrl = String(url ?? '').trim()\n+    if (!safeLabel || !safeUrl) return _full\n+    return `${safeLabel}: ${safeUrl}`\n+  })\n+}\n+\n function inlineReferenceStyleLinks(markdown: string): string {\n   // Some models like emitting reference-style links:\n   //   [Label][1]"
+    },
+    {
+      "sha": "44356bbd79c91876bc0b9f87313d4c45656c3018",
+      "filename": "src/run/summary-engine.ts",
+      "status": "modified",
+      "additions": 36,
+      "deletions": 47,
+      "changes": 83,
+      "blob_url": "https://github.com/steipete/summarize/blob/a505ca3c799e018ed1bc25e2decd651804762a1f/src%2Frun%2Fsummary-engine.ts",
+      "raw_url": "https://github.com/steipete/summarize/raw/a505ca3c799e018ed1bc25e2decd651804762a1f/src%2Frun%2Fsummary-engine.ts",
+      "contents_url": "https://api.github.com/repos/steipete/summarize/contents/src%2Frun%2Fsummary-engine.ts?ref=a505ca3c799e018ed1bc25e2decd651804762a1f",
+      "patch": "@@ -7,7 +7,7 @@ import { streamTextWithModelId } from '../llm/generate-text.js'\n import { parseGatewayStyleModelId } from '../llm/model-id.js'\n import { formatCompactCount } from '../tty/format.js'\n import { createRetryLogger, writeVerbose } from './logging.js'\n-import { prepareMarkdownForTerminal } from './markdown.js'\n+import { prepareMarkdownLineForTerminal } from './markdown.js'\n import {\n   isGoogleStreamingUnsupportedError,\n   isStreamingTimeoutError,\n@@ -374,54 +374,49 @@ export function createSummaryEngine(deps: SummaryEngineDeps) {\n \t      let streamedRaw = ''\n \t      const liveWidth = markdownRenderWidth(deps.stdout, deps.env)\n \n-      let previousRendered = ''\n-      let pendingAnsi = ''\n-      let reflowCount = 0\n+      let markdownFlushedLen = 0\n+      let markdownFence = false\n \n-      const renderFrame = (markdown: string): string =>\n-        renderMarkdownAnsi(prepareMarkdownForTerminal(markdown), {\n+      const renderLine = (line: string): string => {\n+        const trimmed = line.trimStart()\n+        const isFence = trimmed.startsWith('```')\n+        if (isFence) {\n+          markdownFence = !markdownFence\n+          return `${line}\\n`\n+        }\n+        if (markdownFence) return `${line}\\n`\n+\n+        // Keep reference definitions stable in streaming mode; they can affect earlier lines.\n+        if (/^\\s*\\[[^\\]]+\\]:\\s*\\S+/.test(line)) return `${line}\\n`\n+\n+        if (!line) return '\\n'\n+\n+        const rendered = renderMarkdownAnsi(prepareMarkdownLineForTerminal(line), {\n           width: liveWidth,\n           wrap: true,\n           color: supportsColor(deps.stdout, deps.envForRun),\n           hyperlinks: true,\n         })\n+        return rendered.endsWith('\\n') ? rendered : `${rendered}\\n`\n+      }\n \n-      const flushCompleteLines = () => {\n-        const idx = pendingAnsi.lastIndexOf('\\n')\n-        if (idx < 0) return\n-        const upto = idx + 1\n-        const chunk = pendingAnsi.slice(0, upto)\n-        pendingAnsi = pendingAnsi.slice(upto)\n+      const flushRenderedLines = (markdown: string, { final }: { final: boolean }) => {\n+        const lastNl = markdown.lastIndexOf('\\n')\n+        const upto = final ? markdown.length : lastNl >= 0 ? lastNl + 1 : 0\n+        if (upto <= markdownFlushedLen) return\n+        const chunk = markdown.slice(markdownFlushedLen, upto)\n+        markdownFlushedLen = upto\n         if (!chunk) return\n-        deps.clearProgressForStdout()\n-        deps.stdout.write(chunk)\n-      }\n \n-      const updateRenderedStream = (markdown: string, { final }: { final: boolean }) => {\n-        const raw = renderFrame(markdown)\n-        const rendered = final && !raw.endsWith('\\n') ? `${raw}\\n` : raw\n-        if (previousRendered && !rendered.startsWith(previousRendered)) {\n-          reflowCount += 1\n-          if (reflowCount === 1) {\n-            // Rare: renderer changed earlier output (tables, etc). Keep scrollback-only semantics:\n-            // append a full frame (may duplicate), then continue with prefix matching from there.\n-            pendingAnsi = ''\n-            previousRendered = ''\n-            pendingAnsi += rendered\n-            flushCompleteLines()\n-            previousRendered = rendered\n-            return\n-          }\n-          // Too many reflows; stop emitting incremental ANSI to avoid massive duplication.\n-          previousRendered = rendered\n-          return\n+        deps.clearProgressForStdout()\n+        const lines = chunk.split('\\n')\n+        const trailing = lines.pop() ?? ''\n+        for (const line of lines) {\n+          deps.stdout.write(renderLine(line))\n+        }\n+        if (final && trailing.length > 0) {\n+          deps.stdout.write(renderLine(trailing))\n         }\n-\n-        const appended = previousRendered ? rendered.slice(previousRendered.length) : rendered\n-        previousRendered = rendered\n-        if (!appended) return\n-        pendingAnsi += appended\n-        flushCompleteLines()\n       }\n \n \t      try {\n@@ -442,21 +437,15 @@ export function createSummaryEngine(deps: SummaryEngineDeps) {\n \t            continue\n \t          }\n \n-          if (shouldStreamRenderedMarkdownToStdout) {\n-            const hasNewline = delta.includes('\\n')\n-            if (hasNewline) {\n-              updateRenderedStream(streamed, { final: false })\n-            }\n-          }\n+          if (shouldStreamRenderedMarkdownToStdout) flushRenderedLines(streamed, { final: false })\n \t        }\n \n \t        streamedRaw = streamed\n \t        const trimmed = streamed.trim()\n \t        streamed = trimmed\n \t      } finally {\n \t        if (shouldStreamRenderedMarkdownToStdout) {\n-\t          updateRenderedStream(streamed, { final: true })\n-\t          flushCompleteLines()\n+\t          flushRenderedLines(streamedRaw || streamed, { final: true })\n           summaryAlreadyPrinted = true\n         }\n       }"
+    },
+    {
+      "sha": "bb813da4f7cb6479e667ba275fc55a4888aca37c",
+      "filename": "tests/cli.render.md.reference-links.test.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 2,
+      "changes": 5,
+      "blob_url": "https://github.com/steipete/summarize/blob/a505ca3c799e018ed1bc25e2decd651804762a1f/tests%2Fcli.render.md.reference-links.test.ts",
+      "raw_url": "https://github.com/steipete/summarize/raw/a505ca3c799e018ed1bc25e2decd651804762a1f/tests%2Fcli.render.md.reference-links.test.ts",
+      "contents_url": "https://api.github.com/repos/steipete/summarize/contents/tests%2Fcli.render.md.reference-links.test.ts?ref=a505ca3c799e018ed1bc25e2decd651804762a1f",
+      "patch": "@@ -58,7 +58,7 @@ vi.mock('@ai-sdk/openai', () => ({\n }))\n \n describe('cli markdown reference links', () => {\n-  it('inlines reference-style links so URLs remain clickable', async () => {\n+  it('streams without re-rendering earlier lines when reference definitions arrive', async () => {\n     const root = mkdtempSync(join(tmpdir(), 'summarize-md-links-'))\n     const cacheDir = join(root, '.summarize', 'cache')\n     mkdirSync(cacheDir, { recursive: true })\n@@ -115,7 +115,8 @@ describe('cli markdown reference links', () => {\n \n     const out = stdout.getText()\n     expect(out).toContain('https://example.com')\n-    expect(out).not.toContain('[1]: https://example.com')\n+    expect(out).toContain('[1]: https://example.com')\n+    expect(out.split('Here is a link:').length - 1).toBe(1)\n \n     globalFetchSpy.mockRestore()\n   })"
+    }
+  ]
+}

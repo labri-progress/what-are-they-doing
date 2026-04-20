@@ -1,0 +1,137 @@
+{
+  "message": "fix(runtime,core,time): harden quiescence drain lifecycle, reusable cleanup stacks, and timer edge cases\n\nRefactor obligation checking into asx_region_obligations_resolved() and\ncall it from both quiescence_check and the region_drain finalizing path,\nensuring unresolved obligations properly block region closure instead of\nbeing silently leaked. Also propagate ASX_E_POLL_BUDGET_EXHAUSTED from\nasx_parallel_run instead of spinning forever when budget is too small.\n\n- cleanup.c: allow cleanup_push after a full drain by resetting the\n  drained flag when count reaches zero, enabling deterministic stack reuse\n- timer_wheel.c: split NULL/zero-capacity check so collect_expired still\n  advances wheel current_time even when max_wakers==0\n- timer_wheel.h: document that old_handle may be NULL in asx_timer_update\n  (treated as a pure register operation)\n- adapter.c: add default branch to asx_adapter_router_decide switch\n- parallel.c: return budget-exhausted instead of infinite loop when no\n  lane gets a quota\n- Makefile: add build rule for test_codec_equivalence\n\nTests added:\n- region_drain_propagates_budget_exhaustion\n- region_drain_blocks_unresolved_obligations\n- cleanup_push_after_drain_rearms_stack\n- timer_collect_zero_capacity_advances_time\n- timer_update_allows_null_old_handle\n- Updated ghost integration test to expect ASX_E_OBLIGATIONS_UNRESOLVED\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "e0ec1d608a76d60d0d4e1ac5e555a478db38c5c3",
+      "filename": "Makefile",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync_ansi_c/blob/56b084ca01949cc25b4be0189870aee5e8f83bc7/Makefile",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync_ansi_c/raw/56b084ca01949cc25b4be0189870aee5e8f83bc7/Makefile",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync_ansi_c/contents/Makefile?ref=56b084ca01949cc25b4be0189870aee5e8f83bc7",
+      "patch": "@@ -434,6 +434,10 @@ $(TEST_DIR)/unit/runtime/test_adapter: tests/unit/runtime/test_adapter.c src/run\n $(TEST_DIR)/unit/runtime/test_vertical_adapter: tests/unit/runtime/test_vertical_adapter.c src/runtime/vertical_adapter.c src/runtime/automotive_instrument.c src/runtime/hft_instrument.c src/runtime/overload_catalog.c $(LIB_A) | test-dirs\n \t$(CC) $(TEST_CFLAGS) -o $@ $< src/runtime/vertical_adapter.c src/runtime/automotive_instrument.c src/runtime/hft_instrument.c src/runtime/overload_catalog.c $(LIB_A) $(ALL_LDFLAGS)\n \n+# Codec equivalence test needs equivalence.c (not in libasx.a)\n+$(TEST_DIR)/unit/runtime/test_codec_equivalence: tests/unit/runtime/test_codec_equivalence.c src/runtime/equivalence.c $(LIB_A) | test-dirs\n+\t$(CC) $(TEST_CFLAGS) -o $@ $< src/runtime/equivalence.c $(LIB_A) $(ALL_LDFLAGS)\n+\n # Link individual unit tests\n $(TEST_DIR)/unit/%: tests/unit/%.c $(LIB_A) | test-dirs\n \t$(CC) $(TEST_CFLAGS) -o $@ $< $(LIB_A) $(ALL_LDFLAGS)"
+    },
+    {
+      "sha": "6fabb2cd7c3f2a191505db5c1ebbb516f1df4718",
+      "filename": "include/asx/time/timer_wheel.h",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync_ansi_c/blob/56b084ca01949cc25b4be0189870aee5e8f83bc7/include%2Fasx%2Ftime%2Ftimer_wheel.h",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync_ansi_c/raw/56b084ca01949cc25b4be0189870aee5e8f83bc7/include%2Fasx%2Ftime%2Ftimer_wheel.h",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync_ansi_c/contents/include%2Fasx%2Ftime%2Ftimer_wheel.h?ref=56b084ca01949cc25b4be0189870aee5e8f83bc7",
+      "patch": "@@ -113,7 +113,8 @@ ASX_API uint32_t asx_timer_collect_expired(\n \n /* Cancel old timer and register a new one with updated deadline.\n  *\n- * Preconditions: wheel, old_handle, and out_handle must not be NULL.\n+ * Preconditions: wheel and out_handle must not be NULL.\n+ * old_handle may be NULL (treated as a pure register operation).\n  * Returns ASX_OK on success, ASX_E_INVALID_ARGUMENT if NULL params,\n  *   ASX_E_RESOURCE_EXHAUSTED if timer arena is full.\n  * Thread-safety: not thread-safe; single-threaded mode only. */"
+    },
+    {
+      "sha": "13e495889d44e8ae22270db76fa82002dd1189ec",
+      "filename": "src/core/cleanup.c",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync_ansi_c/blob/56b084ca01949cc25b4be0189870aee5e8f83bc7/src%2Fcore%2Fcleanup.c",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync_ansi_c/raw/56b084ca01949cc25b4be0189870aee5e8f83bc7/src%2Fcore%2Fcleanup.c",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync_ansi_c/contents/src%2Fcore%2Fcleanup.c?ref=56b084ca01949cc25b4be0189870aee5e8f83bc7",
+      "patch": "@@ -32,6 +32,12 @@ asx_status asx_cleanup_push(asx_cleanup_stack *stack,\n \n     if (stack == NULL || fn == NULL || out_handle == NULL)\n         return ASX_E_INVALID_ARGUMENT;\n+\n+    if (stack->drained && stack->count == 0) {\n+        /* Allow deterministic reuse after a prior full drain. */\n+        stack->drained = 0;\n+    }\n+\n     if (stack->count >= ASX_CLEANUP_STACK_CAPACITY)\n         return ASX_E_RESOURCE_EXHAUSTED;\n "
+    },
+    {
+      "sha": "b52b34fc8c9eea139261b8f215f281c04429bf0b",
+      "filename": "src/runtime/adapter.c",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync_ansi_c/blob/56b084ca01949cc25b4be0189870aee5e8f83bc7/src%2Fruntime%2Fadapter.c",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync_ansi_c/raw/56b084ca01949cc25b4be0189870aee5e8f83bc7/src%2Fruntime%2Fadapter.c",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync_ansi_c/contents/src%2Fruntime%2Fadapter.c?ref=56b084ca01949cc25b4be0189870aee5e8f83bc7",
+      "patch": "@@ -209,6 +209,7 @@ void asx_adapter_router_decide(uint32_t used, uint32_t capacity,\n     case ASX_CLASS_R3:    scaled_capacity = capacity * 2; break;\n     case ASX_CLASS_R2:    scaled_capacity = capacity;     break;\n     case ASX_CLASS_COUNT: scaled_capacity = capacity;     break;\n+    default:              scaled_capacity = capacity;     break;\n     }\n \n     if (scaled_capacity == 0) {"
+    },
+    {
+      "sha": "94bacdfa2bad7a3862c0c56188c416760fdaf31d",
+      "filename": "src/runtime/parallel.c",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync_ansi_c/blob/56b084ca01949cc25b4be0189870aee5e8f83bc7/src%2Fruntime%2Fparallel.c",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync_ansi_c/raw/56b084ca01949cc25b4be0189870aee5e8f83bc7/src%2Fruntime%2Fparallel.c",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync_ansi_c/contents/src%2Fruntime%2Fparallel.c?ref=56b084ca01949cc25b4be0189870aee5e8f83bc7",
+      "patch": "@@ -469,6 +469,9 @@ asx_status asx_parallel_run(asx_region_id region, asx_budget *budget)\n             if (asx_lane_total_tasks() == 0) {\n                 return ASX_OK;\n             }\n+            /* Budget too small for any lane to get a quota \u2014 return\n+             * exhausted instead of spinning forever. */\n+            return ASX_E_POLL_BUDGET_EXHAUSTED;\n         }\n     }\n }"
+    },
+    {
+      "sha": "f10fd7af8ce12394b555552b31cad96b6a099e02",
+      "filename": "src/runtime/quiescence.c",
+      "status": "modified",
+      "additions": 21,
+      "deletions": 16,
+      "changes": 37,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync_ansi_c/blob/56b084ca01949cc25b4be0189870aee5e8f83bc7/src%2Fruntime%2Fquiescence.c",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync_ansi_c/raw/56b084ca01949cc25b4be0189870aee5e8f83bc7/src%2Fruntime%2Fquiescence.c",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync_ansi_c/contents/src%2Fruntime%2Fquiescence.c?ref=56b084ca01949cc25b4be0189870aee5e8f83bc7",
+      "patch": "@@ -17,6 +17,21 @@\n #include <asx/core/ghost.h>\n #include \"runtime_internal.h\"\n \n+static asx_status asx_region_obligations_resolved(asx_region_id id)\n+{\n+    uint32_t i;\n+\n+    for (i = 0; i < g_obligation_count; i++) {\n+        if (!g_obligations[i].alive) continue;\n+        if (g_obligations[i].region != id) continue;\n+        if (g_obligations[i].state == ASX_OBLIGATION_RESERVED) {\n+            return ASX_E_OBLIGATIONS_UNRESOLVED;\n+        }\n+    }\n+\n+    return ASX_OK;\n+}\n+\n /* -------------------------------------------------------------------\n  * Quiescence check\n  * ------------------------------------------------------------------- */\n@@ -25,7 +40,6 @@ asx_status asx_quiescence_check(asx_region_id id)\n {\n     asx_region_slot *r;\n     asx_status st;\n-    uint32_t i;\n \n     st = asx_region_slot_lookup(id, &r);\n     if (st != ASX_OK) return st;\n@@ -38,18 +52,7 @@ asx_status asx_quiescence_check(asx_region_id id)\n         return ASX_E_QUIESCENCE_TASKS_LIVE;\n     }\n \n-    /* Q3: All obligations in this region must be resolved (committed or\n-     * aborted). An unresolved obligation blocks quiescence per the formal\n-     * spec (QUIESCENCE_FINALIZATION_INVARIANTS.md \u00a71.1). */\n-    for (i = 0; i < g_obligation_count; i++) {\n-        if (!g_obligations[i].alive) continue;\n-        if (g_obligations[i].region != id) continue;\n-        if (g_obligations[i].state == ASX_OBLIGATION_RESERVED) {\n-            return ASX_E_OBLIGATIONS_UNRESOLVED;\n-        }\n-    }\n-\n-    return ASX_OK;\n+    return asx_region_obligations_resolved(id);\n }\n \n /* -------------------------------------------------------------------\n@@ -88,9 +91,8 @@ asx_status asx_region_drain(asx_region_id id, asx_budget *budget)\n     /* Step 2: Run scheduler to drain tasks */\n     if (r->task_count > 0) {\n         st = asx_scheduler_run(id, budget);\n-        if (st != ASX_OK && st != ASX_E_POLL_BUDGET_EXHAUSTED) {\n-            return st;\n-        }\n+        if (st == ASX_E_POLL_BUDGET_EXHAUSTED) return st;\n+        if (st != ASX_OK) return st;\n         if (r->task_count > 0) {\n             return ASX_E_QUIESCENCE_TASKS_LIVE;\n         }\n@@ -117,6 +119,9 @@ asx_status asx_region_drain(asx_region_id id, asx_budget *budget)\n     }\n \n     if (r->state == ASX_REGION_FINALIZING) {\n+        st = asx_region_obligations_resolved(id);\n+        if (st != ASX_OK) return st;\n+\n         /* Ghost linearity monitor: check for leaked obligations before close */\n         (void)asx_ghost_check_obligation_leaks(id);\n "
+    },
+    {
+      "sha": "6b023483a8a353f7d978f98b1764bce03606aeb8",
+      "filename": "src/time/timer_wheel.c",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 1,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync_ansi_c/blob/56b084ca01949cc25b4be0189870aee5e8f83bc7/src%2Ftime%2Ftimer_wheel.c",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync_ansi_c/raw/56b084ca01949cc25b4be0189870aee5e8f83bc7/src%2Ftime%2Ftimer_wheel.c",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync_ansi_c/contents/src%2Ftime%2Ftimer_wheel.c?ref=56b084ca01949cc25b4be0189870aee5e8f83bc7",
+      "patch": "@@ -186,13 +186,15 @@ uint32_t asx_timer_collect_expired(asx_timer_wheel *wheel,\n     uint64_t cand_deadline[ASX_MAX_TIMERS];\n     uint64_t cand_seq[ASX_MAX_TIMERS];\n \n-    if (wheel == NULL || out_wakers == NULL || max_wakers == 0) return 0;\n+    if (wheel == NULL) return 0;\n \n     /* Advance current time */\n     if (now > wheel->current_time) {\n         wheel->current_time = now;\n     }\n \n+    if (out_wakers == NULL || max_wakers == 0) return 0;\n+\n     /* Scan for expired alive timers */\n     count = 0;\n     for (i = 0; i < wheel->slot_count && count < ASX_MAX_TIMERS; i++) {"
+    },
+    {
+      "sha": "c0f41296df4552a8acbfcef187ca7b8d4c597aee",
+      "filename": "tests/invariant/lifecycle/skeleton_test.c",
+      "status": "modified",
+      "additions": 52,
+      "deletions": 0,
+      "changes": 52,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync_ansi_c/blob/56b084ca01949cc25b4be0189870aee5e8f83bc7/tests%2Finvariant%2Flifecycle%2Fskeleton_test.c",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync_ansi_c/raw/56b084ca01949cc25b4be0189870aee5e8f83bc7/tests%2Finvariant%2Flifecycle%2Fskeleton_test.c",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync_ansi_c/contents/tests%2Finvariant%2Flifecycle%2Fskeleton_test.c?ref=56b084ca01949cc25b4be0189870aee5e8f83bc7",
+      "patch": "@@ -246,6 +246,56 @@ TEST(region_drain_full_lifecycle)\n     ASSERT_EQ(tstate, ASX_TASK_COMPLETED);\n }\n \n+TEST(region_drain_propagates_budget_exhaustion)\n+{\n+    asx_region_id rid;\n+    asx_task_id tid;\n+    asx_budget budget;\n+    asx_status st;\n+    countdown_ctx ctx;\n+\n+    ctx.remaining = 100;\n+\n+    st = asx_region_open(&rid);\n+    ASSERT_EQ(st, ASX_OK);\n+\n+    st = asx_task_spawn(rid, countdown_poll, &ctx, &tid);\n+    ASSERT_EQ(st, ASX_OK);\n+\n+    budget = asx_budget_from_polls(1);\n+    st = asx_region_drain(rid, &budget);\n+    ASSERT_EQ(st, ASX_E_POLL_BUDGET_EXHAUSTED);\n+}\n+\n+TEST(region_drain_blocks_unresolved_obligations)\n+{\n+    asx_region_id rid;\n+    asx_obligation_id oid;\n+    asx_region_state rstate;\n+    asx_budget budget;\n+    asx_status st;\n+\n+    st = asx_region_open(&rid);\n+    ASSERT_EQ(st, ASX_OK);\n+    ASSERT_EQ(asx_obligation_reserve(rid, &oid), ASX_OK);\n+\n+    budget = asx_budget_infinite();\n+    st = asx_region_drain(rid, &budget);\n+    ASSERT_EQ(st, ASX_E_OBLIGATIONS_UNRESOLVED);\n+\n+    st = asx_region_get_state(rid, &rstate);\n+    ASSERT_EQ(st, ASX_OK);\n+    ASSERT_EQ(rstate, ASX_REGION_FINALIZING);\n+\n+    ASSERT_EQ(asx_obligation_abort(oid), ASX_OK);\n+    st = asx_region_drain(rid, &budget);\n+    ASSERT_EQ(st, ASX_OK);\n+\n+    st = asx_region_get_state(rid, &rstate);\n+    ASSERT_EQ(st, ASX_OK);\n+    ASSERT_EQ(rstate, ASX_REGION_CLOSED);\n+}\n+\n TEST(quiescence_after_drain)\n {\n     asx_region_id rid;\n@@ -446,6 +496,8 @@ int main(void)\n     asx_runtime_reset(); RUN_TEST(failing_task_outcome_err);\n     asx_runtime_reset(); RUN_TEST(budget_exhaustion_stops_scheduler);\n     asx_runtime_reset(); RUN_TEST(region_drain_full_lifecycle);\n+    asx_runtime_reset(); RUN_TEST(region_drain_propagates_budget_exhaustion);\n+    asx_runtime_reset(); RUN_TEST(region_drain_blocks_unresolved_obligations);\n     asx_runtime_reset(); RUN_TEST(quiescence_after_drain);\n     asx_runtime_reset(); RUN_TEST(quiescence_fails_before_close);\n     asx_runtime_reset(); RUN_TEST(spawn_rejected_after_close);"
+    },
+    {
+      "sha": "309d213f7f972e00063da286b2918e1f7d2de7c1",
+      "filename": "tests/unit/core/test_cleanup.c",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 0,
+      "changes": 16,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync_ansi_c/blob/56b084ca01949cc25b4be0189870aee5e8f83bc7/tests%2Funit%2Fcore%2Ftest_cleanup.c",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync_ansi_c/raw/56b084ca01949cc25b4be0189870aee5e8f83bc7/tests%2Funit%2Fcore%2Ftest_cleanup.c",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync_ansi_c/contents/tests%2Funit%2Fcore%2Ftest_cleanup.c?ref=56b084ca01949cc25b4be0189870aee5e8f83bc7",
+      "patch": "@@ -149,6 +149,21 @@ TEST(cleanup_drain_idempotent) {\n     ASSERT_EQ(counter, 1);\n }\n \n+TEST(cleanup_push_after_drain_rearms_stack) {\n+    asx_cleanup_stack s;\n+    asx_cleanup_handle h;\n+    int counter = 0;\n+\n+    asx_cleanup_init(&s);\n+    ASSERT_EQ(asx_cleanup_push(&s, increment_counter, &counter, &h), ASX_OK);\n+    asx_cleanup_drain(&s);\n+    ASSERT_EQ(counter, 1);\n+\n+    ASSERT_EQ(asx_cleanup_push(&s, increment_counter, &counter, &h), ASX_OK);\n+    asx_cleanup_drain(&s);\n+    ASSERT_EQ(counter, 2);\n+}\n+\n TEST(cleanup_drain_empty_is_noop) {\n     asx_cleanup_stack s;\n     asx_cleanup_init(&s);\n@@ -213,6 +228,7 @@ int main(void) {\n     RUN_TEST(cleanup_drain_lifo_order);\n     RUN_TEST(cleanup_drain_skips_popped);\n     RUN_TEST(cleanup_drain_idempotent);\n+    RUN_TEST(cleanup_push_after_drain_rearms_stack);\n     RUN_TEST(cleanup_drain_empty_is_noop);\n     RUN_TEST(cleanup_drain_null_is_safe);\n     RUN_TEST(cleanup_capacity_exhaustion);"
+    },
+    {
+      "sha": "2f98022fbde71ad26c174de9ca5007623edbd99c",
+      "filename": "tests/unit/core/test_ghost.c",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 3,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync_ansi_c/blob/56b084ca01949cc25b4be0189870aee5e8f83bc7/tests%2Funit%2Fcore%2Ftest_ghost.c",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync_ansi_c/raw/56b084ca01949cc25b4be0189870aee5e8f83bc7/tests%2Funit%2Fcore%2Ftest_ghost.c",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync_ansi_c/contents/tests%2Funit%2Fcore%2Ftest_ghost.c?ref=56b084ca01949cc25b4be0189870aee5e8f83bc7",
+      "patch": "@@ -371,11 +371,12 @@ TEST(ghost_integration_lifecycle_obligation_leak_on_drain) {\n     ASSERT_EQ(asx_region_open(&rid), ASX_OK);\n     ASSERT_EQ(asx_obligation_reserve(rid, &oid), ASX_OK);\n \n-    /* Drain without resolving obligation \u2014 ghost should detect leak */\n+    /* Drain without resolving obligation \u2014 runtime must reject closure. */\n     budget = asx_budget_infinite();\n-    ASSERT_EQ(asx_region_drain(rid, &budget), ASX_OK);\n+    ASSERT_EQ(asx_region_drain(rid, &budget), ASX_E_OBLIGATIONS_UNRESOLVED);\n \n-    /* Ghost should have recorded the leak during finalization */\n+    /* Leak remains observable to ghost monitor even though close is blocked. */\n+    ASSERT_TRUE(asx_ghost_check_obligation_leaks(rid) >= (uint32_t)1);\n     ASSERT_TRUE(asx_ghost_violation_count() >= (uint32_t)1);\n }\n "
+    },
+    {
+      "sha": "7673415453b4d208422639db3fd162bf257e69cf",
+      "filename": "tests/unit/time/test_timer_wheel.c",
+      "status": "modified",
+      "additions": 37,
+      "deletions": 0,
+      "changes": 37,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync_ansi_c/blob/56b084ca01949cc25b4be0189870aee5e8f83bc7/tests%2Funit%2Ftime%2Ftest_timer_wheel.c",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync_ansi_c/raw/56b084ca01949cc25b4be0189870aee5e8f83bc7/tests%2Funit%2Ftime%2Ftest_timer_wheel.c",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync_ansi_c/contents/tests%2Funit%2Ftime%2Ftest_timer_wheel.c?ref=56b084ca01949cc25b4be0189870aee5e8f83bc7",
+      "patch": "@@ -297,6 +297,27 @@ TEST(timer_collect_respects_max_wakers) {\n     ASSERT_EQ(asx_timer_active_count(w), (uint32_t)3); /* 3 remaining */\n }\n \n+/* -------------------------------------------------------------------\n+ * Test: zero-capacity collection still advances wheel time\n+ * ------------------------------------------------------------------- */\n+\n+TEST(timer_collect_zero_capacity_advances_time) {\n+    asx_timer_wheel *w = asx_timer_wheel_global();\n+    asx_timer_handle h;\n+    void *wakers[1];\n+    uint32_t count;\n+\n+    asx_timer_wheel_reset(w);\n+    asx_timer_set_max_duration(w, 1000);\n+\n+    ASSERT_EQ(asx_timer_register(w, 100, (void *)1, &h), ASX_OK);\n+    count = asx_timer_collect_expired(w, 100, wakers, 0);\n+    ASSERT_EQ(count, (uint32_t)0);\n+\n+    /* If collect() advanced current_time to 100, delta is 950 and should pass. */\n+    ASSERT_EQ(asx_timer_register(w, 1050, (void *)2, &h), ASX_OK);\n+}\n+\n /* -------------------------------------------------------------------\n  * Test: timer update (cancel + re-register)\n  * ------------------------------------------------------------------- */\n@@ -327,6 +348,20 @@ TEST(timer_update_cancels_old_and_registers_new) {\n     ASSERT_FALSE(asx_timer_cancel(w, &old_h));\n }\n \n+TEST(timer_update_allows_null_old_handle) {\n+    asx_timer_wheel *w = asx_timer_wheel_global();\n+    asx_timer_handle h;\n+    void *wakers[2];\n+    uint32_t count;\n+\n+    asx_timer_wheel_reset(w);\n+    ASSERT_EQ(asx_timer_update(w, NULL, 100, (void *)0xCAFE, &h), ASX_OK);\n+\n+    count = asx_timer_collect_expired(w, 100, wakers, 2);\n+    ASSERT_EQ(count, (uint32_t)1);\n+    ASSERT_EQ(wakers[0], (void *)0xCAFE);\n+}\n+\n /* -------------------------------------------------------------------\n  * Test: churn \u2014 rapid register/cancel cycles\n  * ------------------------------------------------------------------- */\n@@ -533,7 +568,9 @@ int main(void) {\n     RUN_TEST(timer_slot_recycling_after_cancel);\n     RUN_TEST(timer_duration_exceeded);\n     RUN_TEST(timer_collect_respects_max_wakers);\n+    RUN_TEST(timer_collect_zero_capacity_advances_time);\n     RUN_TEST(timer_update_cancels_old_and_registers_new);\n+    RUN_TEST(timer_update_allows_null_old_handle);\n     RUN_TEST(timer_churn_register_cancel);\n     RUN_TEST(timer_generation_increments_on_reuse);\n     RUN_TEST(timer_zero_deadline_fires_immediately);"
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "message": "fix(paste): use Input.insertText for cross-frame compatibility\n\n- Simplify typeText to always use CDP Input.insertText command\n- Works across all frames including Monaco iframes\n- Remove synthetic paste event approach that only worked in main frame\n- Update clipboard polyfill to check parent frames for data\n- Make updateBrowserClipboard synchronous for reliable timing",
+  "files": [
+    {
+      "sha": "da47ba03169c92bccb62440f348a00ac11787c39",
+      "filename": "src/chrome/clipboard_polyfill.js",
+      "status": "modified",
+      "additions": 28,
+      "deletions": 1,
+      "changes": 29,
+      "blob_url": "https://github.com/teamchong/termweb/blob/1ba4ab6d0349f68618024cbbaba0475fa2eb997a/src%2Fchrome%2Fclipboard_polyfill.js",
+      "raw_url": "https://github.com/teamchong/termweb/raw/1ba4ab6d0349f68618024cbbaba0475fa2eb997a/src%2Fchrome%2Fclipboard_polyfill.js",
+      "contents_url": "https://api.github.com/repos/teamchong/termweb/contents/src%2Fchrome%2Fclipboard_polyfill.js?ref=1ba4ab6d0349f68618024cbbaba0475fa2eb997a",
+      "patch": "@@ -41,16 +41,43 @@\n     };\n   }\n \n+  // Helper to get clipboard data from this frame or parent frames\n+  function getClipboardData() {\n+    // Check local window\n+    if (window._termwebClipboardData) return window._termwebClipboardData;\n+    // Check parent frames (for iframes like Monaco)\n+    try {\n+      let w = window.parent;\n+      while (w && w !== window) {\n+        if (w._termwebClipboardData) return w._termwebClipboardData;\n+        if (w === w.parent) break;\n+        w = w.parent;\n+      }\n+    } catch(e) {} // Cross-origin frames will throw\n+    // Check top\n+    try {\n+      if (window.top && window.top._termwebClipboardData) return window.top._termwebClipboardData;\n+    } catch(e) {}\n+    return '';\n+  }\n+\n   // Hook navigator.clipboard.readText\n   if (navigator.clipboard && navigator.clipboard.readText) {\n     navigator.clipboard.readText = async function() {\n+      // If data already set (from Cmd+V path), return immediately\n+      const data = getClipboardData();\n+      if (data) {\n+        console.log('[TERMWEB] readText returning cached data, len=' + data.length);\n+        return data;\n+      }\n+      // Otherwise request from host (for menu paste)\n       const ver = window._termwebClipboardVersion;\n       console.log('__TERMWEB_CLIPBOARD_REQUEST__');\n       for (let i = 0; i < 20; i++) {\n         await new Promise(r => setTimeout(r, 10));\n         if (window._termwebClipboardVersion > ver) break;\n       }\n-      return window._termwebClipboardData || '';\n+      return getClipboardData();\n     };\n   }\n "
+    },
+    {
+      "sha": "8f6c74f83ecdb1e90be637a14162a0c427af383c",
+      "filename": "src/chrome/interact.zig",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 38,
+      "changes": 45,
+      "blob_url": "https://github.com/teamchong/termweb/blob/1ba4ab6d0349f68618024cbbaba0475fa2eb997a/src%2Fchrome%2Finteract.zig",
+      "raw_url": "https://github.com/teamchong/termweb/raw/1ba4ab6d0349f68618024cbbaba0475fa2eb997a/src%2Fchrome%2Finteract.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/termweb/contents/src%2Fchrome%2Finteract.zig?ref=1ba4ab6d0349f68618024cbbaba0475fa2eb997a",
+      "patch": "@@ -121,45 +121,14 @@ pub fn typeText(\n     allocator: std.mem.Allocator,\n     text: []const u8,\n ) !void {\n-    // Check if text contains newlines - use synthetic paste event for multi-line\n-    const has_newline = std.mem.indexOf(u8, text, \"\\n\") != null;\n-\n     // Escape special characters for JSON\n     var escape_buf: [65536]u8 = undefined;\n     const escaped = json.escapeContents(text, &escape_buf) catch return;\n \n-    if (has_newline) {\n-        // Dispatch synthetic paste event - editors should handle this without auto-indent\n-        const js = std.fmt.allocPrint(allocator,\n-            \\\\(function() {{\n-            \\\\  const el = document.activeElement;\n-            \\\\  if (!el) return false;\n-            \\\\  const dt = new DataTransfer();\n-            \\\\  dt.setData('text/plain', \"{s}\");\n-            \\\\  const evt = new ClipboardEvent('paste', {{\n-            \\\\    bubbles: true,\n-            \\\\    cancelable: true,\n-            \\\\    clipboardData: dt\n-            \\\\  }});\n-            \\\\  return el.dispatchEvent(evt);\n-            \\\\}})()\n-            , .{escaped}) catch return;\n-        defer allocator.free(js);\n-\n-        var js_escape_buf: [131072]u8 = undefined;\n-        const js_escaped = json.escapeString(js, &js_escape_buf) catch return;\n-\n-        var params_buf: [131072]u8 = undefined;\n-        const params = std.fmt.bufPrint(&params_buf, \"{{\\\"expression\\\":{s}}}\", .{js_escaped}) catch return;\n-\n-        // Use nav_ws for Runtime.evaluate (pipe is for screencast only)\n-        client.sendNavCommandAsync(\"Runtime.evaluate\", params);\n-    } else {\n-        // Single line: use insertText directly\n-        const params = std.fmt.allocPrint(allocator, \"{{\\\"text\\\":\\\"{s}\\\"}}\", .{escaped}) catch return;\n-        defer allocator.free(params);\n-        client.sendKeyboardCommandAsync(\"Input.insertText\", params);\n-    }\n+    // Use Input.insertText - works across all frames including iframes\n+    const params = std.fmt.allocPrint(allocator, \"{{\\\"text\\\":\\\"{s}\\\"}}\", .{escaped}) catch return;\n+    defer allocator.free(params);\n+    client.sendKeyboardCommandAsync(\"Input.insertText\", params);\n }\n \n /// Toggle checkbox using JavaScript\n@@ -226,7 +195,6 @@ pub fn injectClipboardInterceptor(client: *cdp.CdpClient, allocator: std.mem.All\n /// Uses async command to avoid blocking/hanging on exit\n /// Also increments version counter so JS polling knows data was updated\n pub fn updateBrowserClipboard(client: *cdp.CdpClient, allocator: std.mem.Allocator, text: []const u8) !void {\n-    _ = allocator;\n \n     // Limit text size to avoid buffer overflow\n     const max_len = 8000;\n@@ -248,9 +216,10 @@ pub fn updateBrowserClipboard(client: *cdp.CdpClient, allocator: std.mem.Allocat\n     var params_buf: [131072]u8 = undefined;\n     const params = std.fmt.bufPrint(&params_buf, \"{{\\\"expression\\\":\\\"{s}\\\"}}\", .{json_escaped}) catch return;\n \n-    // Use nav_ws async to avoid blocking - fire and forget\n+    // Use nav_ws synchronously to ensure clipboard is set before Cmd+V is sent\n     // IMPORTANT: Don't use pipe for this - pipe is for screencast only\n-    client.sendNavCommandAsync(\"Runtime.evaluate\", params);\n+    const result = client.sendNavCommand(\"Runtime.evaluate\", params) catch return;\n+    allocator.free(result);\n }\n \n /// Send raw mouse event - fire-and-forget via dedicated mouse WebSocket"
+    },
+    {
+      "sha": "6101f8da12c8609dbcf82c74c47a969e545f4aec",
+      "filename": "src/viewer.zig",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 4,
+      "changes": 5,
+      "blob_url": "https://github.com/teamchong/termweb/blob/1ba4ab6d0349f68618024cbbaba0475fa2eb997a/src%2Fviewer.zig",
+      "raw_url": "https://github.com/teamchong/termweb/raw/1ba4ab6d0349f68618024cbbaba0475fa2eb997a/src%2Fviewer.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/termweb/contents/src%2Fviewer.zig?ref=1ba4ab6d0349f68618024cbbaba0475fa2eb997a",
+      "patch": "@@ -1044,10 +1044,7 @@ pub const Viewer = struct {\n                 defer self.allocator.free(text);\n                 // Terminal sent bracketed paste (Cmd+V intercepted by terminal)\n                 if (self.mode == .normal) {\n-                    self.log(\"[PASTE] Bracketed paste: {d} bytes\\n\", .{text.len});\n-                    // Also sync to browser clipboard for web apps that use Clipboard API\n-                    interact_mod.updateBrowserClipboard(self.cdp_client, self.allocator, text) catch {};\n-                    // Use typeText for reliable direct text insertion\n+                    // Use typeText for reliable direct text insertion (works with Monaco)\n                     interact_mod.typeText(self.cdp_client, self.allocator, text) catch {};\n                 } else if (self.mode == .url_prompt) {\n                     // Paste into URL bar"
+    }
+  ]
+}

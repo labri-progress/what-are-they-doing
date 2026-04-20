@@ -1,0 +1,65 @@
+{
+  "message": "fix(macos): harden openclaw deep links",
+  "files": [
+    {
+      "sha": "25d5cd8f54fbfd1a0c04af4550f1c67462c5ee90",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/28d9dd7a772501ccc3f71457b4adfee79084fe6f/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/28d9dd7a772501ccc3f71457b4adfee79084fe6f/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=28d9dd7a772501ccc3f71457b4adfee79084fe6f",
+      "patch": "@@ -6,6 +6,12 @@ Docs: https://docs.openclaw.ai\n \n ### Fixes\n \n+- macOS: hard-limit unkeyed `openclaw://agent` deep links and ignore `deliver` / `to` / `channel` unless a valid unattended key is provided. Thanks @Cillian-Collins.\n+\n+## 2026.2.14\n+\n+### Fixes\n+\n - Security/Skills: harden archive extraction for download-installed skills to prevent path traversal outside the target directory. Thanks @markmusson.\n - Security/Signal: harden signal-cli archive extraction during install to prevent path traversal outside the install root.\n - Security/Hooks: restrict hook transform modules to `~/.openclaw/hooks/transforms` (prevents path traversal/escape module loads via config). Config note: `hooks.transformsDir` must now be within that directory. Thanks @akhmittra."
+    },
+    {
+      "sha": "bb1fd73b660855863d17b173a349098cec8af92b",
+      "filename": "apps/macos/Sources/OpenClaw/DeepLinks.swift",
+      "status": "modified",
+      "additions": 53,
+      "deletions": 7,
+      "changes": 60,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/28d9dd7a772501ccc3f71457b4adfee79084fe6f/apps%2Fmacos%2FSources%2FOpenClaw%2FDeepLinks.swift",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/28d9dd7a772501ccc3f71457b4adfee79084fe6f/apps%2Fmacos%2FSources%2FOpenClaw%2FDeepLinks.swift",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/apps%2Fmacos%2FSources%2FOpenClaw%2FDeepLinks.swift?ref=28d9dd7a772501ccc3f71457b4adfee79084fe6f",
+      "patch": "@@ -6,6 +6,43 @@ import Security\n \n private let deepLinkLogger = Logger(subsystem: \"ai.openclaw\", category: \"DeepLink\")\n \n+enum DeepLinkAgentPolicy {\n+    static let maxMessageChars = 20_000\n+    static let maxUnkeyedConfirmChars = 240\n+\n+    enum ValidationError: Error, Equatable, LocalizedError {\n+        case messageTooLongForConfirmation(max: Int, actual: Int)\n+\n+        var errorDescription: String? {\n+            switch self {\n+            case let .messageTooLongForConfirmation(max, actual):\n+                return \"Message is too long to confirm safely (\\(actual) chars; max \\(max) without key).\"\n+            }\n+        }\n+    }\n+\n+    static func validateMessageForHandle(message: String, allowUnattended: Bool) -> Result<Void, ValidationError> {\n+        if !allowUnattended, message.count > self.maxUnkeyedConfirmChars {\n+            return .failure(.messageTooLongForConfirmation(max: self.maxUnkeyedConfirmChars, actual: message.count))\n+        }\n+        return .success(())\n+    }\n+\n+    static func effectiveDelivery(\n+        link: AgentDeepLink,\n+        allowUnattended: Bool) -> (deliver: Bool, to: String?, channel: GatewayAgentChannel)\n+    {\n+        if !allowUnattended {\n+            // Without the unattended key, ignore delivery/routing knobs to reduce exfiltration risk.\n+            return (deliver: false, to: nil, channel: .last)\n+        }\n+        let channel = GatewayAgentChannel(raw: link.channel)\n+        let deliver = channel.shouldDeliver(link.deliver)\n+        let to = link.to?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty\n+        return (deliver: deliver, to: to, channel: channel)\n+    }\n+}\n+\n @MainActor\n final class DeepLinkHandler {\n     static let shared = DeepLinkHandler()\n@@ -35,7 +72,7 @@ final class DeepLinkHandler {\n \n     private func handleAgent(link: AgentDeepLink, originalURL: URL) async {\n         let messagePreview = link.message.trimmingCharacters(in: .whitespacesAndNewlines)\n-        if messagePreview.count > 20000 {\n+        if messagePreview.count > DeepLinkAgentPolicy.maxMessageChars {\n             self.presentAlert(title: \"Deep link too large\", message: \"Message exceeds 20,000 characters.\")\n             return\n         }\n@@ -48,9 +85,18 @@ final class DeepLinkHandler {\n             }\n             self.lastPromptAt = Date()\n \n-            let trimmed = messagePreview.count > 240 ? \"\\(messagePreview.prefix(240))\u2026\" : messagePreview\n+            if case let .failure(error) = DeepLinkAgentPolicy.validateMessageForHandle(\n+                message: messagePreview,\n+                allowUnattended: allowUnattended)\n+            {\n+                self.presentAlert(title: \"Deep link blocked\", message: error.localizedDescription)\n+                return\n+            }\n+\n+            let urlText = originalURL.absoluteString\n+            let urlPreview = urlText.count > 500 ? \"\\(urlText.prefix(500))\u2026\" : urlText\n             let body =\n-                \"Run the agent with this message?\\n\\n\\(trimmed)\\n\\nURL:\\n\\(originalURL.absoluteString)\"\n+                \"Run the agent with this message?\\n\\n\\(messagePreview)\\n\\nURL:\\n\\(urlPreview)\"\n             guard self.confirm(title: \"Run OpenClaw agent?\", message: body) else { return }\n         }\n \n@@ -59,7 +105,7 @@ final class DeepLinkHandler {\n         }\n \n         do {\n-            let channel = GatewayAgentChannel(raw: link.channel)\n+            let effectiveDelivery = DeepLinkAgentPolicy.effectiveDelivery(link: link, allowUnattended: allowUnattended)\n             let explicitSessionKey = link.sessionKey?\n                 .trimmingCharacters(in: .whitespacesAndNewlines)\n                 .nonEmpty\n@@ -72,9 +118,9 @@ final class DeepLinkHandler {\n                 message: messagePreview,\n                 sessionKey: resolvedSessionKey,\n                 thinking: link.thinking?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,\n-                deliver: channel.shouldDeliver(link.deliver),\n-                to: link.to?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,\n-                channel: channel,\n+                deliver: effectiveDelivery.deliver,\n+                to: effectiveDelivery.to,\n+                channel: effectiveDelivery.channel,\n                 timeoutSeconds: link.timeoutSeconds,\n                 idempotencyKey: UUID().uuidString)\n "
+    },
+    {
+      "sha": "ee537f1b62a511bfb5ecd095f4eea87e736f6d42",
+      "filename": "apps/macos/Tests/OpenClawIPCTests/DeepLinkAgentPolicyTests.swift",
+      "status": "added",
+      "additions": 77,
+      "deletions": 0,
+      "changes": 77,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/28d9dd7a772501ccc3f71457b4adfee79084fe6f/apps%2Fmacos%2FTests%2FOpenClawIPCTests%2FDeepLinkAgentPolicyTests.swift",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/28d9dd7a772501ccc3f71457b4adfee79084fe6f/apps%2Fmacos%2FTests%2FOpenClawIPCTests%2FDeepLinkAgentPolicyTests.swift",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/apps%2Fmacos%2FTests%2FOpenClawIPCTests%2FDeepLinkAgentPolicyTests.swift?ref=28d9dd7a772501ccc3f71457b4adfee79084fe6f",
+      "patch": "@@ -0,0 +1,77 @@\n+import OpenClawKit\n+import Testing\n+@testable import OpenClaw\n+\n+@Suite struct DeepLinkAgentPolicyTests {\n+    @Test func validateMessageForHandleRejectsTooLongWhenUnkeyed() {\n+        let msg = String(repeating: \"a\", count: DeepLinkAgentPolicy.maxUnkeyedConfirmChars + 1)\n+        let res = DeepLinkAgentPolicy.validateMessageForHandle(message: msg, allowUnattended: false)\n+        switch res {\n+        case let .failure(error):\n+            #expect(\n+                error == .messageTooLongForConfirmation(\n+                    max: DeepLinkAgentPolicy.maxUnkeyedConfirmChars,\n+                    actual: DeepLinkAgentPolicy.maxUnkeyedConfirmChars + 1))\n+        case .success:\n+            Issue.record(\"expected failure, got success\")\n+        }\n+    }\n+\n+    @Test func validateMessageForHandleAllowsTooLongWhenKeyed() {\n+        let msg = String(repeating: \"a\", count: DeepLinkAgentPolicy.maxUnkeyedConfirmChars + 1)\n+        let res = DeepLinkAgentPolicy.validateMessageForHandle(message: msg, allowUnattended: true)\n+        switch res {\n+        case .success:\n+            break\n+        case let .failure(error):\n+            Issue.record(\"expected success, got failure: \\(error)\")\n+        }\n+    }\n+\n+    @Test func effectiveDeliveryIgnoresDeliveryFieldsWhenUnkeyed() {\n+        let link = AgentDeepLink(\n+            message: \"Hello\",\n+            sessionKey: \"s\",\n+            thinking: \"low\",\n+            deliver: true,\n+            to: \"+15551234567\",\n+            channel: \"whatsapp\",\n+            timeoutSeconds: 10,\n+            key: nil)\n+        let res = DeepLinkAgentPolicy.effectiveDelivery(link: link, allowUnattended: false)\n+        #expect(res.deliver == false)\n+        #expect(res.to == nil)\n+        #expect(res.channel == .last)\n+    }\n+\n+    @Test func effectiveDeliveryHonorsDeliverForDeliverableChannelsWhenKeyed() {\n+        let link = AgentDeepLink(\n+            message: \"Hello\",\n+            sessionKey: \"s\",\n+            thinking: \"low\",\n+            deliver: true,\n+            to: \"  +15551234567 \",\n+            channel: \"whatsapp\",\n+            timeoutSeconds: 10,\n+            key: \"secret\")\n+        let res = DeepLinkAgentPolicy.effectiveDelivery(link: link, allowUnattended: true)\n+        #expect(res.deliver == true)\n+        #expect(res.to == \"+15551234567\")\n+        #expect(res.channel == .whatsapp)\n+    }\n+\n+    @Test func effectiveDeliveryStillBlocksWebChatDeliveryWhenKeyed() {\n+        let link = AgentDeepLink(\n+            message: \"Hello\",\n+            sessionKey: \"s\",\n+            thinking: \"low\",\n+            deliver: true,\n+            to: \"+15551234567\",\n+            channel: \"webchat\",\n+            timeoutSeconds: 10,\n+            key: \"secret\")\n+        let res = DeepLinkAgentPolicy.effectiveDelivery(link: link, allowUnattended: true)\n+        #expect(res.deliver == false)\n+        #expect(res.channel == .webchat)\n+    }\n+}"
+    },
+    {
+      "sha": "661382dda69c5bbd04dae85ca9c598df73d9d68b",
+      "filename": "apps/macos/Tests/OpenClawIPCTests/MacGatewayChatTransportMappingTests.swift",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/28d9dd7a772501ccc3f71457b4adfee79084fe6f/apps%2Fmacos%2FTests%2FOpenClawIPCTests%2FMacGatewayChatTransportMappingTests.swift",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/28d9dd7a772501ccc3f71457b4adfee79084fe6f/apps%2Fmacos%2FTests%2FOpenClawIPCTests%2FMacGatewayChatTransportMappingTests.swift",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/apps%2Fmacos%2FTests%2FOpenClawIPCTests%2FMacGatewayChatTransportMappingTests.swift?ref=28d9dd7a772501ccc3f71457b4adfee79084fe6f",
+      "patch": "@@ -12,7 +12,8 @@ import Testing\n             uptimems: 123,\n             configpath: nil,\n             statedir: nil,\n-            sessiondefaults: nil)\n+            sessiondefaults: nil,\n+            authmode: nil)\n \n         let hello = HelloOk(\n             type: \"hello\","
+    },
+    {
+      "sha": "7f38ba36b04548d8939fcbcde3cf7083dbd5d90a",
+      "filename": "docs/platforms/macos.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/28d9dd7a772501ccc3f71457b4adfee79084fe6f/docs%2Fplatforms%2Fmacos.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/28d9dd7a772501ccc3f71457b4adfee79084fe6f/docs%2Fplatforms%2Fmacos.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/docs%2Fplatforms%2Fmacos.md?ref=28d9dd7a772501ccc3f71457b4adfee79084fe6f",
+      "patch": "@@ -130,6 +130,7 @@ Query parameters:\n Safety:\n \n - Without `key`, the app prompts for confirmation.\n+- Without `key`, the app enforces a short message limit for the confirmation prompt and ignores `deliver` / `to` / `channel`.\n - With a valid `key`, the run is unattended (intended for personal automations).\n \n ## Onboarding flow (typical)"
+    }
+  ]
+}

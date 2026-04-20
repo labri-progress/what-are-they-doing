@@ -1,0 +1,41 @@
+{
+  "message": "feat(mcp): improve client and stdio transport",
+  "files": [
+    {
+      "sha": "2439c93536dc04bf803058a37b8a45f258cfa1de",
+      "filename": "Sources/TachikomaMCP/Client/MCPClient.swift",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/steipete/Tachikoma/blob/2fc4da8ba53fb9f47114f15d8e4e585f2f6029e6/Sources%2FTachikomaMCP%2FClient%2FMCPClient.swift",
+      "raw_url": "https://github.com/steipete/Tachikoma/raw/2fc4da8ba53fb9f47114f15d8e4e585f2f6029e6/Sources%2FTachikomaMCP%2FClient%2FMCPClient.swift",
+      "contents_url": "https://api.github.com/repos/steipete/Tachikoma/contents/Sources%2FTachikomaMCP%2FClient%2FMCPClient.swift?ref=2fc4da8ba53fb9f47114f15d8e4e585f2f6029e6",
+      "patch": "@@ -112,6 +112,8 @@ public final class MCPClient: Sendable {\n         case \"stdio\":\n             // Always use standard stdio transport now that we've fixed the reading issue\n             transport = StdioTransport()\n+        case \"stdio-pty\":\n+            transport = StdioTransportPTY()\n         case \"sse\":\n             transport = SSETransport()\n         case \"http\":"
+    },
+    {
+      "sha": "b63d3160bc038cf6a3bd72c6ed52a4592179363d",
+      "filename": "Sources/TachikomaMCP/Client/StdioTransportPTY.swift",
+      "status": "modified",
+      "additions": 32,
+      "deletions": 8,
+      "changes": 40,
+      "blob_url": "https://github.com/steipete/Tachikoma/blob/2fc4da8ba53fb9f47114f15d8e4e585f2f6029e6/Sources%2FTachikomaMCP%2FClient%2FStdioTransportPTY.swift",
+      "raw_url": "https://github.com/steipete/Tachikoma/raw/2fc4da8ba53fb9f47114f15d8e4e585f2f6029e6/Sources%2FTachikomaMCP%2FClient%2FStdioTransportPTY.swift",
+      "contents_url": "https://api.github.com/repos/steipete/Tachikoma/contents/Sources%2FTachikomaMCP%2FClient%2FStdioTransportPTY.swift?ref=2fc4da8ba53fb9f47114f15d8e4e585f2f6029e6",
+      "patch": "@@ -275,8 +275,10 @@ public final class StdioTransportPTY: MCPTransport {\n \n                     buffer.append(chunk)\n \n-                    // Process complete lines\n-                    while let newlineRange = buffer.firstRange(of: Data(\"\\n\".utf8)) {\n+                    // Process complete lines (treat both LF and CR as delimiters)\n+                    while let newlineRange = buffer.firstRange(of: Data(\"\\n\".utf8)) ??\n+                        buffer.firstRange(of: Data(\"\\r\".utf8))\n+                    {\n                         let lineData = buffer[..<newlineRange.lowerBound]\n                         buffer.removeSubrange(..<newlineRange.upperBound)\n \n@@ -293,15 +295,37 @@ public final class StdioTransportPTY: MCPTransport {\n     }\n \n     private func processLine(_ data: Data) async {\n-        // Try to parse as JSON-RPC response\n-        if\n-            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],\n+        var payload = data\n+        if let lastByte = payload.last, lastByte == 13 {\n+            payload.removeLast()\n+        }\n+        guard\n+            let json = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],\n             let idValue = json[\"id\"]\n-        {\n-            let idString = String(describing: idValue)\n+        else {\n+            return\n+        }\n+\n+        if let id = idValue as? Int {\n+            if let continuation = await state.removePendingRequest(id: id) {\n+                await state.cancelTimeoutTask(id: id)\n+                continuation.resume(returning: payload)\n+            }\n+            return\n+        }\n+\n+        if let idString = idValue as? String {\n             if let continuation = await state.removePendingRequestByStringId(idString) {\n-                continuation.resume(returning: data)\n+                if let idInt = Int(idString) {\n+                    await state.cancelTimeoutTask(id: idInt)\n+                }\n+                continuation.resume(returning: payload)\n             }\n+            return\n+        }\n+\n+        if idValue is NSNull {\n+            return\n         }\n     }\n }"
+    },
+    {
+      "sha": "7b6a6a543a8a1c6bf31d624a2bd44ecab1df1049",
+      "filename": "Tests/TachikomaMCPTests/MCPClientTests.swift",
+      "status": "modified",
+      "additions": 79,
+      "deletions": 0,
+      "changes": 79,
+      "blob_url": "https://github.com/steipete/Tachikoma/blob/2fc4da8ba53fb9f47114f15d8e4e585f2f6029e6/Tests%2FTachikomaMCPTests%2FMCPClientTests.swift",
+      "raw_url": "https://github.com/steipete/Tachikoma/raw/2fc4da8ba53fb9f47114f15d8e4e585f2f6029e6/Tests%2FTachikomaMCPTests%2FMCPClientTests.swift",
+      "contents_url": "https://api.github.com/repos/steipete/Tachikoma/contents/Tests%2FTachikomaMCPTests%2FMCPClientTests.swift?ref=2fc4da8ba53fb9f47114f15d8e4e585f2f6029e6",
+      "patch": "@@ -311,6 +311,85 @@ struct MCPClientTests {\n         #expect(decoded.count == 42)\n         #expect(decoded.active == true)\n     }\n+\n+#if os(macOS)\n+    @Test(\"MCPClient connects via PTY transport\")\n+    func clientConnectsOverPTY() async throws {\n+        let tempDirectory = FileManager.default.temporaryDirectory\n+        let scriptURL = tempDirectory.appendingPathComponent(\"mcp-pty-\\(UUID().uuidString)\")\n+        let logURL = tempDirectory.appendingPathComponent(\"mcp-pty-log-\\(UUID().uuidString)\")\n+        let script = #\"\"\"\n+#!/usr/bin/env python3\n+import json\n+import sys\n+\n+LOG_PATH = r\"%LOG_PATH%\"\n+log = open(LOG_PATH, \"a\", buffering=1)\n+log.write(\"ready\\n\")\n+\n+def respond(obj):\n+    payload = json.dumps(obj)\n+    log.write(\"OUT:\" + payload + \"\\n\")\n+    sys.stdout.write(payload + \"\\n\")\n+    sys.stdout.flush()\n+\n+while True:\n+    line = sys.stdin.readline()\n+    if not line:\n+        break\n+    line = line.strip(\"\\r\\n\")\n+    if not line:\n+        continue\n+    log.write(\"IN:\" + line + \"\\n\")\n+    msg = json.loads(line)\n+    method = msg.get(\"method\")\n+    mid = msg.get(\"id\")\n+    if method == \"initialize\":\n+        respond({\n+            \"jsonrpc\": \"2.0\",\n+            \"id\": mid,\n+            \"result\": {\n+                \"protocolVersion\": \"2025-03-26\",\n+                \"serverInfo\": {\"name\": \"Test Browser\", \"version\": \"1.0\"},\n+                \"capabilities\": {\n+                    \"tools\": {\"listChanged\": True},\n+                    \"resources\": {\"listChanged\": True},\n+                    \"completions\": {}\n+                }\n+            }\n+        })\n+    elif method == \"tools/list\":\n+        respond({\n+            \"jsonrpc\": \"2.0\",\n+            \"id\": mid,\n+            \"result\": {\"tools\": []}\n+        })\n+        break\n+\"\"\"#\n+            .replacingOccurrences(of: \"%LOG_PATH%\", with: logURL.path)\n+        try script.write(to: scriptURL, atomically: true, encoding: .utf8)\n+        try FileManager.default.setAttributes(\n+            [.posixPermissions: NSNumber(value: Int16(0o755))],\n+            ofItemAtPath: scriptURL.path\n+        )\n+\n+        let config = MCPServerConfig(\n+            transport: \"stdio-pty\",\n+            command: scriptURL.path,\n+            timeout: 5,\n+            autoReconnect: false\n+        )\n+        let client = MCPClient(name: \"browser-test\", config: config)\n+\n+        try await client.connect()\n+        let connected = await client.isConnected\n+        #expect(connected)\n+        await client.disconnect()\n+\n+        try? FileManager.default.removeItem(at: scriptURL)\n+        try? FileManager.default.removeItem(at: logURL)\n+    }\n+#endif\n }\n \n // MARK: - Mock MCP Tool for Testing"
+    }
+  ]
+}

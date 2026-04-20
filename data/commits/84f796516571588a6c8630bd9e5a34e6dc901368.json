@@ -1,0 +1,41 @@
+{
+  "message": "feat(runtime): add join_with_drop_reason for explicit abort attribution\n\nWhen race combinators drop losing futures, the abort reason should be\nexplicitly \"race loser\" rather than the generic \"dropped\" reason. This\nimproves debugging and allows distinguishing intentional cancellation\nfrom unexpected drops.\n\nChanges:\n- Add TaskHandle::join_with_drop_reason() method that stores the reason\n  to use when the JoinFuture is dropped before completion\n- Update JoinFuture to track optional drop_reason\n- Modify JoinFuture::drop to use the stored reason if present\n- Update race/race_all in Scope to use join_with_drop_reason with\n  CancelReason::race_loser()\n- Add clarifying comments about double-abort being idempotent\n\nThis makes the cancellation attribution explicit: when a task loses a\nrace, logs and error handling see \"race_loser\" instead of just \"dropped\",\nmaking it clearer what happened.\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "951b71de3b6478aef7e32cf309a4525b0735fa04",
+      "filename": "src/cx/scope.rs",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 3,
+      "changes": 13,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/84f796516571588a6c8630bd9e5a34e6dc901368/src%2Fcx%2Fscope.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/84f796516571588a6c8630bd9e5a34e6dc901368/src%2Fcx%2Fscope.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fcx%2Fscope.rs?ref=84f796516571588a6c8630bd9e5a34e6dc901368",
+      "patch": "@@ -685,12 +685,14 @@ impl<P: Policy> Scope<'_, P> {\n         h1: TaskHandle<T>,\n         h2: TaskHandle<T>,\n     ) -> Result<T, JoinError> {\n-        let f1 = Box::pin(h1.join(cx));\n-        let f2 = Box::pin(h2.join(cx));\n+        let f1 = Box::pin(h1.join_with_drop_reason(cx, CancelReason::race_loser()));\n+        let f2 = Box::pin(h2.join_with_drop_reason(cx, CancelReason::race_loser()));\n \n         match Select::new(f1, f2).await {\n             Either::Left(res) => {\n                 // h1 finished first\n+                // h2 was dropped and aborted by JoinFuture::drop\n+                // We manually ensure it's cancelled (idempotent) and drain it\n                 h2.abort_with_reason(CancelReason::race_loser());\n                 let _ = h2.join(cx).await; // Drain h2\n                 res\n@@ -722,11 +724,16 @@ impl<P: Policy> Scope<'_, P> {\n     ) -> Result<(T, usize), JoinError> {\n         use crate::combinator::select::SelectAll;\n \n-        let futures: Vec<_> = handles.iter().map(|h| Box::pin(h.join(cx))).collect();\n+        let futures: Vec<_> = handles\n+            .iter()\n+            .map(|h| Box::pin(h.join_with_drop_reason(cx, CancelReason::race_loser())))\n+            .collect();\n \n         let (result, winner_idx) = SelectAll::new(futures).await;\n \n         // Cancel and drain losers\n+        // Note: Losers were already aborted when SelectAll dropped their futures.\n+        // The abort reason was set to RaceLost by JoinFuture::drop.\n         for (i, handle) in handles.iter().enumerate() {\n             if i != winner_idx {\n                 handle.abort_with_reason(CancelReason::race_loser());"
+    },
+    {
+      "sha": "3e571d245a3278c79f9c6b6fb301ec2998550c67",
+      "filename": "src/runtime/task_handle.rs",
+      "status": "modified",
+      "additions": 27,
+      "deletions": 1,
+      "changes": 28,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/84f796516571588a6c8630bd9e5a34e6dc901368/src%2Fruntime%2Ftask_handle.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/84f796516571588a6c8630bd9e5a34e6dc901368/src%2Fruntime%2Ftask_handle.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Ftask_handle.rs?ref=84f796516571588a6c8630bd9e5a34e6dc901368",
+      "patch": "@@ -120,6 +120,27 @@ impl<T> TaskHandle<T> {\n             handle: self,\n             inner: self.receiver.recv(cx),\n             completed: false,\n+            drop_reason: None,\n+        }\n+    }\n+\n+    /// Waits for the task to complete, aborting with a specific reason if dropped.\n+    ///\n+    /// This is like `join()`, but allows specifying the cancellation reason that\n+    /// should be used if the join future is dropped before completion. This is\n+    /// useful for combinators like `race` that want to attribute cancellation\n+    /// to \"losing the race\".\n+    #[must_use]\n+    pub fn join_with_drop_reason<'a>(\n+        &'a self,\n+        cx: &'a Cx,\n+        reason: CancelReason,\n+    ) -> JoinFuture<'a, T> {\n+        JoinFuture {\n+            handle: self,\n+            inner: self.receiver.recv(cx),\n+            completed: false,\n+            drop_reason: Some(reason),\n         }\n     }\n \n@@ -172,6 +193,7 @@ pub struct JoinFuture<'a, T> {\n     handle: &'a TaskHandle<T>,\n     inner: oneshot::RecvFuture<'a, Result<T, JoinError>>,\n     completed: bool,\n+    drop_reason: Option<CancelReason>,\n }\n \n impl<T> std::future::Future for JoinFuture<'_, T> {\n@@ -202,7 +224,11 @@ impl<T> Drop for JoinFuture<'_, T> {\n         // Abort the task if we stop waiting for it.\n         // This makes TaskHandle::join cancel-safe and race-safe.\n         if !self.completed {\n-            self.handle.abort();\n+            if let Some(reason) = self.drop_reason.take() {\n+                self.handle.abort_with_reason(reason);\n+            } else {\n+                self.handle.abort();\n+            }\n         }\n     }\n }"
+    },
+    {
+      "sha": "0561c63b0b17c113b25de740c4071e0f64ac6b48",
+      "filename": "tests/repro_race_empty.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/84f796516571588a6c8630bd9e5a34e6dc901368/tests%2Frepro_race_empty.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/84f796516571588a6c8630bd9e5a34e6dc901368/tests%2Frepro_race_empty.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/tests%2Frepro_race_empty.rs?ref=84f796516571588a6c8630bd9e5a34e6dc901368",
+      "patch": "@@ -46,4 +46,4 @@ async fn test_race_identity_law_violation() {\n     \n     // f1 should win with 42. f2 (race([])) should hang.\n     assert_eq!(inner_res.unwrap(), 42, \"race(a, race([])) should behave like a\");\n-}\n+}\n\\ No newline at end of file"
+    }
+  ]
+}

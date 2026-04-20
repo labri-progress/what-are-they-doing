@@ -1,0 +1,65 @@
+{
+  "message": "refactor(runtime): migrate RuntimeState from std Mutex to ContendedMutex\n\nReplace all Arc<Mutex<RuntimeState>> usages with Arc<ContendedMutex<RuntimeState>>\nacross the runtime layer to enable lock contention tracking and diagnostics.\n\n- builder.rs: construct ContendedMutex with \"runtime_state\" label\n- mod.rs: re-export ContendedMutex and LockMetricsSnapshot from sync module\n- local_queue.rs: update LocalQueue/Stealer state field and test_state helper\n- three_lane.rs: update ThreeLaneScheduler and ThreeLaneWorker state fields,\n  plus new/new_with_cancel_limit/new_with_options constructors\n- worker.rs: update Worker state field and new() constructor signature\n\nThis follows the ContendedMutex introduced in 8aab90c and wires it into\nall scheduler/worker paths that hold the shared runtime state lock.\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "20bc2a356a22673f358b15db2b9338388f574767",
+      "filename": "src/runtime/builder.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/e03879ac3dbf42f8f41ce5546801f2d294508dfd/src%2Fruntime%2Fbuilder.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/e03879ac3dbf42f8f41ce5546801f2d294508dfd/src%2Fruntime%2Fbuilder.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Fbuilder.rs?ref=e03879ac3dbf42f8f41ce5546801f2d294508dfd",
+      "patch": "@@ -941,7 +941,7 @@ impl<F: Future> Future for CatchUnwind<F> {\n struct RuntimeInner {\n     config: RuntimeConfig,\n     next_worker_id: AtomicUsize,\n-    state: Arc<Mutex<RuntimeState>>,\n+    state: Arc<crate::sync::ContendedMutex<RuntimeState>>,\n     scheduler: ThreeLaneScheduler,\n     worker_threads: Mutex<Vec<std::thread::JoinHandle<()>>>,\n     root_region: crate::types::RegionId,\n@@ -951,7 +951,7 @@ struct RuntimeInner {\n \n impl RuntimeInner {\n     fn new(config: RuntimeConfig, reactor: Option<Arc<dyn Reactor>>) -> io::Result<Self> {\n-        let state = Arc::new(Mutex::new(match reactor {\n+        let state = Arc::new(crate::sync::ContendedMutex::new(\"runtime_state\", match reactor {\n             Some(reactor) => {\n                 RuntimeState::with_reactor_and_metrics(reactor, config.metrics_provider.clone())\n             }"
+    },
+    {
+      "sha": "00656b1f4733adccad823e124ef9fd7520a79469",
+      "filename": "src/runtime/mod.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/e03879ac3dbf42f8f41ce5546801f2d294508dfd/src%2Fruntime%2Fmod.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/e03879ac3dbf42f8f41ce5546801f2d294508dfd/src%2Fruntime%2Fmod.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Fmod.rs?ref=e03879ac3dbf42f8f41ce5546801f2d294508dfd",
+      "patch": "@@ -159,6 +159,7 @@ pub use reactor::{Event, Events, Interest, LabReactor, Reactor, Registration, So\n pub use region_heap::{global_alloc_count, HeapIndex, HeapRef, HeapStats, RegionHeap};\n pub use scheduler::Scheduler;\n pub use spawn_blocking::{spawn_blocking, spawn_blocking_io};\n+pub use crate::sync::{ContendedMutex, LockMetricsSnapshot};\n pub use state::{RegionCreateError, RuntimeSnapshot, RuntimeState, SpawnError};\n pub use stored_task::StoredTask;\n pub use task_handle::{JoinError, TaskHandle};"
+    },
+    {
+      "sha": "c9765cbf97b0fc1812673d49db26ac895a1db9e3",
+      "filename": "src/runtime/scheduler/local_queue.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 5,
+      "changes": 11,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/e03879ac3dbf42f8f41ce5546801f2d294508dfd/src%2Fruntime%2Fscheduler%2Flocal_queue.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/e03879ac3dbf42f8f41ce5546801f2d294508dfd/src%2Fruntime%2Fscheduler%2Flocal_queue.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Fscheduler%2Flocal_queue.rs?ref=e03879ac3dbf42f8f41ce5546801f2d294508dfd",
+      "patch": "@@ -8,6 +8,7 @@ use super::intrusive::{IntrusiveStack, QUEUE_TAG_READY};\n #[cfg(any(test, feature = \"test-internals\"))]\n use crate::record::task::TaskRecord;\n use crate::runtime::RuntimeState;\n+use crate::sync::ContendedMutex;\n use crate::types::TaskId;\n #[cfg(any(test, feature = \"test-internals\"))]\n use crate::types::{Budget, RegionId};\n@@ -25,14 +26,14 @@ thread_local! {\n /// from the other end (FIFO).\n #[derive(Debug, Clone)]\n pub struct LocalQueue {\n-    state: Arc<Mutex<RuntimeState>>,\n+    state: Arc<ContendedMutex<RuntimeState>>,\n     inner: Arc<Mutex<IntrusiveStack>>,\n }\n \n impl LocalQueue {\n     /// Creates a new local queue.\n     #[must_use]\n-    pub fn new(state: Arc<Mutex<RuntimeState>>) -> Self {\n+    pub fn new(state: Arc<ContendedMutex<RuntimeState>>) -> Self {\n         Self {\n             state,\n             inner: Arc::new(Mutex::new(IntrusiveStack::new(QUEUE_TAG_READY))),\n@@ -67,15 +68,15 @@ impl LocalQueue {\n     /// Creates a runtime state with preallocated task records for tests.\n     #[cfg(any(test, feature = \"test-internals\"))]\n     #[must_use]\n-    pub fn test_state(max_task_id: u32) -> Arc<Mutex<RuntimeState>> {\n+    pub fn test_state(max_task_id: u32) -> Arc<ContendedMutex<RuntimeState>> {\n         let mut state = RuntimeState::new();\n         for id in 0..=max_task_id {\n             let task_id = TaskId::new_for_test(id, 0);\n             let record = TaskRecord::new(task_id, RegionId::new_for_test(0, 0), Budget::INFINITE);\n             let idx = state.tasks.insert(record);\n             debug_assert_eq!(idx.index(), id);\n         }\n-        Arc::new(Mutex::new(state))\n+        Arc::new(ContendedMutex::new(\"runtime_state\", state))\n     }\n \n     /// Creates a local queue with an isolated test runtime state.\n@@ -134,7 +135,7 @@ impl Drop for CurrentQueueGuard {\n /// A handle to steal tasks from a local queue.\n #[derive(Debug, Clone)]\n pub struct Stealer {\n-    state: Arc<Mutex<RuntimeState>>,\n+    state: Arc<ContendedMutex<RuntimeState>>,\n     inner: Arc<Mutex<IntrusiveStack>>,\n }\n "
+    },
+    {
+      "sha": "14c5febf070db709ba7dd5b001e8339d8fc4f7a8",
+      "filename": "src/runtime/scheduler/three_lane.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 5,
+      "changes": 11,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/e03879ac3dbf42f8f41ce5546801f2d294508dfd/src%2Fruntime%2Fscheduler%2Fthree_lane.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/e03879ac3dbf42f8f41ce5546801f2d294508dfd/src%2Fruntime%2Fscheduler%2Fthree_lane.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Fscheduler%2Fthree_lane.rs?ref=e03879ac3dbf42f8f41ce5546801f2d294508dfd",
+      "patch": "@@ -55,6 +55,7 @@ use crate::runtime::scheduler::priority::Scheduler as PriorityScheduler;\n use crate::runtime::scheduler::worker::Parker;\n use crate::runtime::stored_task::AnyStoredTask;\n use crate::runtime::RuntimeState;\n+use crate::sync::ContendedMutex;\n use crate::time::TimerDriverHandle;\n use crate::tracing_compat::trace;\n use crate::types::{CxInner, TaskId, Time};\n@@ -290,19 +291,19 @@ pub struct ThreeLaneScheduler {\n     /// Timer driver for processing timer wakeups.\n     timer_driver: Option<TimerDriverHandle>,\n     /// Shared runtime state for accessing task records and wake_state.\n-    state: Arc<Mutex<RuntimeState>>,\n+    state: Arc<ContendedMutex<RuntimeState>>,\n }\n \n impl ThreeLaneScheduler {\n     /// Creates a new 3-lane scheduler with the given number of workers.\n-    pub fn new(worker_count: usize, state: &Arc<Mutex<RuntimeState>>) -> Self {\n+    pub fn new(worker_count: usize, state: &Arc<ContendedMutex<RuntimeState>>) -> Self {\n         Self::new_with_options(worker_count, state, DEFAULT_CANCEL_STREAK_LIMIT, false, 32)\n     }\n \n     /// Creates a new 3-lane scheduler with a configurable cancel streak limit.\n     pub fn new_with_cancel_limit(\n         worker_count: usize,\n-        state: &Arc<Mutex<RuntimeState>>,\n+        state: &Arc<ContendedMutex<RuntimeState>>,\n         cancel_streak_limit: usize,\n     ) -> Self {\n         Self::new_with_options(worker_count, state, cancel_streak_limit, false, 32)\n@@ -316,7 +317,7 @@ impl ThreeLaneScheduler {\n     /// to the ungoverned baseline.\n     pub fn new_with_options(\n         worker_count: usize,\n-        state: &Arc<Mutex<RuntimeState>>,\n+        state: &Arc<ContendedMutex<RuntimeState>>,\n         cancel_streak_limit: usize,\n         enable_governor: bool,\n         governor_interval: u32,\n@@ -778,7 +779,7 @@ pub struct ThreeLaneWorker {\n     /// Global injection queue.\n     pub global: Arc<GlobalInjector>,\n     /// Shared runtime state.\n-    pub state: Arc<Mutex<RuntimeState>>,\n+    pub state: Arc<ContendedMutex<RuntimeState>>,\n     /// Parking mechanism for idle workers.\n     pub parker: Parker,\n     /// Coordination for waking other workers."
+    },
+    {
+      "sha": "7b5ccd1e6f9324cb658259f2ced727b6e7dea834",
+      "filename": "src/runtime/scheduler/worker.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 2,
+      "changes": 5,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/e03879ac3dbf42f8f41ce5546801f2d294508dfd/src%2Fruntime%2Fscheduler%2Fworker.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/e03879ac3dbf42f8f41ce5546801f2d294508dfd/src%2Fruntime%2Fscheduler%2Fworker.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Fscheduler%2Fworker.rs?ref=e03879ac3dbf42f8f41ce5546801f2d294508dfd",
+      "patch": "@@ -5,6 +5,7 @@ use crate::runtime::scheduler::global_queue::GlobalQueue;\n use crate::runtime::scheduler::local_queue::{LocalQueue, Stealer};\n use crate::runtime::scheduler::stealing;\n use crate::runtime::RuntimeState;\n+use crate::sync::ContendedMutex;\n use crate::time::TimerDriverHandle;\n use crate::trace::{TraceBufferHandle, TraceEvent};\n use crate::tracing_compat::trace;\n@@ -31,7 +32,7 @@ pub struct Worker {\n     /// Global queue shared across workers.\n     pub global: Arc<GlobalQueue>,\n     /// Shared runtime state.\n-    pub state: Arc<Mutex<RuntimeState>>, // RuntimeState is usually guarded\n+    pub state: Arc<ContendedMutex<RuntimeState>>,\n     /// Parking mechanism for idle workers.\n     pub parker: Parker,\n     /// Deterministic RNG for stealing decisions.\n@@ -54,7 +55,7 @@ impl Worker {\n         id: WorkerId,\n         stealers: Vec<Stealer>,\n         global: Arc<GlobalQueue>,\n-        state: Arc<Mutex<RuntimeState>>,\n+        state: Arc<ContendedMutex<RuntimeState>>,\n         shutdown: Arc<AtomicBool>,\n     ) -> Self {\n         let (io_driver, trace, timer_driver) = {"
+    }
+  ]
+}

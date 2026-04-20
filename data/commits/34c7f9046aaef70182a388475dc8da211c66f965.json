@@ -1,0 +1,173 @@
+{
+  "message": "Fix 14 correctness and safety issues across inference, collection, redaction, and telemetry subsystems\n\npt-config:\n- Respect case_insensitive flag in regex and glob fallback pattern\n  matching; strip ^ and $ anchors from regex fallback patterns\n\npt-core (action):\n- Replace unsafe libc::getpwuid() with /etc/passwd file parsing\n  for thread-safe UID-to-username resolution\n- Fix launchctl service status detection to parse plist dictionary\n  output (search for \"PID\" = key) instead of assuming TSV format\n\npt-core (collect):\n- Extract systemd unit info from name=systemd cgroup v1 controller\n- Query systemctl show with unit name directly instead of unreliable\n  --pid flag; remove double-fallback; update tests to pass cgroup\n  unit name\n\npt-core (decision):\n- Move selected_ids/not_selected computation inside local_search\n  loop to prevent stale candidate sets across iterations\n\npt-core (inference):\n- Fix BOCPD step counter: increment self.step before early returns\n  in single-observation and outlier code paths\n- Extract actual prior from \"prior\" evidence term in posterior\n  instead of hardcoded uniform [0.25, 0.25, 0.25, 0.25]\n- Fix ImpactScorer child count: return Some(0) for missing PIDs\n  when cache is populated instead of None (which triggers wasteful\n  /proc fallback scans)\n\npt-core (supervision):\n- Use bounds-checked .get() instead of direct slice indexing when\n  parsing /proc/pid/stat to prevent panics on malformed entries\n\npt-redact:\n- Preserve text before temp session directory in canonicalization;\n  use .replace() for /tmp/ and /var/tmp/ to handle mid-path occurrences\n- Use .chars().count() instead of .len() in truncate_value() for\n  correct Unicode multi-byte string handling\n\npt-redact (hash):\n- Write key material to .tmp file first, then atomically rename\n  to prevent partial/corrupt key files on interrupted writes\n\npt-telemetry:\n- Close writer and atomically rename temp-to-output in\n  BatchedWriter Drop to prevent orphaned temp files\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "89f11f90d22f07984ffa2092022fe2b861ba9e5e",
+      "filename": "crates/pt-config/src/policy.rs",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 5,
+      "changes": 19,
+      "blob_url": "https://github.com/Dicklesworthstone/process_triage/blob/34c7f9046aaef70182a388475dc8da211c66f965/crates%2Fpt-config%2Fsrc%2Fpolicy.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/process_triage/raw/34c7f9046aaef70182a388475dc8da211c66f965/crates%2Fpt-config%2Fsrc%2Fpolicy.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/process_triage/contents/crates%2Fpt-config%2Fsrc%2Fpolicy.rs?ref=34c7f9046aaef70182a388475dc8da211c66f965",
+      "patch": "@@ -603,13 +603,22 @@ impl Policy {\n                     }\n                 }\n                 PatternKind::Regex => {\n-                    // Basic regex check (full implementation would use regex crate)\n-                    // For now, just check if pattern appears in command\n-                    command.contains(&p.pattern.replace(\"\\\\b\", \"\"))\n+                    // Basic regex check fallback (full implementation uses regex crate in pt-core)\n+                    let p = p.pattern.replace(\"\\\\b\", \"\").replace(\"^\", \"\").replace(\"$\", \"\");\n+                    if p.case_insensitive {\n+                        command.to_lowercase().contains(&p.to_lowercase())\n+                    } else {\n+                        command.contains(&p)\n+                    }\n                 }\n                 PatternKind::Glob => {\n-                    // Simplified glob matching\n-                    command.contains(&p.pattern.replace(\"*\", \"\"))\n+                    // Simplified glob matching fallback\n+                    let p = p.pattern.replace(\"*\", \"\");\n+                    if p.case_insensitive {\n+                        command.to_lowercase().contains(&p.to_lowercase())\n+                    } else {\n+                        command.contains(&p)\n+                    }\n                 }\n             }\n         })"
+    },
+    {
+      "sha": "5a3936ce300f18633b2a075e3c4bd007cd211774",
+      "filename": "crates/pt-core/src/action/prechecks.rs",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 8,
+      "changes": 17,
+      "blob_url": "https://github.com/Dicklesworthstone/process_triage/blob/34c7f9046aaef70182a388475dc8da211c66f965/crates%2Fpt-core%2Fsrc%2Faction%2Fprechecks.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/process_triage/raw/34c7f9046aaef70182a388475dc8da211c66f965/crates%2Fpt-core%2Fsrc%2Faction%2Fprechecks.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/process_triage/contents/crates%2Fpt-core%2Fsrc%2Faction%2Fprechecks.rs?ref=34c7f9046aaef70182a388475dc8da211c66f965",
+      "patch": "@@ -503,16 +503,17 @@ impl LivePreCheckProvider {\n             if line.starts_with(\"Uid:\") {\n                 if let Some(uid_str) = line.split_whitespace().nth(1) {\n                     if let Ok(uid) = uid_str.parse::<u32>() {\n-                        // Try to resolve UID to username\n+                        // Try to resolve UID to username safely without thread-unsafe libc calls\n                         #[cfg(unix)]\n                         {\n-                            use std::ffi::CStr;\n-                            unsafe {\n-                                let pwd = libc::getpwuid(uid);\n-                                if !pwd.is_null() {\n-                                    let name = CStr::from_ptr((*pwd).pw_name);\n-                                    if let Ok(s) = name.to_str() {\n-                                        return Some(s.to_string());\n+                            if let Ok(passwd) = std::fs::read_to_string(\"/etc/passwd\") {\n+                                let uid_str_target = uid.to_string();\n+                                for pwd_line in passwd.lines() {\n+                                    let mut fields = pwd_line.split(':');\n+                                    if let (Some(name), _, Some(id)) = (fields.next(), fields.next(), fields.next()) {\n+                                        if id == uid_str_target {\n+                                            return Some(name.to_string());\n+                                        }\n                                     }\n                                 }\n                             }"
+    },
+    {
+      "sha": "90c181e7037996ed853c036518b51c42415584e1",
+      "filename": "crates/pt-core/src/action/supervisor.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 12,
+      "changes": 19,
+      "blob_url": "https://github.com/Dicklesworthstone/process_triage/blob/34c7f9046aaef70182a388475dc8da211c66f965/crates%2Fpt-core%2Fsrc%2Faction%2Fsupervisor.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/process_triage/raw/34c7f9046aaef70182a388475dc8da211c66f965/crates%2Fpt-core%2Fsrc%2Faction%2Fsupervisor.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/process_triage/contents/crates%2Fpt-core%2Fsrc%2Faction%2Fsupervisor.rs?ref=34c7f9046aaef70182a388475dc8da211c66f965",
+      "patch": "@@ -823,8 +823,8 @@ impl SupervisorActionRunner {\n             .unwrap_or(&action.unit_identifier);\n \n         // launchctl list <label> returns info about a specific service\n-        // Output: <pid>\\t<last_exit_status>\\t<label>\n-        // If PID is \"-\", the service is not running\n+        // Output is a property list dictionary.\n+        // If the service is running, it will contain a \"PID\" key.\n         let output = Command::new(\"launchctl\").args([\"list\", label]).output();\n \n         if let Ok(output) = output {\n@@ -833,16 +833,11 @@ impl SupervisorActionRunner {\n                 return false;\n             }\n             let stdout = String::from_utf8_lossy(&output.stdout);\n-            // Parse the output - first column is PID\n-            // Example: \"12345\\t0\\tcom.example.myservice\"\n-            // Or: \"-\\t0\\tcom.example.myservice\" (not running)\n-            if let Some(first_line) = stdout.lines().next() {\n-                let parts: Vec<&str> = first_line.split('\\t').collect();\n-                if let Some(pid_str) = parts.first() {\n-                    // If PID is not \"-\" and parses as a number, service is running\n-                    if *pid_str != \"-\" && pid_str.parse::<u32>().is_ok() {\n-                        return true;\n-                    }\n+            // Search for \"PID\" = <number>;\n+            for line in stdout.lines() {\n+                let trimmed = line.trim();\n+                if trimmed.starts_with(\"\\\"PID\\\" =\") {\n+                    return true;\n                 }\n             }\n             false"
+    },
+    {
+      "sha": "19bd2bac2e097e49d6a42e68c095f3d7aac8828a",
+      "filename": "crates/pt-core/src/collect/cgroup.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/process_triage/blob/34c7f9046aaef70182a388475dc8da211c66f965/crates%2Fpt-core%2Fsrc%2Fcollect%2Fcgroup.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/process_triage/raw/34c7f9046aaef70182a388475dc8da211c66f965/crates%2Fpt-core%2Fsrc%2Fcollect%2Fcgroup.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/process_triage/contents/crates%2Fpt-core%2Fsrc%2Fcollect%2Fcgroup.rs?ref=34c7f9046aaef70182a388475dc8da211c66f965",
+      "patch": "@@ -206,6 +206,9 @@ pub fn collect_cgroup_from_content(\n             // Cgroup v1\n             has_v1 = true;\n             for controller in controllers.split(',') {\n+                if controller == \"name=systemd\" {\n+                    extract_systemd_info(&mut details, path);\n+                }\n                 details\n                     .v1_paths\n                     .insert(controller.to_string(), path.to_string());"
+    },
+    {
+      "sha": "a1a6224a9c1087703c58987b738c1640e535a9a1",
+      "filename": "crates/pt-core/src/collect/systemd.rs",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 22,
+      "changes": 42,
+      "blob_url": "https://github.com/Dicklesworthstone/process_triage/blob/34c7f9046aaef70182a388475dc8da211c66f965/crates%2Fpt-core%2Fsrc%2Fcollect%2Fsystemd.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/process_triage/raw/34c7f9046aaef70182a388475dc8da211c66f965/crates%2Fpt-core%2Fsrc%2Fcollect%2Fsystemd.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/process_triage/contents/crates%2Fpt-core%2Fsrc%2Fcollect%2Fsystemd.rs?ref=34c7f9046aaef70182a388475dc8da211c66f965",
+      "patch": "@@ -181,21 +181,21 @@ pub enum SystemdDataSource {\n /// # Returns\n /// * `Option<SystemdUnit>` - Unit info or None if not managed by systemd\n pub fn collect_systemd_unit(pid: u32, cgroup_unit: Option<&str>) -> Option<SystemdUnit> {\n-    // Try systemctl show first\n-    if let Some(unit) = query_systemctl(pid) {\n-        return Some(unit);\n-    }\n-\n-    // Fall back to cgroup path info\n     if let Some(unit_name) = cgroup_unit {\n+        // Try systemctl show first\n+        if let Some(unit) = query_systemctl(unit_name, pid) {\n+            return Some(unit);\n+        }\n+\n+        // Fall back to cgroup path info\n         return Some(unit_from_cgroup_path(unit_name, pid));\n     }\n \n     None\n }\n \n /// Query systemctl for unit information.\n-fn query_systemctl(pid: u32) -> Option<SystemdUnit> {\n+fn query_systemctl(unit_name: &str, pid: u32) -> Option<SystemdUnit> {\n     // Properties to query\n     let properties = [\n         \"Id\",\n@@ -209,23 +209,15 @@ fn query_systemctl(pid: u32) -> Option<SystemdUnit> {\n \n     let property_arg = properties.join(\",\");\n     let output = Command::new(\"systemctl\")\n-        .args([\"show\", \"--property\", &property_arg, &format!(\"--pid={pid}\")])\n+        .args([\"show\", \"--property\", &property_arg, unit_name])\n         .output()\n         .ok()?;\n \n-    let stdout = if output.status.success() {\n-        String::from_utf8_lossy(&output.stdout).to_string()\n-    } else {\n-        let fallback = Command::new(\"systemctl\")\n-            .args([\"show\", \"--property\", &property_arg, &pid.to_string()])\n-            .output()\n-            .ok()?;\n-        if !fallback.status.success() {\n-            return None;\n-        }\n-        String::from_utf8_lossy(&fallback.stdout).to_string()\n-    };\n+    if !output.status.success() {\n+        return None;\n+    }\n \n+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();\n     parse_systemctl_output(&stdout, pid)\n }\n \n@@ -552,7 +544,10 @@ ActiveState=inactive\n         let my_pid = std::process::id();\n         crate::test_log!(INFO, \"systemd unit collection for self\", pid = my_pid);\n \n-        let unit = collect_systemd_unit(my_pid, None);\n+        let cgroup = crate::collect::cgroup::collect_cgroup_details(my_pid);\n+        let cgroup_unit = cgroup.as_ref().and_then(|c| c.systemd_unit.as_deref());\n+\n+        let unit = collect_systemd_unit(my_pid, cgroup_unit);\n \n         crate::test_log!(\n             INFO,\n@@ -602,7 +597,10 @@ ActiveState=inactive\n             pid = proc.pid()\n         );\n \n-        let unit = collect_systemd_unit(proc.pid(), None);\n+        let cgroup = crate::collect::cgroup::collect_cgroup_details(proc.pid());\n+        let cgroup_unit = cgroup.as_ref().and_then(|c| c.systemd_unit.as_deref());\n+\n+        let unit = collect_systemd_unit(proc.pid(), cgroup_unit);\n \n         crate::test_log!(\n             INFO,"
+    },
+    {
+      "sha": "7d21cc0925058ea7aef435d7aa1b655016e732c9",
+      "filename": "crates/pt-core/src/decision/goal_optimizer.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 7,
+      "changes": 14,
+      "blob_url": "https://github.com/Dicklesworthstone/process_triage/blob/34c7f9046aaef70182a388475dc8da211c66f965/crates%2Fpt-core%2Fsrc%2Fdecision%2Fgoal_optimizer.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/process_triage/raw/34c7f9046aaef70182a388475dc8da211c66f965/crates%2Fpt-core%2Fsrc%2Fdecision%2Fgoal_optimizer.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/process_triage/contents/crates%2Fpt-core%2Fsrc%2Fdecision%2Fgoal_optimizer.rs?ref=34c7f9046aaef70182a388475dc8da211c66f965",
+      "patch": "@@ -768,14 +768,14 @@ pub fn local_search_improve(\n ) {\n     let eligible: Vec<&OptCandidate> = candidates.iter().filter(|c| !c.blocked).collect();\n \n-    let selected_ids: HashSet<String> = result.selected.iter().map(|s| s.id.clone()).collect();\n-    let not_selected: Vec<&OptCandidate> = eligible\n-        .iter()\n-        .filter(|c| !selected_ids.contains(&c.id))\n-        .copied()\n-        .collect();\n-\n     for _ in 0..max_iterations {\n+        let selected_ids: HashSet<String> = result.selected.iter().map(|s| s.id.clone()).collect();\n+        let not_selected: Vec<&OptCandidate> = eligible\n+            .iter()\n+            .filter(|c| !selected_ids.contains(&c.id))\n+            .copied()\n+            .collect();\n+\n         let mut improved = false;\n \n         for i in 0..result.selected.len() {"
+    },
+    {
+      "sha": "ddfafb6aca7444012c7a1033d7ee6daa7b8cbf01",
+      "filename": "crates/pt-core/src/inference/bocpd.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 2,
+      "changes": 8,
+      "blob_url": "https://github.com/Dicklesworthstone/process_triage/blob/34c7f9046aaef70182a388475dc8da211c66f965/crates%2Fpt-core%2Fsrc%2Finference%2Fbocpd.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/process_triage/raw/34c7f9046aaef70182a388475dc8da211c66f965/crates%2Fpt-core%2Fsrc%2Finference%2Fbocpd.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/process_triage/contents/crates%2Fpt-core%2Fsrc%2Finference%2Fbocpd.rs?ref=34c7f9046aaef70182a388475dc8da211c66f965",
+      "patch": "@@ -483,14 +483,16 @@ impl BocpdDetector {\n                 .map(|(r, &p)| r as f64 * p)\n                 .sum();\n \n-            return BocpdUpdateResult {\n+            let res = BocpdUpdateResult {\n                 step: self.step,\n                 change_point_probability,\n                 map_run_length,\n                 expected_run_length,\n                 log_evidence: self.cum_log_evidence,\n                 run_length_posterior: posterior,\n             };\n+            self.step += 1;\n+            return res;\n         }\n \n         let h = self.config.hazard_rate;\n@@ -570,14 +572,16 @@ impl BocpdDetector {\n                 .map(|(r, &p)| r as f64 * p)\n                 .sum();\n \n-            return BocpdUpdateResult {\n+            let res = BocpdUpdateResult {\n                 step: self.step,\n                 change_point_probability,\n                 map_run_length,\n                 expected_run_length,\n                 log_evidence: self.cum_log_evidence,\n                 run_length_posterior: posterior,\n             };\n+            self.step += 1;\n+            return res;\n         }\n \n         for x in &mut new_log_dist {"
+    },
+    {
+      "sha": "d2d31de76d2faf6343a117ccc4a053f114df2991",
+      "filename": "crates/pt-core/src/inference/galaxy_brain.rs",
+      "status": "modified",
+      "additions": 23,
+      "deletions": 5,
+      "changes": 28,
+      "blob_url": "https://github.com/Dicklesworthstone/process_triage/blob/34c7f9046aaef70182a388475dc8da211c66f965/crates%2Fpt-core%2Fsrc%2Finference%2Fgalaxy_brain.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/process_triage/raw/34c7f9046aaef70182a388475dc8da211c66f965/crates%2Fpt-core%2Fsrc%2Finference%2Fgalaxy_brain.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/process_triage/contents/crates%2Fpt-core%2Fsrc%2Finference%2Fgalaxy_brain.rs?ref=34c7f9046aaef70182a388475dc8da211c66f965",
+      "patch": "@@ -294,12 +294,21 @@ fn sym<'a>(mode: MathMode, unicode: &'a str, ascii: &'a str) -> &'a str {\n     }\n }\n \n-/// Estimate the prior from the posterior by removing evidence contribution.\n+/// Estimate the prior from the posterior by extracting the prior term.\n ///\n-/// This is an approximation: we use uniform [0.25, 0.25, 0.25, 0.25] if\n-/// no prior info is available (the actual prior is baked into the posterior\n-/// computation and not separately stored in `PosteriorResult`).\n-fn prior_from_posterior(_posterior: &PosteriorResult) -> ClassScores {\n+/// The actual prior is stored as the first evidence term (log-likelihood).\n+fn prior_from_posterior(posterior: &PosteriorResult) -> ClassScores {\n+    for term in &posterior.evidence_terms {\n+        if term.feature == \"prior\" {\n+            return ClassScores {\n+                useful: term.log_likelihood.useful.exp(),\n+                useful_bad: term.log_likelihood.useful_bad.exp(),\n+                abandoned: term.log_likelihood.abandoned.exp(),\n+                zombie: term.log_likelihood.zombie.exp(),\n+            };\n+        }\n+    }\n+\n     ClassScores {\n         useful: 0.25,\n         useful_bad: 0.25,\n@@ -333,6 +342,15 @@ mod tests {\n             },\n             log_odds_abandoned_useful: 2.86,\n             evidence_terms: vec![\n+                EvidenceTerm {\n+                    feature: \"prior\".to_string(),\n+                    log_likelihood: ClassScores {\n+                        useful: -1.386,\n+                        useful_bad: -1.386,\n+                        abandoned: -1.386,\n+                        zombie: -1.386,\n+                    },\n+                },\n                 EvidenceTerm {\n                     feature: \"cpu_occupancy\".to_string(),\n                     log_likelihood: ClassScores {"
+    },
+    {
+      "sha": "6c3856ed64100644c523c4b9f64ce64224c190db",
+      "filename": "crates/pt-core/src/inference/impact.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 3,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/process_triage/blob/34c7f9046aaef70182a388475dc8da211c66f965/crates%2Fpt-core%2Fsrc%2Finference%2Fimpact.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/process_triage/raw/34c7f9046aaef70182a388475dc8da211c66f965/crates%2Fpt-core%2Fsrc%2Finference%2Fimpact.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/process_triage/contents/crates%2Fpt-core%2Fsrc%2Finference%2Fimpact.rs?ref=34c7f9046aaef70182a388475dc8da211c66f965",
+      "patch": "@@ -367,6 +367,7 @@ impl From<&ImpactResult> for ImpactEvidence {\n pub struct ImpactScorer {\n     config: ImpactConfig,\n     child_count_cache: HashMap<u32, usize>,\n+    cache_populated: bool,\n     #[cfg(target_os = \"linux\")]\n     network_snapshot: Option<NetworkSnapshot>,\n }\n@@ -382,6 +383,7 @@ impl ImpactScorer {\n         Self {\n             config,\n             child_count_cache: HashMap::new(),\n+            cache_populated: false,\n             #[cfg(target_os = \"linux\")]\n             network_snapshot: None,\n         }\n@@ -408,12 +410,14 @@ impl ImpactScorer {\n                 }\n             }\n         }\n+        self.cache_populated = true;\n \n         Ok(())\n     }\n \n     #[cfg(not(target_os = \"linux\"))]\n     pub fn populate_caches(&mut self) -> Result<(), ImpactError> {\n+        self.cache_populated = true;\n         Ok(())\n     }\n \n@@ -439,9 +443,9 @@ impl ImpactScorer {\n \n     /// Get child count for a process.\n     fn get_child_count(&self, pid: u32) -> Option<usize> {\n-        // First check cache\n-        if let Some(&count) = self.child_count_cache.get(&pid) {\n-            return Some(count);\n+        // First check if cache is populated\n+        if self.cache_populated {\n+            return Some(self.child_count_cache.get(&pid).copied().unwrap_or(0));\n         }\n \n         // If cache not populated, scan /proc"
+    },
+    {
+      "sha": "d430c1b73fcf4e2de3296ce9b797ef727eeb4c9f",
+      "filename": "crates/pt-core/src/supervision/orphan.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 1,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/process_triage/blob/34c7f9046aaef70182a388475dc8da211c66f965/crates%2Fpt-core%2Fsrc%2Fsupervision%2Forphan.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/process_triage/raw/34c7f9046aaef70182a388475dc8da211c66f965/crates%2Fpt-core%2Fsrc%2Fsupervision%2Forphan.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/process_triage/contents/crates%2Fpt-core%2Fsrc%2Fsupervision%2Forphan.rs?ref=34c7f9046aaef70182a388475dc8da211c66f965",
+      "patch": "@@ -235,7 +235,9 @@ fn read_ppid(pid: u32) -> Result<u32, OrphanError> {\n     let close_paren = content\n         .rfind(')')\n         .ok_or(OrphanError::ProcessNotFound(pid))?;\n-    let rest = &content[close_paren + 2..];\n+    let rest = content\n+        .get(close_paren + 2..)\n+        .ok_or(OrphanError::ProcessNotFound(pid))?;\n     let fields: Vec<&str> = rest.split_whitespace().collect();\n \n     if fields.len() < 2 {"
+    },
+    {
+      "sha": "127a2671f2bc332e5a395521e55fbad2d29b5059",
+      "filename": "crates/pt-redact/src/canonicalize.rs",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 6,
+      "changes": 11,
+      "blob_url": "https://github.com/Dicklesworthstone/process_triage/blob/34c7f9046aaef70182a388475dc8da211c66f965/crates%2Fpt-redact%2Fsrc%2Fcanonicalize.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/process_triage/raw/34c7f9046aaef70182a388475dc8da211c66f965/crates%2Fpt-redact%2Fsrc%2Fcanonicalize.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/process_triage/contents/crates%2Fpt-redact%2Fsrc%2Fcanonicalize.rs?ref=34c7f9046aaef70182a388475dc8da211c66f965",
+      "patch": "@@ -171,13 +171,12 @@ impl Canonicalizer {\n         // Replace temp session directories first (more specific)\n         // Match patterns like /tmp/pytest-123, /tmp/session-abc, etc.\n         if let Some(caps) = RE_TMP_SESSION.find(&result) {\n-            // Keep anything after the session directory\n+            let before_session = &result[..caps.start()];\n             let after_session = &result[caps.end()..];\n-            result = format!(\"[TMP]{}\", after_session);\n-        } else if result.starts_with(\"/tmp/\") {\n-            result = format!(\"[TMP]{}\", &result[4..]);\n-        } else if result.starts_with(\"/var/tmp/\") {\n-            result = format!(\"[TMP]{}\", &result[8..]);\n+            result = format!(\"{}[TMP]{}\", before_session, after_session);\n+        } else {\n+            result = result.replace(\"/tmp/\", \"[TMP]/\");\n+            result = result.replace(\"/var/tmp/\", \"[TMP]/\");\n         }\n \n         result"
+    },
+    {
+      "sha": "b2c034430f0d8d4ec7af8ef7f875d45586341eb7",
+      "filename": "crates/pt-redact/src/engine.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/process_triage/blob/34c7f9046aaef70182a388475dc8da211c66f965/crates%2Fpt-redact%2Fsrc%2Fengine.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/process_triage/raw/34c7f9046aaef70182a388475dc8da211c66f965/crates%2Fpt-redact%2Fsrc%2Fengine.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/process_triage/contents/crates%2Fpt-redact%2Fsrc%2Fengine.rs?ref=34c7f9046aaef70182a388475dc8da211c66f965",
+      "patch": "@@ -273,7 +273,7 @@ impl RedactionEngine {\n \n /// Truncate a value, keeping prefix and suffix.\n fn truncate_value(value: &str, keep_chars: usize) -> String {\n-    if value.len() <= keep_chars * 2 {\n+    if value.chars().count() <= keep_chars * 2 {\n         return value.to_string();\n     }\n "
+    },
+    {
+      "sha": "90e7c47a55ec93edef4e263ebb866b5983a1301d",
+      "filename": "crates/pt-redact/src/hash.rs",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 1,
+      "changes": 11,
+      "blob_url": "https://github.com/Dicklesworthstone/process_triage/blob/34c7f9046aaef70182a388475dc8da211c66f965/crates%2Fpt-redact%2Fsrc%2Fhash.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/process_triage/raw/34c7f9046aaef70182a388475dc8da211c66f965/crates%2Fpt-redact%2Fsrc%2Fhash.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/process_triage/contents/crates%2Fpt-redact%2Fsrc%2Fhash.rs?ref=34c7f9046aaef70182a388475dc8da211c66f965",
+      "patch": "@@ -151,16 +151,25 @@ impl KeyManager {\n         {\n             use std::io::Write;\n             use std::os::unix::fs::OpenOptionsExt;\n+            use std::path::PathBuf;\n+\n+            let path_ref = path.as_ref();\n+            let tmp_path = {\n+                let mut p = path_ref.as_os_str().to_os_string();\n+                p.push(\".tmp\");\n+                PathBuf::from(p)\n+            };\n \n             // Create file with restricted permissions atomically\n             let mut file = std::fs::OpenOptions::new()\n                 .write(true)\n                 .create(true)\n                 .truncate(true)\n                 .mode(0o600)\n-                .open(&path)?;\n+                .open(&tmp_path)?;\n             file.write_all(content.as_bytes())?;\n             file.sync_all()?;\n+            std::fs::rename(&tmp_path, path_ref)?;\n         }\n \n         #[cfg(not(unix))]"
+    },
+    {
+      "sha": "cf0ce0ed5cb4ab5864f7ee4fd5d90f3f0c55af83",
+      "filename": "crates/pt-telemetry/src/writer.rs",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 1,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/process_triage/blob/34c7f9046aaef70182a388475dc8da211c66f965/crates%2Fpt-telemetry%2Fsrc%2Fwriter.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/process_triage/raw/34c7f9046aaef70182a388475dc8da211c66f965/crates%2Fpt-telemetry%2Fsrc%2Fwriter.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/process_triage/contents/crates%2Fpt-telemetry%2Fsrc%2Fwriter.rs?ref=34c7f9046aaef70182a388475dc8da211c66f965",
+      "patch": "@@ -244,10 +244,18 @@ impl BatchedWriter {\n \n impl Drop for BatchedWriter {\n     fn drop(&mut self) {\n-        // Best-effort flush on drop\n+        // Best-effort flush, close, and rename on drop\n         if !self.buffer.is_empty() {\n             let _ = self.flush();\n         }\n+        \n+        if let Some(writer) = self.writer.take() {\n+            let _ = writer.close();\n+        }\n+        \n+        if let (Some(temp_path), Some(output_path)) = (self.temp_path.take(), self.output_path.take()) {\n+            let _ = atomic_rename(&temp_path, &output_path);\n+        }\n     }\n }\n "
+    }
+  ]
+}

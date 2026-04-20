@@ -1,0 +1,89 @@
+{
+  "message": "refactor: unify gateway connectivity state",
+  "files": [
+    {
+      "sha": "e72ccbbde7875d3128db9dcc80dac77bb729b9e3",
+      "filename": "apps/macos/Sources/Clawdbot/ControlChannel.swift",
+      "status": "modified",
+      "additions": 30,
+      "deletions": 15,
+      "changes": 45,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/de0a488985abf85e899c671b3ef22fe334d89b28/apps%2Fmacos%2FSources%2FClawdbot%2FControlChannel.swift",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/de0a488985abf85e899c671b3ef22fe334d89b28/apps%2Fmacos%2FSources%2FClawdbot%2FControlChannel.swift",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/apps%2Fmacos%2FSources%2FClawdbot%2FControlChannel.swift?ref=de0a488985abf85e899c671b3ef22fe334d89b28",
+      "patch": "@@ -87,15 +87,7 @@ final class ControlChannel {\n \n     func configure() async {\n         self.logger.info(\"control channel configure mode=local\")\n-        self.state = .connecting\n-        do {\n-            try await GatewayConnection.shared.refresh()\n-            self.state = .connected\n-            PresenceReporter.shared.sendImmediate(reason: \"connect\")\n-        } catch {\n-            let message = self.friendlyGatewayMessage(error)\n-            self.state = .degraded(message)\n-        }\n+        await self.refreshEndpoint(reason: \"configure\")\n     }\n \n     func configure(mode: Mode = .local) async throws {\n@@ -111,14 +103,27 @@ final class ControlChannel {\n                         \"target=\\(target, privacy: .public) identitySet=\\(idSet, privacy: .public)\")\n                 self.state = .connecting\n                 _ = try await GatewayEndpointStore.shared.ensureRemoteControlTunnel()\n-                await self.configure()\n+                await self.refreshEndpoint(reason: \"configure\")\n             } catch {\n                 self.state = .degraded(error.localizedDescription)\n                 throw error\n             }\n         }\n     }\n \n+    func refreshEndpoint(reason: String) async {\n+        self.logger.info(\"control channel refresh endpoint reason=\\(reason, privacy: .public)\")\n+        self.state = .connecting\n+        do {\n+            try await self.establishGatewayConnection()\n+            self.state = .connected\n+            PresenceReporter.shared.sendImmediate(reason: \"connect\")\n+        } catch {\n+            let message = self.friendlyGatewayMessage(error)\n+            self.state = .degraded(message)\n+        }\n+    }\n+\n     func disconnect() async {\n         await GatewayConnection.shared.shutdown()\n         self.state = .disconnected\n@@ -275,18 +280,28 @@ final class ControlChannel {\n                 }\n             }\n \n-            do {\n-                try await GatewayConnection.shared.refresh()\n+            await self.refreshEndpoint(reason: \"recovery:\\(reasonText)\")\n+            if case .connected = self.state {\n                 self.logger.info(\"control channel recovery finished\")\n-            } catch {\n-                self.logger.error(\n-                    \"control channel recovery failed \\(error.localizedDescription, privacy: .public)\")\n+            } else if case let .degraded(message) = self.state {\n+                self.logger.error(\"control channel recovery failed \\(message, privacy: .public)\")\n             }\n \n             self.recoveryTask = nil\n         }\n     }\n \n+    private func establishGatewayConnection(timeoutMs: Int = 5000) async throws {\n+        try await GatewayConnection.shared.refresh()\n+        let ok = try await GatewayConnection.shared.healthOK(timeoutMs: timeoutMs)\n+        if ok == false {\n+            throw NSError(\n+                domain: \"Gateway\",\n+                code: 0,\n+                userInfo: [NSLocalizedDescriptionKey: \"gateway health not ok\"])\n+        }\n+    }\n+\n     func sendSystemEvent(_ text: String, params: [String: AnyHashable] = [:]) async throws {\n         var merged = params\n         merged[\"text\"] = AnyHashable(text)"
+    },
+    {
+      "sha": "ac65ec0ac5fb51f45abaa6289ff8802b698cc424",
+      "filename": "apps/macos/Sources/Clawdbot/GatewayConnectivityCoordinator.swift",
+      "status": "added",
+      "additions": 63,
+      "deletions": 0,
+      "changes": 63,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/de0a488985abf85e899c671b3ef22fe334d89b28/apps%2Fmacos%2FSources%2FClawdbot%2FGatewayConnectivityCoordinator.swift",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/de0a488985abf85e899c671b3ef22fe334d89b28/apps%2Fmacos%2FSources%2FClawdbot%2FGatewayConnectivityCoordinator.swift",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/apps%2Fmacos%2FSources%2FClawdbot%2FGatewayConnectivityCoordinator.swift?ref=de0a488985abf85e899c671b3ef22fe334d89b28",
+      "patch": "@@ -0,0 +1,63 @@\n+import Foundation\n+import Observation\n+import OSLog\n+\n+@MainActor\n+@Observable\n+final class GatewayConnectivityCoordinator {\n+    static let shared = GatewayConnectivityCoordinator()\n+\n+    private let logger = Logger(subsystem: \"com.clawdbot\", category: \"gateway.connectivity\")\n+    private var endpointTask: Task<Void, Never>?\n+    private var lastResolvedURL: URL?\n+\n+    private(set) var endpointState: GatewayEndpointState?\n+    private(set) var resolvedURL: URL?\n+    private(set) var resolvedMode: AppState.ConnectionMode?\n+    private(set) var resolvedHostLabel: String?\n+\n+    private init() {\n+        self.start()\n+    }\n+\n+    func start() {\n+        guard self.endpointTask == nil else { return }\n+        self.endpointTask = Task { [weak self] in\n+            guard let self else { return }\n+            let stream = await GatewayEndpointStore.shared.subscribe()\n+            for await state in stream {\n+                await MainActor.run { self.handleEndpointState(state) }\n+            }\n+        }\n+    }\n+\n+    var localEndpointHostLabel: String? {\n+        guard self.resolvedMode == .local, let url = self.resolvedURL else { return nil }\n+        return Self.hostLabel(for: url)\n+    }\n+\n+    private func handleEndpointState(_ state: GatewayEndpointState) {\n+        self.endpointState = state\n+        switch state {\n+        case let .ready(mode, url, _, _):\n+            self.resolvedMode = mode\n+            self.resolvedURL = url\n+            self.resolvedHostLabel = Self.hostLabel(for: url)\n+            let urlChanged = self.lastResolvedURL?.absoluteString != url.absoluteString\n+            if urlChanged {\n+                self.lastResolvedURL = url\n+                Task { await ControlChannel.shared.refreshEndpoint(reason: \"endpoint changed\") }\n+            }\n+        case let .connecting(mode, _):\n+            self.resolvedMode = mode\n+        case let .unavailable(mode, _):\n+            self.resolvedMode = mode\n+        }\n+    }\n+\n+    private static func hostLabel(for url: URL) -> String {\n+        let host = url.host ?? url.absoluteString\n+        if let port = url.port { return \"\\(host):\\(port)\" }\n+        return host\n+    }\n+}"
+    },
+    {
+      "sha": "6a5f02ca07a448561748d0e212b845632f1caf71",
+      "filename": "apps/macos/Sources/Clawdbot/GatewayEndpointStore.swift",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/de0a488985abf85e899c671b3ef22fe334d89b28/apps%2Fmacos%2FSources%2FClawdbot%2FGatewayEndpointStore.swift",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/de0a488985abf85e899c671b3ef22fe334d89b28/apps%2Fmacos%2FSources%2FClawdbot%2FGatewayEndpointStore.swift",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/apps%2Fmacos%2FSources%2FClawdbot%2FGatewayEndpointStore.swift?ref=de0a488985abf85e899c671b3ef22fe334d89b28",
+      "patch": "@@ -68,6 +68,7 @@ actor GatewayEndpointStore {\n                     env: ProcessInfo.processInfo.environment)\n                 let customBindHost = GatewayEndpointStore.resolveGatewayCustomBindHost(root: root)\n                 let tailscaleIP = await MainActor.run { TailscaleService.shared.tailscaleIP }\n+                    ?? TailscaleService.fallbackTailnetIPv4()\n                 return GatewayEndpointStore.resolveLocalGatewayHost(\n                     bindMode: bind,\n                     customBindHost: customBindHost,\n@@ -487,6 +488,7 @@ actor GatewayEndpointStore {\n         guard currentHost == \"127.0.0.1\" || currentHost == \"localhost\" else { return nil }\n \n         let tailscaleIP = await MainActor.run { TailscaleService.shared.tailscaleIP }\n+            ?? TailscaleService.fallbackTailnetIPv4()\n         guard let tailscaleIP, !tailscaleIP.isEmpty else { return nil }\n \n         let scheme = GatewayEndpointStore.resolveGatewayScheme("
+    },
+    {
+      "sha": "cc3d5e136eac9bb22cbea9ea024c07e705e9d029",
+      "filename": "apps/macos/Sources/Clawdbot/HealthStore.swift",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/de0a488985abf85e899c671b3ef22fe334d89b28/apps%2Fmacos%2FSources%2FClawdbot%2FHealthStore.swift",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/de0a488985abf85e899c671b3ef22fe334d89b28/apps%2Fmacos%2FSources%2FClawdbot%2FHealthStore.swift",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/apps%2Fmacos%2FSources%2FClawdbot%2FHealthStore.swift?ref=de0a488985abf85e899c671b3ef22fe334d89b28",
+      "patch": "@@ -235,8 +235,8 @@ final class HealthStore {\n             let lower = error.lowercased()\n             if lower.contains(\"connection refused\") {\n                 let port = GatewayEnvironment.gatewayPort()\n-                return \"The gateway control port (127.0.0.1:\\(port)) isn\u2019t listening \u2014 \" +\n-                    \"restart Clawdbot to bring it back.\"\n+                let host = GatewayConnectivityCoordinator.shared.localEndpointHostLabel ?? \"127.0.0.1:\\(port)\"\n+                return \"The gateway control port (\\(host)) isn\u2019t listening \u2014 restart Clawdbot to bring it back.\"\n             }\n             if lower.contains(\"timeout\") {\n                 return \"Timed out waiting for the control server; the gateway may be crashed or still starting.\""
+    },
+    {
+      "sha": "9738c310bb9b0de49764857446fe6f45b5027c12",
+      "filename": "apps/macos/Sources/Clawdbot/MenuBar.swift",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/de0a488985abf85e899c671b3ef22fe334d89b28/apps%2Fmacos%2FSources%2FClawdbot%2FMenuBar.swift",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/de0a488985abf85e899c671b3ef22fe334d89b28/apps%2Fmacos%2FSources%2FClawdbot%2FMenuBar.swift",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/apps%2Fmacos%2FSources%2FClawdbot%2FMenuBar.swift?ref=de0a488985abf85e899c671b3ef22fe334d89b28",
+      "patch": "@@ -13,6 +13,7 @@ struct ClawdbotApp: App {\n     private let gatewayManager = GatewayProcessManager.shared\n     private let controlChannel = ControlChannel.shared\n     private let activityStore = WorkActivityStore.shared\n+    private let connectivityCoordinator = GatewayConnectivityCoordinator.shared\n     @State private var statusItem: NSStatusItem?\n     @State private var isMenuPresented = false\n     @State private var isPanelVisible = false"
+    },
+    {
+      "sha": "7bbe907baf33ca453ae428ff2b1871e46e98d785",
+      "filename": "apps/macos/Sources/Clawdbot/MenuSessionsInjector.swift",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/de0a488985abf85e899c671b3ef22fe334d89b28/apps%2Fmacos%2FSources%2FClawdbot%2FMenuSessionsInjector.swift",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/de0a488985abf85e899c671b3ef22fe334d89b28/apps%2Fmacos%2FSources%2FClawdbot%2FMenuSessionsInjector.swift",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/apps%2Fmacos%2FSources%2FClawdbot%2FMenuSessionsInjector.swift?ref=de0a488985abf85e899c671b3ef22fe334d89b28",
+      "patch": "@@ -469,7 +469,7 @@ extension MenuSessionsInjector {\n             }\n         case .local:\n             platform = \"local\"\n-            host = \"127.0.0.1:\\(port)\"\n+            host = GatewayConnectivityCoordinator.shared.localEndpointHostLabel ?? \"127.0.0.1:\\(port)\"\n         case .unconfigured:\n             platform = nil\n             host = nil"
+    },
+    {
+      "sha": "1d886aec3c994043b88519fe74786f9f48aef357",
+      "filename": "apps/macos/Sources/Clawdbot/TailscaleService.swift",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 0,
+      "changes": 9,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/de0a488985abf85e899c671b3ef22fe334d89b28/apps%2Fmacos%2FSources%2FClawdbot%2FTailscaleService.swift",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/de0a488985abf85e899c671b3ef22fe334d89b28/apps%2Fmacos%2FSources%2FClawdbot%2FTailscaleService.swift",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/apps%2Fmacos%2FSources%2FClawdbot%2FTailscaleService.swift?ref=de0a488985abf85e899c671b3ef22fe334d89b28",
+      "patch": "@@ -103,6 +103,7 @@ final class TailscaleService {\n     }\n \n     func checkTailscaleStatus() async {\n+        let previousIP = self.tailscaleIP\n         self.isInstalled = self.checkAppInstallation()\n         if !self.isInstalled {\n             self.isRunning = false\n@@ -147,6 +148,10 @@ final class TailscaleService {\n             self.statusError = nil\n             self.logger.info(\"Tailscale interface IP detected (fallback) ip=\\(fallback, privacy: .public)\")\n         }\n+\n+        if previousIP != self.tailscaleIP {\n+            await GatewayEndpointStore.shared.refresh()\n+        }\n     }\n \n     func openTailscaleApp() {\n@@ -214,4 +219,8 @@ final class TailscaleService {\n \n         return nil\n     }\n+\n+    nonisolated static func fallbackTailnetIPv4() -> String? {\n+        Self.detectTailnetIPv4()\n+    }\n }"
+    }
+  ]
+}

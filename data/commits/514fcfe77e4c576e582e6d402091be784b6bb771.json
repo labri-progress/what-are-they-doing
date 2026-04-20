@@ -1,0 +1,77 @@
+{
+  "message": "fix: harden sub-agent model overrides",
+  "files": [
+    {
+      "sha": "744737a4f45a109ba5b8246fd86f8827402b3e10",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/514fcfe77e4c576e582e6d402091be784b6bb771/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/514fcfe77e4c576e582e6d402091be784b6bb771/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=514fcfe77e4c576e582e6d402091be784b6bb771",
+      "patch": "@@ -25,6 +25,7 @@\n - CLI: add `clawdbot docs` live docs search with pretty output.\n - Agent: treat compaction retry AbortError as a fallback trigger without swallowing non-abort errors. Thanks @erikpr1994 for PR #341.\n - Sub-agents: allow `sessions_spawn` model overrides and error on invalid models. Thanks @azade-c for PR #298.\n+- Sub-agents: skip invalid model overrides with a warning and keep the run alive; tool exceptions now return tool errors instead of crashing the agent.\n - Heartbeat: default interval 30m; clarified default prompt usage and HEARTBEAT.md template behavior.\n - Onboarding: write auth profiles to the multi-agent path (`~/.clawdbot/agents/main/agent/`) so the gateway finds credentials on first startup. Thanks @minghinmatthewlam for PR #327.\n - Docs: add missing `ui:install` setup step in the README. Thanks @hugobarauna for PR #300."
+    },
+    {
+      "sha": "6286e3d6bf93be97525ba51db2dfeac31918f2aa",
+      "filename": "docs/tools/subagents.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/514fcfe77e4c576e582e6d402091be784b6bb771/docs%2Ftools%2Fsubagents.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/514fcfe77e4c576e582e6d402091be784b6bb771/docs%2Ftools%2Fsubagents.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/docs%2Ftools%2Fsubagents.md?ref=514fcfe77e4c576e582e6d402091be784b6bb771",
+      "patch": "@@ -24,7 +24,7 @@ Use `sessions_spawn`:\n Tool params:\n - `task` (required)\n - `label?` (optional)\n-- `model?` (optional; overrides the sub-agent model; invalid values error)\n+- `model?` (optional; overrides the sub-agent model; invalid values are skipped and the sub-agent runs on the default model with a warning in the tool result)\n - `timeoutSeconds?` (default `0`; `0` = fire-and-forget)\n - `cleanup?` (`delete|keep`, default `delete`)\n "
+    },
+    {
+      "sha": "e27ff2d175453dd45a5f6c5b7525bf20a15f0be6",
+      "filename": "src/agents/clawdbot-tools.subagents.test.ts",
+      "status": "modified",
+      "additions": 41,
+      "deletions": 4,
+      "changes": 45,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/514fcfe77e4c576e582e6d402091be784b6bb771/src%2Fagents%2Fclawdbot-tools.subagents.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/514fcfe77e4c576e582e6d402091be784b6bb771/src%2Fagents%2Fclawdbot-tools.subagents.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fagents%2Fclawdbot-tools.subagents.test.ts?ref=514fcfe77e4c576e582e6d402091be784b6bb771",
+      "patch": "@@ -277,16 +277,50 @@ describe(\"subagents\", () => {\n     });\n   });\n \n-  it(\"sessions_spawn fails when model override is invalid\", async () => {\n+  it(\"sessions_spawn skips invalid model overrides and continues\", async () => {\n     callGatewayMock.mockReset();\n     const calls: Array<{ method?: string; params?: unknown }> = [];\n+    let agentCallCount = 0;\n+    let lastWaitedRunId: string | undefined;\n+    const replyByRunId = new Map<string, string>();\n \n     callGatewayMock.mockImplementation(async (opts: unknown) => {\n       const request = opts as { method?: string; params?: unknown };\n       calls.push(request);\n       if (request.method === \"sessions.patch\") {\n         throw new Error(\"invalid model: bad-model\");\n       }\n+      if (request.method === \"agent\") {\n+        agentCallCount += 1;\n+        const runId = `run-${agentCallCount}`;\n+        const params = request.params as\n+          | { message?: string; sessionKey?: string }\n+          | undefined;\n+        const message = params?.message ?? \"\";\n+        const reply =\n+          message === \"Sub-agent announce step.\" ? \"ANNOUNCE_SKIP\" : \"done\";\n+        replyByRunId.set(runId, reply);\n+        return {\n+          runId,\n+          status: \"accepted\",\n+          acceptedAt: 4000 + agentCallCount,\n+        };\n+      }\n+      if (request.method === \"agent.wait\") {\n+        const params = request.params as { runId?: string } | undefined;\n+        lastWaitedRunId = params?.runId;\n+        return { runId: params?.runId ?? \"run-1\", status: \"ok\" };\n+      }\n+      if (request.method === \"chat.history\") {\n+        const text =\n+          (lastWaitedRunId && replyByRunId.get(lastWaitedRunId)) ?? \"\";\n+        return {\n+          messages: [{ role: \"assistant\", content: [{ type: \"text\", text }] }],\n+        };\n+      }\n+      if (request.method === \"sessions.delete\") {\n+        return { ok: true };\n+      }\n       return {};\n     });\n \n@@ -301,10 +335,13 @@ describe(\"subagents\", () => {\n       timeoutSeconds: 1,\n       model: \"bad-model\",\n     });\n-    expect(result.details).toMatchObject({ status: \"error\" });\n+    expect(result.details).toMatchObject({\n+      status: \"ok\",\n+      modelApplied: false,\n+    });\n     expect(\n-      String((result.details as { error?: string }).error ?? \"\"),\n+      String((result.details as { warning?: string }).warning ?? \"\"),\n     ).toContain(\"invalid model\");\n-    expect(calls.some((call) => call.method === \"agent\")).toBe(false);\n+    expect(calls.some((call) => call.method === \"agent\")).toBe(true);\n   });\n });"
+    },
+    {
+      "sha": "e05d579c0683031132e63e875326dd989454329d",
+      "filename": "src/agents/pi-tool-definition-adapter.test.ts",
+      "status": "added",
+      "additions": 28,
+      "deletions": 0,
+      "changes": 28,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/514fcfe77e4c576e582e6d402091be784b6bb771/src%2Fagents%2Fpi-tool-definition-adapter.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/514fcfe77e4c576e582e6d402091be784b6bb771/src%2Fagents%2Fpi-tool-definition-adapter.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fagents%2Fpi-tool-definition-adapter.test.ts?ref=514fcfe77e4c576e582e6d402091be784b6bb771",
+      "patch": "@@ -0,0 +1,28 @@\n+import { describe, expect, it } from \"vitest\";\n+\n+import type { AgentTool } from \"@mariozechner/pi-agent-core\";\n+\n+import { toToolDefinitions } from \"./pi-tool-definition-adapter.js\";\n+\n+describe(\"pi tool definition adapter\", () => {\n+  it(\"wraps tool errors into a tool result\", async () => {\n+    const tool = {\n+      name: \"boom\",\n+      label: \"Boom\",\n+      description: \"throws\",\n+      parameters: {},\n+      execute: async () => {\n+        throw new Error(\"nope\");\n+      },\n+    } satisfies AgentTool<unknown, unknown>;\n+\n+    const defs = toToolDefinitions([tool]);\n+    const result = await defs[0].execute(\"call1\", {}, undefined, undefined);\n+\n+    expect(result.details).toMatchObject({\n+      status: \"error\",\n+      tool: \"boom\",\n+    });\n+    expect(JSON.stringify(result.details)).toContain(\"nope\");\n+  });\n+});"
+    },
+    {
+      "sha": "6df70bf6b2b353e37751605e2ab59afbd8850d3d",
+      "filename": "src/agents/pi-tool-definition-adapter.ts",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 1,
+      "changes": 21,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/514fcfe77e4c576e582e6d402091be784b6bb771/src%2Fagents%2Fpi-tool-definition-adapter.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/514fcfe77e4c576e582e6d402091be784b6bb771/src%2Fagents%2Fpi-tool-definition-adapter.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fagents%2Fpi-tool-definition-adapter.ts?ref=514fcfe77e4c576e582e6d402091be784b6bb771",
+      "patch": "@@ -4,6 +4,8 @@ import type {\n   AgentToolUpdateCallback,\n } from \"@mariozechner/pi-agent-core\";\n import type { ToolDefinition } from \"@mariozechner/pi-coding-agent\";\n+import { logError } from \"../logger.js\";\n+import { jsonResult } from \"./tools/common.js\";\n \n // biome-ignore lint/suspicious/noExplicitAny: TypeBox schema type from pi-agent-core uses a different module instance.\n type AnyAgentTool = AgentTool<any, unknown>;\n@@ -26,7 +28,24 @@ export function toToolDefinitions(tools: AnyAgentTool[]): ToolDefinition[] {\n       ): Promise<AgentToolResult<unknown>> => {\n         // KNOWN: pi-coding-agent `ToolDefinition.execute` has a different signature/order\n         // than pi-agent-core `AgentTool.execute`. This adapter keeps our existing tools intact.\n-        return tool.execute(toolCallId, params, signal, onUpdate);\n+        try {\n+          return await tool.execute(toolCallId, params, signal, onUpdate);\n+        } catch (err) {\n+          if (signal?.aborted) throw err;\n+          const name =\n+            err && typeof err === \"object\" && \"name\" in err\n+              ? String((err as { name?: unknown }).name)\n+              : \"\";\n+          if (name === \"AbortError\") throw err;\n+          const message =\n+            err instanceof Error ? err.stack ?? err.message : String(err);\n+          logError(`[tools] ${tool.name} failed: ${message}`);\n+          return jsonResult({\n+            status: \"error\",\n+            tool: tool.name,\n+            error: message,\n+          });\n+        }\n       },\n     } satisfies ToolDefinition;\n   });"
+    },
+    {
+      "sha": "650638082eca21b5dfbd117ea48b33a6681cef17",
+      "filename": "src/agents/tools/sessions-spawn-tool.ts",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 5,
+      "changes": 27,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/514fcfe77e4c576e582e6d402091be784b6bb771/src%2Fagents%2Ftools%2Fsessions-spawn-tool.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/514fcfe77e4c576e582e6d402091be784b6bb771/src%2Fagents%2Ftools%2Fsessions-spawn-tool.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fagents%2Ftools%2Fsessions-spawn-tool.ts?ref=514fcfe77e4c576e582e6d402091be784b6bb771",
+      "patch": "@@ -190,6 +190,8 @@ export function createSessionsSpawnTool(opts?: {\n           ? Math.max(0, Math.floor(params.timeoutSeconds))\n           : 0;\n       const timeoutMs = timeoutSeconds * 1000;\n+      let modelWarning: string | undefined;\n+      let modelApplied = false;\n \n       const cfg = loadConfig();\n       const { mainKey, alias } = resolveMainSessionAlias(cfg);\n@@ -238,18 +240,25 @@ export function createSessionsSpawnTool(opts?: {\n             params: { key: childSessionKey, model },\n             timeoutMs: 10_000,\n           });\n+          modelApplied = true;\n         } catch (err) {\n           const messageText =\n             err instanceof Error\n               ? err.message\n               : typeof err === \"string\"\n                 ? err\n                 : \"error\";\n-          return jsonResult({\n-            status: \"error\",\n-            error: messageText,\n-            childSessionKey,\n-          });\n+          const recoverable =\n+            messageText.includes(\"invalid model\") ||\n+            messageText.includes(\"model not allowed\");\n+          if (!recoverable) {\n+            return jsonResult({\n+              status: \"error\",\n+              error: messageText,\n+              childSessionKey,\n+            });\n+          }\n+          modelWarning = messageText;\n         }\n       }\n       const childSystemPrompt = buildSubagentSystemPrompt({\n@@ -307,6 +316,8 @@ export function createSessionsSpawnTool(opts?: {\n           status: \"accepted\",\n           childSessionKey,\n           runId: childRunId,\n+          modelApplied: model ? modelApplied : undefined,\n+          warning: modelWarning,\n         });\n       }\n \n@@ -354,6 +365,8 @@ export function createSessionsSpawnTool(opts?: {\n           error: waitError,\n           childSessionKey,\n           runId: childRunId,\n+          modelApplied: model ? modelApplied : undefined,\n+          warning: modelWarning,\n         });\n       }\n       if (waitStatus === \"error\") {\n@@ -372,6 +385,8 @@ export function createSessionsSpawnTool(opts?: {\n           error: waitError ?? \"agent error\",\n           childSessionKey,\n           runId: childRunId,\n+          modelApplied: model ? modelApplied : undefined,\n+          warning: modelWarning,\n         });\n       }\n \n@@ -395,6 +410,8 @@ export function createSessionsSpawnTool(opts?: {\n         childSessionKey,\n         runId: childRunId,\n         reply: replyText,\n+        modelApplied: model ? modelApplied : undefined,\n+        warning: modelWarning,\n       });\n     },\n   };"
+    }
+  ]
+}

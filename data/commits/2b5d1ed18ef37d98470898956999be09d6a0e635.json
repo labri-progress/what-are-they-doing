@@ -1,0 +1,41 @@
+{
+  "message": "ipc: add rescan request plumbing\n\n- add RescanRequest/RescanResponse types to ipc crate for initiating full volume rescan via named pipes\\n- extend Windows named pipe client with rescan() helper alongside existing reload/status calls\\n- service IPC dispatcher now accepts RescanRequest, triggers scan_volumes, enqueues content jobs, and reports per-request result",
+  "files": [
+    {
+      "sha": "cc0705411dd5d10bd8c26edf5f9ca99b8fe1b730",
+      "filename": "ultrasearch/crates/ipc/src/client/named_pipe_client.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 2,
+      "changes": 8,
+      "blob_url": "https://github.com/Dicklesworthstone/ultrasearch/blob/2b5d1ed18ef37d98470898956999be09d6a0e635/ultrasearch%2Fcrates%2Fipc%2Fsrc%2Fclient%2Fnamed_pipe_client.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/ultrasearch/raw/2b5d1ed18ef37d98470898956999be09d6a0e635/ultrasearch%2Fcrates%2Fipc%2Fsrc%2Fclient%2Fnamed_pipe_client.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ultrasearch/contents/ultrasearch%2Fcrates%2Fipc%2Fsrc%2Fclient%2Fnamed_pipe_client.rs?ref=2b5d1ed18ef37d98470898956999be09d6a0e635",
+      "patch": "@@ -1,8 +1,8 @@\n #![cfg(target_os = \"windows\")]\n \n use crate::{\n-    ReloadConfigRequest, ReloadConfigResponse, SearchRequest, SearchResponse, StatusRequest,\n-    StatusResponse, framing,\n+    ReloadConfigRequest, ReloadConfigResponse, RescanRequest, RescanResponse, SearchRequest,\n+    SearchResponse, StatusRequest, StatusResponse, framing,\n };\n use anyhow::{Result, bail};\n use serde::{Serialize, de::DeserializeOwned};\n@@ -88,6 +88,10 @@ impl PipeClient {\n         self.request(&req).await\n     }\n \n+    pub async fn rescan(&self, req: RescanRequest) -> Result<RescanResponse> {\n+        self.request(&req).await\n+    }\n+\n     async fn request<Req, Resp>(&self, req: &Req) -> Result<Resp>\n     where\n         Req: Serialize,"
+    },
+    {
+      "sha": "8d4a2bf7b079cdab5211147b3b31bbd8e16404a9",
+      "filename": "ultrasearch/crates/ipc/src/lib.rs",
+      "status": "modified",
+      "additions": 12,
+      "deletions": 0,
+      "changes": 12,
+      "blob_url": "https://github.com/Dicklesworthstone/ultrasearch/blob/2b5d1ed18ef37d98470898956999be09d6a0e635/ultrasearch%2Fcrates%2Fipc%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/ultrasearch/raw/2b5d1ed18ef37d98470898956999be09d6a0e635/ultrasearch%2Fcrates%2Fipc%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ultrasearch/contents/ultrasearch%2Fcrates%2Fipc%2Fsrc%2Flib.rs?ref=2b5d1ed18ef37d98470898956999be09d6a0e635",
+      "patch": "@@ -253,6 +253,18 @@ pub struct ReloadConfigResponse {\n     pub message: Option<String>,\n }\n \n+#[derive(Debug, Clone, Serialize, Deserialize)]\n+pub struct RescanRequest {\n+    pub id: Uuid,\n+}\n+\n+#[derive(Debug, Clone, Serialize, Deserialize)]\n+pub struct RescanResponse {\n+    pub id: Uuid,\n+    pub success: bool,\n+    pub message: Option<String>,\n+}\n+\n #[derive(Debug, Clone, Serialize, Deserialize)]\n pub struct VolumeStatus {\n     pub volume: u16,"
+    },
+    {
+      "sha": "c98db1830391a0dc89ee0d6c9efb19970daf3da5",
+      "filename": "ultrasearch/crates/service/src/ipc.rs",
+      "status": "modified",
+      "additions": 31,
+      "deletions": 2,
+      "changes": 33,
+      "blob_url": "https://github.com/Dicklesworthstone/ultrasearch/blob/2b5d1ed18ef37d98470898956999be09d6a0e635/ultrasearch%2Fcrates%2Fservice%2Fsrc%2Fipc.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/ultrasearch/raw/2b5d1ed18ef37d98470898956999be09d6a0e635/ultrasearch%2Fcrates%2Fservice%2Fsrc%2Fipc.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ultrasearch/contents/ultrasearch%2Fcrates%2Fservice%2Fsrc%2Fipc.rs?ref=2b5d1ed18ef37d98470898956999be09d6a0e635",
+      "patch": "@@ -9,8 +9,8 @@ use crate::status::make_status_response;\n use crate::status_provider::status_snapshot;\n use anyhow::Result;\n use ipc::{\n-    MetricsSnapshot, ReloadConfigRequest, ReloadConfigResponse, SearchRequest, StatusRequest,\n-    framing,\n+    MetricsSnapshot, ReloadConfigRequest, ReloadConfigResponse, RescanRequest, RescanResponse,\n+    SearchRequest, StatusRequest, framing,\n };\n #[cfg(test)]\n use ipc::{SearchResponse, StatusResponse};\n@@ -244,6 +244,35 @@ fn dispatch(payload: &[u8]) -> Vec<u8> {\n         return encoded;\n     }\n \n+    // Handle RescanRequest\n+    if let Some(req) = deserialize_exact::<RescanRequest>(payload) {\n+        let started = Instant::now();\n+        let cfg = core_types::config::get_current_config();\n+        let res = crate::scanner::scan_volumes(&cfg).and_then(|jobs| {\n+            let mut submitted = 0usize;\n+            for job in jobs {\n+                if crate::scheduler_runtime::enqueue_content_job(job) {\n+                    submitted += 1;\n+                }\n+            }\n+            Ok::<usize, anyhow::Error>(submitted)\n+        });\n+\n+        let (success, message) = match res {\n+            Ok(count) => (true, Some(format!(\"Submitted {} jobs\", count))),\n+            Err(e) => (false, Some(e.to_string())),\n+        };\n+\n+        let resp = RescanResponse {\n+            id: req.id,\n+            success,\n+            message,\n+        };\n+        let encoded = bincode::serialize(&resp).unwrap_or_default();\n+        record_ipc_request(started.elapsed());\n+        return encoded;\n+    }\n+\n     // Fallback: dispatch SearchRequest.\n     if let Some(req) = deserialize_exact::<SearchRequest>(payload) {\n         let start = Instant::now();"
+    }
+  ]
+}

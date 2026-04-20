@@ -1,0 +1,41 @@
+{
+  "message": "Optimize query patterns and reduce allocations\n\n- Consolidate indexable_document_count() to single query (4 queries \u2192 1)\n- Optimize median calculation: reuse count from first query instead of\n  subquery scan in OFFSET clause\n- Optimize type_counts(): count with &'static str keys first, convert\n  to String only for final 4-entry result (O(n) allocations \u2192 O(1))\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "a95e266496d773efa06ce177988a27a1cda7de9d",
+      "filename": "src/stats_analytics.rs",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 6,
+      "changes": 19,
+      "blob_url": "https://github.com/Dicklesworthstone/xf/blob/318386f30e3a629acabca040c1fcc327291183ed/src%2Fstats_analytics.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/xf/raw/318386f30e3a629acabca040c1fcc327291183ed/src%2Fstats_analytics.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/xf/contents/src%2Fstats_analytics.rs?ref=318386f30e3a629acabca040c1fcc327291183ed",
+      "patch": "@@ -437,31 +437,38 @@ impl EngagementStats {\n     }\n \n     /// Query total engagement metrics.\n+    ///\n+    /// Computes sum, average, and median engagement in two queries, reusing\n+    /// the count from the first query to avoid a subquery scan in the median.\n     #[allow(clippy::cast_sign_loss, clippy::cast_precision_loss)]\n     fn query_engagement_totals(storage: &Storage) -> Result<(u64, u64, f64, u64)> {\n         let query = r\"\n             SELECT\n                 COALESCE(SUM(favorite_count), 0) as total_likes,\n                 COALESCE(SUM(retweet_count), 0) as total_retweets,\n-                COALESCE(AVG(favorite_count + retweet_count), 0) as avg_engagement\n+                COALESCE(AVG(favorite_count + retweet_count), 0) as avg_engagement,\n+                COUNT(*) as tweet_count\n             FROM tweets\n         \";\n \n         let conn = storage.connection();\n-        let (total_likes, total_retweets, avg_engagement): (i64, i64, f64) =\n-            conn.query_row(query, [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;\n+        let (total_likes, total_retweets, avg_engagement, tweet_count): (i64, i64, f64, i64) = conn\n+            .query_row(query, [], |row| {\n+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))\n+            })?;\n \n-        // Query median (approximate using percentile)\n+        // Query median using pre-computed offset (avoids subquery scan)\n+        let median_offset = tweet_count / 2;\n         let median_query = r\"\n             SELECT favorite_count + retweet_count as engagement\n             FROM tweets\n             WHERE favorite_count IS NOT NULL\n             ORDER BY engagement\n-            LIMIT 1 OFFSET (SELECT COUNT(*) / 2 FROM tweets)\n+            LIMIT 1 OFFSET ?\n         \";\n \n         let median: i64 = conn\n-            .query_row(median_query, [], |row| row.get(0))\n+            .query_row(median_query, [median_offset], |row| row.get(0))\n             .unwrap_or(0);\n \n         Ok(("
+    },
+    {
+      "sha": "4e5f60b34a05107b783b0f50e8f0b1e69dde37b6",
+      "filename": "src/storage.rs",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 19,
+      "changes": 30,
+      "blob_url": "https://github.com/Dicklesworthstone/xf/blob/318386f30e3a629acabca040c1fcc327291183ed/src%2Fstorage.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/xf/raw/318386f30e3a629acabca040c1fcc327291183ed/src%2Fstorage.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/xf/contents/src%2Fstorage.rs?ref=318386f30e3a629acabca040c1fcc327291183ed",
+      "patch": "@@ -801,29 +801,21 @@ impl Storage {\n \n     /// Get the count of documents expected in the Tantivy index.\n     ///\n+    /// Uses a single consolidated query instead of 4 separate round-trips.\n+    ///\n     /// # Errors\n     ///\n-    /// Returns an error if the count queries fail.\n+    /// Returns an error if the count query fails.\n     pub fn indexable_document_count(&self) -> Result<i64> {\n-        let tweets_count: i64 = self\n-            .conn\n-            .query_row(\"SELECT COUNT(*) FROM tweets\", [], |row| row.get(0))?;\n-\n-        let likes_count: i64 = self.conn.query_row(\n-            \"SELECT COUNT(*) FROM likes WHERE full_text IS NOT NULL AND full_text != ''\",\n-            [],\n-            |row| row.get(0),\n-        )?;\n-\n-        let dms_count: i64 =\n-            self.conn\n-                .query_row(\"SELECT COUNT(*) FROM direct_messages\", [], |row| row.get(0))?;\n-\n-        let grok_count: i64 =\n-            self.conn\n-                .query_row(\"SELECT COUNT(*) FROM grok_messages\", [], |row| row.get(0))?;\n+        let query = r\"\n+            SELECT\n+                (SELECT COUNT(*) FROM tweets) +\n+                (SELECT COUNT(*) FROM likes WHERE full_text IS NOT NULL AND full_text != '') +\n+                (SELECT COUNT(*) FROM direct_messages) +\n+                (SELECT COUNT(*) FROM grok_messages)\n+        \";\n \n-        Ok(tweets_count + likes_count + dms_count + grok_count)\n+        Ok(self.conn.query_row(query, [], |row| row.get(0))?)\n     }\n \n     /// Run database health checks for `xf doctor`."
+    },
+    {
+      "sha": "2c62ab9deead48defba8155c145ddae92d36ed3e",
+      "filename": "src/vector.rs",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 4,
+      "changes": 13,
+      "blob_url": "https://github.com/Dicklesworthstone/xf/blob/318386f30e3a629acabca040c1fcc327291183ed/src%2Fvector.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/xf/raw/318386f30e3a629acabca040c1fcc327291183ed/src%2Fvector.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/xf/contents/src%2Fvector.rs?ref=318386f30e3a629acabca040c1fcc327291183ed",
+      "patch": "@@ -825,12 +825,17 @@ impl VectorIndex {\n     /// Get counts of embeddings by document type.\n     #[must_use]\n     pub fn type_counts(&self) -> std::collections::HashMap<String, usize> {\n-        let mut counts = std::collections::HashMap::new();\n+        // Count using static strings first (no allocations during counting)\n+        let mut static_counts: std::collections::HashMap<&'static str, usize> =\n+            std::collections::HashMap::with_capacity(4);\n         for (_, doc_type, _) in &self.vectors {\n-            // doc_type is &'static str, convert to String for API compatibility\n-            *counts.entry((*doc_type).to_string()).or_insert(0) += 1;\n+            *static_counts.entry(*doc_type).or_insert(0) += 1;\n         }\n-        counts\n+        // Convert to String only for the final result (at most 4 entries)\n+        static_counts\n+            .into_iter()\n+            .map(|(k, v)| (k.to_string(), v))\n+            .collect()\n     }\n \n     /// Get the embedding dimension."
+    }
+  ]
+}

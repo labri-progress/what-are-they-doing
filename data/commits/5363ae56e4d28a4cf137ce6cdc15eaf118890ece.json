@@ -1,0 +1,29 @@
+{
+  "message": "perf(extensions-js): add call_global_void() and refactor pijs_workload\nto eliminate per-call JS parsing overhead\n\nextensions_js.rs \u2014 new call_global_void() method:\n- Add `pub async fn call_global_void(&self, name: &str) -> Result<()>`\n  to PiJsRuntime that invokes a named global JS function with no\n  arguments and no return value\n- Uses rquickjs globals().get(name) \u2192 Function::call::<(), ()>(())\n  instead of eval(), avoiding the QuickJS parser/compile phase on\n  every invocation \u2014 significant for hot-path extension callbacks\n- Respects interrupt_budget.reset() and drain_jobs() for async safety\n- Properly maps rquickjs errors through the existing anyhow chain\n\npijs_workload.rs \u2014 benchmark refactoring:\n- Replace eval(BENCH_TOOL_CALL) loop with call_global_void(BENCH_BEGIN_FN)\n  to exercise the new fast-path in benchmarks\n- Consolidate BENCH_TOOL_SETUP + BENCH_TOOL_CALL into single\n  BENCH_TOOL_SETUP constant that registers the named global function\n  once during setup, then the benchmark loop calls it by name\n- More accurately reflects real extension dispatch patterns where\n  functions are registered once and called repeatedly\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "8e357fa88e4524e039b28e47675534b59dc14e0e",
+      "filename": "src/bin/pijs_workload.rs",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 13,
+      "changes": 28,
+      "blob_url": "https://github.com/Dicklesworthstone/pi_agent_rust/blob/5363ae56e4d28a4cf137ce6cdc15eaf118890ece/src%2Fbin%2Fpijs_workload.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/pi_agent_rust/raw/5363ae56e4d28a4cf137ce6cdc15eaf118890ece/src%2Fbin%2Fpijs_workload.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/pi_agent_rust/contents/src%2Fbin%2Fpijs_workload.rs?ref=5363ae56e4d28a4cf137ce6cdc15eaf118890ece",
+      "patch": "@@ -9,6 +9,9 @@ use pi::scheduler::HostcallOutcome;\n use serde_json::json;\n use std::time::Instant;\n \n+const BENCH_BEGIN_FN: &str = \"__bench_begin_roundtrip\";\n+const BENCH_ASSERT_FN: &str = \"__bench_assert_roundtrip\";\n+\n const BENCH_TOOL_SETUP: &str = r#\"\n __pi_begin_extension(\"ext.bench\", { name: \"Bench\" });\n pi.registerTool({\n@@ -19,18 +22,17 @@ pi.registerTool({\n     return { ok: true, value: input.value };\n   },\n });\n-__pi_end_extension();\n-\"#;\n-\n-const BENCH_TOOL_CALL: &str = r#\"\n globalThis.__bench_done = false;\n-pi.tool(\"bench_tool\", { value: 1 }).then(() => { globalThis.__bench_done = true; });\n-\"#;\n-\n-const BENCH_TOOL_ASSERT: &str = r#\"\n-if (!globalThis.__bench_done) {\n-  throw new Error(\"bench tool call did not resolve\");\n-}\n+globalThis.__bench_begin_roundtrip = () => {\n+  globalThis.__bench_done = false;\n+  return pi.tool(\"bench_tool\", { value: 1 }).then(() => { globalThis.__bench_done = true; });\n+};\n+globalThis.__bench_assert_roundtrip = () => {\n+  if (!globalThis.__bench_done) {\n+    throw new Error(\"bench tool call did not resolve\");\n+  }\n+};\n+__pi_end_extension();\n \"#;\n \n #[derive(Parser, Debug)]\n@@ -94,7 +96,7 @@ fn run() -> Result<()> {\n \n fn run_tool_roundtrip(runtime: &PiJsRuntime) -> Result<()> {\n     block_on(async {\n-        runtime.eval(BENCH_TOOL_CALL).await?;\n+        runtime.call_global_void(BENCH_BEGIN_FN).await?;\n         let mut requests = runtime.drain_hostcall_requests();\n         let request = requests\n             .pop_front()\n@@ -110,7 +112,7 @@ fn run_tool_roundtrip(runtime: &PiJsRuntime) -> Result<()> {\n             HostcallOutcome::Success(json!({\"ok\": true})),\n         );\n         runtime.tick().await?;\n-        runtime.eval(BENCH_TOOL_ASSERT).await?;\n+        runtime.call_global_void(BENCH_ASSERT_FN).await?;\n         Ok(())\n     })\n }"
+    },
+    {
+      "sha": "a4d8a48ad897afebeb39004fa43c57324ffc9e3d",
+      "filename": "src/extensions_js.rs",
+      "status": "modified",
+      "additions": 23,
+      "deletions": 0,
+      "changes": 23,
+      "blob_url": "https://github.com/Dicklesworthstone/pi_agent_rust/blob/5363ae56e4d28a4cf137ce6cdc15eaf118890ece/src%2Fextensions_js.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/pi_agent_rust/raw/5363ae56e4d28a4cf137ce6cdc15eaf118890ece/src%2Fextensions_js.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/pi_agent_rust/contents/src%2Fextensions_js.rs?ref=5363ae56e4d28a4cf137ce6cdc15eaf118890ece",
+      "patch": "@@ -11293,6 +11293,29 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {\n         Ok(())\n     }\n \n+    /// Invoke a zero-argument global JS function and drain immediate microtasks.\n+    ///\n+    /// This is useful for hot loops that need to trigger pre-installed JS helpers\n+    /// without paying per-call parser/compile overhead from `eval()`.\n+    pub async fn call_global_void(&self, name: &str) -> Result<()> {\n+        self.interrupt_budget.reset();\n+        match self\n+            .context\n+            .with(|ctx| {\n+                let global = ctx.globals();\n+                let function: Function<'_> = global.get(name)?;\n+                function.call::<(), ()>(())?;\n+                Ok::<(), rquickjs::Error>(())\n+            })\n+            .await\n+        {\n+            Ok(()) => {}\n+            Err(err) => return Err(self.map_quickjs_error(&err)),\n+        }\n+        self.drain_jobs().await?;\n+        Ok(())\n+    }\n+\n     // ---- Auto-repair event infrastructure (bd-k5q5.8.1) --------------------\n \n     /// The configured repair mode for this runtime."
+    }
+  ]
+}

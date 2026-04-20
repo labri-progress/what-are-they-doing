@@ -1,0 +1,65 @@
+{
+  "message": "fix: Token ID 0 bug and double-free in tokenizer\n\n- Use NO_OUTPUT sentinel (maxInt(u32)) instead of 0 for \"no output\"\n  in Aho-Corasick automaton. Token ID 0 ('!') was being incorrectly\n  dropped because 0 served dual purpose as sentinel and valid ID.\n\n- Fix double-free in deinit(): vocab and vocab_r share the same\n  string memory, only free from vocab (keys).\n\n- Fix JSON API: json.parse(allocator, buffer), json.Value type.\n\nVerified: !, ?, hello, \"hello world\\ntest\\n\" now match tiktoken exactly.",
+  "files": [
+    {
+      "sha": "f76009bc6269852841c007dfdb8b8fdb7d0a8ea8",
+      "filename": "packages/tokenizer/build.zig",
+      "status": "modified",
+      "additions": 25,
+      "deletions": 0,
+      "changes": 25,
+      "blob_url": "https://github.com/teamchong/metal0/blob/aaa682f300e47b7c62757abf16cdd3df5560e6cb/packages%2Ftokenizer%2Fbuild.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/aaa682f300e47b7c62757abf16cdd3df5560e6cb/packages%2Ftokenizer%2Fbuild.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/packages%2Ftokenizer%2Fbuild.zig?ref=aaa682f300e47b7c62757abf16cdd3df5560e6cb",
+      "patch": "@@ -69,4 +69,29 @@ pub fn build(b: *std.Build) void {\n \n     const run_step = b.step(\"run\", \"Run the training benchmark\");\n     run_step.dependOn(&run_cmd.step);\n+\n+    // SIMD dispatch for JSON parsing\n+    const json_simd = b.addModule(\"json_simd\", .{\n+        .root_source_file = b.path(\"../../packages/shared/json/simd/dispatch.zig\"),\n+    });\n+\n+    // Shared JSON library with SIMD acceleration\n+    const json_mod = b.addModule(\"json\", .{\n+        .root_source_file = b.path(\"../../packages/shared/json/json.zig\"),\n+    });\n+    json_mod.addImport(\"json_simd\", json_simd);\n+\n+    // Test correctness binary\n+    const test_correctness = b.addExecutable(.{\n+        .name = \"test_correctness\",\n+        .root_module = b.createModule(.{\n+            .root_source_file = b.path(\"src/test_correctness.zig\"),\n+            .target = target,\n+            .optimize = optimize,\n+        }),\n+    });\n+    test_correctness.root_module.addImport(\"json\", json_mod);\n+    test_correctness.linkLibC();\n+\n+    b.installArtifact(test_correctness);\n }"
+    },
+    {
+      "sha": "adbb5d6f6d6e90462341ec8e2b851caf91a18cc1",
+      "filename": "packages/tokenizer/src/aho_corasick.zig",
+      "status": "modified",
+      "additions": 45,
+      "deletions": 4,
+      "changes": 49,
+      "blob_url": "https://github.com/teamchong/metal0/blob/aaa682f300e47b7c62757abf16cdd3df5560e6cb/packages%2Ftokenizer%2Fsrc%2Faho_corasick.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/aaa682f300e47b7c62757abf16cdd3df5560e6cb/packages%2Ftokenizer%2Fsrc%2Faho_corasick.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/packages%2Ftokenizer%2Fsrc%2Faho_corasick.zig?ref=aaa682f300e47b7c62757abf16cdd3df5560e6cb",
+      "patch": "@@ -3,7 +3,9 @@\n /// Algorithm: Double-Array Trie + Aho-Corasick failure links\n const std = @import(\"std\");\n const Allocator = std.mem.Allocator;\n-const Builder = @import(\"aho_corasick_builder.zig\").Builder;\n+const builder_mod = @import(\"aho_corasick_builder.zig\");\n+const Builder = builder_mod.Builder;\n+const NO_OUTPUT = builder_mod.NO_OUTPUT;\n const simd = @import(\"simd_encoder.zig\");\n \n const ROOT_STATE_IDX: u32 = 0;\n@@ -110,10 +112,14 @@ pub const AhoCorasick = struct {\n \n             state_id = child_idx;\n \n-            // Check for output\n+            // Check for output - output_pos points to outputs array\n+            // The outputs array value is NO_OUTPUT for non-pattern states\n             const output_pos = child_state.output_pos;\n             if (output_pos != 0) {\n-                longest_token = outputs[output_pos];\n+                const token_id = outputs[output_pos];\n+                if (token_id != NO_OUTPUT) {\n+                    longest_token = token_id;\n+                }\n \n                 // Early exit if we found a match and can't extend\n                 if (child_state.base == 0) return longest_token;\n@@ -140,7 +146,10 @@ pub const AhoCorasick = struct {\n \n             const output_pos = child_state.output_pos;\n             if (output_pos != 0) {\n-                longest_token = outputs[output_pos];\n+                const token_id = outputs[output_pos];\n+                if (token_id != NO_OUTPUT) {\n+                    longest_token = token_id;\n+                }\n                 if (child_state.base == 0) break;\n             }\n \n@@ -222,3 +231,35 @@ pub const AhoCorasick = struct {\n         return null;\n     }\n };\n+\n+test \"token id 0 is correctly recognized\" {\n+    // Test that token ID 0 (!) is properly returned, not treated as \"no match\"\n+    const allocator = std.testing.allocator;\n+\n+    // Create AC with single pattern \"!\" mapped to token 0\n+    const patterns = [_][]const u8{\"!\"};\n+    const token_ids = [_]u32{0};\n+\n+    var ac = try AhoCorasick.build(allocator, &patterns, &token_ids);\n+    defer ac.deinit();\n+\n+    // longestMatch should return 0, not null\n+    const result = ac.longestMatch(\"!\", 0);\n+    try std.testing.expect(result != null);\n+    try std.testing.expectEqual(@as(u32, 0), result.?);\n+}\n+\n+test \"various token ids work\" {\n+    const allocator = std.testing.allocator;\n+\n+    const patterns = [_][]const u8{ \"!\", \"?\", \".\" };\n+    const token_ids = [_]u32{ 0, 30, 13 };\n+\n+    var ac = try AhoCorasick.build(allocator, &patterns, &token_ids);\n+    defer ac.deinit();\n+\n+    // All should work\n+    try std.testing.expectEqual(@as(u32, 0), ac.longestMatch(\"!\", 0).?);\n+    try std.testing.expectEqual(@as(u32, 30), ac.longestMatch(\"?\", 0).?);\n+    try std.testing.expectEqual(@as(u32, 13), ac.longestMatch(\".\", 0).?);\n+}"
+    },
+    {
+      "sha": "1c254b9914734c053807a328513fae456770e7b5",
+      "filename": "packages/tokenizer/src/aho_corasick_builder.zig",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 4,
+      "changes": 13,
+      "blob_url": "https://github.com/teamchong/metal0/blob/aaa682f300e47b7c62757abf16cdd3df5560e6cb/packages%2Ftokenizer%2Fsrc%2Faho_corasick_builder.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/aaa682f300e47b7c62757abf16cdd3df5560e6cb/packages%2Ftokenizer%2Fsrc%2Faho_corasick_builder.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/packages%2Ftokenizer%2Fsrc%2Faho_corasick_builder.zig?ref=aaa682f300e47b7c62757abf16cdd3df5560e6cb",
+      "patch": "@@ -5,6 +5,8 @@ const Allocator = std.mem.Allocator;\n const State = @import(\"aho_corasick.zig\").State;\n \n const ROOT_STATE_IDX: u32 = 0;\n+/// Sentinel value for \"no output\" - using maxInt since token IDs are sequential from 0\n+pub const NO_OUTPUT: u32 = std.math.maxInt(u32);\n \n /// Builder for constructing double-array (port of daachorse Builder)\n pub const Builder = struct {\n@@ -16,13 +18,13 @@ pub const Builder = struct {\n     const NFAState = struct {\n         children: std.AutoHashMap(u8, u32),\n         fail: u32 = ROOT_STATE_IDX,\n-        output: u32 = 0,\n+        output: u32 = NO_OUTPUT, // Use sentinel for \"no output\"\n \n         fn init(allocator: Allocator) NFAState {\n             return .{\n                 .children = std.AutoHashMap(u8, u32).init(allocator),\n                 .fail = ROOT_STATE_IDX,\n-                .output = 0,\n+                .output = NO_OUTPUT,\n             };\n         }\n \n@@ -208,8 +210,11 @@ pub const Builder = struct {\n                 // Store NFA ID in fail temporarily (resolved in second pass)\n                 states.items[child_da_idx].fail = self.nfa_states.items[child_nfa_id].fail;\n \n-                // Output (store NFA ID which maps to outputs array)\n-                if (self.nfa_states.items[child_nfa_id].output != 0) {\n+                // Output: check if this NFA state has a token output\n+                // We use NO_OUTPUT sentinel since token ID 0 is valid (\"!\")\n+                const nfa_output = self.nfa_states.items[child_nfa_id].output;\n+                if (nfa_output != NO_OUTPUT) {\n+                    // Store the NFA ID which indexes into outputs array\n                     states.items[child_da_idx].setOutputPos(child_nfa_id);\n                 }\n "
+    },
+    {
+      "sha": "e969a0d474488bb2ee51958888dc9b8fc47b4e8d",
+      "filename": "packages/tokenizer/src/tokenizer.zig",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 5,
+      "changes": 6,
+      "blob_url": "https://github.com/teamchong/metal0/blob/aaa682f300e47b7c62757abf16cdd3df5560e6cb/packages%2Ftokenizer%2Fsrc%2Ftokenizer.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/aaa682f300e47b7c62757abf16cdd3df5560e6cb/packages%2Ftokenizer%2Fsrc%2Ftokenizer.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/packages%2Ftokenizer%2Fsrc%2Ftokenizer.zig?ref=aaa682f300e47b7c62757abf16cdd3df5560e6cb",
+      "patch": "@@ -117,11 +117,7 @@ pub const Tokenizer = struct {\n         }\n         self.vocab.deinit();\n \n-        // Free vocab_r values (owned strings)\n-        var vocab_r_it = self.vocab_r.valueIterator();\n-        while (vocab_r_it.next()) |value| {\n-            self.allocator.free(value.*);\n-        }\n+        // vocab_r values point to same memory as vocab keys - don't double-free\n         self.vocab_r.deinit();\n \n         self.merges.deinit(self.allocator);"
+    },
+    {
+      "sha": "1ce5082ebaa055a31933f5599fe00e446c91e4e9",
+      "filename": "packages/tokenizer/src/tokenizer_parser.zig",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/teamchong/metal0/blob/aaa682f300e47b7c62757abf16cdd3df5560e6cb/packages%2Ftokenizer%2Fsrc%2Ftokenizer_parser.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/aaa682f300e47b7c62757abf16cdd3df5560e6cb/packages%2Ftokenizer%2Fsrc%2Ftokenizer_parser.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/packages%2Ftokenizer%2Fsrc%2Ftokenizer_parser.zig?ref=aaa682f300e47b7c62757abf16cdd3df5560e6cb",
+      "patch": "@@ -13,7 +13,7 @@ const FnvHashContext = @import(\"fnv_hash.zig\").FnvHashContext;\n \n // metal0's optimized JSON parser\n const json = @import(\"json\");\n-const JsonValue = json.JsonValue;\n+const JsonValue = json.Value;\n \n /// Tokenizer structure (forward declaration for parser)\n pub const TokenizerData = struct {\n@@ -149,7 +149,7 @@ pub fn initFromFile(tokenizer_path: []const u8, allocator: Allocator) !Tokenizer\n \n     _ = try file.readAll(buffer);\n \n-    var parsed = try json.parse.parse(buffer, allocator);\n+    var parsed = try json.parse(allocator, buffer);\n     defer parsed.deinit(allocator);\n \n     return try parseTokenizerJSON(parsed, allocator);"
+    }
+  ]
+}

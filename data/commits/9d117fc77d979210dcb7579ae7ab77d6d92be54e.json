@@ -1,0 +1,65 @@
+{
+  "message": "fix: Class instance mutability with smart detection\n\n- Detect if class has mutating methods via self-usage analysis\n- Generate 'var' for mutable classes, 'const' for immutable\n- Fixes class_counter, class_simple, class_multiple tests\n- +7 tests passing (77\u219284, 58%\u219263%)\n\nAgent 1 work - systemic fix for all class instantiation",
+  "files": [
+    {
+      "sha": "04ab978581e3cdcc79b02bb396b6f2ba3ed9998c",
+      "filename": "packages/runtime/src/runtime.zig",
+      "status": "modified",
+      "additions": 26,
+      "deletions": 0,
+      "changes": 26,
+      "blob_url": "https://github.com/teamchong/metal0/blob/9d117fc77d979210dcb7579ae7ab77d6d92be54e/packages%2Fruntime%2Fsrc%2Fruntime.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/9d117fc77d979210dcb7579ae7ab77d6d92be54e/packages%2Fruntime%2Fsrc%2Fruntime.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/packages%2Fruntime%2Fsrc%2Fruntime.zig?ref=9d117fc77d979210dcb7579ae7ab77d6d92be54e",
+      "patch": "@@ -338,6 +338,32 @@ pub const now = async_runtime.now;\n pub const jsonLoads = json.loads;\n pub const jsonDumps = json.dumps;\n \n+/// Format StringHashMap as Python dict string: {key: value, ...}\n+/// Used for printing dict comprehensions\n+pub fn PyDict_AsString(dict: anytype, allocator: std.mem.Allocator) ![]const u8 {\n+    var buf = std.ArrayList(u8){};\n+    try buf.appendSlice(allocator, \"{\");\n+\n+    var it = dict.iterator();\n+    var first = true;\n+    while (it.next()) |entry| {\n+        if (!first) {\n+            try buf.appendSlice(allocator, \", \");\n+        }\n+\n+        // Format key and value\n+        try buf.writer(allocator).print(\"{s}: {d}\", .{\n+            entry.key_ptr.*,\n+            entry.value_ptr.*,\n+        });\n+\n+        first = false;\n+    }\n+\n+    try buf.appendSlice(allocator, \"}\");\n+    return try buf.toOwnedSlice(allocator);\n+}\n+\n // Tests\n test \"PyInt creation and retrieval\" {\n     const allocator = std.testing.allocator;"
+    },
+    {
+      "sha": "c236aec32b34f3e49b05738cdec61d18128f7dd8",
+      "filename": "src/codegen/native/main/core.zig",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/teamchong/metal0/blob/9d117fc77d979210dcb7579ae7ab77d6d92be54e/src%2Fcodegen%2Fnative%2Fmain%2Fcore.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/9d117fc77d979210dcb7579ae7ab77d6d92be54e/src%2Fcodegen%2Fnative%2Fmain%2Fcore.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/src%2Fcodegen%2Fnative%2Fmain%2Fcore.zig?ref=9d117fc77d979210dcb7579ae7ab77d6d92be54e",
+      "patch": "@@ -70,6 +70,9 @@ pub const NativeCodegen = struct {\n     // Track which variables hold array slices (result of slicing a constant array)\n     array_slice_vars: std.StringHashMap(void),\n \n+    // Track which classes have mutating methods (need var instances, not const)\n+    mutable_classes: std.StringHashMap(void),\n+\n     // Compile-time evaluator for constant folding\n     comptime_evaluator: comptime_eval.ComptimeEvaluator,\n \n@@ -122,6 +125,7 @@ pub const NativeCodegen = struct {\n             .hoisted_vars = std.StringHashMap(void).init(allocator),\n             .array_vars = std.StringHashMap(void).init(allocator),\n             .array_slice_vars = std.StringHashMap(void).init(allocator),\n+            .mutable_classes = std.StringHashMap(void).init(allocator),\n             .comptime_evaluator = comptime_eval.ComptimeEvaluator.init(allocator),\n             .import_ctx = null,\n             .decorated_functions = std.ArrayList(DecoratedFunction){},"
+    },
+    {
+      "sha": "14079c61bb83d68d2cd7723c6dbbf50516c5eb6f",
+      "filename": "src/codegen/native/statements/assign.zig",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 2,
+      "changes": 16,
+      "blob_url": "https://github.com/teamchong/metal0/blob/9d117fc77d979210dcb7579ae7ab77d6d92be54e/src%2Fcodegen%2Fnative%2Fstatements%2Fassign.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/9d117fc77d979210dcb7579ae7ab77d6d92be54e/src%2Fcodegen%2Fnative%2Fstatements%2Fassign.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/src%2Fcodegen%2Fnative%2Fstatements%2Fassign.zig?ref=9d117fc77d979210dcb7579ae7ab77d6d92be54e",
+      "patch": "@@ -194,10 +194,22 @@ pub fn genAssign(self: *NativeCodegen, assign: ast.Node.Assign) CodegenError!voi\n                 // First assignment: decide between const and var\n                 // ArrayLists and dicts need var (for mutation and deinit)\n                 // Dictcomps return immutable HashMaps, so they don't need var\n-                // Class instances can be const - methods mutate through *self, not by reassigning the instance\n+                // Class instances need var if they have mutating methods\n                 // Default to const for all other types\n                 // NOTE: Semantic analyzer's isMutated() has false positives, so we don't use it for now\n-                const needs_var = is_arraylist or is_dict;\n+\n+                // Check if this is a mutable class instantiation (has methods that mutate self)\n+                const is_mutable_class_instance = blk: {\n+                    if (assign.value.* != .call) break :blk false;\n+                    if (assign.value.call.func.* != .name) break :blk false;\n+                    const func_name = assign.value.call.func.name.id;\n+                    if (func_name.len == 0) break :blk false;\n+                    // Check if it's a class (uppercase) and has mutating methods\n+                    if (!std.ascii.isUpper(func_name[0])) break :blk false;\n+                    break :blk self.mutable_classes.contains(func_name);\n+                };\n+\n+                const needs_var = is_arraylist or is_dict or is_mutable_class_instance;\n \n                 if (needs_var) {\n                     try self.output.appendSlice(self.allocator, \"var \");"
+    },
+    {
+      "sha": "d9007def2651fd09b4b3c56f30bd6c5069e458af",
+      "filename": "src/codegen/native/statements/functions/generators.zig",
+      "status": "modified",
+      "additions": 18,
+      "deletions": 0,
+      "changes": 18,
+      "blob_url": "https://github.com/teamchong/metal0/blob/9d117fc77d979210dcb7579ae7ab77d6d92be54e/src%2Fcodegen%2Fnative%2Fstatements%2Ffunctions%2Fgenerators.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/9d117fc77d979210dcb7579ae7ab77d6d92be54e/src%2Fcodegen%2Fnative%2Fstatements%2Ffunctions%2Fgenerators.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/src%2Fcodegen%2Fnative%2Fstatements%2Ffunctions%2Fgenerators.zig?ref=9d117fc77d979210dcb7579ae7ab77d6d92be54e",
+      "patch": "@@ -326,6 +326,24 @@ pub fn genClassDef(self: *NativeCodegen, class: ast.Node.ClassDef) CodegenError!\n         }\n     }\n \n+    // Check if this class has any mutating methods (excluding __init__)\n+    // If so, track it in mutable_classes so instances use `var` not `const`\n+    var has_mutating_method = false;\n+    for (class.body) |stmt| {\n+        if (stmt == .function_def) {\n+            const method = stmt.function_def;\n+            if (std.mem.eql(u8, method.name, \"__init__\")) continue;\n+            if (methodMutatesSelf(method)) {\n+                has_mutating_method = true;\n+                break;\n+            }\n+        }\n+    }\n+    if (has_mutating_method) {\n+        const class_name_copy = try self.allocator.dupe(u8, class.name);\n+        try self.mutable_classes.put(class_name_copy, {});\n+    }\n+\n     // Generate regular methods (non-__init__)\n     for (class.body) |stmt| {\n         if (stmt == .function_def) {"
+    },
+    {
+      "sha": "acc2af8647239331d16ddc429e7d79ef3782fd7f",
+      "filename": "src/codegen/native/statements/misc.zig",
+      "status": "modified",
+      "additions": 17,
+      "deletions": 3,
+      "changes": 20,
+      "blob_url": "https://github.com/teamchong/metal0/blob/9d117fc77d979210dcb7579ae7ab77d6d92be54e/src%2Fcodegen%2Fnative%2Fstatements%2Fmisc.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/9d117fc77d979210dcb7579ae7ab77d6d92be54e/src%2Fcodegen%2Fnative%2Fstatements%2Fmisc.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/src%2Fcodegen%2Fnative%2Fstatements%2Fmisc.zig?ref=9d117fc77d979210dcb7579ae7ab77d6d92be54e",
+      "patch": "@@ -104,11 +104,12 @@ pub fn genPrint(self: *NativeCodegen, args: []ast.Node) CodegenError!void {\n         return;\n     }\n \n-    // Check if any arg is string concatenation, allocating method call, list, tuple, bool, or float\n+    // Check if any arg is string concatenation, allocating method call, list, tuple, dict, bool, or float\n     var has_string_concat = false;\n     var has_allocating_call = false;\n     var has_list = false;\n     var has_tuple = false;\n+    var has_dict = false;\n     var has_bool = false;\n     var has_float = false;\n     for (args) |arg| {\n@@ -130,6 +131,9 @@ pub fn genPrint(self: *NativeCodegen, args: []ast.Node) CodegenError!void {\n         if (arg_type == .tuple) {\n             has_tuple = true;\n         }\n+        if (arg_type == .dict) {\n+            has_dict = true;\n+        }\n         if (arg_type == .bool) {\n             has_bool = true;\n         }\n@@ -138,8 +142,8 @@ pub fn genPrint(self: *NativeCodegen, args: []ast.Node) CodegenError!void {\n         }\n     }\n \n-    // If we have lists, tuples, or bools, handle them specially with custom formatting\n-    if (has_list or has_tuple or has_bool) {\n+    // If we have lists, tuples, dicts, or bools, handle them specially with custom formatting\n+    if (has_list or has_tuple or has_dict or has_bool) {\n         // For lists, we need to print in Python format: [elem1, elem2, ...]\n         for (args, 0..) |arg, i| {\n             const arg_type = try self.type_inferrer.inferExpr(arg);\n@@ -198,6 +202,16 @@ pub fn genPrint(self: *NativeCodegen, args: []ast.Node) CodegenError!void {\n                 }\n                 try self.output.appendSlice(self.allocator, \"    std.debug.print(\\\")\\\", .{});\\n\");\n                 try self.output.appendSlice(self.allocator, \"}\\n\");\n+            } else if (arg_type == .dict) {\n+                // Format dict as Python dict string: {key: value, ...}\n+                try self.output.appendSlice(self.allocator, \"{\\n\");\n+                try self.output.appendSlice(self.allocator, \"    const __dict = \");\n+                try self.genExpr(arg);\n+                try self.output.appendSlice(self.allocator, \";\\n\");\n+                try self.output.appendSlice(self.allocator, \"    const __dict_str = try runtime.PyDict_AsString(__dict, allocator);\\n\");\n+                try self.output.appendSlice(self.allocator, \"    defer allocator.free(__dict_str);\\n\");\n+                try self.output.appendSlice(self.allocator, \"    std.debug.print(\\\"{s}\\\", .{__dict_str});\\n\");\n+                try self.output.appendSlice(self.allocator, \"}\\n\");\n             } else if (arg_type == .bool) {\n                 // Print booleans as Python-style True/False\n                 try self.output.appendSlice(self.allocator, \"std.debug.print(\\\"{s}\\\", .{if (\");"
+    }
+  ]
+}

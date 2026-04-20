@@ -1,0 +1,89 @@
+{
+  "message": "Add agent connector scaffolding for six supported tools\n\nEstablish connectors module structure with placeholder implementations\nfor all six supported coding agent integrations: Codex CLI, Claude Code,\nGemini CLI, Cline, Amp, and OpenCode.\n\nModule purpose (per PLAN \u00a7 2, \u00a7 3.1, \u00a7 7):\nConnectors are the data ingestion layer, responsible for detecting\nwhether each agent is installed on the system, locating its conversation\nhistory storage (JSONL files, JSON checkpoints, SQLite databases, VS Code\nextension state), parsing agent-specific formats, and normalizing\nheterogeneous data into the unified Conversation/Message schema defined\nin model::types for persistence in SQLite and indexing in Tantivy.\n\nPer-connector responsibilities (planned, per PLAN \u00a7 7):\n\ncodex.rs - OpenAI Codex CLI connector (PLAN \u00a7 7.2):\n- Detection: Check for codex binary in PATH (via which crate) or\n  ~/.codex directory existence\n- History location: $CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl\n  with fallback to $CODEX_HOME (default ~/.codex), optionally scan\n  $CODEX_HOME/history.jsonl if history.persistence enabled in config\n- Format: JSONL with one event per line (user_message, assistant_message,\n  tool_run, approval events), reconstruct conversation from event stream\n- Normalization: external_id = session UUID or file path, workspace =\n  working_directory field from session metadata, started_at/ended_at =\n  first/last event timestamp, role mapping (user_message \u2192 User,\n  assistant_message \u2192 Agent, tool_run \u2192 Tool)\n- Incremental updates: notify watcher on $CODEX_HOME/sessions for new\n  rollout-*.jsonl files, parse and upsert via source_path uniqueness\n\nclaude_code.rs - Anthropic Claude Code connector (PLAN \u00a7 7.3):\n- Detection: ~/.claude directory existence, optional VS Code extension\n  check via globalStorage presence\n- History location: ~/.claude/projects/**/*.jsonl session logs, plus\n  per-repo .claude/.claude.json files for embedded transcripts\n- Format: JSONL with session-id field grouping events into conversations,\n  map user/assistant/tool roles, extract title from first user message\n  or task name metadata\n- Normalization: workspace = project path if embedded in events,\n  external_id = session-id, handle JSONL line errors gracefully (skip\n  malformed lines, log warning)\n- Watch: ~/.claude/projects for new/modified .jsonl files\n\ngemini.rs - Google Gemini CLI connector (PLAN \u00a7 7.4):\n- Detection: gemini or gemini-cli binary in PATH, or ~/.gemini directory\n- History location: ~/.gemini/tmp/<project-hash>/ directories containing\n  checkpoint-*.json and chat-log-*.json files per project\n- Format: JSON checkpoints store conversation state, chat logs store\n  message history (prefer logs, fallback to checkpoints), each project-\n  hash directory = one project cluster\n- Normalization: external_id = project-hash + checkpoint id, title =\n  first user message or model-provided session name, timestamps from\n  message created_at fields\n- Watch: ~/.gemini/tmp for new project directories and JSON file updates\n\ncline.rs - Cline VS Code extension connector (PLAN \u00a7 7.6):\n- Detection: VS Code globalStorage path existence at platform-specific\n  location (~/Library/Application Support/Code/User/globalStorage/\n  saoudrizwan.claude-dev on macOS, ~/.config/Code/User/globalStorage/\n  saoudrizwan.claude-dev on Linux, %APPDATA%\\Code\\User\\globalStorage\\\n  saoudrizwan.claude-dev on Windows)\n- History location: Per-task directories within globalStorage containing\n  task_metadata.json (title, provider, workspace root), ui_messages.json\n  and api_conversation_history.json (transcript), optional taskHistory.json\n  index (may be corrupted per Stack Overflow issues, rebuild from task\n  directories if missing)\n- Format: JSON files per task, reconstruct conversation from ui_messages\n  or api_conversation_history arrays ordered by timestamp\n- Normalization: external_id = task UUID (directory name), workspace =\n  task_metadata.json workspace field, role mapping from provider-specific\n  message types\n- Watch: globalStorage directory for new task directories\n\namp.rs - Sourcegraph Amp connector (PLAN \u00a7 7.5):\n- Detection: amp binary in PATH (npm global install), or ~/.local/share/amp\n  (Linux/macOS) or %APPDATA%\\amp (Windows) existence\n- History location: Limited\u2014Amp stores threads primarily on Sourcegraph\n  servers, only partial cache in VS Code globalStorage (extension-managed)\n  and CLI config directory. Scan both globalStorage and ~/.local/share/amp\n  for any JSON/JSONL logs\n- Format: Underdocumented, exploratory scanning for JSON with thread/\n  message structure, may need to reverse-engineer from cache files\n- Normalization: external_id = thread id if found, metadata_json flag\n  partial=true to indicate incomplete conversation history, UI should\n  display caveat per PLAN \u00a7 2.4\n- Watch: globalStorage and CLI cache directories if detected\n\nopencode.rs - OpenCode CLI connector (PLAN \u00a7 7.7):\n- Detection: opencode binary in PATH (optional), scan CWD upward for\n  .opencode directories (project-local), check ~/.config/opencode for\n  global database if configured\n- History location: .opencode/<config>/<database.sqlite> per project,\n  or global SQLite database path from config\n- Format: SQLite schema with sessions, messages, files tables (introspect\n  schema at runtime via rusqlite PRAGMA table_info), one session row =\n  one Conversation, messages JOIN to session\n- Normalization: external_id = session.id, workspace = .opencode parent\n  directory (project root), map session/message rows to Conversation/\n  Message structs, snippets from files table if present\n- Incremental: track SQLite mtime and last-imported row id/timestamp,\n  query for newer rows on change (no notify watcher, periodic poll)\n\nShared abstractions (PLAN \u00a7 7.1):\nAll connectors will implement common traits (to be defined):\n- DetectionResult: enum (Detected{paths}, NotFound, ConfigOverride)\n- fn detect_installation(env: &Environment) -> DetectionResult\n- fn scan_sessions(ctx: &ScanContext) -> anyhow::Result<Vec<Conversation>>\n- fn watch_paths(ctx: &ScanContext, tx: Sender<IndexUpdate>) -> anyhow::Result<()>\n\nScanContext provides config (enabled/paths), Environment provides PATH\nand home dir. Conversation struct from model::types already defined,\nconnectors populate fields and return vec for batch insert.\n\nIdempotency via source_path:\nEach connector sets Conversation.source_path to original log/DB file\npath. Storage layer uses (agent_id, external_id) UNIQUE constraint to\ndetect duplicate scans\u2014if source_path unchanged, skip re-parsing. This\nenables \"cargo run -- index --incremental\" to only process new/modified\nfiles, critical for large corpora where full rescan would take minutes.\n\nError handling strategy:\nIndividual connector parse failures should not crash indexer\u2014wrap each\nconversation parse in anyhow::Context, log error with source file path,\ncontinue to next file. Accumulate parse error count and display in UI\nstatus bar or final summary. For example, if Gemini checkpoint JSON has\nunexpected schema, log \"Failed to parse checkpoint-abc123.json: missing\n'messages' field\" and skip that file, continue scanning other checkpoints.\n\nThis commit contains only module declarations (mod.rs with pub mod\nstatements) and empty placeholder files (codex.rs, claude_code.rs,\ngemini.rs, cline.rs, amp.rs, opencode.rs with minimal comments) to\nestablish the connectors/ namespace per implementation checklist\n(PLAN \u00a7 14.4: Codex connector first for MVP, then Cline, then Gemini,\nthen remaining three for v1). Actual detection heuristics and parsing\nlogic will be implemented in connector-specific commits after storage\nlayer provides upsert API and indexer orchestrates scan flow.\n\nRelated: PLAN_TO_MAKE_CODING_AGENT_SESSION_SEARCH.md \u00a7 2 (agent history\nresearch), \u00a7 3.1 (connectors component), \u00a7 7 (detailed connector specs),\n\u00a7  10 (auto-detection), \u00a7 14.4-14.6 (implementation order), README.md\n(connectors/ module description).\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "18b2fa4238deaa493a6671f3928a1898b61f3bde",
+      "filename": "src/connectors/amp.rs",
+      "status": "added",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/b4f420d33983f09573b82398d06abd804958dd01/src%2Fconnectors%2Famp.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/b4f420d33983f09573b82398d06abd804958dd01/src%2Fconnectors%2Famp.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/src%2Fconnectors%2Famp.rs?ref=b4f420d33983f09573b82398d06abd804958dd01",
+      "patch": "@@ -0,0 +1 @@\n+//! amp connector placeholder."
+    },
+    {
+      "sha": "dfd8204793d92b1a210dbc371a7147c92b3c2911",
+      "filename": "src/connectors/claude_code.rs",
+      "status": "added",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/b4f420d33983f09573b82398d06abd804958dd01/src%2Fconnectors%2Fclaude_code.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/b4f420d33983f09573b82398d06abd804958dd01/src%2Fconnectors%2Fclaude_code.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/src%2Fconnectors%2Fclaude_code.rs?ref=b4f420d33983f09573b82398d06abd804958dd01",
+      "patch": "@@ -0,0 +1 @@\n+//! claude_code connector placeholder."
+    },
+    {
+      "sha": "71ced5a5891983a09fc52eeb405abde3afbfd4fe",
+      "filename": "src/connectors/cline.rs",
+      "status": "added",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/b4f420d33983f09573b82398d06abd804958dd01/src%2Fconnectors%2Fcline.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/b4f420d33983f09573b82398d06abd804958dd01/src%2Fconnectors%2Fcline.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/src%2Fconnectors%2Fcline.rs?ref=b4f420d33983f09573b82398d06abd804958dd01",
+      "patch": "@@ -0,0 +1 @@\n+//! cline connector placeholder."
+    },
+    {
+      "sha": "79388e910189e236dee4ac5f4a4e8745d1670b3c",
+      "filename": "src/connectors/codex.rs",
+      "status": "added",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/b4f420d33983f09573b82398d06abd804958dd01/src%2Fconnectors%2Fcodex.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/b4f420d33983f09573b82398d06abd804958dd01/src%2Fconnectors%2Fcodex.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/src%2Fconnectors%2Fcodex.rs?ref=b4f420d33983f09573b82398d06abd804958dd01",
+      "patch": "@@ -0,0 +1 @@\n+//! codex connector placeholder."
+    },
+    {
+      "sha": "0033491e6d3e943e3b38f44664ac7a0aa2e3a09d",
+      "filename": "src/connectors/gemini.rs",
+      "status": "added",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/b4f420d33983f09573b82398d06abd804958dd01/src%2Fconnectors%2Fgemini.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/b4f420d33983f09573b82398d06abd804958dd01/src%2Fconnectors%2Fgemini.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/src%2Fconnectors%2Fgemini.rs?ref=b4f420d33983f09573b82398d06abd804958dd01",
+      "patch": "@@ -0,0 +1 @@\n+//! gemini connector placeholder."
+    },
+    {
+      "sha": "886abdfe089cdcccfdf80f5ca30a0b0c798d837d",
+      "filename": "src/connectors/mod.rs",
+      "status": "added",
+      "additions": 7,
+      "deletions": 0,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/b4f420d33983f09573b82398d06abd804958dd01/src%2Fconnectors%2Fmod.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/b4f420d33983f09573b82398d06abd804958dd01/src%2Fconnectors%2Fmod.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/src%2Fconnectors%2Fmod.rs?ref=b4f420d33983f09573b82398d06abd804958dd01",
+      "patch": "@@ -0,0 +1,7 @@\n+//! Connectors for agent histories.\n+pub mod amp;\n+pub mod claude_code;\n+pub mod cline;\n+pub mod codex;\n+pub mod gemini;\n+pub mod opencode;"
+    },
+    {
+      "sha": "0e6039e801c0d2cd77e1109ef499acca70f2d3a1",
+      "filename": "src/connectors/opencode.rs",
+      "status": "added",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/b4f420d33983f09573b82398d06abd804958dd01/src%2Fconnectors%2Fopencode.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/b4f420d33983f09573b82398d06abd804958dd01/src%2Fconnectors%2Fopencode.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/src%2Fconnectors%2Fopencode.rs?ref=b4f420d33983f09573b82398d06abd804958dd01",
+      "patch": "@@ -0,0 +1 @@\n+//! opencode connector placeholder."
+    }
+  ]
+}

@@ -1,0 +1,101 @@
+{
+  "message": "web: Consolidate server functions to reduce RPC round-trips\n\nAdd orchestrating server functions (getJoinPageData, getAdminPageData,\ngetTeamPageData, getHomePageData) that combine multiple data fetches\ninto single RPC calls. Update routes to use parent context for session\nchecks instead of redundant getSession() calls.\n\n\ud83d\udd2e View transcript: https://agentlogs.ai/s/w9s9ug8pacs3ajgj6csy2ucz",
+  "files": [
+    {
+      "sha": "19663729f533851d5ae99f034df58f00da086792",
+      "filename": "AGENTS.md",
+      "status": "modified",
+      "additions": 48,
+      "deletions": 0,
+      "changes": 48,
+      "blob_url": "https://github.com/agentlogs/agentlogs/blob/0fc180809c129378641a5fc8356d142d2d4b7a1e/AGENTS.md",
+      "raw_url": "https://github.com/agentlogs/agentlogs/raw/0fc180809c129378641a5fc8356d142d2d4b7a1e/AGENTS.md",
+      "contents_url": "https://api.github.com/repos/agentlogs/agentlogs/contents/AGENTS.md?ref=0fc180809c129378641a5fc8356d142d2d4b7a1e",
+      "patch": "@@ -41,6 +41,54 @@\n - Run from packages/web: `bunx shadcn@latest add <component-name>`\n - Example: `bunx shadcn@latest add data-table`\n \n+## Server Functions & Loaders\n+\n+- **One server function per loader**: Each route loader should call exactly ONE server function that orchestrates all data fetching.\n+- **Use parent context for session**: Child routes should use `context.session` from `beforeLoad` instead of calling `getSession()` again.\n+- **Why**: Reduces network round-trips (1 RPC instead of N), keeps server-side logic together, and makes data flow easier to reason about.\n+\n+```typescript\n+// \u274c Bad: Multiple server function calls from loader\n+loader: async ({ params }) => {\n+  const [invite, session, team] = await Promise.all([\n+    getInviteInfo({ data: params.code }), // RPC 1\n+    getSession(), // RPC 2\n+    getTeam(), // RPC 3\n+  ]);\n+  return { invite, session, team };\n+};\n+\n+// \u2705 Good: Single server function orchestrates everything\n+loader: ({ params }) => getJoinPageData({ data: params.code });\n+\n+// In server-functions.ts:\n+export const getJoinPageData = createServerFn({ method: \"GET\" })\n+  .validator(z.object({ code: z.string() }))\n+  .handler(async ({ data }) => {\n+    const [invite, session, team] = await Promise.all([\n+      getInviteInfoInternal(data.code),\n+      getSessionInternal(),\n+      getTeamInternal(),\n+    ]);\n+    return { invite, session, team, code: data.code };\n+  });\n+```\n+\n+### Using Parent Context (for session checks)\n+\n+```typescript\n+// \u274c Bad: Fetching session again when parent already has it\n+beforeLoad: async () => {\n+  const session = await getSession(); // Redundant RPC!\n+  if (!session) throw redirect({ to: \"/\" });\n+};\n+\n+// \u2705 Good: Use session from parent route's context\n+beforeLoad: ({ context }) => {\n+  if (!context.session) throw redirect({ to: \"/\" });\n+};\n+```\n+\n ## Releasing the CLI\n \n 1. Bump version in `packages/cli/package.json` and commit: `cli: Release version X.Y.Z`"
+    },
+    {
+      "sha": "7d381284ab4a9c5d9fc10a1d18fa1683fad2cf9b",
+      "filename": "packages/web/src/lib/server-functions.ts",
+      "status": "modified",
+      "additions": 137,
+      "deletions": 0,
+      "changes": 137,
+      "blob_url": "https://github.com/agentlogs/agentlogs/blob/0fc180809c129378641a5fc8356d142d2d4b7a1e/packages%2Fweb%2Fsrc%2Flib%2Fserver-functions.ts",
+      "raw_url": "https://github.com/agentlogs/agentlogs/raw/0fc180809c129378641a5fc8356d142d2d4b7a1e/packages%2Fweb%2Fsrc%2Flib%2Fserver-functions.ts",
+      "contents_url": "https://api.github.com/repos/agentlogs/agentlogs/contents/packages%2Fweb%2Fsrc%2Flib%2Fserver-functions.ts?ref=0fc180809c129378641a5fc8356d142d2d4b7a1e",
+      "patch": "@@ -877,3 +877,140 @@ export const updateVisibility = createServerFn({ method: \"POST\" })\n     logger.info(\"Transcript visibility updated\", { transcriptId, visibility, sharedWithTeamId, userId });\n     return { success: true, visibility, sharedWithTeamId };\n   });\n+\n+// =============================================================================\n+// Orchestrating Server Functions (one per loader)\n+// =============================================================================\n+\n+/**\n+ * Get all data needed for the join page\n+ * Consolidates getInviteInfo, getSession, and getTeam into a single RPC call\n+ */\n+export const getJoinPageData = createServerFn({ method: \"GET\" })\n+  .inputValidator((code: string) => code)\n+  .handler(async ({ data: code }) => {\n+    const db = createDrizzle(env.DB);\n+    const auth = createAuth();\n+    const headers = getRequestHeaders();\n+\n+    // Fetch invite info (public, doesn't need auth)\n+    const invite = await queries.getInviteByCode(db, code);\n+    const inviteData = invite\n+      ? {\n+          code: invite.code,\n+          teamName: invite.team.name,\n+          memberCount: invite.team.members.length,\n+          ownerName: invite.team.owner.name,\n+          expired: new Date(invite.expiresAt) < new Date(),\n+        }\n+      : null;\n+\n+    // Fetch session (may be null for unauthenticated users)\n+    let session: Awaited<ReturnType<typeof auth.api.getSession>> = null;\n+    try {\n+      session = await auth.api.getSession({ headers });\n+    } catch {\n+      // Session fetch failed, user is not authenticated\n+    }\n+\n+    // Fetch current team (only if authenticated)\n+    let currentTeam: Awaited<ReturnType<typeof queries.getUserTeam>> = null;\n+    if (session?.user) {\n+      currentTeam = await queries.getUserTeam(db, session.user.id);\n+    }\n+\n+    return { invite: inviteData, session, currentTeam, code };\n+  });\n+\n+/**\n+ * Get all data needed for the admin page\n+ * Consolidates getAdminStats and getAdminUsers into a single RPC call\n+ */\n+export const getAdminPageData = createServerFn({ method: \"GET\" }).handler(async () => {\n+  await requireAdmin();\n+  const db = createDrizzle(env.DB);\n+\n+  const [stats, users] = await Promise.all([queries.getAdminAggregateStats(db), queries.getAdminUserStats(db)]);\n+\n+  return { stats, users };\n+});\n+\n+/**\n+ * Get all data needed for the team page\n+ * Consolidates getTeam and getSession into a single RPC call\n+ */\n+export const getTeamPageData = createServerFn({ method: \"GET\" }).handler(async () => {\n+  const db = createDrizzle(env.DB);\n+  const auth = createAuth();\n+  const headers = getRequestHeaders();\n+\n+  const session = await auth.api.getSession({ headers });\n+  if (!session?.user) {\n+    throw new Error(\"Unauthorized\");\n+  }\n+\n+  const team = await queries.getUserTeam(db, session.user.id);\n+\n+  return { team, session };\n+});\n+\n+/**\n+ * Get all data needed for the home page\n+ * Consolidates getTranscriptsPaginated, getDailyActivity, and getRepos into a single RPC call\n+ */\n+export const getHomePageData = createServerFn({ method: \"GET\" }).handler(async () => {\n+  const db = createDrizzle(env.DB);\n+  const userId = await getAuthenticatedUserId();\n+\n+  const [paginatedResult, repos, dailyActivityResults] = await Promise.all([\n+    queries.getTranscriptsPaginated(db, userId, { limit: PAGE_SIZE }),\n+    queries.getRepos(db, userId),\n+    queries.getDailyActivityCounts(db, userId),\n+  ]);\n+\n+  // Transform paginated result\n+  const initialData = {\n+    items: paginatedResult.items.map((t) => ({\n+      id: t.id,\n+      repoId: t.repoId,\n+      transcriptId: t.transcriptId,\n+      source: t.source,\n+      preview: t.preview,\n+      summary: t.summary,\n+      createdAt: t.createdAt,\n+      updatedAt: t.updatedAt,\n+      messageCount: t.messageCount,\n+      toolCount: t.toolCount,\n+      userMessageCount: t.userMessageCount,\n+      filesChanged: t.filesChanged,\n+      linesAdded: t.linesAdded,\n+      linesRemoved: t.linesRemoved,\n+      linesModified: t.linesModified,\n+      costUsd: t.costUsd,\n+      userName: t.userName,\n+      userImage: t.userImage,\n+      repoName: t.repoName,\n+      branch: t.branch,\n+      cwd: t.cwd,\n+      visibility: t.visibility,\n+      previewBlobSha256: (t as typeof t & { previewBlobSha256?: string | null }).previewBlobSha256 ?? null,\n+    })),\n+    nextCursor: paginatedResult.nextCursor\n+      ? { createdAt: paginatedResult.nextCursor.createdAt.toISOString(), id: paginatedResult.nextCursor.id }\n+      : null,\n+    hasMore: paginatedResult.hasMore,\n+  };\n+\n+  // Fill in missing days for daily activity\n+  const counts = new Map<string, number>(dailyActivityResults.map((r) => [r.date, r.count]));\n+  const dailyActivity: Array<{ date: string; count: number }> = [];\n+  const today = new Date();\n+  for (let i = 29; i >= 0; i--) {\n+    const date = new Date(today);\n+    date.setDate(date.getDate() - i);\n+    const key = date.toISOString().split(\"T\")[0];\n+    dailyActivity.push({ date: key, count: counts.get(key) ?? 0 });\n+  }\n+\n+  return { initialData, dailyActivity, repos };\n+});"
+    },
+    {
+      "sha": "d32b2ce04daa07499179b585375f383db699cebe",
+      "filename": "packages/web/src/routes/_app.tsx",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 3,
+      "changes": 6,
+      "blob_url": "https://github.com/agentlogs/agentlogs/blob/0fc180809c129378641a5fc8356d142d2d4b7a1e/packages%2Fweb%2Fsrc%2Froutes%2F_app.tsx",
+      "raw_url": "https://github.com/agentlogs/agentlogs/raw/0fc180809c129378641a5fc8356d142d2d4b7a1e/packages%2Fweb%2Fsrc%2Froutes%2F_app.tsx",
+      "contents_url": "https://api.github.com/repos/agentlogs/agentlogs/contents/packages%2Fweb%2Fsrc%2Froutes%2F_app.tsx?ref=0fc180809c129378641a5fc8356d142d2d4b7a1e",
+      "patch": "@@ -13,11 +13,11 @@ import { createFileRoute, Link, Outlet, redirect, useRouter } from \"@tanstack/re\n import { ChevronDownIcon, LogOutIcon, LogsIcon, ShieldIcon, UsersIcon } from \"lucide-react\";\n import { DiscordIcon, Logo } from \"@/components/icons/source-icons\";\n import { authClient } from \"../lib/auth-client\";\n-import { getSession } from \"../lib/server-functions\";\n \n export const Route = createFileRoute(\"/_app\")({\n-  beforeLoad: async ({ location }) => {\n-    const session = await getSession();\n+  beforeLoad: ({ location, context }) => {\n+    // Use session from parent __root layout (already fetched)\n+    const session = context.session;\n \n     // Allow unauthenticated access to public transcript pages and redirects\n     const isPublicTranscriptRoute = location.pathname.startsWith(\"/app/logs/\") || location.pathname.startsWith(\"/s/\");"
+    },
+    {
+      "sha": "0aea1d19f76a886111dec3154e23c609344f7fec",
+      "filename": "packages/web/src/routes/_app/app/admin.tsx",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 14,
+      "changes": 19,
+      "blob_url": "https://github.com/agentlogs/agentlogs/blob/0fc180809c129378641a5fc8356d142d2d4b7a1e/packages%2Fweb%2Fsrc%2Froutes%2F_app%2Fapp%2Fadmin.tsx",
+      "raw_url": "https://github.com/agentlogs/agentlogs/raw/0fc180809c129378641a5fc8356d142d2d4b7a1e/packages%2Fweb%2Fsrc%2Froutes%2F_app%2Fapp%2Fadmin.tsx",
+      "contents_url": "https://api.github.com/repos/agentlogs/agentlogs/contents/packages%2Fweb%2Fsrc%2Froutes%2F_app%2Fapp%2Fadmin.tsx?ref=0fc180809c129378641a5fc8356d142d2d4b7a1e",
+      "patch": "@@ -7,26 +7,17 @@ import { Button } from \"@/components/ui/button\";\n import { Card, CardAction, CardDescription, CardFooter, CardHeader, CardTitle } from \"@/components/ui/card\";\n import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from \"@/components/ui/select\";\n import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from \"@/components/ui/table\";\n-import {\n-  getAdminStats,\n-  getAdminUsers,\n-  getSession,\n-  sendWelcomeEmail,\n-  updateUserRole,\n-} from \"../../../lib/server-functions\";\n+import { getAdminPageData, sendWelcomeEmail, updateUserRole } from \"../../../lib/server-functions\";\n import { userRoles, type UserRole } from \"../../../db/schema\";\n \n export const Route = createFileRoute(\"/_app/app/admin\")({\n-  beforeLoad: async () => {\n-    const session = await getSession();\n-    if (!session || session.user.role !== \"admin\") {\n+  beforeLoad: ({ context }) => {\n+    // Use session from parent _app layout (already fetched)\n+    if (!context.session || context.session.user.role !== \"admin\") {\n       throw redirect({ to: \"/app\" });\n     }\n   },\n-  loader: async () => {\n-    const [stats, users] = await Promise.all([getAdminStats(), getAdminUsers()]);\n-    return { stats, users };\n-  },\n+  loader: () => getAdminPageData(),\n   component: AdminPage,\n });\n "
+    },
+    {
+      "sha": "674b6e6a949ccfc33c6a69ba780e48cfb03b75e7",
+      "filename": "packages/web/src/routes/_app/app/index.tsx",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 14,
+      "changes": 16,
+      "blob_url": "https://github.com/agentlogs/agentlogs/blob/0fc180809c129378641a5fc8356d142d2d4b7a1e/packages%2Fweb%2Fsrc%2Froutes%2F_app%2Fapp%2Findex.tsx",
+      "raw_url": "https://github.com/agentlogs/agentlogs/raw/0fc180809c129378641a5fc8356d142d2d4b7a1e/packages%2Fweb%2Fsrc%2Froutes%2F_app%2Fapp%2Findex.tsx",
+      "contents_url": "https://api.github.com/repos/agentlogs/agentlogs/contents/packages%2Fweb%2Fsrc%2Froutes%2F_app%2Fapp%2Findex.tsx?ref=0fc180809c129378641a5fc8356d142d2d4b7a1e",
+      "patch": "@@ -6,7 +6,7 @@ import { createFileRoute, Link } from \"@tanstack/react-router\";\n import { Globe, Loader2, Lock, MessageSquare, Search, Terminal } from \"lucide-react\";\n import { ClaudeCodeIcon, CodexIcon, GitHubIcon, OpenCodeIcon } from \"../../../components/icons/source-icons\";\n import { useCallback, useEffect, useRef, useState } from \"react\";\n-import { getDailyActivity, getRepos, getTranscriptsPaginated } from \"../../../lib/server-functions\";\n+import { getHomePageData, getTranscriptsPaginated } from \"../../../lib/server-functions\";\n import { useInfiniteScroll } from \"../../../hooks/use-infinite-scroll\";\n import { ClientOnly } from \"../../../components/client-only\";\n \n@@ -85,19 +85,7 @@ function ActivityChart({ data }: { data: DailyCount[] }) {\n }\n \n export const Route = createFileRoute(\"/_app/app/\")({\n-  loader: async () => {\n-    try {\n-      const [initialData, dailyActivity, repos] = await Promise.all([\n-        getTranscriptsPaginated({ data: {} }),\n-        getDailyActivity(),\n-        getRepos(),\n-      ]);\n-      return { initialData, dailyActivity, repos };\n-    } catch (error) {\n-      console.error(\"Failed to load data:\", error);\n-      throw error;\n-    }\n-  },\n+  loader: () => getHomePageData(),\n   staleTime: 0, // Always refetch to ensure visibility changes are reflected\n   component: HomeComponent,\n   errorComponent: ErrorComponent,"
+    },
+    {
+      "sha": "1c7929052d85706c3601546c7b09e8b8b3bd0da7",
+      "filename": "packages/web/src/routes/_app/app/team.tsx",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 7,
+      "changes": 10,
+      "blob_url": "https://github.com/agentlogs/agentlogs/blob/0fc180809c129378641a5fc8356d142d2d4b7a1e/packages%2Fweb%2Fsrc%2Froutes%2F_app%2Fapp%2Fteam.tsx",
+      "raw_url": "https://github.com/agentlogs/agentlogs/raw/0fc180809c129378641a5fc8356d142d2d4b7a1e/packages%2Fweb%2Fsrc%2Froutes%2F_app%2Fapp%2Fteam.tsx",
+      "contents_url": "https://api.github.com/repos/agentlogs/agentlogs/contents/packages%2Fweb%2Fsrc%2Froutes%2F_app%2Fapp%2Fteam.tsx?ref=0fc180809c129378641a5fc8356d142d2d4b7a1e",
+      "patch": "@@ -17,17 +17,13 @@ import {\n   createTeam,\n   deleteTeam,\n   generateInvite,\n-  getSession,\n-  getTeam,\n+  getTeamPageData,\n   leaveTeam,\n   removeMember,\n } from \"../../../lib/server-functions\";\n \n export const Route = createFileRoute(\"/_app/app/team\")({\n-  loader: async () => {\n-    const [team, session] = await Promise.all([getTeam(), getSession()]);\n-    return { team, session };\n-  },\n+  loader: () => getTeamPageData(),\n   component: TeamPage,\n });\n \n@@ -165,7 +161,7 @@ function NoTeamView({ onSuccess }: { onSuccess: () => void }) {\n   );\n }\n \n-type TeamData = NonNullable<Awaited<ReturnType<typeof getTeam>>>;\n+type TeamData = NonNullable<Awaited<ReturnType<typeof getTeamPageData>>[\"team\"]>;\n \n function AddMemberPopover({ teamId, onSuccess }: { teamId: string; onSuccess: () => void }) {\n   const [isOpen, setIsOpen] = useState(false);"
+    },
+    {
+      "sha": "05e9e71693a51d83875f0646209e6d7c04952550",
+      "filename": "packages/web/src/routes/_app/join.$code.tsx",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 9,
+      "changes": 11,
+      "blob_url": "https://github.com/agentlogs/agentlogs/blob/0fc180809c129378641a5fc8356d142d2d4b7a1e/packages%2Fweb%2Fsrc%2Froutes%2F_app%2Fjoin.%24code.tsx",
+      "raw_url": "https://github.com/agentlogs/agentlogs/raw/0fc180809c129378641a5fc8356d142d2d4b7a1e/packages%2Fweb%2Fsrc%2Froutes%2F_app%2Fjoin.%24code.tsx",
+      "contents_url": "https://api.github.com/repos/agentlogs/agentlogs/contents/packages%2Fweb%2Fsrc%2Froutes%2F_app%2Fjoin.%24code.tsx?ref=0fc180809c129378641a5fc8356d142d2d4b7a1e",
+      "patch": "@@ -1,17 +1,10 @@\n import { createFileRoute, Link, useNavigate } from \"@tanstack/react-router\";\n import { Button } from \"@/components/ui/button\";\n import { useState } from \"react\";\n-import { acceptInvite, getInviteInfo, getSession, getTeam } from \"../../lib/server-functions\";\n+import { acceptInvite, getJoinPageData } from \"../../lib/server-functions\";\n \n export const Route = createFileRoute(\"/_app/join/$code\")({\n-  loader: async ({ params }) => {\n-    const [invite, session, currentTeam] = await Promise.all([\n-      getInviteInfo({ data: params.code }),\n-      getSession(),\n-      getTeam(),\n-    ]);\n-    return { invite, session, currentTeam, code: params.code };\n-  },\n+  loader: ({ params }) => getJoinPageData({ data: params.code }),\n   component: JoinPage,\n });\n "
+    },
+    {
+      "sha": "8693faed0767b84720da1eb0bab9204e9f57d461",
+      "filename": "packages/web/src/routes/waitlist.tsx",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 3,
+      "changes": 6,
+      "blob_url": "https://github.com/agentlogs/agentlogs/blob/0fc180809c129378641a5fc8356d142d2d4b7a1e/packages%2Fweb%2Fsrc%2Froutes%2Fwaitlist.tsx",
+      "raw_url": "https://github.com/agentlogs/agentlogs/raw/0fc180809c129378641a5fc8356d142d2d4b7a1e/packages%2Fweb%2Fsrc%2Froutes%2Fwaitlist.tsx",
+      "contents_url": "https://api.github.com/repos/agentlogs/agentlogs/contents/packages%2Fweb%2Fsrc%2Froutes%2Fwaitlist.tsx?ref=0fc180809c129378641a5fc8356d142d2d4b7a1e",
+      "patch": "@@ -1,9 +1,9 @@\n import { createFileRoute, redirect } from \"@tanstack/react-router\";\n-import { getSession } from \"../lib/server-functions\";\n \n export const Route = createFileRoute(\"/waitlist\")({\n-  beforeLoad: async () => {\n-    const session = await getSession();\n+  beforeLoad: ({ context }) => {\n+    // Use session from parent __root layout (already fetched)\n+    const session = context.session;\n     // If user is already approved, redirect to app\n     if (session?.user.role === \"user\" || session?.user.role === \"admin\") {\n       throw redirect({ to: \"/app\" });"
+    }
+  ]
+}

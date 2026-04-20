@@ -1,0 +1,53 @@
+{
+  "message": "Add errdefer cleanup to expression parsers\n\n- parsePostfix: Track ownership, clean up node on error\n- parseAttribute: Take ownership of value, clean up on error\n- parseSubscript: Track val_copied flag, clean up appropriately\n- parseAddSub/parseMulDiv/parsePower: errdefer for left/right nodes\n- parseExprOrAssign: errdefer for initial expression\n\nResults:\n- Simple files: 0 leaks\n- blinker import: 0 leaks\n- Flask import: 6 leaks (one per failed module file)\n\nThe remaining 6 leaks are from Flask submodules that fail parsing\ndue to unsupported Python syntax. Each failed module leaks ~1 node.",
+  "files": [
+    {
+      "sha": "638301d68105f5488479048667c59c3121adb332",
+      "filename": "src/parser/expressions/arithmetic.zig",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 4,
+      "changes": 14,
+      "blob_url": "https://github.com/teamchong/metal0/blob/75c4e660b2c1a262e648faf19b340556565de6b7/src%2Fparser%2Fexpressions%2Farithmetic.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/75c4e660b2c1a262e648faf19b340556565de6b7/src%2Fparser%2Fexpressions%2Farithmetic.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/src%2Fparser%2Fexpressions%2Farithmetic.zig?ref=75c4e660b2c1a262e648faf19b340556565de6b7",
+      "patch": "@@ -140,6 +140,7 @@ pub fn parseShift(self: *Parser) ParseError!ast.Node {\n /// Parse addition and subtraction\n pub fn parseAddSub(self: *Parser) ParseError!ast.Node {\n     var left = try parseMulDiv(self);\n+    errdefer left.deinit(self.allocator);\n \n     while (true) {\n         var op: ?ast.Operator = null;\n@@ -152,7 +153,8 @@ pub fn parseAddSub(self: *Parser) ParseError!ast.Node {\n \n         if (op == null) break;\n \n-        const right = try parseMulDiv(self);\n+        var right = try parseMulDiv(self);\n+        errdefer right.deinit(self.allocator);\n \n         const left_ptr = try self.allocator.create(ast.Node);\n         left_ptr.* = left;\n@@ -175,6 +177,7 @@ pub fn parseAddSub(self: *Parser) ParseError!ast.Node {\n /// Parse multiplication, division, floor division, and modulo\n pub fn parseMulDiv(self: *Parser) ParseError!ast.Node {\n     var left = try parsePower(self);\n+    errdefer left.deinit(self.allocator);\n \n     while (true) {\n         var op: ?ast.Operator = null;\n@@ -191,7 +194,8 @@ pub fn parseMulDiv(self: *Parser) ParseError!ast.Node {\n \n         if (op == null) break;\n \n-        const right = try parsePower(self);\n+        var right = try parsePower(self);\n+        errdefer right.deinit(self.allocator);\n \n         const left_ptr = try self.allocator.create(ast.Node);\n         left_ptr.* = left;\n@@ -213,10 +217,12 @@ pub fn parseMulDiv(self: *Parser) ParseError!ast.Node {\n \n /// Parse power (exponentiation) - right associative\n pub fn parsePower(self: *Parser) ParseError!ast.Node {\n-    const left = try self.parsePostfix();\n+    var left = try self.parsePostfix();\n+    errdefer left.deinit(self.allocator);\n \n     if (self.match(.DoubleStar)) {\n-        const right = try parsePower(self); // Right associative\n+        var right = try parsePower(self); // Right associative\n+        errdefer right.deinit(self.allocator);\n \n         const left_ptr = try self.allocator.create(ast.Node);\n         left_ptr.* = left;"
+    },
+    {
+      "sha": "a9dea3e501018d5982078980d0ecebf641a499d9",
+      "filename": "src/parser/postfix.zig",
+      "status": "modified",
+      "additions": 21,
+      "deletions": 1,
+      "changes": 22,
+      "blob_url": "https://github.com/teamchong/metal0/blob/75c4e660b2c1a262e648faf19b340556565de6b7/src%2Fparser%2Fpostfix.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/75c4e660b2c1a262e648faf19b340556565de6b7/src%2Fparser%2Fpostfix.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/src%2Fparser%2Fpostfix.zig?ref=75c4e660b2c1a262e648faf19b340556565de6b7",
+      "patch": "@@ -14,14 +14,29 @@ pub const parsePrimary = primary.parsePrimary;\n /// Parse postfix expressions: function calls, subscripts, attribute access\n pub fn parsePostfix(self: *Parser) ParseError!ast.Node {\n     var node = try parsePrimary(self);\n+    var owned = true; // Track if we still own node (for cleanup)\n+\n+    errdefer {\n+        if (owned) {\n+            node.deinit(self.allocator);\n+        }\n+    }\n \n     while (true) {\n         if (self.match(.LParen)) {\n+            // parseCall takes ownership - if it fails after copying, it cleans up\n+            // We don't own node anymore once we pass it\n+            owned = false;\n             node = try parseCall(self, node);\n+            owned = true; // We now own the result\n         } else if (self.match(.LBracket)) {\n+            owned = false;\n             node = try subscript.parseSubscript(self, node);\n+            owned = true;\n         } else if (self.match(.Dot)) {\n+            owned = false;\n             node = try parseAttribute(self, node);\n+            owned = true;\n         } else {\n             break;\n         }\n@@ -31,11 +46,16 @@ pub fn parsePostfix(self: *Parser) ParseError!ast.Node {\n }\n \n /// Parse attribute access: value.attr\n+/// Takes ownership of `value` - cleans it up on error\n fn parseAttribute(self: *Parser, value: ast.Node) ParseError!ast.Node {\n+    var val = value;\n+    errdefer val.deinit(self.allocator);\n+\n     const attr_tok = try self.expect(.Ident);\n \n     const node_ptr = try self.allocator.create(ast.Node);\n-    node_ptr.* = value;\n+    node_ptr.* = val;\n+    // On success, ownership transfers to node_ptr in returned node\n \n     return ast.Node{\n         .attribute = .{"
+    },
+    {
+      "sha": "9a17be5ba90bcac3f8714fca82a89dc97279838c",
+      "filename": "src/parser/postfix/subscript.zig",
+      "status": "modified",
+      "additions": 21,
+      "deletions": 2,
+      "changes": 23,
+      "blob_url": "https://github.com/teamchong/metal0/blob/75c4e660b2c1a262e648faf19b340556565de6b7/src%2Fparser%2Fpostfix%2Fsubscript.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/75c4e660b2c1a262e648faf19b340556565de6b7/src%2Fparser%2Fpostfix%2Fsubscript.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/src%2Fparser%2Fpostfix%2Fsubscript.zig?ref=75c4e660b2c1a262e648faf19b340556565de6b7",
+      "patch": "@@ -4,16 +4,35 @@ const ParseError = @import(\"../../parser.zig\").ParseError;\n const Parser = @import(\"../../parser.zig\").Parser;\n \n /// Parse subscript/slice expression after '[' has been consumed\n+/// Takes ownership of `value` - cleans it up on error\n pub fn parseSubscript(self: *Parser, value: ast.Node) ParseError!ast.Node {\n+    var val = value;\n+    var val_copied = false;\n+\n+    errdefer {\n+        if (val_copied) {\n+            // val was copied to node_ptr, don't double-free\n+        } else {\n+            val.deinit(self.allocator);\n+        }\n+    }\n+\n     const node_ptr = try self.allocator.create(ast.Node);\n-    node_ptr.* = value;\n+    node_ptr.* = val;\n+    val_copied = true;\n+\n+    errdefer {\n+        node_ptr.deinit(self.allocator);\n+        self.allocator.destroy(node_ptr);\n+    }\n \n     // Check if it starts with colon (e.g., [:5] or [::2])\n     if (self.check(.Colon)) {\n         return parseSliceFromStart(self, node_ptr);\n     }\n \n-    const lower = try self.parseExpression();\n+    var lower = try self.parseExpression();\n+    errdefer lower.deinit(self.allocator);\n \n     if (self.match(.Colon)) {\n         return parseSliceWithLower(self, node_ptr, lower);"
+    },
+    {
+      "sha": "6e0a4d5a457f4f0974fdf1515b89f6b2faae09d7",
+      "filename": "src/parser/statements/assign.zig",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/teamchong/metal0/blob/75c4e660b2c1a262e648faf19b340556565de6b7/src%2Fparser%2Fstatements%2Fassign.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/75c4e660b2c1a262e648faf19b340556565de6b7/src%2Fparser%2Fstatements%2Fassign.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/src%2Fparser%2Fstatements%2Fassign.zig?ref=75c4e660b2c1a262e648faf19b340556565de6b7",
+      "patch": "@@ -6,7 +6,8 @@ const ParseError = @import(\"../../parser.zig\").ParseError;\n const Parser = @import(\"../../parser.zig\").Parser;\n \n pub fn parseExprOrAssign(self: *Parser) ParseError!ast.Node {\n-    const expr = try self.parseExpression();\n+    var expr = try self.parseExpression();\n+    errdefer expr.deinit(self.allocator);\n \n     // Check for type annotation: x: int = 5\n     if (self.match(.Colon)) {"
+    }
+  ]
+}

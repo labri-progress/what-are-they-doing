@@ -1,0 +1,89 @@
+{
+  "message": "refactor(core): add join!/select!/task::spawn_blocking to runtime_compat, migrate consumers\n\nAdd three new runtime_compat primitives:\n- task::spawn_blocking: returns JoinHandle for abort/select! usage\n- join! macro: re-export of tokio::join for concurrent futures\n- select! macro: re-export of tokio::select for multiplexing\n\nMigrate 10 callsites across 7 files:\n- search_bridge.rs: spawn_blocking + select! (2 production sites)\n- snapshot_engine.rs: spawn_blocking + select! (3 cfg-gated sites)\n- storage.rs: spawn_blocking + join! (2 sites)\n- tui/query.rs: join! (1 production site)\n- perf_integration_tests.rs: join! (1 test site)\n- socket_throughput.rs: join! + spawn (4 bench sites)\n\n12 new tests for the added primitives (167 total in runtime_compat).\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "ecfa4ee81b9a39a62910f2b66b97888567a48cbf",
+      "filename": "crates/frankenterm-core/benches/socket_throughput.rs",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 4,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/d082a84feb18b289b8acce518ac40abc9a44a4ab/crates%2Ffrankenterm-core%2Fbenches%2Fsocket_throughput.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/d082a84feb18b289b8acce518ac40abc9a44a4ab/crates%2Ffrankenterm-core%2Fbenches%2Fsocket_throughput.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Ffrankenterm-core%2Fbenches%2Fsocket_throughput.rs?ref=d082a84feb18b289b8acce518ac40abc9a44a4ab",
+      "patch": "@@ -52,7 +52,7 @@ async fn roundtrip_once(payload_size: usize) -> io::Result<usize> {\n     let payload = vec![0x5Au8; payload_size];\n \n     let server_payload_size = payload_size;\n-    let server = tokio::spawn(async move {\n+    let server = frankenterm_core::runtime_compat::task::spawn(async move {\n         let (mut stream, _addr) = listener.accept().await?;\n         let mut inbound = vec![0_u8; server_payload_size];\n         stream.read_exact(&mut inbound).await?;\n@@ -74,7 +74,7 @@ async fn connect_accept_once() -> io::Result<()> {\n     let socket_path = socket_path(\"connect\");\n     let listener = unix::bind(&socket_path).await?;\n \n-    let server = tokio::spawn(async move {\n+    let server = frankenterm_core::runtime_compat::task::spawn(async move {\n         let (_stream, _addr) = listener.accept().await?;\n         Ok::<(), io::Error>(())\n     });\n@@ -91,12 +91,13 @@ async fn stream_throughput_once(\n ) -> io::Result<usize> {\n     let socket_path = socket_path(\"stream\");\n     let listener = unix::bind(&socket_path).await?;\n-    let (writer_res, accept_res) = tokio::join!(unix::connect(&socket_path), listener.accept());\n+    let (writer_res, accept_res) =\n+        frankenterm_core::runtime_compat::join!(unix::connect(&socket_path), listener.accept());\n     let mut writer = writer_res?;\n     let (mut reader, _addr) = accept_res?;\n     let payload = vec![0xA5u8; payload_size];\n \n-    let read_task = tokio::spawn(async move {\n+    let read_task = frankenterm_core::runtime_compat::task::spawn(async move {\n         let mut bytes_read = 0usize;\n         for _ in 0..frame_count {\n             if use_framing {"
+    },
+    {
+      "sha": "4649763963f02f1ce470befa371ddcb621e9a69f",
+      "filename": "crates/frankenterm-core/src/runtime_compat.rs",
+      "status": "modified",
+      "additions": 152,
+      "deletions": 0,
+      "changes": 152,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/d082a84feb18b289b8acce518ac40abc9a44a4ab/crates%2Ffrankenterm-core%2Fsrc%2Fruntime_compat.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/d082a84feb18b289b8acce518ac40abc9a44a4ab/crates%2Ffrankenterm-core%2Fsrc%2Fruntime_compat.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Ffrankenterm-core%2Fsrc%2Fruntime_compat.rs?ref=d082a84feb18b289b8acce518ac40abc9a44a4ab",
+      "patch": "@@ -359,8 +359,35 @@ pub mod task {\n     {\n         tokio::spawn(future)\n     }\n+\n+    /// Spawns blocking work on the runtime's dedicated blocking thread pool,\n+    /// returning a `JoinHandle` that can be awaited, aborted, or used in\n+    /// `select!`.\n+    ///\n+    /// Use this when callers need direct `JoinHandle` control (e.g. `.abort()`).\n+    /// For fire-and-forget blocking work, prefer the top-level\n+    /// [`super::spawn_blocking`] helper which returns `Result<T, String>`.\n+    pub fn spawn_blocking<F, T>(f: F) -> JoinHandle<T>\n+    where\n+        F: FnOnce() -> T + Send + 'static,\n+        T: Send + 'static,\n+    {\n+        tokio::task::spawn_blocking(f)\n+    }\n }\n \n+/// Re-export `join!` macro for concurrent future evaluation.\n+///\n+/// Wraps `tokio::join!` in the default (non-asupersync) build.\n+#[cfg(not(feature = \"asupersync-runtime\"))]\n+pub use tokio::join;\n+\n+/// Re-export `select!` macro for multiplexing futures.\n+///\n+/// Wraps `tokio::select!` in the default (non-asupersync) build.\n+#[cfg(not(feature = \"asupersync-runtime\"))]\n+pub use tokio::select;\n+\n /// Unix socket aliases/helpers for the active runtime.\n #[cfg(feature = \"asupersync-runtime\")]\n pub mod unix {\n@@ -2437,4 +2464,129 @@ mod tests {\n             .build();\n         assert!(rt.is_ok());\n     }\n+\n+    // ========================================================================\n+    // task::spawn_blocking tests\n+    // ========================================================================\n+\n+    #[tokio::test]\n+    async fn task_spawn_blocking_returns_value() {\n+        let handle = task::spawn_blocking(|| 42);\n+        let result = handle.await.expect(\"join\");\n+        assert_eq!(result, 42);\n+    }\n+\n+    #[tokio::test]\n+    async fn task_spawn_blocking_runs_closure() {\n+        let handle = task::spawn_blocking(|| {\n+            let mut sum = 0;\n+            for i in 0..100 {\n+                sum += i;\n+            }\n+            sum\n+        });\n+        assert_eq!(handle.await.expect(\"join\"), 4950);\n+    }\n+\n+    #[tokio::test]\n+    async fn task_spawn_blocking_abort_cancels() {\n+        let handle = task::spawn_blocking(|| {\n+            std::thread::sleep(Duration::from_secs(60));\n+            \"never\"\n+        });\n+        handle.abort();\n+        let result = handle.await;\n+        assert!(result.is_err());\n+    }\n+\n+    #[tokio::test]\n+    async fn task_spawn_blocking_returns_join_handle() {\n+        let handle: task::JoinHandle<String> =\n+            task::spawn_blocking(|| \"hello\".to_string());\n+        let val = handle.await.expect(\"join\");\n+        assert_eq!(val, \"hello\");\n+    }\n+\n+    // ========================================================================\n+    // join! macro tests\n+    // ========================================================================\n+\n+    #[tokio::test]\n+    async fn join_two_futures() {\n+        let (a, b) = join!(async { 1 }, async { 2 });\n+        assert_eq!(a, 1);\n+        assert_eq!(b, 2);\n+    }\n+\n+    #[tokio::test]\n+    async fn join_three_futures() {\n+        let (a, b, c) = join!(async { \"x\" }, async { \"y\" }, async { \"z\" });\n+        assert_eq!(a, \"x\");\n+        assert_eq!(b, \"y\");\n+        assert_eq!(c, \"z\");\n+    }\n+\n+    #[tokio::test]\n+    async fn join_with_sleep() {\n+        let (a, b) = join!(\n+            async {\n+                sleep(Duration::from_millis(1)).await;\n+                10\n+            },\n+            async {\n+                sleep(Duration::from_millis(1)).await;\n+                20\n+            }\n+        );\n+        assert_eq!(a + b, 30);\n+    }\n+\n+    #[tokio::test]\n+    async fn join_single_future() {\n+        let (result,) = join!(async { 99 });\n+        assert_eq!(result, 99);\n+    }\n+\n+    // ========================================================================\n+    // select! macro tests\n+    // ========================================================================\n+\n+    #[tokio::test]\n+    async fn select_first_branch_ready() {\n+        let result = select! {\n+            val = async { 1 } => val,\n+            _ = sleep(Duration::from_secs(10)) => 0,\n+        };\n+        assert_eq!(result, 1);\n+    }\n+\n+    #[tokio::test]\n+    async fn select_sleep_branch() {\n+        let result = select! {\n+            () = sleep(Duration::from_millis(1)) => \"timer\",\n+            () = sleep(Duration::from_secs(60)) => \"never\",\n+        };\n+        assert_eq!(result, \"timer\");\n+    }\n+\n+    #[tokio::test]\n+    async fn select_with_channel() {\n+        let (tx, mut rx) = mpsc::channel(1);\n+        tx.send(42).await.expect(\"send\");\n+        let result = select! {\n+            val = rx.recv() => val.unwrap_or(0),\n+            () = sleep(Duration::from_secs(10)) => 0,\n+        };\n+        assert_eq!(result, 42);\n+    }\n+\n+    #[tokio::test]\n+    async fn select_biased_picks_first_ready() {\n+        let result = select! {\n+            biased;\n+            val = async { \"first\" } => val,\n+            val = async { \"second\" } => val,\n+        };\n+        assert_eq!(result, \"first\");\n+    }\n }"
+    },
+    {
+      "sha": "24e117cfdee057bd6f12970086470312a0a0d508",
+      "filename": "crates/frankenterm-core/src/search_bridge.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/d082a84feb18b289b8acce518ac40abc9a44a4ab/crates%2Ffrankenterm-core%2Fsrc%2Fsearch_bridge.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/d082a84feb18b289b8acce518ac40abc9a44a4ab/crates%2Ffrankenterm-core%2Fsrc%2Fsearch_bridge.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Ffrankenterm-core%2Fsrc%2Fsearch_bridge.rs?ref=d082a84feb18b289b8acce518ac40abc9a44a4ab",
+      "patch": "@@ -319,7 +319,7 @@ impl SearchBridge {\n         let worker_cancellation = cancellation.clone();\n \n         let mut worker =\n-            tokio::task::spawn_blocking(move || -> Result<SearchBridgeResult, SearchError> {\n+            crate::runtime_compat::task::spawn_blocking(move || -> Result<SearchBridgeResult, SearchError> {\n                 let (cancel_done, cancel_thread) =\n                     spawn_cancellation_thread(cx.clone(), worker_cancellation.clone());\n \n@@ -362,7 +362,7 @@ impl SearchBridge {\n             });\n \n         let search_result = loop {\n-            tokio::select! {\n+            crate::runtime_compat::select! {\n                 maybe_phase = phase_rx.recv() => {\n                     if let Some(phase) = maybe_phase {\n                         on_phase(phase);"
+    },
+    {
+      "sha": "4e5763a5cdaca23fb8867c8c6d007f1ddd6932ef",
+      "filename": "crates/frankenterm-core/src/snapshot_engine.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 3,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/d082a84feb18b289b8acce518ac40abc9a44a4ab/crates%2Ffrankenterm-core%2Fsrc%2Fsnapshot_engine.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/d082a84feb18b289b8acce518ac40abc9a44a4ab/crates%2Ffrankenterm-core%2Fsrc%2Fsnapshot_engine.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Ffrankenterm-core%2Fsrc%2Fsnapshot_engine.rs?ref=d082a84feb18b289b8acce518ac40abc9a44a4ab",
+      "patch": "@@ -180,7 +180,7 @@ impl SnapshotEngine {\n         }\n         #[cfg(not(feature = \"asupersync-runtime\"))]\n         {\n-            tokio::task::spawn_blocking(work)\n+            crate::runtime_compat::task::spawn_blocking(work)\n                 .await\n                 .map_err(|e| SnapshotError::Database(format!(\"task join: {e}\")))?\n                 .map_err(|e| SnapshotError::Database(e.to_string()))\n@@ -423,7 +423,7 @@ impl SnapshotEngine {\n                         #[cfg(not(feature = \"asupersync-runtime\"))]\n                         let shutdown_fut = shutdown.changed();\n \n-                        tokio::select! {\n+                        crate::runtime_compat::select! {\n                             () = sleep(interval) => {}\n                             _ = shutdown_fut => {\n                                 tracing::info!(\"snapshot engine shutting down\");\n@@ -489,7 +489,7 @@ impl SnapshotEngine {\n                     #[cfg(not(feature = \"asupersync-runtime\"))]\n                     let shutdown_fut = shutdown.changed();\n \n-                    tokio::select! {\n+                    crate::runtime_compat::select! {\n                         maybe_trigger = maybe_trigger_fut => {\n                             let Some(trigger) = maybe_trigger else {\n                                 tracing::info!(\"trigger channel closed; intelligent scheduler stopping\");"
+    },
+    {
+      "sha": "005c1c3075b5c6dd01637835b85c75c5a3583e9a",
+      "filename": "crates/frankenterm-core/src/storage.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/d082a84feb18b289b8acce518ac40abc9a44a4ab/crates%2Ffrankenterm-core%2Fsrc%2Fstorage.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/d082a84feb18b289b8acce518ac40abc9a44a4ab/crates%2Ffrankenterm-core%2Fsrc%2Fstorage.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Ffrankenterm-core%2Fsrc%2Fstorage.rs?ref=d082a84feb18b289b8acce518ac40abc9a44a4ab",
+      "patch": "@@ -5013,7 +5013,7 @@ impl StorageHandle {\n         }\n         #[cfg(not(feature = \"asupersync-runtime\"))]\n         {\n-            tokio::task::spawn_blocking(work)\n+            crate::runtime_compat::task::spawn_blocking(work)\n                 .await\n                 .map_err(|e| StorageError::Database(format!(\"{join_error_prefix}: {e}\")))?\n         }\n@@ -19861,7 +19861,7 @@ mod storage_handle_tests {\n         // Concurrent reads should work (WAL mode)\n         let read1 = handle.get_segments(1, 10);\n         let read2 = handle.get_segments(1, 10);\n-        let (result1, result2) = tokio::join!(read1, read2);\n+        let (result1, result2) = crate::runtime_compat::join!(read1, read2);\n \n         assert!(result1.is_ok());\n         assert!(result2.is_ok());"
+    },
+    {
+      "sha": "41306a27f7bbdb43fab473f2a725d985b112b44a",
+      "filename": "crates/frankenterm-core/src/tui/query.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/d082a84feb18b289b8acce518ac40abc9a44a4ab/crates%2Ffrankenterm-core%2Fsrc%2Ftui%2Fquery.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/d082a84feb18b289b8acce518ac40abc9a44a4ab/crates%2Ffrankenterm-core%2Fsrc%2Ftui%2Fquery.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Ffrankenterm-core%2Fsrc%2Ftui%2Fquery.rs?ref=d082a84feb18b289b8acce518ac40abc9a44a4ab",
+      "patch": "@@ -406,7 +406,7 @@ impl QueryClient for ProductionQueryClient {\n             let mut pane_views: Vec<PaneView> = panes.iter().map(PaneView::from).collect();\n \n             if let Some(storage) = storage {\n-                let (unhandled_res, last_activity_res) = tokio::join!(\n+                let (unhandled_res, last_activity_res) = crate::runtime_compat::join!(\n                     storage.count_unhandled_events_by_pane(),\n                     storage.get_last_activity_by_pane()\n                 );"
+    },
+    {
+      "sha": "884d605668885cd3c00dfb744ee32b0b2b3f329e",
+      "filename": "crates/frankenterm-core/tests/perf_integration_tests.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/d082a84feb18b289b8acce518ac40abc9a44a4ab/crates%2Ffrankenterm-core%2Ftests%2Fperf_integration_tests.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/d082a84feb18b289b8acce518ac40abc9a44a4ab/crates%2Ffrankenterm-core%2Ftests%2Fperf_integration_tests.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Ffrankenterm-core%2Ftests%2Fperf_integration_tests.rs?ref=d082a84feb18b289b8acce518ac40abc9a44a4ab",
+      "patch": "@@ -892,7 +892,7 @@ async fn concurrent_pool_acquire_and_evict() {\n     });\n \n     // Both should complete without deadlock\n-    let (r1, r2) = tokio::join!(acquire_task, evict_task);\n+    let (r1, r2) = frankenterm_core::runtime_compat::join!(acquire_task, evict_task);\n     r1.unwrap();\n     r2.unwrap();\n }"
+    }
+  ]
+}

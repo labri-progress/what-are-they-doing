@@ -1,0 +1,101 @@
+{
+  "message": "fix(safety,stability): 8 review findings across scoring, deletion, PID, EWMA, PAL, bootstrap, guardrails\n\nScoring: add 9 missing system path vetoes (/dev,/home,/lib,/lib64,/opt,/root,/run,/snap,/var),\n  cap delete_advantage_ratio at 1e6 to avoid f64::INFINITY in JSON serialization.\nDeletion: reject symlinks in preflight (remove_dir_all follows symlinks into targets),\n  use symlink_metadata instead of path.exists().\nPID: reset integral accumulator and last_update on target change to prevent stale state\n  after config reload switches from yellow to green threshold.\nEWMA: fix numerical cancellation in project_time for negative acceleration using\n  conjugate multiplication (2*distance/(rate+root)), reject unphysical roots past t_zero.\nPAL: skip malformed /proc/self/mounts lines instead of failing entire parse.\nDaemon: use green_min_free_pct (not yellow) for PID target on config reload, matching init.\nBootstrap: fix ExecStart \"daemon run\" \u2192 \"daemon\", fix plist replacing all <string> entries\n  instead of just binary path, fix permissions 0o755 \u2192 0o111 (add execute only).\nGuardrails: add upper clamp (50.0) to e_process_log to prevent unbounded accumulation\n  making guard impossible to trip after long good-observation streaks.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "7b7dde3e9657d737e641746e7a44dc0c0841c80a",
+      "filename": "src/cli/bootstrap.rs",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 2,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/blob/822e5ce7d899ea6c09d01b83b3f1ce93d9254b8b/src%2Fcli%2Fbootstrap.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/raw/822e5ce7d899ea6c09d01b83b3f1ce93d9254b8b/src%2Fcli%2Fbootstrap.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/storage_ballast_helper/contents/src%2Fcli%2Fbootstrap.rs?ref=822e5ce7d899ea6c09d01b83b3f1ce93d9254b8b",
+      "patch": "@@ -1054,7 +1054,7 @@ fn apply_fix_permissions(action: &MigrationAction) -> std::io::Result<()> {\n     use std::os::unix::fs::PermissionsExt;\n     let meta = fs::metadata(&action.target)?;\n     let mut perms = meta.permissions();\n-    let mode = perms.mode() | 0o755;\n+    let mode = perms.mode() | 0o111; // add execute bits only, preserve existing rw\n     perms.set_mode(mode);\n     fs::set_permissions(&action.target, perms)?;\n     Ok(())\n@@ -1085,24 +1085,30 @@ fn apply_update_service_path(\n     // Track whether we are inside the ProgramArguments array to scope\n     // <string> replacements to only that section.\n     let mut in_program_args = false;\n+    let mut binary_replaced = false;\n     let updated: Vec<String> = contents\n         .lines()\n         .map(|line| {\n             let trimmed = line.trim();\n             if trimmed.starts_with(\"ExecStart=\") {\n-                format!(\"ExecStart={exe_str} daemon run\")\n+                format!(\"ExecStart={exe_str} daemon\")\n             } else if trimmed == \"<key>ProgramArguments</key>\" {\n                 in_program_args = true;\n+                binary_replaced = false;\n                 line.to_string()\n             } else if in_program_args && trimmed == \"</array>\" {\n                 in_program_args = false;\n                 line.to_string()\n             } else if in_program_args\n+                && !binary_replaced\n                 && trimmed.starts_with(\"<string>\")\n                 && trimmed.ends_with(\"</string>\")\n             {\n                 let inner = &trimmed[8..trimmed.len() - 9];\n+                // Only replace the first <string> entry (the binary path).\n+                // Per launchd schema, the first ProgramArguments entry is always the executable.\n                 if inner.contains(\"sbh\") || inner.starts_with('/') {\n+                    binary_replaced = true;\n                     format!(\"        <string>{exe_str}</string>\")\n                 } else {\n                     line.to_string()"
+    },
+    {
+      "sha": "ff10e56be92146e317f16ca3830432b083a64606",
+      "filename": "src/daemon/loop_main.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/blob/822e5ce7d899ea6c09d01b83b3f1ce93d9254b8b/src%2Fdaemon%2Floop_main.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/raw/822e5ce7d899ea6c09d01b83b3f1ce93d9254b8b/src%2Fdaemon%2Floop_main.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/storage_ballast_helper/contents/src%2Fdaemon%2Floop_main.rs?ref=822e5ce7d899ea6c09d01b83b3f1ce93d9254b8b",
+      "patch": "@@ -760,8 +760,9 @@ impl MonitoringDaemon {\n                     self.release_controller.reset();\n \n                     // Propagate pressure thresholds to PID controller.\n+                    // Target must be green_min (the recovery level), consistent with init.\n                     self.pressure_controller\n-                        .set_target_free_pct(new_config.pressure.yellow_min_free_pct);\n+                        .set_target_free_pct(new_config.pressure.green_min_free_pct);\n                     self.pressure_controller.set_pressure_thresholds(\n                         new_config.pressure.green_min_free_pct,\n                         new_config.pressure.yellow_min_free_pct,"
+    },
+    {
+      "sha": "7e07882c7051e911525b1102422cd0913858e02a",
+      "filename": "src/monitor/ewma.rs",
+      "status": "modified",
+      "additions": 25,
+      "deletions": 2,
+      "changes": 27,
+      "blob_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/blob/822e5ce7d899ea6c09d01b83b3f1ce93d9254b8b/src%2Fmonitor%2Fewma.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/raw/822e5ce7d899ea6c09d01b83b3f1ce93d9254b8b/src%2Fmonitor%2Fewma.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/storage_ballast_helper/contents/src%2Fmonitor%2Fewma.rs?ref=822e5ce7d899ea6c09d01b83b3f1ce93d9254b8b",
+      "patch": "@@ -221,8 +221,31 @@ fn project_time(rate: f64, accel: f64, distance_bytes: f64) -> f64 {\n         return f64::INFINITY;\n     }\n     let root = discriminant.sqrt();\n-    let numerator = -rate + root;\n-    let t = numerator / accel;\n+\n+    // Use the numerically stable form to avoid catastrophic cancellation.\n+    // When accel is small and negative, `(-rate + root)` suffers precision loss\n+    // because root \u2248 rate. Instead, multiply both sides by the conjugate:\n+    //   t = (-rate + root) / accel = 2*distance / (rate + root)\n+    // The latter avoids subtracting nearly-equal quantities.\n+    let t = if accel < 0.0 {\n+        let denom = rate + root;\n+        if denom.abs() < f64::EPSILON {\n+            return f64::INFINITY;\n+        }\n+        2.0 * distance_bytes / denom\n+    } else {\n+        (-rate + root) / accel\n+    };\n+\n+    // Reject results where the rate would have reached zero before t\n+    // (unphysical: rate can't go negative).\n+    if accel < 0.0 {\n+        let t_zero = -rate / accel; // time when rate reaches zero\n+        if t > t_zero {\n+            return f64::INFINITY;\n+        }\n+    }\n+\n     if t.is_finite() && t > 0.0 {\n         t\n     } else {"
+    },
+    {
+      "sha": "8564c55fd8fd436695554a7ba6b0fc5523e8320d",
+      "filename": "src/monitor/guardrails.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 1,
+      "changes": 8,
+      "blob_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/blob/822e5ce7d899ea6c09d01b83b3f1ce93d9254b8b/src%2Fmonitor%2Fguardrails.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/raw/822e5ce7d899ea6c09d01b83b3f1ce93d9254b8b/src%2Fmonitor%2Fguardrails.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/storage_ballast_helper/contents/src%2Fmonitor%2Fguardrails.rs?ref=822e5ce7d899ea6c09d01b83b3f1ce93d9254b8b",
+      "patch": "@@ -198,10 +198,16 @@ impl AdaptiveGuard {\n             self.config.e_process_penalty.ln()\n         };\n         self.e_process_log += lr;\n-        // Clamp to prevent numerical underflow.\n+        // Clamp to prevent numerical underflow / overflow.\n+        // Without an upper bound the accumulator grows without limit after a\n+        // long streak of good observations, making the guard effectively\n+        // impossible to trip even after a sudden regime change.\n         if self.e_process_log < -50.0 {\n             self.e_process_log = -50.0;\n         }\n+        if self.e_process_log > 50.0 {\n+            self.e_process_log = 50.0;\n+        }\n \n         // Recompute guard status.\n         self.recompute_status(obs_good);"
+    },
+    {
+      "sha": "ae7595fcb15137e4332b1cd85c54ac9772f25139",
+      "filename": "src/monitor/pid.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/blob/822e5ce7d899ea6c09d01b83b3f1ce93d9254b8b/src%2Fmonitor%2Fpid.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/raw/822e5ce7d899ea6c09d01b83b3f1ce93d9254b8b/src%2Fmonitor%2Fpid.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/storage_ballast_helper/contents/src%2Fmonitor%2Fpid.rs?ref=822e5ce7d899ea6c09d01b83b3f1ce93d9254b8b",
+      "patch": "@@ -121,6 +121,8 @@ impl PidPressureController {\n     pub fn set_target_free_pct(&mut self, target: f64) {\n         if (target - self.prev_target_free_pct).abs() > f64::EPSILON {\n             self.last_error = 0.0; // reset derivative to avoid spike\n+            self.integral = 0.0; // reset integral \u2014 stale accumulation is invalid for new target\n+            self.last_update = None; // treat next update as fresh start\n             self.prev_target_free_pct = target;\n         }\n         self.target_free_pct = target;"
+    },
+    {
+      "sha": "cc81463b93dbf62a685ad30f3d60b15f308c3f3f",
+      "filename": "src/platform/pal.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 3,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/blob/822e5ce7d899ea6c09d01b83b3f1ce93d9254b8b/src%2Fplatform%2Fpal.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/raw/822e5ce7d899ea6c09d01b83b3f1ce93d9254b8b/src%2Fplatform%2Fpal.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/storage_ballast_helper/contents/src%2Fplatform%2Fpal.rs?ref=822e5ce7d899ea6c09d01b83b3f1ce93d9254b8b",
+      "patch": "@@ -261,9 +261,10 @@ fn parse_proc_mounts(raw: &str) -> Result<Vec<MountPoint>> {\n     for line in raw.lines() {\n         let fields: Vec<&str> = line.split_whitespace().collect();\n         if fields.len() < 3 {\n-            return Err(SbhError::MountParse {\n-                details: format!(\"invalid /proc/self/mounts line: {line}\"),\n-            });\n+            // Skip malformed lines (pseudo-filesystems or kernel artifacts)\n+            // rather than failing the entire mount parse.\n+            eprintln!(\"[sbh] warning: skipping malformed /proc/self/mounts line: {line}\");\n+            continue;\n         }\n         let mount_path = unescape_mount_field(fields[1]);\n         let fs_type = fields[2].to_string();"
+    },
+    {
+      "sha": "5065e3fca5b03e9ebcbff5b5e05fc145a9c48670",
+      "filename": "src/scanner/deletion.rs",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 7,
+      "changes": 22,
+      "blob_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/blob/822e5ce7d899ea6c09d01b83b3f1ce93d9254b8b/src%2Fscanner%2Fdeletion.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/raw/822e5ce7d899ea6c09d01b83b3f1ce93d9254b8b/src%2Fscanner%2Fdeletion.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/storage_ballast_helper/contents/src%2Fscanner%2Fdeletion.rs?ref=822e5ce7d899ea6c09d01b83b3f1ce93d9254b8b",
+      "patch": "@@ -96,6 +96,7 @@ pub enum SkipReason {\n     NotWritable,\n     Vetoed,\n     BelowThreshold,\n+    Symlink,\n }\n \n // \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 executor \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n@@ -248,24 +249,31 @@ impl DeletionExecutor {\n     // \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 pre-flight checks \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n \n     fn preflight_check(&self, path: &Path) -> std::result::Result<(), SkipReason> {\n-        // 1. Path still exists.\n-        if !path.exists() {\n-            return Err(SkipReason::PathGone);\n+        // 1. Path still exists (use symlink_metadata to not follow symlinks).\n+        let meta = match fs::symlink_metadata(path) {\n+            Ok(m) => m,\n+            Err(_) => return Err(SkipReason::PathGone),\n+        };\n+\n+        // 2. Reject symlinks \u2014 remove_dir_all follows symlinks into the target,\n+        //    which could destroy data outside watched directories.\n+        if meta.file_type().is_symlink() {\n+            return Err(SkipReason::Symlink);\n         }\n \n-        // 2. Parent directory is writable (effective permission for this process).\n+        // 3. Parent directory is writable (effective permission for this process).\n         if let Some(parent) = path.parent()\n             && !is_writable(parent)\n         {\n             return Err(SkipReason::NotWritable);\n         }\n \n-        // 3. Does not contain .git (safety net).\n-        if path.is_dir() && path.join(\".git\").exists() {\n+        // 4. Does not contain .git (safety net).\n+        if meta.is_dir() && path.join(\".git\").exists() {\n             return Err(SkipReason::ContainsGit);\n         }\n \n-        // 4. Not currently open by any process (Linux /proc check).\n+        // 5. Not currently open by any process (Linux /proc check).\n         if self.config.check_open_files && is_path_open(path) {\n             return Err(SkipReason::FileOpen);\n         }"
+    },
+    {
+      "sha": "978bf7dee577bc4949027fe001268e14363aa716",
+      "filename": "src/scanner/scoring.rs",
+      "status": "modified",
+      "additions": 48,
+      "deletions": 4,
+      "changes": 52,
+      "blob_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/blob/822e5ce7d899ea6c09d01b83b3f1ce93d9254b8b/src%2Fscanner%2Fscoring.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/raw/822e5ce7d899ea6c09d01b83b3f1ce93d9254b8b/src%2Fscanner%2Fscoring.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/storage_ballast_helper/contents/src%2Fscanner%2Fscoring.rs?ref=822e5ce7d899ea6c09d01b83b3f1ce93d9254b8b",
+      "patch": "@@ -466,7 +466,9 @@ fn delete_advantage_ratio(keep_loss: f64, delete_loss: f64) -> f64 {\n     let safe_keep = keep_loss.max(0.0);\n     let safe_delete = delete_loss.max(0.0);\n     if safe_delete <= f64::EPSILON {\n-        f64::INFINITY\n+        // Cap at a large finite value to avoid f64::INFINITY flowing into\n+        // JSON serialization (where \"inf\" is not valid JSON).\n+        1e6\n     } else {\n         safe_keep / safe_delete\n     }\n@@ -590,13 +592,22 @@ fn is_system_path(path: &Path) -> bool {\n     }\n     // Check prefixes for protected system directories.\n     [\n+        Path::new(\"/bin\"),\n         Path::new(\"/boot\"),\n+        Path::new(\"/dev\"),\n         Path::new(\"/etc\"),\n-        Path::new(\"/usr\"),\n-        Path::new(\"/bin\"),\n-        Path::new(\"/sbin\"),\n+        Path::new(\"/home\"),\n+        Path::new(\"/lib\"),\n+        Path::new(\"/lib64\"),\n+        Path::new(\"/opt\"),\n         Path::new(\"/proc\"),\n+        Path::new(\"/root\"),\n+        Path::new(\"/run\"),\n+        Path::new(\"/sbin\"),\n+        Path::new(\"/snap\"),\n         Path::new(\"/sys\"),\n+        Path::new(\"/usr\"),\n+        Path::new(\"/var\"),\n     ]\n     .iter()\n     .any(|root| path == *root || path.starts_with(root))\n@@ -644,6 +655,39 @@ mod tests {\n         assert_eq!(score.decision.action, DecisionAction::Keep);\n     }\n \n+    #[test]\n+    fn system_paths_are_vetoed() {\n+        let engine = default_engine();\n+        for system_dir in [\n+            \"/lib/x86_64-linux-gnu/libc.so\",\n+            \"/lib64/ld-linux.so\",\n+            \"/var/lib/dpkg/status\",\n+            \"/dev/shm/test\",\n+            \"/run/systemd/private\",\n+            \"/home/user/Documents\",\n+            \"/root/.bashrc\",\n+            \"/opt/myapp/bin\",\n+            \"/snap/core/current\",\n+        ] {\n+            let score = engine.score_candidate(\n+                &CandidateInput {\n+                    path: PathBuf::from(system_dir),\n+                    size_bytes: 1_073_741_824,\n+                    age: Duration::from_secs(6 * 3600),\n+                    classification: classification(0.95, ArtifactCategory::RustTarget),\n+                    signals: StructuralSignals::default(),\n+                    is_open: false,\n+                    excluded: false,\n+                },\n+                0.9,\n+            );\n+            assert!(\n+                score.vetoed,\n+                \"system path {system_dir} should be hard-vetoed\"\n+            );\n+        }\n+    }\n+\n     #[test]\n     fn high_confidence_old_target_gets_actionable_recommendation() {\n         let engine = default_engine();"
+    }
+  ]
+}

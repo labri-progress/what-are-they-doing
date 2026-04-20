@@ -1,0 +1,41 @@
+{
+  "message": "fix: Fix use-after-free bug in SQL statement execution\n\nRoot cause: SQL string slices in AST pointed to JavaScript-owned memory.\nWhen JS released the string, AST contained dangling pointers causing\n\"column not found\" errors when executing multiple statements.\n\nChanges:\n- Copy SQL string in lance_sql_parse() so AST slices remain valid\n- Store sql_copy in Statement struct, free in lance_sql_close()\n- Add Statement.finalize() method for explicit resource cleanup\n\nAlso fixes:\n- Database.readonly now defaults to true for Lance files\n- Added FinalizeStmt method to C++ binding",
+  "files": [
+    {
+      "sha": "ce5141c85b55c5318b01975ff21b5914edf5e250",
+      "filename": "packages/node/src/binding.cc",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 0,
+      "changes": 14,
+      "blob_url": "https://github.com/teamchong/lanceql/blob/d868a2483b1314b892f545b5eb5169a5c5bd9c8e/packages%2Fnode%2Fsrc%2Fbinding.cc",
+      "raw_url": "https://github.com/teamchong/lanceql/raw/d868a2483b1314b892f545b5eb5169a5c5bd9c8e/packages%2Fnode%2Fsrc%2Fbinding.cc",
+      "contents_url": "https://api.github.com/repos/teamchong/lanceql/contents/packages%2Fnode%2Fsrc%2Fbinding.cc?ref=d868a2483b1314b892f545b5eb5169a5c5bd9c8e",
+      "patch": "@@ -148,6 +148,7 @@ class Statement : public Napi::ObjectWrap<Statement> {\n     Napi::Value All(const Napi::CallbackInfo& info);\n     Napi::Value Get(const Napi::CallbackInfo& info);\n     Napi::Value Run(const Napi::CallbackInfo& info);\n+    Napi::Value FinalizeStmt(const Napi::CallbackInfo& info);\n };\n \n Statement::Statement(const Napi::CallbackInfo& info)\n@@ -167,9 +168,21 @@ Statement::Statement(const Napi::CallbackInfo& info)\n Statement::~Statement() {\n     if (sql_handle && lance_sql_close_fn) {\n         lance_sql_close_fn(sql_handle);\n+        sql_handle = nullptr;\n     }\n }\n \n+Napi::Value Statement::FinalizeStmt(const Napi::CallbackInfo& info) {\n+    Napi::Env env = info.Env();\n+\n+    if (sql_handle && lance_sql_close_fn) {\n+        lance_sql_close_fn(sql_handle);\n+        sql_handle = nullptr;\n+    }\n+\n+    return env.Undefined();\n+}\n+\n Napi::Value Statement::All(const Napi::CallbackInfo& info) {\n     Napi::Env env = info.Env();\n \n@@ -272,6 +285,7 @@ Napi::Object Statement::Init(Napi::Env env, Napi::Object exports) {\n         InstanceMethod(\"all\", &Statement::All),\n         InstanceMethod(\"get\", &Statement::Get),\n         InstanceMethod(\"run\", &Statement::Run),\n+        InstanceMethod(\"finalize\", &Statement::FinalizeStmt),\n     });\n \n     exports.Set(\"Statement\", func);"
+    },
+    {
+      "sha": "a2eca989b6b11eec4ead47ab42215369ef4cdbea",
+      "filename": "packages/node/src/index.js",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 1,
+      "changes": 12,
+      "blob_url": "https://github.com/teamchong/lanceql/blob/d868a2483b1314b892f545b5eb5169a5c5bd9c8e/packages%2Fnode%2Fsrc%2Findex.js",
+      "raw_url": "https://github.com/teamchong/lanceql/raw/d868a2483b1314b892f545b5eb5169a5c5bd9c8e/packages%2Fnode%2Fsrc%2Findex.js",
+      "contents_url": "https://api.github.com/repos/teamchong/lanceql/contents/packages%2Fnode%2Fsrc%2Findex.js?ref=d868a2483b1314b892f545b5eb5169a5c5bd9c8e",
+      "patch": "@@ -37,7 +37,8 @@ class Database {\n         }\n \n         this._open = true;\n-        this._readonly = options.readonly || false;\n+        // Lance files are always read-only, default to true unless explicitly set to false\n+        this._readonly = options.readonly !== false;\n     }\n \n     // Properties (getters matching better-sqlite3)\n@@ -272,6 +273,15 @@ class Statement {\n         // No-op for v0.1.0 (always uses JavaScript numbers)\n         return this;\n     }\n+\n+    finalize() {\n+        // Explicitly release native statement resources\n+        // This is important for long-running applications or when creating many statements\n+        if (this._stmt && typeof this._stmt.finalize === 'function') {\n+            this._stmt.finalize();\n+        }\n+        this._stmt = null;\n+    }\n }\n \n // ============================================================================"
+    },
+    {
+      "sha": "d91d9ed4e72781b2c1b21c54339b2178df5af2ec",
+      "filename": "src/nodejs.zig",
+      "status": "modified",
+      "additions": 19,
+      "deletions": 4,
+      "changes": 23,
+      "blob_url": "https://github.com/teamchong/lanceql/blob/d868a2483b1314b892f545b5eb5169a5c5bd9c8e/src%2Fnodejs.zig",
+      "raw_url": "https://github.com/teamchong/lanceql/raw/d868a2483b1314b892f545b5eb5169a5c5bd9c8e/src%2Fnodejs.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/lanceql/contents/src%2Fnodejs.zig?ref=d868a2483b1314b892f545b5eb5169a5c5bd9c8e",
+      "patch": "@@ -38,6 +38,7 @@ const Statement = struct {\n     stmt: ast.SelectStmt,\n     table_handle: *Handle,\n     allocator: std.mem.Allocator,\n+    sql_copy: []const u8, // Owned copy of SQL string to keep AST slices valid\n };\n \n // ============================================================================\n@@ -281,22 +282,32 @@ export fn lance_column_type(handle: *Handle, col_idx: u32, buf: [*]u8, buf_len:\n \n /// Parse SQL and return a statement handle\n export fn lance_sql_parse(sql_ptr: [*]const u8, sql_len: usize, handle: *Handle) ?*SQLHandle {\n-    const sql = sql_ptr[0..sql_len];\n+    // Copy the SQL string so AST slices remain valid after JS releases the string\n+    const sql_copy = allocator.alloc(u8, sql_len) catch return null;\n+    @memcpy(sql_copy, sql_ptr[0..sql_len]);\n \n-    // Parse SQL\n-    const stmt = parser.parseSQL(sql, allocator) catch return null;\n+    // Parse SQL using our owned copy\n+    const stmt = parser.parseSQL(sql_copy, allocator) catch {\n+        allocator.free(sql_copy);\n+        return null;\n+    };\n \n     // Only SELECT is supported for now\n     if (stmt != .select) {\n+        allocator.free(sql_copy);\n         return null;\n     }\n \n     // Create Statement wrapper\n-    const stmt_ptr = allocator.create(Statement) catch return null;\n+    const stmt_ptr = allocator.create(Statement) catch {\n+        allocator.free(sql_copy);\n+        return null;\n+    };\n     stmt_ptr.* = Statement{\n         .stmt = stmt.select,\n         .table_handle = handle,\n         .allocator = allocator,\n+        .sql_copy = sql_copy,\n     };\n \n     const sql_handle = stmtToHandle(stmt_ptr);\n@@ -363,6 +374,8 @@ export fn lance_sql_close(sql_handle: *SQLHandle) void {\n         const stmt_ptr = entry.value;\n         // Free all AST allocations (columns, where, group_by, order_by)\n         ast.deinitSelectStmt(&stmt_ptr.stmt, stmt_ptr.allocator);\n+        // Free the SQL string copy\n+        allocator.free(stmt_ptr.sql_copy);\n         allocator.destroy(stmt_ptr);\n     }\n }\n@@ -600,6 +613,8 @@ export fn lance_cleanup() void {\n         const stmt_ptr = entry.value_ptr.*;\n         // Free all AST allocations (columns, where, group_by, order_by)\n         ast.deinitSelectStmt(&stmt_ptr.stmt, stmt_ptr.allocator);\n+        // Free the SQL string copy\n+        allocator.free(stmt_ptr.sql_copy);\n         allocator.destroy(stmt_ptr);\n     }\n     statements.clearAndFree();"
+    }
+  ]
+}

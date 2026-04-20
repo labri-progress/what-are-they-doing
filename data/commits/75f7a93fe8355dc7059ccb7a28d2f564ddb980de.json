@@ -1,0 +1,41 @@
+{
+  "message": "fix: restore soft-deleted users on reauth (#106) (thanks @mkrokosz)",
+  "files": [
+    {
+      "sha": "203e6f1061938f10e92d093339f2d5e45c106f89",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/clawhub/blob/75f7a93fe8355dc7059ccb7a28d2f564ddb980de/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/clawhub/raw/75f7a93fe8355dc7059ccb7a28d2f564ddb980de/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/clawhub/contents/CHANGELOG.md?ref=75f7a93fe8355dc7059ccb7a28d2f564ddb980de",
+      "patch": "@@ -14,6 +14,7 @@\n - Web: show pending-scan skills to owners without 404 (thanks @orlyjamie, #136).\n - Users: backfill empty handles from name/email in ensure (thanks @adlai88, #158).\n - Web: update footer branding to OpenClaw (thanks @jontsai, #122).\n+- Auth: restore soft-deleted users on reauth, block banned users (thanks @mkrokosz, #106).\n \n ## 0.5.1 - TBD\n "
+    },
+    {
+      "sha": "18ba0ba6b0957efd0c205d52c6af16375e01dec1",
+      "filename": "convex/auth.test.ts",
+      "status": "added",
+      "additions": 69,
+      "deletions": 0,
+      "changes": 69,
+      "blob_url": "https://github.com/openclaw/clawhub/blob/75f7a93fe8355dc7059ccb7a28d2f564ddb980de/convex%2Fauth.test.ts",
+      "raw_url": "https://github.com/openclaw/clawhub/raw/75f7a93fe8355dc7059ccb7a28d2f564ddb980de/convex%2Fauth.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/clawhub/contents/convex%2Fauth.test.ts?ref=75f7a93fe8355dc7059ccb7a28d2f564ddb980de",
+      "patch": "@@ -0,0 +1,69 @@\n+import { describe, expect, it, vi } from 'vitest'\n+import type { Id } from './_generated/dataModel'\n+import { BANNED_REAUTH_MESSAGE, handleSoftDeletedUserReauth } from './auth'\n+\n+function makeCtx({\n+  user,\n+  banRecord,\n+}: {\n+  user: { deletedAt?: number } | null\n+  banRecord?: Record<string, unknown> | null\n+}) {\n+  const query = {\n+    withIndex: vi.fn().mockReturnValue({\n+      filter: vi.fn().mockReturnValue({\n+        first: vi.fn().mockResolvedValue(banRecord ?? null),\n+      }),\n+    }),\n+  }\n+  const ctx = {\n+    db: {\n+      get: vi.fn().mockResolvedValue(user),\n+      patch: vi.fn().mockResolvedValue(null),\n+      query: vi.fn().mockReturnValue(query),\n+    },\n+  }\n+  return { ctx, query }\n+}\n+\n+describe('handleSoftDeletedUserReauth', () => {\n+  const userId = 'users:1' as Id<'users'>\n+\n+  it('skips when no existing user', async () => {\n+    const { ctx } = makeCtx({ user: null })\n+\n+    await handleSoftDeletedUserReauth(ctx as never, { userId, existingUserId: null })\n+\n+    expect(ctx.db.get).not.toHaveBeenCalled()\n+  })\n+\n+  it('skips active users', async () => {\n+    const { ctx } = makeCtx({ user: { deletedAt: undefined } })\n+\n+    await handleSoftDeletedUserReauth(ctx as never, { userId, existingUserId: userId })\n+\n+    expect(ctx.db.query).not.toHaveBeenCalled()\n+    expect(ctx.db.patch).not.toHaveBeenCalled()\n+  })\n+\n+  it('restores soft-deleted users when not banned', async () => {\n+    const { ctx } = makeCtx({ user: { deletedAt: 123 }, banRecord: null })\n+\n+    await handleSoftDeletedUserReauth(ctx as never, { userId, existingUserId: userId })\n+\n+    expect(ctx.db.patch).toHaveBeenCalledWith(userId, {\n+      deletedAt: undefined,\n+      updatedAt: expect.any(Number),\n+    })\n+  })\n+\n+  it('blocks banned users with a custom message', async () => {\n+    const { ctx } = makeCtx({ user: { deletedAt: 123 }, banRecord: { action: 'user.ban' } })\n+\n+    await expect(\n+      handleSoftDeletedUserReauth(ctx as never, { userId, existingUserId: userId }),\n+    ).rejects.toThrow(BANNED_REAUTH_MESSAGE)\n+\n+    expect(ctx.db.patch).not.toHaveBeenCalled()\n+  })\n+})"
+    },
+    {
+      "sha": "9f46ab6a742bf6b7f88aec0cf3fbd06a5b4a1019",
+      "filename": "convex/auth.ts",
+      "status": "modified",
+      "additions": 33,
+      "deletions": 38,
+      "changes": 71,
+      "blob_url": "https://github.com/openclaw/clawhub/blob/75f7a93fe8355dc7059ccb7a28d2f564ddb980de/convex%2Fauth.ts",
+      "raw_url": "https://github.com/openclaw/clawhub/raw/75f7a93fe8355dc7059ccb7a28d2f564ddb980de/convex%2Fauth.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/clawhub/contents/convex%2Fauth.ts?ref=75f7a93fe8355dc7059ccb7a28d2f564ddb980de",
+      "patch": "@@ -1,6 +1,36 @@\n import GitHub from '@auth/core/providers/github'\n import { convexAuth } from '@convex-dev/auth/server'\n-import { Id } from './_generated/dataModel'\n+import type { GenericMutationCtx } from 'convex/server'\n+import { ConvexError } from 'convex/values'\n+import type { DataModel, Id } from './_generated/dataModel'\n+\n+export const BANNED_REAUTH_MESSAGE = 'Your account has been suspended.'\n+\n+export async function handleSoftDeletedUserReauth(\n+  ctx: GenericMutationCtx<DataModel>,\n+  args: { userId: Id<'users'>; existingUserId: Id<'users'> | null },\n+) {\n+  if (!args.existingUserId) return\n+\n+  const user = await ctx.db.get(args.userId)\n+  if (!user?.deletedAt) return\n+\n+  const userId = args.userId\n+  const banRecord = await ctx.db\n+    .query('auditLogs')\n+    .withIndex('by_target', (q) => q.eq('targetType', 'user').eq('targetId', userId.toString()))\n+    .filter((q) => q.eq(q.field('action'), 'user.ban'))\n+    .first()\n+\n+  if (banRecord) {\n+    throw new ConvexError(BANNED_REAUTH_MESSAGE)\n+  }\n+\n+  await ctx.db.patch(userId, {\n+    deletedAt: undefined,\n+    updatedAt: Date.now(),\n+  })\n+}\n \n export const { auth, signIn, signOut, store, isAuthenticated } = convexAuth({\n   providers: [\n@@ -26,43 +56,8 @@ export const { auth, signIn, signOut, store, isAuthenticated } = convexAuth({\n      * sign in (user.deletedAt is set). For normal active users, this is\n      * just a single `if` check on an already-loaded field - no extra queries.\n      */\n-    async createOrUpdateUser(ctx, args) {\n-      // New user - let Convex Auth handle creation with default behavior\n-      if (!args.existingUserId) {\n-        return null\n-      }\n-\n-      const userId = args.existingUserId as Id<'users'>\n-      const user = await ctx.db.get(userId)\n-\n-      // Active user - normal sign-in, no additional processing needed\n-      if (!user?.deletedAt) {\n-        return args.existingUserId\n-      }\n-\n-      // Soft-deleted user attempting to sign in - check if banned or self-deleted\n-      // Uses the by_target index for efficient lookup (not a full table scan)\n-      // Note: targetId is stored as v.string() in schema, so convert userId explicitly\n-      const banRecord = await ctx.db\n-        .query('auditLogs')\n-        .withIndex('by_target', (q) =>\n-          q.eq('targetType', 'user').eq('targetId', userId.toString())\n-        )\n-        .filter((q) => q.eq(q.field('action'), 'user.ban'))\n-        .first()\n-\n-      if (banRecord) {\n-        // User was banned by a moderator - do NOT restore\n-        throw new Error('This account has been suspended')\n-      }\n-\n-      // User self-deleted their account - restore it\n-      await ctx.db.patch(userId, {\n-        deletedAt: undefined,\n-        updatedAt: Date.now(),\n-      })\n-\n-      return args.existingUserId\n+    async afterUserCreatedOrUpdated(ctx, args) {\n+      await handleSoftDeletedUserReauth(ctx, args)\n     },\n   },\n })"
+    }
+  ]
+}

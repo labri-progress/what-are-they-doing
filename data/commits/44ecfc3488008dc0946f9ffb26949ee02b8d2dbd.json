@@ -1,0 +1,89 @@
+{
+  "message": "perf(server,cli): suppress noisy fsqlite tracing, relocate integrity check, and minimize worker pool allocations\n\nLogging filter (cli/lib.rs, main.rs): Replace the blanket \"info\" default\ntracing filter with a targeted filter that suppresses high-frequency\nfsqlite internal spans at warn level: fsqlite_core::connection,\nfsqlite_mvcc::{observability,gc,rebase}, fsqlite_wal::checkpoint_executor,\nand fsqlite_vdbe::{jit,engine}. This eliminates hundreds of per-query\ntracing events that previously flooded stderr during normal operation.\nBoth the CLI (apply_release_logging_defaults) and MCP server (main.rs)\nnow share the same filter list via dedicated default_*_log_filter()\nfunctions. Also directs the MCP server's tracing subscriber to stderr\nexplicitly and disables target display for cleaner output.\n\nStartup integrity check relocation (server/lib.rs, startup_checks.rs):\nMove the probe_integrity() call out of run_startup_probes() and into\nreadiness_check(), which already creates a single-connection pool and\nvalidates the database. This consolidates all pre-listen database\nvalidation into one function, avoids creating a redundant pool just for\nthe integrity probe, and fixes a subtle issue where\nnote_startup_integrity_probe_completed() was called unconditionally even\nwhen config.integrity_check_on_startup was false. The startup probes\ntest expectation is updated from 7 to 6 critical probes, and the now\ncall-site-only probe_integrity/attempt_probe_recovery functions get\n#[allow(dead_code)] annotations since they remain useful for manual or\nfuture automated recovery paths.\n\nWorker pool minimization (ack_ttl.rs, cleanup.rs, integrity_guard.rs):\nConfigure the ack-TTL scanner, cleanup worker, and integrity guard\nbackground threads to create minimal 1-connection pools (min=1, max=1,\nwarmup=0) instead of inheriting the default pool sizing from\nDbPoolConfig::from_env(). The ack-TTL and cleanup workers also now\nexplicitly clone the database URL from config and skip migrations, since\nreadiness_check() already ran migrations before these workers start.\nThe integrity guard already had url cloning but now also gets the\nmin/max/warmup reduction.\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "3db8f401c3d0886d137ea1ce37d34df76a555df4",
+      "filename": "crates/mcp-agent-mail-cli/src/lib.rs",
+      "status": "modified",
+      "additions": 18,
+      "deletions": 3,
+      "changes": 21,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/44ecfc3488008dc0946f9ffb26949ee02b8d2dbd/crates%2Fmcp-agent-mail-cli%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/44ecfc3488008dc0946f9ffb26949ee02b8d2dbd/crates%2Fmcp-agent-mail-cli%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-cli%2Fsrc%2Flib.rs?ref=44ecfc3488008dc0946f9ffb26949ee02b8d2dbd",
+      "patch": "@@ -2093,25 +2093,40 @@ fn apply_release_logging_defaults(suppress_runtime_logs_for_tui: bool) {\n \n     TRACING_INIT.call_once(|| {\n         let filter = if env_var_is_truthy(\"AM_ALLOW_DEBUG_STARTUP_LOGS\") {\n-            tracing_subscriber::EnvFilter::try_from_default_env()\n-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(\"info\"))\n+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {\n+                tracing_subscriber::EnvFilter::new(default_release_log_filter())\n+            })\n         } else if suppress_runtime_logs_for_tui {\n             // Prevent tracing output from corrupting the interactive TUI.\n             tracing_subscriber::EnvFilter::new(\"off\")\n         } else {\n-            tracing_subscriber::EnvFilter::new(\"info\")\n+            tracing_subscriber::EnvFilter::new(default_release_log_filter())\n         };\n \n         // Ignore double-init errors when tests or host processes already set a subscriber.\n         let _ = tracing_subscriber::fmt()\n             .with_env_filter(filter)\n+            .with_writer(std::io::stderr)\n             .with_target(false)\n             .with_ansi(crate::output::is_tty())\n             .compact()\n             .try_init();\n     });\n }\n \n+fn default_release_log_filter() -> &'static str {\n+    concat!(\n+        \"info,\",\n+        \"fsqlite_core::connection=warn,\",\n+        \"fsqlite_mvcc::observability=warn,\",\n+        \"fsqlite_mvcc::gc=warn,\",\n+        \"fsqlite_mvcc::rebase=warn,\",\n+        \"fsqlite_wal::checkpoint_executor=warn,\",\n+        \"fsqlite_vdbe::jit=warn,\",\n+        \"fsqlite_vdbe::engine=warn\",\n+    )\n+}\n+\n fn env_var_is_truthy(name: &str) -> bool {\n     std::env::var(name).is_ok_and(|raw| {\n         matches!("
+    },
+    {
+      "sha": "12a84dd649721910c8403366f6526ab24551b5bd",
+      "filename": "crates/mcp-agent-mail-server/src/ack_ttl.rs",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 1,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/44ecfc3488008dc0946f9ffb26949ee02b8d2dbd/crates%2Fmcp-agent-mail-server%2Fsrc%2Fack_ttl.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/44ecfc3488008dc0946f9ffb26949ee02b8d2dbd/crates%2Fmcp-agent-mail-server%2Fsrc%2Fack_ttl.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-server%2Fsrc%2Fack_ttl.rs?ref=44ecfc3488008dc0946f9ffb26949ee02b8d2dbd",
+      "patch": "@@ -66,7 +66,14 @@ pub fn shutdown() {\n fn ack_ttl_loop(config: &Config) {\n     let interval = std::time::Duration::from_secs(config.ack_ttl_scan_interval_seconds.max(5));\n \n-    let pool_config = DbPoolConfig::from_env();\n+    let mut pool_config = DbPoolConfig::from_env();\n+    pool_config.database_url.clone_from(&config.database_url);\n+    pool_config.min_connections = 1;\n+    pool_config.max_connections = 1;\n+    pool_config.warmup_connections = 0;\n+    // HTTP/TUI startup already runs readiness_check with migrations before\n+    // this worker starts, so keep the worker path lean.\n+    pool_config.run_migrations = false;\n     let pool = match create_pool(&pool_config) {\n         Ok(p) => p,\n         Err(e) => {"
+    },
+    {
+      "sha": "56b917f773ec01b68e21950fce9241fb5cc4355c",
+      "filename": "crates/mcp-agent-mail-server/src/cleanup.rs",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 1,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/44ecfc3488008dc0946f9ffb26949ee02b8d2dbd/crates%2Fmcp-agent-mail-server%2Fsrc%2Fcleanup.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/44ecfc3488008dc0946f9ffb26949ee02b8d2dbd/crates%2Fmcp-agent-mail-server%2Fsrc%2Fcleanup.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-server%2Fsrc%2Fcleanup.rs?ref=44ecfc3488008dc0946f9ffb26949ee02b8d2dbd",
+      "patch": "@@ -72,7 +72,14 @@ fn cleanup_loop(config: &Config) {\n     let interval =\n         std::time::Duration::from_secs(config.file_reservations_cleanup_interval_seconds.max(5));\n \n-    let pool_config = DbPoolConfig::from_env();\n+    let mut pool_config = DbPoolConfig::from_env();\n+    pool_config.database_url.clone_from(&config.database_url);\n+    pool_config.min_connections = 1;\n+    pool_config.max_connections = 1;\n+    pool_config.warmup_connections = 0;\n+    // HTTP/TUI startup already runs readiness_check with migrations before\n+    // this worker starts, so keep the worker path lean.\n+    pool_config.run_migrations = false;\n     let pool = match create_pool(&pool_config) {\n         Ok(p) => p,\n         Err(e) => {"
+    },
+    {
+      "sha": "ffd25a804e018586ee773b36c8a47c3f68f3d603",
+      "filename": "crates/mcp-agent-mail-server/src/integrity_guard.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/44ecfc3488008dc0946f9ffb26949ee02b8d2dbd/crates%2Fmcp-agent-mail-server%2Fsrc%2Fintegrity_guard.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/44ecfc3488008dc0946f9ffb26949ee02b8d2dbd/crates%2Fmcp-agent-mail-server%2Fsrc%2Fintegrity_guard.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-server%2Fsrc%2Fintegrity_guard.rs?ref=44ecfc3488008dc0946f9ffb26949ee02b8d2dbd",
+      "patch": "@@ -105,6 +105,9 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {\n \n     let mut pool_config = DbPoolConfig::from_env();\n     pool_config.database_url.clone_from(&config.database_url);\n+    pool_config.min_connections = 1;\n+    pool_config.max_connections = 1;\n+    pool_config.warmup_connections = 0;\n     // Keep migrations enabled here: this worker can be the first component to\n     // acquire a pooled connection (e.g. proactive backup checkpointing in\n     // stdio mode), and that first-acquire path must remain schema-safe."
+    },
+    {
+      "sha": "60c35ab26a31506a41eb9e90e964bdaa32ea3d8f",
+      "filename": "crates/mcp-agent-mail-server/src/lib.rs",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 4,
+      "changes": 18,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/44ecfc3488008dc0946f9ffb26949ee02b8d2dbd/crates%2Fmcp-agent-mail-server%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/44ecfc3488008dc0946f9ffb26949ee02b8d2dbd/crates%2Fmcp-agent-mail-server%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-server%2Fsrc%2Flib.rs?ref=44ecfc3488008dc0946f9ffb26949ee02b8d2dbd",
+      "patch": "@@ -1340,9 +1340,11 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {\n     ack_ttl::start(config);\n     tool_metrics::start(config);\n     retention::start(config);\n-    // Startup probes already performed the first integrity verification.\n+    // readiness_check() already performed the first integrity verification.\n     // Avoid immediately repeating the same expensive check in the guard loop.\n-    integrity_guard::note_startup_integrity_probe_completed();\n+    if config.integrity_check_on_startup {\n+        integrity_guard::note_startup_integrity_probe_completed();\n+    }\n     integrity_guard::start(config);\n     disk_monitor::start(config);\n     start_advisory_consistency_probe(config);\n@@ -1414,9 +1416,11 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul\n     ack_ttl::start(config);\n     tool_metrics::start(config);\n     retention::start(config);\n-    // Startup probes already performed the first integrity verification.\n+    // readiness_check() already performed the first integrity verification.\n     // Avoid immediately repeating the same expensive check in the guard loop.\n-    integrity_guard::note_startup_integrity_probe_completed();\n+    if config.integrity_check_on_startup {\n+        integrity_guard::note_startup_integrity_probe_completed();\n+    }\n     integrity_guard::start(config);\n     disk_monitor::start(config);\n     start_advisory_consistency_probe(config);\n@@ -6013,6 +6017,12 @@ fn readiness_check(config: &mcp_agent_mail_core::Config) -> Result<(), String> {\n         warmup_connections: 0,\n     };\n     let pool = create_pool(&db_config).map_err(|e| e.to_string())?;\n+    if config.integrity_check_on_startup\n+        && !mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url)\n+    {\n+        pool.run_startup_integrity_check()\n+            .map_err(|e| format!(\"startup integrity check failed: {e}\"))?;\n+    }\n     let cx = Cx::for_testing();\n     let conn = match block_on(pool.acquire(&cx)) {\n         asupersync::Outcome::Ok(c) => c,"
+    },
+    {
+      "sha": "edd7d6ad1497b5774364f29a55df627fce88be13",
+      "filename": "crates/mcp-agent-mail-server/src/startup_checks.rs",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 3,
+      "changes": 11,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/44ecfc3488008dc0946f9ffb26949ee02b8d2dbd/crates%2Fmcp-agent-mail-server%2Fsrc%2Fstartup_checks.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/44ecfc3488008dc0946f9ffb26949ee02b8d2dbd/crates%2Fmcp-agent-mail-server%2Fsrc%2Fstartup_checks.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-server%2Fsrc%2Fstartup_checks.rs?ref=44ecfc3488008dc0946f9ffb26949ee02b8d2dbd",
+      "patch": "@@ -487,6 +487,7 @@ fn probe_database(config: &Config) -> ProbeResult {\n /// logs a warning and allows startup to continue.\n ///\n /// Skipped when `INTEGRITY_CHECK_ON_STARTUP=false` or for in-memory databases.\n+#[allow(dead_code)]\n fn probe_integrity(config: &Config) -> ProbeResult {\n     if !config.integrity_check_on_startup {\n         return ProbeResult::Ok { name: \"integrity\" };\n@@ -498,7 +499,10 @@ fn probe_integrity(config: &Config) -> ProbeResult {\n \n     let pool_config = DbPoolConfig {\n         database_url: config.database_url.clone(),\n+        min_connections: 1,\n+        max_connections: 1,\n         run_migrations: false,\n+        warmup_connections: 0,\n         ..DbPoolConfig::default()\n     };\n \n@@ -538,6 +542,7 @@ fn probe_integrity(config: &Config) -> ProbeResult {\n /// 1. Restore from a healthy `.bak` / `.backup-*` / `.recovery*` backup\n /// 2. Reconstruct from the Git archive (recovers messages + agents)\n /// 3. Reinitialize an empty database (last resort)\n+#[allow(dead_code)]\n fn attempt_probe_recovery(config: &Config) -> ProbeResult {\n     let Some(db_path) = sqlite_file_path_from_database_url(&config.database_url) else {\n         return ProbeResult::Fail(ProbeFailure {\n@@ -778,7 +783,6 @@ pub fn run_startup_probes(config: &Config) -> StartupReport {\n         probe_http_path(config),\n         probe_auth(config),\n         probe_database(config),\n-        probe_integrity(config),\n         probe_storage_root(config),\n         probe_port(config),\n         probe_fd_limit(config),\n@@ -964,8 +968,9 @@ mod tests {\n     fn run_startup_probes_returns_results() {\n         let config = default_config();\n         let report = run_startup_probes(&config);\n-        // Should have 7 critical probes (consistency is now background/advisory).\n-        assert_eq!(report.results.len(), 7);\n+        // Should have 6 critical probes (integrity now runs in readiness_check;\n+        // consistency is background/advisory).\n+        assert_eq!(report.results.len(), 6);\n     }\n \n     #[test]"
+    },
+    {
+      "sha": "1124449b30143ffb8d755f882bc477404dab7543",
+      "filename": "crates/mcp-agent-mail/src/main.rs",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 2,
+      "changes": 22,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/44ecfc3488008dc0946f9ffb26949ee02b8d2dbd/crates%2Fmcp-agent-mail%2Fsrc%2Fmain.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/44ecfc3488008dc0946f9ffb26949ee02b8d2dbd/crates%2Fmcp-agent-mail%2Fsrc%2Fmain.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail%2Fsrc%2Fmain.rs?ref=44ecfc3488008dc0946f9ffb26949ee02b8d2dbd",
+      "patch": "@@ -41,6 +41,19 @@ fn am_interface_mode_from_env() -> Result<InterfaceMode, String> {\n     parse_am_interface_mode(env::var(\"AM_INTERFACE_MODE\").ok().as_deref())\n }\n \n+fn default_mcp_log_filter() -> &'static str {\n+    concat!(\n+        \"info,\",\n+        \"fsqlite_core::connection=warn,\",\n+        \"fsqlite_mvcc::observability=warn,\",\n+        \"fsqlite_mvcc::gc=warn,\",\n+        \"fsqlite_mvcc::rebase=warn,\",\n+        \"fsqlite_wal::checkpoint_executor=warn,\",\n+        \"fsqlite_vdbe::jit=warn,\",\n+        \"fsqlite_vdbe::engine=warn\",\n+    )\n+}\n+\n #[derive(Parser)]\n #[command(name = \"mcp-agent-mail\")]\n #[command(\n@@ -351,8 +364,13 @@ fn main() {\n     }\n \n     // MCP mode: initialize logging and proceed with the server binary behavior.\n-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(\"info\"));\n-    tracing_subscriber::fmt().with_env_filter(filter).init();\n+    let filter = EnvFilter::try_from_default_env()\n+        .unwrap_or_else(|_| EnvFilter::new(default_mcp_log_filter()));\n+    tracing_subscriber::fmt()\n+        .with_env_filter(filter)\n+        .with_writer(std::io::stderr)\n+        .with_target(false)\n+        .init();\n \n     let cli = Cli::parse();\n "
+    }
+  ]
+}

@@ -1,0 +1,53 @@
+{
+  "message": "fix(vector): populate type_counts to fix type-filtered semantic search\n\nBug fix: VectorIndexCache.load() was leaving type_counts empty, causing\nhas_embeddings_for_types() to always return false for type-filtered\nsearches. This made semantic search with --types flag incorrectly fail\nwith \"No embeddings found\".\n\nChanges:\n- Add VectorIndex::type_counts() method to compute counts by doc type\n- Use type_counts() in VectorIndexCache.load() instead of empty HashMap\n- Refactor hybrid.rs to use borrowed strings for better performance\n- Update cli_e2e.rs to adapt to FusedHit API change\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "8f7144626f226afccbf428d4b5fc8e09dca69108",
+      "filename": "src/hybrid.rs",
+      "status": "modified",
+      "additions": 35,
+      "deletions": 28,
+      "changes": 63,
+      "blob_url": "https://github.com/Dicklesworthstone/xf/blob/6fc0f779fa6b33cbc0f034ee71614b81667a1d37/src%2Fhybrid.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/xf/raw/6fc0f779fa6b33cbc0f034ee71614b81667a1d37/src%2Fhybrid.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/xf/contents/src%2Fhybrid.rs?ref=6fc0f779fa6b33cbc0f034ee71614b81667a1d37",
+      "patch": "@@ -21,21 +21,21 @@\n //! 2. Appears in both lists (bonus)\n //! 3. Document ID (ascending)\n \n-use crate::model::SearchResult;\n+use crate::model::{SearchResult, SearchResultType};\n use crate::vector::VectorSearchResult;\n use clap::ValueEnum;\n use std::cmp::Ordering;\n use std::collections::HashMap;\n \n-#[derive(Debug, Clone, PartialEq, Eq, Hash)]\n-struct DocKey {\n-    id: String,\n-    doc_type: String,\n+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]\n+struct DocKey<'a> {\n+    id: &'a str,\n+    doc_type: &'a str,\n }\n \n-impl DocKey {\n+impl<'a> DocKey<'a> {\n     #[allow(clippy::missing_const_for_fn)]\n-    fn new(id: String, doc_type: String) -> Self {\n+    fn new(id: &'a str, doc_type: &'a str) -> Self {\n         Self { id, doc_type }\n     }\n }\n@@ -97,19 +97,28 @@ struct HybridScore {\n \n /// Fused search hit combining information from both sources.\n #[derive(Debug, Clone)]\n-pub struct FusedHit {\n+pub struct FusedHit<'a> {\n     /// Document ID.\n-    pub doc_id: String,\n+    pub doc_id: &'a str,\n     /// Document type.\n-    pub doc_type: String,\n+    pub doc_type: &'a str,\n     /// Fused RRF score.\n     pub score: f32,\n-    /// Original lexical result (if present).\n-    pub lexical: Option<SearchResult>,\n+    /// Index into the lexical results (if present).\n+    pub lexical_rank: Option<usize>,\n     /// Whether this hit appeared in both lexical and semantic results.\n     pub in_both: bool,\n }\n \n+const fn result_type_str(result_type: SearchResultType) -> &'static str {\n+    match result_type {\n+        SearchResultType::Tweet => \"tweet\",\n+        SearchResultType::Like => \"like\",\n+        SearchResultType::DirectMessage => \"dm\",\n+        SearchResultType::GrokMessage => \"grok\",\n+    }\n+}\n+\n /// Fuse lexical and semantic search results using RRF.\n ///\n /// # Arguments\n@@ -124,47 +133,45 @@ pub struct FusedHit {\n /// Fused results sorted by RRF score, with deterministic tie-breaking.\n #[must_use]\n #[allow(clippy::cast_precision_loss)]\n-pub fn rrf_fuse(\n-    lexical: &[SearchResult],\n-    semantic: &[VectorSearchResult],\n+pub fn rrf_fuse<'a>(\n+    lexical: &'a [SearchResult],\n+    semantic: &'a [VectorSearchResult],\n     limit: usize,\n     offset: usize,\n-) -> Vec<FusedHit> {\n+) -> Vec<FusedHit<'a>> {\n     if limit == 0 {\n         return Vec::new();\n     }\n \n-    let mut scores: HashMap<DocKey, HybridScore> = HashMap::new();\n-    let mut lexical_results: HashMap<DocKey, SearchResult> = HashMap::new();\n+    let mut scores: HashMap<DocKey<'a>, HybridScore> = HashMap::new();\n \n     // Process lexical results (rank 0, 1, 2, ...)\n     for (rank, hit) in lexical.iter().enumerate() {\n-        let doc_type = hit.result_type.to_string();\n-        let key = DocKey::new(hit.id.clone(), doc_type.clone());\n-        let entry = scores.entry(key.clone()).or_default();\n+        let doc_type = result_type_str(hit.result_type);\n+        let key = DocKey::new(hit.id.as_str(), doc_type);\n+        let entry = scores.entry(key).or_default();\n         entry.rrf += 1.0 / (RRF_K + rank as f32 + 1.0);\n         entry.lexical_rank = Some(rank);\n-        lexical_results.insert(key, hit.clone());\n     }\n \n     // Process semantic results (rank 0, 1, 2, ...)\n     for (rank, hit) in semantic.iter().enumerate() {\n-        let key = DocKey::new(hit.doc_id.clone(), hit.doc_type.clone());\n+        let key = DocKey::new(hit.doc_id.as_str(), hit.doc_type.as_str());\n         let entry = scores.entry(key).or_default();\n         entry.rrf += 1.0 / (RRF_K + rank as f32 + 1.0);\n         entry.semantic_rank = Some(rank);\n     }\n \n     // Convert to fused hits\n-    let mut fused: Vec<FusedHit> = scores\n+    let mut fused: Vec<FusedHit<'a>> = scores\n         .into_iter()\n         .map(|(key, score)| {\n             let in_both = score.lexical_rank.is_some() && score.semantic_rank.is_some();\n             FusedHit {\n-                doc_type: key.doc_type.clone(),\n-                lexical: lexical_results.remove(&key),\n                 doc_id: key.id,\n+                doc_type: key.doc_type,\n                 score: score.rrf,\n+                lexical_rank: score.lexical_rank,\n                 in_both,\n             }\n         })\n@@ -182,8 +189,8 @@ pub fn rrf_fuse(\n                 _ => Ordering::Equal,\n             })\n             // Level 3: Document ID (ascending) for determinism\n-            .then_with(|| a.doc_id.cmp(&b.doc_id))\n-            .then_with(|| a.doc_type.cmp(&b.doc_type))\n+            .then_with(|| a.doc_id.cmp(b.doc_id))\n+            .then_with(|| a.doc_type.cmp(b.doc_type))\n     });\n \n     // Apply offset and limit"
+    },
+    {
+      "sha": "fd93f592a3c56024d2dfca88e56eee01c42362b5",
+      "filename": "src/main.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 6,
+      "changes": 13,
+      "blob_url": "https://github.com/Dicklesworthstone/xf/blob/6fc0f779fa6b33cbc0f034ee71614b81667a1d37/src%2Fmain.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/xf/raw/6fc0f779fa6b33cbc0f034ee71614b81667a1d37/src%2Fmain.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/xf/contents/src%2Fmain.rs?ref=6fc0f779fa6b33cbc0f034ee71614b81667a1d37",
+      "patch": "@@ -102,7 +102,7 @@ impl VectorIndexCache {\n         let index = VectorIndex::load_from_file_or_storage(index_path, storage)?;\n \n         // Collect stats for staleness checking\n-        let type_counts: HashMap<String, usize> = HashMap::new();\n+        let type_counts = index.type_counts();\n         let embedding_count = index.len();\n \n         let db_mtime = db_path\n@@ -1330,11 +1330,11 @@ fn cmd_search(cli: &Cli, args: &cli::SearchArgs) -> Result<()> {\n             let mut lookups = Vec::new();\n             let mut lookup_indices = Vec::new();\n             for (idx, hit) in fused.iter().enumerate() {\n-                if hit.lexical.is_none() {\n+                if hit.lexical_rank.is_none() {\n                     let lookup = if hit.doc_type.is_empty() {\n-                        search::DocLookup::new(&hit.doc_id)\n+                        search::DocLookup::new(hit.doc_id)\n                     } else {\n-                        search::DocLookup::with_type(&hit.doc_id, &hit.doc_type)\n+                        search::DocLookup::with_type(hit.doc_id, hit.doc_type)\n                     };\n                     lookups.push(lookup);\n                     lookup_indices.push(idx);\n@@ -1353,9 +1353,10 @@ fn cmd_search(cli: &Cli, args: &cli::SearchArgs) -> Result<()> {\n             }\n \n             let mut results = Vec::new();\n-            for (idx, hit) in fused.into_iter().enumerate() {\n+            for (idx, hit) in fused.iter().enumerate() {\n                 // Prefer lexical result (has full data)\n-                if let Some(mut result) = hit.lexical {\n+                if let Some(rank) = hit.lexical_rank {\n+                    let mut result = lexical_results[rank].clone();\n                     result.score = hit.score;\n                     results.push(result);\n                 } else if let Some(mut result) = fetched_by_index[idx].take() {"
+    },
+    {
+      "sha": "13a7aa3fe1a85edddb0166aa336d027d3a43bc10",
+      "filename": "src/vector.rs",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 0,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/xf/blob/6fc0f779fa6b33cbc0f034ee71614b81667a1d37/src%2Fvector.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/xf/raw/6fc0f779fa6b33cbc0f034ee71614b81667a1d37/src%2Fvector.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/xf/contents/src%2Fvector.rs?ref=6fc0f779fa6b33cbc0f034ee71614b81667a1d37",
+      "patch": "@@ -732,6 +732,16 @@ impl VectorIndex {\n         self.vectors.is_empty()\n     }\n \n+    /// Get counts of embeddings by document type.\n+    #[must_use]\n+    pub fn type_counts(&self) -> std::collections::HashMap<String, usize> {\n+        let mut counts = std::collections::HashMap::new();\n+        for (_, doc_type, _) in &self.vectors {\n+            *counts.entry(doc_type.clone()).or_insert(0) += 1;\n+        }\n+        counts\n+    }\n+\n     /// Get the embedding dimension.\n     #[must_use]\n     pub const fn dimension(&self) -> usize {"
+    },
+    {
+      "sha": "f4eda9d257788a9658111397f7e9bf14323feb95",
+      "filename": "tests/cli_e2e.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/xf/blob/6fc0f779fa6b33cbc0f034ee71614b81667a1d37/tests%2Fcli_e2e.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/xf/raw/6fc0f779fa6b33cbc0f034ee71614b81667a1d37/tests%2Fcli_e2e.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/xf/contents/tests%2Fcli_e2e.rs?ref=6fc0f779fa6b33cbc0f034ee71614b81667a1d37",
+      "patch": "@@ -250,7 +250,7 @@ fn expected_hybrid_scores(\n \n     fused\n         .into_iter()\n-        .map(|hit| (hit.doc_id, hit.score))\n+        .map(|hit| (hit.doc_id.to_string(), hit.score))\n         .collect()\n }\n "
+    }
+  ]
+}

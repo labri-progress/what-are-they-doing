@@ -1,0 +1,29 @@
+{
+  "message": "fix(lab): Add RNG-based tie-breaking for deterministic scheduling variance\n\nAdds pop_with_rng_hint() to PriorityScheduler that varies task selection\namong equal-priority tasks using the RNG hint value. LabRuntime now uses\nthis method to ensure different seeds produce different task orderings.\n\nFixes: test_lab_different_seeds_different_results\nCloses: bd-3ivp\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "d7c4bc5184d1754548c95bb5dbaf00a9b30fbd56",
+      "filename": "src/lab/runtime.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/d7f1875309ab4dbd63127831df8c385884571ab4/src%2Flab%2Fruntime.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/d7f1875309ab4dbd63127831df8c385884571ab4/src%2Flab%2Fruntime.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Flab%2Fruntime.rs?ref=d7f1875309ab4dbd63127831df8c385884571ab4",
+      "patch": "@@ -235,8 +235,8 @@ impl LabRuntime {\n         self.replay_recorder.record_rng_value(rng_value);\n         self.check_futurelocks();\n \n-        // 1. Pop a task from the scheduler\n-        let Some(task_id) = self.scheduler.lock().unwrap().pop() else {\n+        // 1. Pop a task from the scheduler (using RNG hint for tie-breaking)\n+        let Some(task_id) = self.scheduler.lock().unwrap().pop_with_rng_hint(rng_value) else {\n             self.check_deadline_monitor();\n             return;\n         };"
+    },
+    {
+      "sha": "c5759e8ed1adb5b7817d2fee9f651e0ffd8c655a",
+      "filename": "src/runtime/scheduler/priority.rs",
+      "status": "modified",
+      "additions": 81,
+      "deletions": 0,
+      "changes": 81,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/d7f1875309ab4dbd63127831df8c385884571ab4/src%2Fruntime%2Fscheduler%2Fpriority.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/d7f1875309ab4dbd63127831df8c385884571ab4/src%2Fruntime%2Fscheduler%2Fpriority.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Fscheduler%2Fpriority.rs?ref=d7f1875309ab4dbd63127831df8c385884571ab4",
+      "patch": "@@ -42,6 +42,57 @@ fn insert_by_deadline(lane: &mut VecDeque<TimedEntry>, entry: TimedEntry) {\n     lane.insert(pos, entry);\n }\n \n+/// Pop from a priority-based lane with RNG tie-breaking among equal-priority tasks.\n+fn pop_from_priority_lane_with_hint(\n+    lane: &mut VecDeque<SchedulerEntry>,\n+    rng_hint: u64,\n+) -> Option<TaskId> {\n+    if lane.is_empty() {\n+        return None;\n+    }\n+\n+    // Find how many tasks share the highest priority at the front\n+    let front_priority = lane.front().unwrap().priority;\n+    let tie_count = lane\n+        .iter()\n+        .take_while(|e| e.priority == front_priority)\n+        .count();\n+\n+    if tie_count == 1 {\n+        // No tie, just pop the front\n+        return lane.pop_front().map(|e| e.task);\n+    }\n+\n+    // Use rng_hint to select among the tied tasks\n+    let selected_idx = (rng_hint as usize) % tie_count;\n+    let entry = lane.remove(selected_idx).unwrap();\n+    Some(entry.task)\n+}\n+\n+/// Pop from a timed lane with RNG tie-breaking for equal deadlines.\n+fn pop_from_timed_lane_with_hint(lane: &mut VecDeque<TimedEntry>, rng_hint: u64) -> Option<TaskId> {\n+    if lane.is_empty() {\n+        return None;\n+    }\n+\n+    // Find how many tasks share the earliest deadline at the front\n+    let front_deadline = lane.front().unwrap().deadline;\n+    let tie_count = lane\n+        .iter()\n+        .take_while(|e| e.deadline == front_deadline)\n+        .count();\n+\n+    if tie_count == 1 {\n+        // No tie, just pop the front\n+        return lane.pop_front().map(|e| e.task);\n+    }\n+\n+    // Use rng_hint to select among the tied tasks\n+    let selected_idx = (rng_hint as usize) % tie_count;\n+    let entry = lane.remove(selected_idx).unwrap();\n+    Some(entry.task)\n+}\n+\n /// The three-lane scheduler.\n #[derive(Debug, Default)]\n pub struct Scheduler {\n@@ -123,6 +174,36 @@ impl Scheduler {\n         None\n     }\n \n+    /// Pops the next task to run, using `rng_hint` for tie-breaking among equal-priority tasks.\n+    ///\n+    /// This method provides deterministic but seed-varying scheduling for the lab runtime.\n+    /// When multiple tasks have the same priority at the head of a lane, the `rng_hint`\n+    /// determines which one is selected, enabling different seeds to produce different\n+    /// execution orderings while remaining deterministic for the same seed.\n+    ///\n+    /// Order: cancel lane > timed lane > ready lane.\n+    pub fn pop_with_rng_hint(&mut self, rng_hint: u64) -> Option<TaskId> {\n+        // Try cancel lane first\n+        if let Some(task) = pop_from_priority_lane_with_hint(&mut self.cancel_lane, rng_hint) {\n+            self.scheduled.remove(&task);\n+            return Some(task);\n+        }\n+\n+        // Try timed lane (EDF - equal deadlines get tie-broken)\n+        if let Some(task) = pop_from_timed_lane_with_hint(&mut self.timed_lane, rng_hint) {\n+            self.scheduled.remove(&task);\n+            return Some(task);\n+        }\n+\n+        // Try ready lane\n+        if let Some(task) = pop_from_priority_lane_with_hint(&mut self.ready_lane, rng_hint) {\n+            self.scheduled.remove(&task);\n+            return Some(task);\n+        }\n+\n+        None\n+    }\n+\n     /// Removes a specific task from the scheduler.\n     pub fn remove(&mut self, task: TaskId) {\n         if self.scheduled.remove(&task) {"
+    }
+  ]
+}

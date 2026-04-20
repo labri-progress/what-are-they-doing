@@ -1,0 +1,29 @@
+{
+  "message": "fix: correct semantic bug and add thread safety\n\n- Rename UptimeSeconds to IdleSinceSeconds in SessionAgentHealth struct\n  to accurately reflect what it measures (time since last activity,\n  not uptime)\n- Fix variable shadowing: rename 'copy' to 'backoffCopy' in\n  BackoffManager methods to avoid shadowing builtin\n- Add mutex protection to DetectAllErrorsInOutput and AddErrorPattern\n  in errors.go for thread-safe access to errorPatterns slice\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "e313a3d4f5ab96b0f672f0bbb09d6f8dcfd6471a",
+      "filename": "internal/robot/health.go",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 7,
+      "changes": 14,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/8e6a930ec9a4236714dd0961198cd7b32643a359/internal%2Frobot%2Fhealth.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/8e6a930ec9a4236714dd0961198cd7b32643a359/internal%2Frobot%2Fhealth.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Frobot%2Fhealth.go?ref=8e6a930ec9a4236714dd0961198cd7b32643a359",
+      "patch": "@@ -720,7 +720,7 @@ type SessionAgentHealth struct {\n \tPane             int     `json:\"pane\"`\n \tAgentType        string  `json:\"agent_type\"`\n \tHealth           string  `json:\"health\"` // healthy, degraded, unhealthy, rate_limited\n-\tUptimeSeconds    int     `json:\"uptime_seconds\"`\n+\tIdleSinceSeconds int     `json:\"idle_since_seconds\"` // seconds since last pane activity\n \tRestarts         int     `json:\"restarts\"`\n \tLastError        string  `json:\"last_error,omitempty\"`\n \tRateLimitCount   int     `json:\"rate_limit_count\"`\n@@ -775,10 +775,10 @@ func PrintSessionHealth(session string) error {\n \t\t\tHealth:    \"healthy\",\n \t\t}\n \n-\t\t// Get activity time for uptime calculation\n+\t\t// Get activity time - how long since last pane activity\n \t\tactivityTime, err := tmux.GetPaneActivity(pane.ID)\n \t\tif err == nil {\n-\t\t\tagentHealth.UptimeSeconds = int(time.Since(activityTime).Seconds())\n+\t\t\tagentHealth.IdleSinceSeconds = int(time.Since(activityTime).Seconds())\n \t\t}\n \n \t\t// Perform comprehensive health check\n@@ -1339,8 +1339,8 @@ func (bm *BackoffManager) GetBackoff(paneID string) *RateLimitBackoff {\n \t}\n \n \t// Return a copy\n-\tcopy := *backoff\n-\treturn &copy\n+\tbackoffCopy := *backoff\n+\treturn &backoffCopy\n }\n \n // ClearBackoff clears the backoff state for an agent (e.g., after recovery)\n@@ -1379,8 +1379,8 @@ func (bm *BackoffManager) GetAllBackoffs() map[string]*RateLimitBackoff {\n \n \tfor paneID, backoff := range bm.backoffs {\n \t\tif now.Before(backoff.BackoffEndsAt) {\n-\t\t\tcopy := *backoff\n-\t\t\tresult[paneID] = &copy\n+\t\t\tbackoffCopy := *backoff\n+\t\t\tresult[paneID] = &backoffCopy\n \t\t}\n \t}\n "
+    },
+    {
+      "sha": "4bab1146a3dd8a77071def7221d8ea349d1fb97a",
+      "filename": "internal/status/errors.go",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 1,
+      "changes": 16,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/8e6a930ec9a4236714dd0961198cd7b32643a359/internal%2Fstatus%2Ferrors.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/8e6a930ec9a4236714dd0961198cd7b32643a359/internal%2Fstatus%2Ferrors.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fstatus%2Ferrors.go?ref=8e6a930ec9a4236714dd0961198cd7b32643a359",
+      "patch": "@@ -3,6 +3,7 @@ package status\n import (\n \t\"regexp\"\n \t\"strings\"\n+\t\"sync\"\n )\n \n // ErrorPattern defines a pattern for error detection in agent output\n@@ -17,6 +18,9 @@ type ErrorPattern struct {\n \tDescription string\n }\n \n+// errorPatternsMu protects errorPatterns from concurrent access.\n+var errorPatternsMu sync.RWMutex\n+\n // errorPatterns contains all known error patterns, ordered by priority.\n // More specific patterns should come first within each category.\n var errorPatterns = []ErrorPattern{\n@@ -88,6 +92,9 @@ func DetectErrorInOutput(output string) ErrorType {\n \trecent := strings.Join(lines[start:], \"\\n\")\n \n \t// Patterns are ordered by priority, so first match wins\n+\terrorPatternsMu.RLock()\n+\tdefer errorPatternsMu.RUnlock()\n+\n \tfor _, p := range errorPatterns {\n \t\tif p.Regex != nil && p.Regex.MatchString(recent) {\n \t\t\treturn p.Type\n@@ -115,6 +122,9 @@ func DetectAllErrorsInOutput(output string) []ErrorType {\n \tseen := make(map[ErrorType]bool)\n \tvar errors []ErrorType\n \n+\terrorPatternsMu.RLock()\n+\tdefer errorPatternsMu.RUnlock()\n+\n \tfor _, p := range errorPatterns {\n \t\tmatched := false\n \t\tif p.Regex != nil && p.Regex.MatchString(recent) {\n@@ -137,13 +147,17 @@ func IsError(e ErrorType) bool {\n \treturn e != ErrorNone\n }\n \n-// AddErrorPattern allows adding custom error patterns at runtime\n+// AddErrorPattern allows adding custom error patterns at runtime.\n+// It is thread-safe and can be called concurrently with detection functions.\n func AddErrorPattern(errorType ErrorType, pattern string, description string) error {\n \tregex, err := regexp.Compile(pattern)\n \tif err != nil {\n \t\treturn err\n \t}\n \n+\terrorPatternsMu.Lock()\n+\tdefer errorPatternsMu.Unlock()\n+\n \terrorPatterns = append(errorPatterns, ErrorPattern{\n \t\tType:        errorType,\n \t\tRegex:       regex,"
+    }
+  ]
+}

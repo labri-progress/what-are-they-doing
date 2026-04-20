@@ -1,0 +1,41 @@
+{
+  "message": "feat(metrics): add Prometheus metrics endpoint support\n\nlib.rs:\n- Add conditional metrics module export behind \"metrics\" feature flag\n\nruntime.rs:\n- Add getter methods for runtime metrics: ingest_lag_count(),\n  ingest_lag_sum_ms(), segments_persisted(), events_recorded()\n\nmain.rs:\n- Add CLI flags: --metrics, --metrics-bind, --metrics-prefix\n- Wire metrics flags into config overrides\n- Start MetricsServer when config.metrics.enabled, log bind address\n- Graceful shutdown waits for metrics server\n- Handle feature-gated build with warning for missing metrics feature\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "5245e186181780ba9a0853f3c7617585fa70d7ed",
+      "filename": "crates/wa-core/src/lib.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/58e1ef1b2f81d658be2989d7c37cfb9df09610eb/crates%2Fwa-core%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/58e1ef1b2f81d658be2989d7c37cfb9df09610eb/crates%2Fwa-core%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Fwa-core%2Fsrc%2Flib.rs?ref=58e1ef1b2f81d658be2989d7c37cfb9df09610eb",
+      "patch": "@@ -68,6 +68,8 @@ pub mod ipc;\n pub mod learn;\n pub mod lock;\n pub mod logging;\n+#[cfg(feature = \"metrics\")]\n+pub mod metrics;\n #[cfg(feature = \"mcp\")]\n pub mod mcp;\n pub mod notifications;"
+    },
+    {
+      "sha": "1c6b13027f869d247f9acaa37b1da9eb78ae67d4",
+      "filename": "crates/wa-core/src/runtime.rs",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 0,
+      "changes": 20,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/58e1ef1b2f81d658be2989d7c37cfb9df09610eb/crates%2Fwa-core%2Fsrc%2Fruntime.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/58e1ef1b2f81d658be2989d7c37cfb9df09610eb/crates%2Fwa-core%2Fsrc%2Fruntime.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Fwa-core%2Fsrc%2Fruntime.rs?ref=58e1ef1b2f81d658be2989d7c37cfb9df09610eb",
+      "patch": "@@ -171,6 +171,16 @@ impl RuntimeMetrics {\n         }\n     }\n \n+    /// Get total ingest lag sample count.\n+    pub fn ingest_lag_count(&self) -> u64 {\n+        self.ingest_lag_count.load(Ordering::SeqCst)\n+    }\n+\n+    /// Get total ingest lag sum in milliseconds.\n+    pub fn ingest_lag_sum_ms(&self) -> u64 {\n+        self.ingest_lag_sum_ms.load(Ordering::SeqCst)\n+    }\n+\n     /// Get maximum ingest lag in milliseconds.\n     pub fn max_ingest_lag_ms(&self) -> u64 {\n         self.ingest_lag_max_ms.load(Ordering::SeqCst)\n@@ -181,6 +191,16 @@ impl RuntimeMetrics {\n         let ts = self.last_db_write_at.load(Ordering::SeqCst);\n         if ts == 0 { None } else { Some(ts) }\n     }\n+\n+    /// Get total segments persisted.\n+    pub fn segments_persisted(&self) -> u64 {\n+        self.segments_persisted.load(Ordering::SeqCst)\n+    }\n+\n+    /// Get total events recorded.\n+    pub fn events_recorded(&self) -> u64 {\n+        self.events_recorded.load(Ordering::SeqCst)\n+    }\n }\n \n /// The observation runtime orchestrates passive monitoring."
+    },
+    {
+      "sha": "6234a874f417c69b92c523ad95b3527e018313f4",
+      "filename": "crates/wa/src/main.rs",
+      "status": "modified",
+      "additions": 75,
+      "deletions": 0,
+      "changes": 75,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/58e1ef1b2f81d658be2989d7c37cfb9df09610eb/crates%2Fwa%2Fsrc%2Fmain.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/58e1ef1b2f81d658be2989d7c37cfb9df09610eb/crates%2Fwa%2Fsrc%2Fmain.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Fwa%2Fsrc%2Fmain.rs?ref=58e1ef1b2f81d658be2989d7c37cfb9df09610eb",
+      "patch": "@@ -106,6 +106,18 @@ SEE ALSO:\n         #[arg(long)]\n         no_patterns: bool,\n \n+        /// Enable Prometheus metrics endpoint\n+        #[arg(long)]\n+        metrics: bool,\n+\n+        /// Metrics bind address (overrides config)\n+        #[arg(long)]\n+        metrics_bind: Option<String>,\n+\n+        /// Metrics prefix for exported metrics\n+        #[arg(long)]\n+        metrics_prefix: Option<String>,\n+\n         /// Disable single-instance lock (DANGEROUS: may corrupt data)\n         #[arg(long)]\n         dangerous_disable_lock: bool,\n@@ -5534,6 +5546,43 @@ async fn run_watcher(\n     let handle = runtime.start().await?;\n     tracing::info!(\"Observation runtime started\");\n \n+    let metrics_handle = if config.metrics.enabled {\n+        #[cfg(feature = \"metrics\")]\n+        {\n+            let collector =\n+                wa_core::metrics::RuntimeMetricsCollector::new(Arc::clone(&handle));\n+            let server = wa_core::metrics::MetricsServer::new(\n+                config.metrics.bind.clone(),\n+                config.metrics.prefix.clone(),\n+                Arc::new(collector),\n+                Arc::clone(&handle.shutdown_flag),\n+            );\n+            match server.start().await {\n+                Ok(handle) => {\n+                    tracing::info!(\n+                        bind = %handle.local_addr(),\n+                        prefix = %config.metrics.prefix,\n+                        \"Metrics endpoint enabled\"\n+                    );\n+                    Some(handle)\n+                }\n+                Err(err) => {\n+                    tracing::error!(error = %err, \"Failed to start metrics endpoint\");\n+                    None\n+                }\n+            }\n+        }\n+        #[cfg(not(feature = \"metrics\"))]\n+        {\n+            tracing::warn!(\n+                \"Metrics enabled in config, but wa was built without the metrics feature\"\n+            );\n+            None\n+        }\n+    } else {\n+        None\n+    };\n+\n     let config_path_buf = config_path.map(Path::to_path_buf);\n     let ipc_handle = if config.ipc.enabled {\n         #[cfg(unix)]\n@@ -5706,6 +5755,10 @@ async fn run_watcher(\n     handle.shutdown().await;\n     tracing::info!(\"Watcher shutdown complete\");\n \n+    if let Some(metrics_handle) = metrics_handle {\n+        metrics_handle.wait().await;\n+    }\n+\n     if let Some(backup_handle) = scheduled_backup_handle {\n         let _ = backup_handle.await;\n     }\n@@ -6018,6 +6071,25 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {\n     if verbose > 0 {\n         overrides.log_level = Some(\"debug\".to_string());\n     }\n+    if let Some(Commands::Watch {\n+        metrics,\n+        metrics_bind,\n+        metrics_prefix,\n+        ..\n+    }) = &command\n+    {\n+        if *metrics {\n+            overrides.metrics_enabled = Some(true);\n+        }\n+        if let Some(bind) = metrics_bind {\n+            overrides.metrics_enabled.get_or_insert(true);\n+            overrides.metrics_bind = Some(bind.clone());\n+        }\n+        if let Some(prefix) = metrics_prefix {\n+            overrides.metrics_enabled.get_or_insert(true);\n+            overrides.metrics_prefix = Some(prefix.clone());\n+        }\n+    }\n \n     let config_path = cli_config_arg.as_deref().map(Path::new);\n     let config = match wa_core::config::Config::load_with_overrides(\n@@ -6085,6 +6157,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {\n             foreground,\n             poll_interval,\n             no_patterns,\n+            metrics: _metrics,\n+            metrics_bind: _metrics_bind,\n+            metrics_prefix: _metrics_prefix,\n             dangerous_disable_lock,\n         }) => {\n             run_watcher_with_backoff("
+    }
+  ]
+}

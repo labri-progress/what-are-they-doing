@@ -1,0 +1,29 @@
+{
+  "message": "feat(pt-core): Add tracing support and fix quick_scan zombie leaks\n\nTwo improvements to pt-core:\n\n## 1. Dependencies Added\n\n### Structured Logging (tracing ecosystem)\n- `tracing = \"0.1\"`: Core instrumentation library\n- `tracing-subscriber = \"0.3\"` with `json` and `env-filter` features:\n  - JSON output for machine-readable logs\n  - RUST_LOG environment variable filtering\n\n### Internal Crate\n- `pt-redact`: For command-line and environment redaction during\n  process scanning (protects secrets in cmdline data)\n\n## 2. Quick Scan Bug Fixes\n\n### Zombie Process Prevention\nThe original code spawned the `ps` command but didn't wait() for it\nafter reading stdout, leaving defunct (zombie) child processes:\n\n```rust\n// BEFORE: Zombies accumulate\nlet output = cmd.spawn()?;\nlet stdout = output.stdout...;\n// Process terminates but parent never reaps it\n\n// AFTER: Child properly reaped\nlet mut child = cmd.spawn()?;\nlet stdout = child.stdout.take()...;\n// ... process stdout ...\nlet _ = child.wait();  // Reap child\n```\n\nThis is critical for:\n- Long-running daemon mode where scans repeat frequently\n- Systems with low PID limits\n- Clean process table maintenance\n\n### Variable Simplification\nRemoved redundant platform-conditional assignment:\n```rust\n// BEFORE: Unnecessary conditional\nlet comm_idx = if platform == \"linux\" { 13 } else { 13 };\n\n// AFTER: Direct assignment\nlet comm_idx = 13;  // Same index for Linux and macOS\n```\n\nThis was likely a copy-paste artifact from when the indices differed\nbetween platforms. The comment now documents that both platforms use\nthe same field index.\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "3bc2845ce269cc9905f536cec45310381e18c437",
+      "filename": "crates/pt-core/Cargo.toml",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/Dicklesworthstone/process_triage/blob/5af82844fdb814c91cc742c4ad1b24fa7753d852/crates%2Fpt-core%2FCargo.toml",
+      "raw_url": "https://github.com/Dicklesworthstone/process_triage/raw/5af82844fdb814c91cc742c4ad1b24fa7753d852/crates%2Fpt-core%2FCargo.toml",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/process_triage/contents/crates%2Fpt-core%2FCargo.toml?ref=5af82844fdb814c91cc742c4ad1b24fa7753d852",
+      "patch": "@@ -25,10 +25,15 @@ uuid = { version = \"1\", features = [\"v4\", \"serde\"] }\n thiserror = \"1\"\n dirs = \"5\"\n \n+# Structured logging\n+tracing = \"0.1\"\n+tracing-subscriber = { version = \"0.3\", features = [\"json\", \"env-filter\"] }\n+\n # Internal crates\n pt-common = { path = \"../pt-common\" }\n pt-config = { path = \"../pt-config\" }\n pt-math = { path = \"../pt-math\" }\n+pt-redact = { path = \"../pt-redact\" }\n \n [features]\n default = []"
+    },
+    {
+      "sha": "759ee3798fc569d8292c20a7a576c277ce08cf78",
+      "filename": "crates/pt-core/src/collect/quick_scan.rs",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 6,
+      "changes": 16,
+      "blob_url": "https://github.com/Dicklesworthstone/process_triage/blob/5af82844fdb814c91cc742c4ad1b24fa7753d852/crates%2Fpt-core%2Fsrc%2Fcollect%2Fquick_scan.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/process_triage/raw/5af82844fdb814c91cc742c4ad1b24fa7753d852/crates%2Fpt-core%2Fsrc%2Fcollect%2Fquick_scan.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/process_triage/contents/crates%2Fpt-core%2Fsrc%2Fcollect%2Fquick_scan.rs?ref=5af82844fdb814c91cc742c4ad1b24fa7753d852",
+      "patch": "@@ -72,13 +72,13 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr\n     let mut cmd = build_ps_command(&platform, options)?;\n \n     // Execute and capture output\n-    let output = cmd\n+    let mut child = cmd\n         .stdout(Stdio::piped())\n         .stderr(Stdio::piped())\n         .spawn()\n         .map_err(|e| QuickScanError::CommandFailed(e.to_string()))?;\n \n-    let stdout = output.stdout.ok_or_else(|| {\n+    let stdout = child.stdout.take().ok_or_else(|| {\n         QuickScanError::CommandFailed(\"Failed to capture stdout\".to_string())\n     })?;\n \n@@ -108,17 +108,21 @@ pub fn quick_scan(options: &QuickScanOptions) -> Result<ScanResult, QuickScanErr\n         }\n     }\n \n+    // Wait for child process to avoid leaving zombies\n+    let _ = child.wait();\n+\n     let duration = start.elapsed();\n+    let process_count = processes.len();\n \n     Ok(ScanResult {\n-        processes: processes.clone(),\n+        processes,\n         metadata: ScanMetadata {\n             scan_type: \"quick\".to_string(),\n             platform,\n             boot_id,\n             started_at: chrono::Utc::now().to_rfc3339(),\n             duration_ms: duration.as_millis() as u64,\n-            process_count: processes.len(),\n+            process_count,\n             warnings,\n         },\n     })\n@@ -243,8 +247,8 @@ fn parse_ps_line(\n     // macOS: \"Tue Jan 14 10:30:00 2026\"\n     let (start_time_unix, elapsed) = parse_timing_fields(platform, &fields)?;\n \n-    // Comm is field 13 (0-indexed: 13)\n-    let comm_idx = if platform == \"linux\" { 13 } else { 13 };\n+    // Comm is field 13 (0-indexed: 13) - same index for both Linux and macOS\n+    let comm_idx = 13;\n     let comm = fields.get(comm_idx).unwrap_or(&\"\").to_string();\n \n     // Args/cmd is everything after comm (field 14+)"
+    }
+  ]
+}

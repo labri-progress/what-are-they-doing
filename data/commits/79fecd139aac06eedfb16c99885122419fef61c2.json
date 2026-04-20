@@ -1,0 +1,137 @@
+{
+  "message": "fix(abi): cross-subsystem correctness fixes for dirent, poll, process, signal, string, termios, time, and wchar\n\ndirent_abi:\n- Fix readdir_r to properly distinguish EOF from error by saving/clearing\n  errno before calling readdir and checking it afterward, matching POSIX\n  readdir_r semantics where return value 0 + *result==NULL means EOF, and\n  return value != 0 means error.\n- Route scandir's internal malloc/free through frankenlibc's allocator\n  instead of libc::malloc/free, ensuring the returned entries are\n  allocated from the membrane-managed arena and can be safely freed with\n  the interposed free().\n\ndlfcn_abi:\n- Extract dlvsym_next() helper to centralize RTLD_NEXT lookups via\n  libc::dlvsym, used by startup_abi to avoid routing through the\n  interposed dlsym.\n\npoll_abi:\n- Add aarch64 support: aarch64 Linux does not provide SYS_poll or\n  SYS_select, so poll() now uses SYS_ppoll with a converted timespec,\n  and select() uses SYS_pselect6 with a converted timespec. x86_64\n  retains the direct SYS_poll/SYS_select paths.\n\nprocess_abi:\n- Fix execvp_via_execve and execvpe to read errno from the host's\n  __errno_location via last_host_errno() instead of reading our\n  interposed errno. After a failed execve syscall, the error code is\n  in the host errno, not the frankenlibc errno.\n\nsetjmp_abi:\n- Replace libc::abort() with std::process::abort() in\n  terminate_deferred_transfer to avoid re-entering the interposed\n  signal infrastructure during termination.\n\nsignal_abi:\n- Fix sigwait error path to use last_host_errno() instead of reading\n  our interposed errno, matching the process_abi fix.\n\nstartup_abi:\n- Use the new dlfcn_abi::dlvsym_next() helper instead of calling\n  libc::dlvsym(RTLD_NEXT, ...) directly, avoiding potential symbol\n  resolution loops during startup.\n\nstring_abi:\n- Fix stpncpy return pointer: measure the written length from dst\n  (which may have been clamped by the membrane) rather than scanning\n  the source, so the returned pointer respects any healing/truncation\n  that occurred during the copy.\n- Fix strncat truncation detection: only report truncation when the\n  source string was clamped by its allocation bound (not by the caller's\n  n parameter), preventing false-positive truncation warnings for normal\n  bounded concatenation.\n\ntermios_abi:\n- Fix tcsendbreak to use TCSBRKP ioctl when duration > 0 (which sends\n  a break for the specified duration) and TCSBRK when duration == 0,\n  matching POSIX semantics. Previously TCSBRK was always used with the\n  duration argument, which TCSBRK ignores.\n\ntime_abi:\n- Replace libc::strlen with scan_c_string for format string length\n  measurement in strftime, using the membrane-aware bounded scanner\n  instead of the raw host strlen.\n\nwchar_abi:\n- Route wcsdup allocation through frankenlibc's malloc instead of\n  libc::malloc for consistency with the membrane allocator.\n- Replace libc::strlen calls with scan_c_string in mbstowcs, mbsrtowcs,\n  basename, and dirname to use membrane-aware bounded scanning.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "1ec4f59511a921121dbf5cd719ec5e6e5b8aa7b6",
+      "filename": "crates/frankenlibc-abi/src/dirent_abi.rs",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 7,
+      "changes": 23,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/79fecd139aac06eedfb16c99885122419fef61c2/crates%2Ffrankenlibc-abi%2Fsrc%2Fdirent_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/79fecd139aac06eedfb16c99885122419fef61c2/crates%2Ffrankenlibc-abi%2Fsrc%2Fdirent_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Fdirent_abi.rs?ref=79fecd139aac06eedfb16c99885122419fef61c2",
+      "patch": "@@ -376,12 +376,21 @@ pub unsafe extern \"C\" fn readdir_r(\n     if dirp.is_null() || entry.is_null() || result.is_null() {\n         return libc::EINVAL;\n     }\n-    // readdir returns a thread-local pointer; copy into caller's buffer.\n+    // To distinguish EOF from error without modifying the caller's errno.\n+    let old_errno = unsafe { *super::errno_abi::__errno_location() };\n+    unsafe { set_abi_errno(0) };\n     let ptr = unsafe { readdir(dirp) };\n     if ptr.is_null() {\n         unsafe { *result = std::ptr::null_mut() };\n-        0 // End of directory \u2014 not an error\n+        let e = unsafe { *super::errno_abi::__errno_location() };\n+        unsafe { set_abi_errno(old_errno) };\n+        if e != 0 {\n+            e\n+        } else {\n+            0 // End of directory\n+        }\n     } else {\n+        unsafe { set_abi_errno(old_errno) };\n         unsafe {\n             std::ptr::copy_nonoverlapping(ptr, entry, 1);\n             *result = entry;\n@@ -484,10 +493,10 @@ pub unsafe extern \"C\" fn scandir(\n \n         if include {\n             let size = std::mem::size_of::<libc::dirent>();\n-            let copy = unsafe { libc::malloc(size) } as *mut libc::dirent;\n+            let copy = unsafe { crate::malloc_abi::malloc(size) } as *mut libc::dirent;\n             if copy.is_null() {\n                 for &e in &entries {\n-                    unsafe { libc::free(e as *mut c_void) };\n+                    unsafe { crate::malloc_abi::free(e as *mut c_void) };\n                 }\n                 unsafe { closedir(dir) };\n                 unsafe { set_abi_errno(errno::ENOMEM) };\n@@ -505,7 +514,7 @@ pub unsafe extern \"C\" fn scandir(\n     // Allocate the namelist array\n     if count == 0 {\n         // Empty result \u2014 allocate a minimal array\n-        let array = unsafe { libc::malloc(std::mem::size_of::<*mut libc::dirent>()) }\n+        let array = unsafe { crate::malloc_abi::malloc(std::mem::size_of::<*mut libc::dirent>()) }\n             as *mut *mut libc::dirent;\n         if array.is_null() {\n             unsafe { set_abi_errno(errno::ENOMEM) };\n@@ -516,10 +525,10 @@ pub unsafe extern \"C\" fn scandir(\n     }\n \n     let array_size = count * std::mem::size_of::<*mut libc::dirent>();\n-    let array = unsafe { libc::malloc(array_size) } as *mut *mut libc::dirent;\n+    let array = unsafe { crate::malloc_abi::malloc(array_size) } as *mut *mut libc::dirent;\n     if array.is_null() {\n         for &e in &entries {\n-            unsafe { libc::free(e as *mut c_void) };\n+            unsafe { crate::malloc_abi::free(e as *mut c_void) };\n         }\n         unsafe { set_abi_errno(errno::ENOMEM) };\n         return -1;"
+    },
+    {
+      "sha": "869c1338a13d0a770d6bd0a8a27ff2ca3acb6bd7",
+      "filename": "crates/frankenlibc-abi/src/dlfcn_abi.rs",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/79fecd139aac06eedfb16c99885122419fef61c2/crates%2Ffrankenlibc-abi%2Fsrc%2Fdlfcn_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/79fecd139aac06eedfb16c99885122419fef61c2/crates%2Ffrankenlibc-abi%2Fsrc%2Fdlfcn_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Fdlfcn_abi.rs?ref=79fecd139aac06eedfb16c99885122419fef61c2",
+      "patch": "@@ -29,6 +29,11 @@ fn clear_dlerror() {\n     DLERROR_MSG.with(|cell| cell.set(std::ptr::null()));\n }\n \n+#[inline]\n+pub(crate) unsafe fn dlvsym_next(symbol: *const c_char, version: *const c_char) -> *mut c_void {\n+    unsafe { libc::dlvsym(libc::RTLD_NEXT, symbol, version) }\n+}\n+\n // ---------------------------------------------------------------------------\n // dlopen\n // ---------------------------------------------------------------------------"
+    },
+    {
+      "sha": "52bcf1eb2b75811ea8ac5c9220992bd2d70c195b",
+      "filename": "crates/frankenlibc-abi/src/poll_abi.rs",
+      "status": "modified",
+      "additions": 64,
+      "deletions": 0,
+      "changes": 64,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/79fecd139aac06eedfb16c99885122419fef61c2/crates%2Ffrankenlibc-abi%2Fsrc%2Fpoll_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/79fecd139aac06eedfb16c99885122419fef61c2/crates%2Ffrankenlibc-abi%2Fsrc%2Fpoll_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Fpoll_abi.rs?ref=79fecd139aac06eedfb16c99885122419fef61c2",
+      "patch": "@@ -52,7 +52,38 @@ pub unsafe extern \"C\" fn poll(fds: *mut libc::pollfd, nfds: libc::nfds_t, timeou\n         nfds\n     };\n \n+    // SYS_poll doesn't exist on aarch64; use SYS_ppoll with timeout conversion.\n+    #[cfg(target_arch = \"x86_64\")]\n     let rc = unsafe { libc::syscall(libc::SYS_poll as c_long, fds, actual_nfds, timeout) as c_int };\n+    #[cfg(not(target_arch = \"x86_64\"))]\n+    let rc = {\n+        // Convert millisecond timeout to timespec for ppoll.\n+        let (ts_ptr, ts_storage);\n+        if timeout < 0 {\n+            ts_storage = libc::timespec {\n+                tv_sec: 0,\n+                tv_nsec: 0,\n+            };\n+            let _ = &ts_storage; // suppress unused warning\n+            ts_ptr = std::ptr::null::<libc::timespec>();\n+        } else {\n+            ts_storage = libc::timespec {\n+                tv_sec: (timeout / 1000) as libc::time_t,\n+                tv_nsec: ((timeout % 1000) as i64) * 1_000_000,\n+            };\n+            ts_ptr = &ts_storage as *const libc::timespec;\n+        }\n+        unsafe {\n+            libc::syscall(\n+                libc::SYS_ppoll as c_long,\n+                fds,\n+                actual_nfds,\n+                ts_ptr,\n+                std::ptr::null::<libc::sigset_t>(),\n+                0usize,\n+            ) as c_int\n+        }\n+    };\n     let adverse = rc < 0;\n     if adverse {\n         let e = std::io::Error::last_os_error()\n@@ -168,6 +199,8 @@ pub unsafe extern \"C\" fn select(\n         nfds\n     };\n \n+    // SYS_select doesn't exist on aarch64; use SYS_pselect6 with timeout conversion.\n+    #[cfg(target_arch = \"x86_64\")]\n     let rc = unsafe {\n         libc::syscall(\n             libc::SYS_select as c_long,\n@@ -178,6 +211,37 @@ pub unsafe extern \"C\" fn select(\n             timeout,\n         ) as c_int\n     };\n+    #[cfg(not(target_arch = \"x86_64\"))]\n+    let rc = {\n+        // Convert timeval to timespec for pselect6.\n+        let (ts_ptr, ts_storage);\n+        if timeout.is_null() {\n+            ts_storage = libc::timespec {\n+                tv_sec: 0,\n+                tv_nsec: 0,\n+            };\n+            let _ = &ts_storage;\n+            ts_ptr = std::ptr::null::<libc::timespec>();\n+        } else {\n+            let tv = unsafe { &*timeout };\n+            ts_storage = libc::timespec {\n+                tv_sec: tv.tv_sec,\n+                tv_nsec: tv.tv_usec * 1000,\n+            };\n+            ts_ptr = &ts_storage as *const libc::timespec;\n+        }\n+        unsafe {\n+            libc::syscall(\n+                libc::SYS_pselect6 as c_long,\n+                actual_nfds,\n+                readfds,\n+                writefds,\n+                exceptfds,\n+                ts_ptr,\n+                std::ptr::null::<[usize; 2]>(),\n+            ) as c_int\n+        }\n+    };\n     let adverse = rc < 0;\n     if adverse {\n         let e = std::io::Error::last_os_error()"
+    },
+    {
+      "sha": "227c688748bbbc4bcfed43e2464c1919fd5bdb75",
+      "filename": "crates/frankenlibc-abi/src/process_abi.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/79fecd139aac06eedfb16c99885122419fef61c2/crates%2Ffrankenlibc-abi%2Fsrc%2Fprocess_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/79fecd139aac06eedfb16c99885122419fef61c2/crates%2Ffrankenlibc-abi%2Fsrc%2Fprocess_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Fprocess_abi.rs?ref=79fecd139aac06eedfb16c99885122419fef61c2",
+      "patch": "@@ -69,7 +69,7 @@ unsafe fn execvp_via_execve(file: *const c_char, argv: *const *const c_char) ->\n         };\n         // execve only returns on failure (rc == -1); on success the process is replaced.\n \n-        let err = unsafe { *super::errno_abi::__errno_location() };\n+        let err = last_host_errno(libc::ENOENT);\n         if err != libc::ENOENT && err != libc::ENOTDIR {\n             return -1;\n         }\n@@ -397,7 +397,7 @@ pub unsafe extern \"C\" fn execvpe(\n             return rc;\n         }\n \n-        let err = unsafe { *super::errno_abi::__errno_location() };\n+        let err = last_host_errno(libc::ENOENT);\n         if err != libc::ENOENT && err != libc::ENOTDIR {\n             return -1;\n         }"
+    },
+    {
+      "sha": "99eace153467236a061a0a0b305e802726b43cd1",
+      "filename": "crates/frankenlibc-abi/src/setjmp_abi.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 2,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/79fecd139aac06eedfb16c99885122419fef61c2/crates%2Ffrankenlibc-abi%2Fsrc%2Fsetjmp_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/79fecd139aac06eedfb16c99885122419fef61c2/crates%2Ffrankenlibc-abi%2Fsrc%2Fsetjmp_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Fsetjmp_abi.rs?ref=79fecd139aac06eedfb16c99885122419fef61c2",
+      "patch": "@@ -138,8 +138,7 @@ fn terminate_deferred_transfer(\n ) -> ! {\n     // SAFETY: writes thread-local errno before explicit process termination.\n     unsafe { set_abi_errno(errno_val) };\n-    // SAFETY: explicit deterministic termination for deferred non-local transfer.\n-    unsafe { libc::abort() }\n+    std::process::abort()\n }\n \n fn capture_entrypoint(env: *mut c_void, savemask: bool) -> c_int {"
+    },
+    {
+      "sha": "dd42e0d02f6b2a246d3082cfb421e54f5535b325",
+      "filename": "crates/frankenlibc-abi/src/signal_abi.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/79fecd139aac06eedfb16c99885122419fef61c2/crates%2Ffrankenlibc-abi%2Fsrc%2Fsignal_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/79fecd139aac06eedfb16c99885122419fef61c2/crates%2Ffrankenlibc-abi%2Fsrc%2Fsignal_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Fsignal_abi.rs?ref=79fecd139aac06eedfb16c99885122419fef61c2",
+      "patch": "@@ -462,6 +462,6 @@ pub unsafe extern \"C\" fn sigwait(set: *const libc::sigset_t, sig: *mut c_int) ->\n         0\n     } else {\n         // On error, return the errno value per POSIX sigwait semantics.\n-        unsafe { *libc::__errno_location() }\n+        last_host_errno(libc::EINTR)\n     }\n }"
+    },
+    {
+      "sha": "e02a63d35f60172fe6a628e2a37d656a860e7017",
+      "filename": "crates/frankenlibc-abi/src/startup_abi.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 4,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/79fecd139aac06eedfb16c99885122419fef61c2/crates%2Ffrankenlibc-abi%2Fsrc%2Fstartup_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/79fecd139aac06eedfb16c99885122419fef61c2/crates%2Ffrankenlibc-abi%2Fsrc%2Fstartup_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Fstartup_abi.rs?ref=79fecd139aac06eedfb16c99885122419fef61c2",
+      "patch": "@@ -343,17 +343,15 @@ unsafe fn delegate_to_host_libc_start_main(\n     // SAFETY: versioned lookup via host dynamic loader, bypassing our interposed\n     // dlsym symbol to avoid recursive startup-resolution loops.\n     let mut ptr = unsafe {\n-        libc::dlvsym(\n-            libc::RTLD_NEXT,\n+        crate::dlfcn_abi::dlvsym_next(\n             symbol.as_ptr().cast::<c_char>(),\n             glibc_v34.as_ptr().cast::<c_char>(),\n         )\n     };\n     if ptr.is_null() {\n         // SAFETY: fallback to older glibc symbol version when 2.34 alias is absent.\n         ptr = unsafe {\n-            libc::dlvsym(\n-                libc::RTLD_NEXT,\n+            crate::dlfcn_abi::dlvsym_next(\n                 symbol.as_ptr().cast::<c_char>(),\n                 glibc_v225.as_ptr().cast::<c_char>(),\n             )"
+    },
+    {
+      "sha": "617282a4d3c0377c85ca4b36c7ab6aad49798ae6",
+      "filename": "crates/frankenlibc-abi/src/string_abi.rs",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 7,
+      "changes": 21,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/79fecd139aac06eedfb16c99885122419fef61c2/crates%2Ffrankenlibc-abi%2Fsrc%2Fstring_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/79fecd139aac06eedfb16c99885122419fef61c2/crates%2Ffrankenlibc-abi%2Fsrc%2Fstring_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Fstring_abi.rs?ref=79fecd139aac06eedfb16c99885122419fef61c2",
+      "patch": "@@ -1496,9 +1496,10 @@ pub unsafe extern \"C\" fn stpncpy(dst: *mut c_char, src: *const c_char, n: usize)\n     }\n \n     // SAFETY: bounded scan by `n` matches `stpncpy` return contract.\n-    let src_prefix = unsafe { strnlen(src, n) };\n-    let offset = if src_prefix < n { src_prefix } else { n };\n-    // SAFETY: offset is bounded by `n`, the API contract's writable span.\n+    // By measuring `dst` instead of `src`, we automatically respect any\n+    // bounds clamping that `strncpy` applied in hardened mode.\n+    let offset = unsafe { strnlen(dst, n) };\n+    // SAFETY: offset is bounded by `n` (and clamped membrane bounds).\n     unsafe { dst.add(offset) }\n }\n \n@@ -1723,9 +1724,11 @@ pub unsafe extern \"C\" fn strncat(dst: *mut c_char, src: *const c_char, n: usize)\n                             );\n                         }\n                         *dst.add(dst_len.saturating_add(copy_payload)) = 0;\n-                        let truncated = (!src_terminated && src_scan_bound == Some(src_len))\n-                            || copy_payload < src_len\n-                            || src_len == n;\n+                        let hit_src_alloc_bound = !src_terminated\n+                            && src_bound.is_some()\n+                            && src_bound.unwrap() < n\n+                            && src_len == src_bound.unwrap();\n+                        let truncated = hit_src_alloc_bound || copy_payload < src_len;\n                         if truncated {\n                             record_truncation(n.saturating_add(1), copy_payload);\n                         }\n@@ -1740,7 +1743,11 @@ pub unsafe extern \"C\" fn strncat(dst: *mut c_char, src: *const c_char, n: usize)\n                         raw_memcpy_bytes(dst.add(dst_len).cast::<u8>(), src.cast::<u8>(), src_len);\n                     }\n                     *dst.add(dst_len.saturating_add(src_len)) = 0;\n-                    let truncated = !src_terminated && src_scan_bound == Some(src_len);\n+                    let hit_src_alloc_bound = !src_terminated\n+                        && src_bound.is_some()\n+                        && src_bound.unwrap() < n\n+                        && src_len == src_bound.unwrap();\n+                    let truncated = hit_src_alloc_bound;\n                     if truncated {\n                         record_truncation(n.saturating_add(1), src_len);\n                     }"
+    },
+    {
+      "sha": "34013aa08b62af1bebe7bcafa2a52afae91a36fa",
+      "filename": "crates/frankenlibc-abi/src/termios_abi.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 1,
+      "changes": 8,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/79fecd139aac06eedfb16c99885122419fef61c2/crates%2Ffrankenlibc-abi%2Fsrc%2Ftermios_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/79fecd139aac06eedfb16c99885122419fef61c2/crates%2Ffrankenlibc-abi%2Fsrc%2Ftermios_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Ftermios_abi.rs?ref=79fecd139aac06eedfb16c99885122419fef61c2",
+      "patch": "@@ -277,8 +277,14 @@ pub unsafe extern \"C\" fn tcsendbreak(fd: c_int, duration: c_int) -> c_int {\n         runtime_policy::observe(ApiFamily::Termios, decision.profile, 5, true);\n         return -1;\n     }\n+    let request = if duration > 0 {\n+        libc::TCSBRKP\n+    } else {\n+        libc::TCSBRK\n+    };\n+    let arg = if duration > 0 { duration as libc::c_long as usize } else { 0 };\n     let rc = match unsafe {\n-        syscall::sys_ioctl(fd, libc::TCSBRK as usize, duration as libc::c_long as usize)\n+        syscall::sys_ioctl(fd, request as usize, arg)\n     } {\n         Ok(_) => 0,\n         Err(e) => {"
+    },
+    {
+      "sha": "770b5781ec8c536ec0a10b6db5d05d7574eb7296",
+      "filename": "crates/frankenlibc-abi/src/time_abi.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 1,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/79fecd139aac06eedfb16c99885122419fef61c2/crates%2Ffrankenlibc-abi%2Fsrc%2Ftime_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/79fecd139aac06eedfb16c99885122419fef61c2/crates%2Ffrankenlibc-abi%2Fsrc%2Ftime_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Ftime_abi.rs?ref=79fecd139aac06eedfb16c99885122419fef61c2",
+      "patch": "@@ -9,6 +9,8 @@ use std::os::raw::c_long;\n use frankenlibc_core::errno;\n use frankenlibc_core::time as time_core;\n \n+use crate::util::scan_c_string;\n+\n /// Set the ABI errno via `__errno_location`.\n #[inline]\n unsafe fn set_abi_errno(val: c_int) {\n@@ -388,7 +390,7 @@ pub unsafe extern \"C\" fn strftime(\n     }\n \n     // Read the format string as a byte slice.\n-    let fmt_len = unsafe { libc::strlen(format as *const _) };\n+    let (fmt_len, _terminated) = unsafe { scan_c_string(format, None) };\n     let fmt = unsafe { std::slice::from_raw_parts(format as *const u8, fmt_len) };\n \n     // Read the broken-down time."
+    },
+    {
+      "sha": "9b846da549cd0470b1a19b657ffa32a95cb6869d",
+      "filename": "crates/frankenlibc-abi/src/wchar_abi.rs",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 8,
+      "changes": 16,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/79fecd139aac06eedfb16c99885122419fef61c2/crates%2Ffrankenlibc-abi%2Fsrc%2Fwchar_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/79fecd139aac06eedfb16c99885122419fef61c2/crates%2Ffrankenlibc-abi%2Fsrc%2Fwchar_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Fwchar_abi.rs?ref=79fecd139aac06eedfb16c99885122419fef61c2",
+      "patch": "@@ -11,6 +11,7 @@ use frankenlibc_membrane::runtime_math::{ApiFamily, MembraneAction};\n \n use crate::malloc_abi::known_remaining;\n use crate::runtime_policy;\n+use crate::util::scan_c_string;\n \n #[inline]\n fn repair_enabled(heals_enabled: bool, action: MembraneAction) -> bool {\n@@ -1230,8 +1231,7 @@ pub unsafe extern \"C\" fn wcsdup(s: *const u32) -> *mut u32 {\n         let alloc_elems = len + 1;\n         let alloc_bytes = alloc_elems * 4;\n \n-        // Use libc malloc for allocation\n-        let ptr = libc::malloc(alloc_bytes) as *mut u32;\n+        let ptr = crate::malloc_abi::malloc(alloc_bytes) as *mut u32;\n         if ptr.is_null() {\n             runtime_policy::observe(ApiFamily::StringMemory, decision.profile, 8, true);\n             return std::ptr::null_mut();\n@@ -1623,8 +1623,8 @@ pub unsafe extern \"C\" fn mbstowcs(dst: *mut u32, src: *const u8, n: usize) -> us\n     if src.is_null() {\n         return usize::MAX; // (size_t)-1\n     }\n-    let src_len = unsafe { libc::strlen(src as *const _) + 1 }; // include NUL\n-    let src_slice = unsafe { std::slice::from_raw_parts(src, src_len) };\n+    let (src_len, _terminated) = unsafe { scan_c_string(src as *const std::ffi::c_char, None) };\n+    let src_slice = unsafe { std::slice::from_raw_parts(src, src_len.saturating_add(1)) }; // include NUL\n     if dst.is_null() {\n         // Count mode\n         let mut count = 0usize;\n@@ -1765,7 +1765,7 @@ pub unsafe extern \"C\" fn basename(path: *mut std::ffi::c_char) -> *mut std::ffi:\n     if path.is_null() {\n         return dot.as_ptr() as *mut std::ffi::c_char;\n     }\n-    let len = unsafe { libc::strlen(path as *const _) };\n+    let (len, _terminated) = unsafe { scan_c_string(path as *const std::ffi::c_char, None) };\n     if len == 0 {\n         return dot.as_ptr() as *mut std::ffi::c_char;\n     }\n@@ -1794,7 +1794,7 @@ pub unsafe extern \"C\" fn dirname(path: *mut std::ffi::c_char) -> *mut std::ffi::\n     if path.is_null() {\n         return dot.as_ptr() as *mut std::ffi::c_char;\n     }\n-    let len = unsafe { libc::strlen(path as *const _) };\n+    let (len, _terminated) = unsafe { scan_c_string(path as *const std::ffi::c_char, None) };\n     if len == 0 {\n         return dot.as_ptr() as *mut std::ffi::c_char;\n     }\n@@ -2105,8 +2105,8 @@ pub unsafe extern \"C\" fn mbsrtowcs(\n         return 0;\n     }\n \n-    // SAFETY: source pointer references a NUL-terminated byte string.\n-    let src_len_with_nul = unsafe { libc::strlen(src_ptr) + 1 };\n+    let (src_len, _terminated) = unsafe { scan_c_string(src_ptr, None) };\n+    let src_len_with_nul = src_len.saturating_add(1);\n     // SAFETY: bounded by strlen + NUL.\n     let src_bytes = unsafe { std::slice::from_raw_parts(src_ptr as *const u8, src_len_with_nul) };\n "
+    }
+  ]
+}

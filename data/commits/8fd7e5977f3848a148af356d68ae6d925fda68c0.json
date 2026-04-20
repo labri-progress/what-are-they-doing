@@ -1,0 +1,77 @@
+{
+  "message": "feat: integrate ContactResolver into SyncEngine with Info.plist\n\n- SyncEngine resolves phone-number chat titles to contact names for\n  iMessage chats using the macOS Contacts framework\n- Add resolvedTitle field to ChatMetadata (raw title preserved for\n  traceability)\n- Embed Info.plist with NSContactsUsageDescription for TCC prompt\n- Package.swift uses linker flags to embed plist in __TEXT/__info_plist\n- ContactResolver is injectable for testability\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "0f5cd587a908463b960c8b8eace5d5acfe6fe062",
+      "filename": "Package.swift",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 1,
+      "changes": 10,
+      "blob_url": "https://github.com/prime-radiant-inc/beeper-message-sync/blob/8fd7e5977f3848a148af356d68ae6d925fda68c0/Package.swift",
+      "raw_url": "https://github.com/prime-radiant-inc/beeper-message-sync/raw/8fd7e5977f3848a148af356d68ae6d925fda68c0/Package.swift",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/beeper-message-sync/contents/Package.swift?ref=8fd7e5977f3848a148af356d68ae6d925fda68c0",
+      "patch": "@@ -7,7 +7,15 @@ let package = Package(\n     targets: [\n         .executableTarget(\n             name: \"beeper-message-sync\",\n-            path: \"Sources/BeeperMessageSync\"\n+            path: \"Sources/BeeperMessageSync\",\n+            linkerSettings: [\n+                .unsafeFlags([\n+                    \"-Xlinker\", \"-sectcreate\",\n+                    \"-Xlinker\", \"__TEXT\",\n+                    \"-Xlinker\", \"__info_plist\",\n+                    \"-Xlinker\", \"Sources/Resources/Info.plist\",\n+                ]),\n+            ]\n         ),\n         .testTarget(\n             name: \"BeeperMessageSyncTests\","
+    },
+    {
+      "sha": "916372475e7b8a825d4bcfc42c282ad29294613d",
+      "filename": "Sources/BeeperMessageSync/MetadataWriter.swift",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/prime-radiant-inc/beeper-message-sync/blob/8fd7e5977f3848a148af356d68ae6d925fda68c0/Sources%2FBeeperMessageSync%2FMetadataWriter.swift",
+      "raw_url": "https://github.com/prime-radiant-inc/beeper-message-sync/raw/8fd7e5977f3848a148af356d68ae6d925fda68c0/Sources%2FBeeperMessageSync%2FMetadataWriter.swift",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/beeper-message-sync/contents/Sources%2FBeeperMessageSync%2FMetadataWriter.swift?ref=8fd7e5977f3848a148af356d68ae6d925fda68c0",
+      "patch": "@@ -7,6 +7,7 @@ struct ChatMetadata: Codable {\n     let accountId: String\n     let network: String\n     let title: String\n+    let resolvedTitle: String?\n     let type: String\n     let participants: [ParticipantInfo]\n     let firstSeen: String\n@@ -42,6 +43,7 @@ struct MetadataWriter {\n                 accountId: metadata.accountId,\n                 network: metadata.network,\n                 title: metadata.title,\n+                resolvedTitle: metadata.resolvedTitle,\n                 type: metadata.type,\n                 participants: metadata.participants,\n                 firstSeen: existing.firstSeen,"
+    },
+    {
+      "sha": "525ae55ed354e881d9dc57086a8a465d174f6e79",
+      "filename": "Sources/BeeperMessageSync/SyncEngine.swift",
+      "status": "modified",
+      "additions": 45,
+      "deletions": 10,
+      "changes": 55,
+      "blob_url": "https://github.com/prime-radiant-inc/beeper-message-sync/blob/8fd7e5977f3848a148af356d68ae6d925fda68c0/Sources%2FBeeperMessageSync%2FSyncEngine.swift",
+      "raw_url": "https://github.com/prime-radiant-inc/beeper-message-sync/raw/8fd7e5977f3848a148af356d68ae6d925fda68c0/Sources%2FBeeperMessageSync%2FSyncEngine.swift",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/beeper-message-sync/contents/Sources%2FBeeperMessageSync%2FSyncEngine.swift?ref=8fd7e5977f3848a148af356d68ae6d925fda68c0",
+      "patch": "@@ -6,9 +6,10 @@ class SyncEngine {\n     let metadataWriter: MetadataWriter\n     let attachmentFetcher: AttachmentFetcher\n     let stateStore: StateStore\n+    let contactResolver: ContactResolver\n     let config: Config\n \n-    init(config: Config) {\n+    init(config: Config, contactResolver: ContactResolver? = nil) {\n         self.config = config\n         self.client = BeeperClient(\n             baseURL: config.beeperURL,\n@@ -20,6 +21,7 @@ class SyncEngine {\n             client: client, logWriter: logWriter\n         )\n         self.stateStore = StateStore(path: config.stateFile)\n+        self.contactResolver = contactResolver ?? ContactResolver.load()\n     }\n \n     /// Run a single poll cycle: check all chats for new messages\n@@ -55,12 +57,14 @@ class SyncEngine {\n \n     /// Fetch and log new messages for a single chat\n     func syncChat(_ chat: Chat) async throws {\n+        let displayTitle = resolvedTitle(for: chat)\n+\n         // Update metadata\n-        let chatDir = logWriter.chatDir(network: chat.network, chatTitle: chat.title)\n+        let chatDir = logWriter.chatDir(network: chat.network, chatTitle: displayTitle)\n         try FileManager.default.createDirectory(\n             atPath: chatDir, withIntermediateDirectories: true\n         )\n-        let metadata = buildMetadata(from: chat)\n+        let metadata = buildMetadata(from: chat, resolvedTitle: displayTitle)\n         try metadataWriter.write(metadata: metadata, toDir: chatDir)\n \n         // Fetch messages newer than our last seen sort key\n@@ -100,7 +104,7 @@ class SyncEngine {\n                     let localPath = try await attachmentFetcher.fetch(\n                         attachment: attachment,\n                         network: chat.network,\n-                        chatTitle: chat.title,\n+                        chatTitle: displayTitle,\n                         date: date\n                     )\n                     attachmentRecords.append(AttachmentRecord(\n@@ -126,7 +130,7 @@ class SyncEngine {\n                 id: message.id,\n                 chatId: chat.id,\n                 network: chat.network,\n-                chatTitle: chat.title,\n+                chatTitle: displayTitle,\n                 senderId: message.senderID,\n                 senderName: message.senderName,\n                 timestamp: message.timestamp,\n@@ -158,11 +162,13 @@ class SyncEngine {\n     /// Full backfill: paginate backward through all messages in a chat\n     @discardableResult\n     func backfillChat(_ chat: Chat) async throws -> Int {\n-        let chatDir = logWriter.chatDir(network: chat.network, chatTitle: chat.title)\n+        let displayTitle = resolvedTitle(for: chat)\n+\n+        let chatDir = logWriter.chatDir(network: chat.network, chatTitle: displayTitle)\n         try FileManager.default.createDirectory(\n             atPath: chatDir, withIntermediateDirectories: true\n         )\n-        let metadata = buildMetadata(from: chat)\n+        let metadata = buildMetadata(from: chat, resolvedTitle: displayTitle)\n         try metadataWriter.write(metadata: metadata, toDir: chatDir)\n \n         var allMessages: [Message] = []\n@@ -193,7 +199,7 @@ class SyncEngine {\n                     let localPath = try await attachmentFetcher.fetch(\n                         attachment: attachment,\n                         network: chat.network,\n-                        chatTitle: chat.title,\n+                        chatTitle: displayTitle,\n                         date: date\n                     )\n                     attachmentRecords.append(AttachmentRecord(\n@@ -219,7 +225,7 @@ class SyncEngine {\n                 id: message.id,\n                 chatId: chat.id,\n                 network: chat.network,\n-                chatTitle: chat.title,\n+                chatTitle: displayTitle,\n                 senderId: message.senderID,\n                 senderName: message.senderName,\n                 timestamp: message.timestamp,\n@@ -247,13 +253,42 @@ class SyncEngine {\n \n     // MARK: - Helpers\n \n-    private func buildMetadata(from chat: Chat) -> ChatMetadata {\n+    /// Resolve chat title to contact name(s) for iMessage phone-number titles\n+    func resolvedTitle(for chat: Chat) -> String {\n+        let isIMessage = chat.network.lowercased().contains(\"imessage\")\n+        guard isIMessage else { return chat.title }\n+\n+        // Single chat: title is the phone number\n+        if chat.type == \"single\" && ContactResolver.looksLikePhoneNumber(chat.title) {\n+            if let name = contactResolver.resolve(chat.title) {\n+                return name\n+            }\n+        }\n+\n+        // Group chat: title may be comma-separated phone numbers\n+        if chat.type == \"group\" && ContactResolver.looksLikePhoneNumber(chat.title) {\n+            let nonSelfParticipants = chat.participants.items.filter { !($0.isSelf ?? false) }\n+            let resolvedNames = nonSelfParticipants.compactMap { user -> String? in\n+                guard let phone = user.phoneNumber else { return user.fullName ?? user.username }\n+                return contactResolver.resolve(phone) ?? user.fullName ?? user.username ?? phone\n+            }\n+            if !resolvedNames.isEmpty {\n+                return resolvedNames.joined(separator: \", \")\n+            }\n+        }\n+\n+        return chat.title\n+    }\n+\n+    private func buildMetadata(from chat: Chat, resolvedTitle: String) -> ChatMetadata {\n         let now = ISO8601DateFormatter().string(from: Date())\n+        let resolved = resolvedTitle != chat.title ? resolvedTitle : nil\n         return ChatMetadata(\n             chatId: chat.id,\n             accountId: chat.accountID,\n             network: chat.network,\n             title: chat.title,\n+            resolvedTitle: resolved,\n             type: chat.type,\n             participants: chat.participants.items.map { user in\n                 ParticipantInfo("
+    },
+    {
+      "sha": "338c0fde7fe83d6e43b06e2eecfaf28bc9e666bd",
+      "filename": "Sources/Resources/Info.plist",
+      "status": "added",
+      "additions": 10,
+      "deletions": 0,
+      "changes": 10,
+      "blob_url": "https://github.com/prime-radiant-inc/beeper-message-sync/blob/8fd7e5977f3848a148af356d68ae6d925fda68c0/Sources%2FResources%2FInfo.plist",
+      "raw_url": "https://github.com/prime-radiant-inc/beeper-message-sync/raw/8fd7e5977f3848a148af356d68ae6d925fda68c0/Sources%2FResources%2FInfo.plist",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/beeper-message-sync/contents/Sources%2FResources%2FInfo.plist?ref=8fd7e5977f3848a148af356d68ae6d925fda68c0",
+      "patch": "@@ -0,0 +1,10 @@\n+<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n+<plist version=\"1.0\">\n+<dict>\n+\t<key>CFBundleIdentifier</key>\n+\t<string>com.primeradiant.beeper-message-sync</string>\n+\t<key>NSContactsUsageDescription</key>\n+\t<string>Beeper Message Sync uses your contacts to resolve phone numbers to names in chat titles.</string>\n+</dict>\n+</plist>"
+    },
+    {
+      "sha": "b2d2a2eef509f21343e636480f5888b416961c0f",
+      "filename": "Tests/BeeperMessageSyncTests/MetadataWriterTests.swift",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 2,
+      "changes": 5,
+      "blob_url": "https://github.com/prime-radiant-inc/beeper-message-sync/blob/8fd7e5977f3848a148af356d68ae6d925fda68c0/Tests%2FBeeperMessageSyncTests%2FMetadataWriterTests.swift",
+      "raw_url": "https://github.com/prime-radiant-inc/beeper-message-sync/raw/8fd7e5977f3848a148af356d68ae6d925fda68c0/Tests%2FBeeperMessageSyncTests%2FMetadataWriterTests.swift",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/beeper-message-sync/contents/Tests%2FBeeperMessageSyncTests%2FMetadataWriterTests.swift?ref=8fd7e5977f3848a148af356d68ae6d925fda68c0",
+      "patch": "@@ -20,6 +20,7 @@ final class MetadataWriterTests: XCTestCase {\n             accountId: \"local-signal_ba_abc\",\n             network: \"Signal\",\n             title: \"Alice\",\n+            resolvedTitle: nil,\n             type: \"single\",\n             participants: [\n                 ParticipantInfo(id: \"u1\", name: \"Alice\", phone: \"+1555\", isSelf: false),\n@@ -50,14 +51,14 @@ final class MetadataWriterTests: XCTestCase {\n \n         let original = ChatMetadata(\n             chatId: \"!test:beeper.com\", accountId: \"acc1\", network: \"Signal\",\n-            title: \"Alice\", type: \"single\", participants: [],\n+            title: \"Alice\", resolvedTitle: nil, type: \"single\", participants: [],\n             firstSeen: \"2026-02-12T10:00:00Z\", lastUpdated: \"2026-02-12T10:00:00Z\"\n         )\n         try writer.write(metadata: original, toDir: dir)\n \n         let updated = ChatMetadata(\n             chatId: \"!test:beeper.com\", accountId: \"acc1\", network: \"Signal\",\n-            title: \"Alice (New Name)\", type: \"single\", participants: [],\n+            title: \"Alice (New Name)\", resolvedTitle: nil, type: \"single\", participants: [],\n             firstSeen: \"2026-02-12T10:00:00Z\", lastUpdated: \"2026-02-12T16:00:00Z\"\n         )\n         try writer.write(metadata: updated, toDir: dir)"
+    },
+    {
+      "sha": "ecf9a68b884f5e14e87f06a3eb26db2b2f895cdd",
+      "filename": "Tests/BeeperMessageSyncTests/SyncEngineTests.swift",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 2,
+      "changes": 6,
+      "blob_url": "https://github.com/prime-radiant-inc/beeper-message-sync/blob/8fd7e5977f3848a148af356d68ae6d925fda68c0/Tests%2FBeeperMessageSyncTests%2FSyncEngineTests.swift",
+      "raw_url": "https://github.com/prime-radiant-inc/beeper-message-sync/raw/8fd7e5977f3848a148af356d68ae6d925fda68c0/Tests%2FBeeperMessageSyncTests%2FSyncEngineTests.swift",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/beeper-message-sync/contents/Tests%2FBeeperMessageSyncTests%2FSyncEngineTests.swift?ref=8fd7e5977f3848a148af356d68ae6d925fda68c0",
+      "patch": "@@ -28,7 +28,8 @@ final class SyncEngineTests: XCTestCase {\n                 \"BEEPER_URL\": config.beeperURL,\n                 \"LOG_DIR\": tmpDir!,\n                 \"STATE_FILE\": stateFile,\n-            ])\n+            ]),\n+            contactResolver: ContactResolver()\n         )\n \n         do {\n@@ -52,7 +53,8 @@ final class SyncEngineTests: XCTestCase {\n                 \"BEEPER_URL\": config.beeperURL,\n                 \"LOG_DIR\": tmpDir!,\n                 \"STATE_FILE\": stateFile,\n-            ])\n+            ]),\n+            contactResolver: ContactResolver()\n         )\n \n         let chats: ChatListResponse"
+    }
+  ]
+}

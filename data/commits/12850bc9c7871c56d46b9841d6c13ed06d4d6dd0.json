@@ -1,0 +1,29 @@
+{
+  "message": "fix(pthread): resolve self-join deadlock by spin-waiting for TID publication\n\nFix a race condition in join_thread() where self-join detection could\nmiss the EDEADLK check during the clone startup window before the\nparent-side TID publication is visible in the handle's tid field.\n\nThe problem: when a child thread calls pthread_join(self), there is a\nsmall window after clone() where handle.tid is still 0 because the\nparent hasn't published it yet. The existing self-join check compared\nmy_tid against target_tid=0 and fell through, causing the thread to\nblock forever waiting on itself.\n\nThe fix: when target_tid is 0 and the thread is still in STARTING or\nRUNNING state, spin-wait (with core::hint::spin_loop()) until either\nthe TID is published or the thread transitions to a terminal state.\nThis ensures the self-join comparison always sees a valid TID when the\nthread is alive.\n\nAlso add pthread_self_join_is_rejected_with_edeadlk test that spawns a\nchild which calls pthread_join(self) and verifies the child receives\nEDEADLK, confirming the fix end-to-end.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "cf52b87a06f70a7ab734688c7d6e1d950ef8fe6c",
+      "filename": "crates/frankenlibc-abi/tests/pthread_thread_lifecycle_test.rs",
+      "status": "modified",
+      "additions": 35,
+      "deletions": 0,
+      "changes": 35,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/12850bc9c7871c56d46b9841d6c13ed06d4d6dd0/crates%2Ffrankenlibc-abi%2Ftests%2Fpthread_thread_lifecycle_test.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/12850bc9c7871c56d46b9841d6c13ed06d4d6dd0/crates%2Ffrankenlibc-abi%2Ftests%2Fpthread_thread_lifecycle_test.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Ftests%2Fpthread_thread_lifecycle_test.rs?ref=12850bc9c7871c56d46b9841d6c13ed06d4d6dd0",
+      "patch": "@@ -25,6 +25,14 @@ unsafe extern \"C\" fn start_return_pthread_self(_arg: *mut c_void) -> *mut c_void\n     unsafe { pthread_self() as usize as *mut c_void }\n }\n \n+unsafe extern \"C\" fn start_self_join_errno(_arg: *mut c_void) -> *mut c_void {\n+    // SAFETY: calling our ABI-layer pthread_self/pthread_join in the child.\n+    let self_tid = unsafe { pthread_self() };\n+    // SAFETY: self_tid is a valid pthread_t for this thread; null retval is allowed.\n+    let rc = unsafe { pthread_join(self_tid, std::ptr::null_mut()) };\n+    rc as usize as *mut c_void\n+}\n+\n fn env_usize(var: &str, default: usize, max: usize) -> usize {\n     std::env::var(var)\n         .ok()\n@@ -255,6 +263,33 @@ fn pthread_join_then_reuse_handle_is_esrch() {\n     );\n }\n \n+#[test]\n+fn pthread_self_join_is_rejected_with_edeadlk() {\n+    let _guard = lock_and_force_native();\n+\n+    let mut tid: libc::pthread_t = 0;\n+    let create_rc = unsafe {\n+        pthread_create(\n+            &mut tid as *mut libc::pthread_t,\n+            std::ptr::null(),\n+            Some(start_self_join_errno),\n+            std::ptr::null_mut(),\n+        )\n+    };\n+    assert_eq!(create_rc, 0, \"pthread_create failed rc={create_rc}\");\n+\n+    let mut retval: *mut c_void = std::ptr::null_mut();\n+    let join_rc = unsafe { pthread_join(tid, &mut retval as *mut *mut c_void) };\n+    assert_eq!(join_rc, 0, \"pthread_join(child) failed rc={join_rc}\");\n+\n+    let child_errno = retval as usize as i32;\n+    assert_eq!(\n+        child_errno,\n+        libc::EDEADLK,\n+        \"child pthread_join(self) should return EDEADLK\"\n+    );\n+}\n+\n #[test]\n #[ignore = \"stress profile; run explicitly when exercising lifecycle endurance\"]\n fn pthread_detach_join_esrch_stress() {"
+    },
+    {
+      "sha": "38a986b43a4ca94d26aab2a3303c46da54fb30bf",
+      "filename": "crates/frankenlibc-core/src/pthread/thread.rs",
+      "status": "modified",
+      "additions": 21,
+      "deletions": 1,
+      "changes": 22,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/12850bc9c7871c56d46b9841d6c13ed06d4d6dd0/crates%2Ffrankenlibc-core%2Fsrc%2Fpthread%2Fthread.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/12850bc9c7871c56d46b9841d6c13ed06d4d6dd0/crates%2Ffrankenlibc-core%2Fsrc%2Fpthread%2Fthread.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-core%2Fsrc%2Fpthread%2Fthread.rs?ref=12850bc9c7871c56d46b9841d6c13ed06d4d6dd0",
+      "patch": "@@ -522,8 +522,28 @@ pub unsafe fn join_thread(handle_ptr: *mut ThreadHandle) -> Result<usize, i32> {\n \n     // Self-join detection: if the calling thread's TID matches the handle's\n     // TID, we'd deadlock.\n+    //\n+    // On clone startup there is a small publication window where the child can\n+    // run user code before parent-side TID publication is visible in `tid`.\n+    // If we evaluate self-join during that window, we'd miss EDEADLK and later\n+    // block forever waiting on a zero tid value.\n     let my_tid = syscall::sys_gettid();\n-    let target_tid = handle.tid.load(Ordering::Acquire);\n+    let mut target_tid = handle.tid.load(Ordering::Acquire);\n+    if target_tid == 0 {\n+        loop {\n+            let state = handle.state.load(Ordering::Acquire);\n+            if state != THREAD_STARTING && state != THREAD_RUNNING {\n+                break;\n+            }\n+\n+            target_tid = handle.tid.load(Ordering::Acquire);\n+            if target_tid != 0 {\n+                break;\n+            }\n+            core::hint::spin_loop();\n+        }\n+    }\n+\n     if target_tid != 0 && my_tid == target_tid {\n         return Err(EDEADLK);\n     }"
+    }
+  ]
+}

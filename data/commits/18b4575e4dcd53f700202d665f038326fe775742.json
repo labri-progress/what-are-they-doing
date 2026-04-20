@@ -1,0 +1,101 @@
+{
+  "message": "feat(usage): add minimax usage snapshot",
+  "files": [
+    {
+      "sha": "fd8eba6f42ca2e8fe09644d71f3678adade048e3",
+      "filename": "docs/concepts/usage-tracking.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/18b4575e4dcd53f700202d665f038326fe775742/docs%2Fconcepts%2Fusage-tracking.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/18b4575e4dcd53f700202d665f038326fe775742/docs%2Fconcepts%2Fusage-tracking.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/docs%2Fconcepts%2Fusage-tracking.md?ref=18b4575e4dcd53f700202d665f038326fe775742",
+      "patch": "@@ -23,6 +23,7 @@ read_when:\n - **Gemini CLI**: OAuth tokens in auth profiles.\n - **Antigravity**: OAuth tokens in auth profiles.\n - **OpenAI Codex**: OAuth tokens in auth profiles (accountId used when present).\n+- **MiniMax**: API key (coding plan key); uses the 5\u2011hour coding plan window.\n - **z.ai**: API key via env/config/auth store.\n \n Usage is hidden if no matching OAuth/API credentials exist."
+    },
+    {
+      "sha": "e1a9d79f66deaf9246f5f9db80dde832e47d7705",
+      "filename": "src/infra/provider-usage.auth.ts",
+      "status": "modified",
+      "additions": 34,
+      "deletions": 0,
+      "changes": 34,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/18b4575e4dcd53f700202d665f038326fe775742/src%2Finfra%2Fprovider-usage.auth.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/18b4575e4dcd53f700202d665f038326fe775742/src%2Finfra%2Fprovider-usage.auth.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Fprovider-usage.auth.ts?ref=18b4575e4dcd53f700202d665f038326fe775742",
+      "patch": "@@ -74,6 +74,35 @@ function resolveZaiApiKey(): string | undefined {\n   }\n }\n \n+function resolveMinimaxApiKey(): string | undefined {\n+  const envDirect =\n+    process.env.MINIMAX_CODE_PLAN_KEY?.trim() ||\n+    process.env.MINIMAX_API_KEY?.trim();\n+  if (envDirect) return envDirect;\n+\n+  const envResolved = resolveEnvApiKey(\"minimax\");\n+  if (envResolved?.apiKey) return envResolved.apiKey;\n+\n+  const cfg = loadConfig();\n+  const key = getCustomProviderApiKey(cfg, \"minimax\");\n+  if (key) return key;\n+\n+  const store = ensureAuthProfileStore();\n+  const apiProfile = listProfilesForProvider(store, \"minimax\").find((id) => {\n+    const cred = store.profiles[id];\n+    return cred?.type === \"api_key\" || cred?.type === \"token\";\n+  });\n+  if (!apiProfile) return undefined;\n+  const cred = store.profiles[apiProfile];\n+  if (cred?.type === \"api_key\" && cred.key?.trim()) {\n+    return cred.key.trim();\n+  }\n+  if (cred?.type === \"token\" && cred.token?.trim()) {\n+    return cred.token.trim();\n+  }\n+  return undefined;\n+}\n+\n async function resolveOAuthToken(params: {\n   provider: UsageProviderId;\n   agentDir?: string;\n@@ -182,6 +211,11 @@ export async function resolveProviderAuths(params: {\n       if (apiKey) auths.push({ provider, token: apiKey });\n       continue;\n     }\n+    if (provider === \"minimax\") {\n+      const apiKey = resolveMinimaxApiKey();\n+      if (apiKey) auths.push({ provider, token: apiKey });\n+      continue;\n+    }\n \n     if (!oauthProviders.includes(provider)) continue;\n     const auth = await resolveOAuthToken({"
+    },
+    {
+      "sha": "c493213ab28462f791a76d7a0cf52c092a64ced4",
+      "filename": "src/infra/provider-usage.fetch.minimax.ts",
+      "status": "added",
+      "additions": 259,
+      "deletions": 0,
+      "changes": 259,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/18b4575e4dcd53f700202d665f038326fe775742/src%2Finfra%2Fprovider-usage.fetch.minimax.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/18b4575e4dcd53f700202d665f038326fe775742/src%2Finfra%2Fprovider-usage.fetch.minimax.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Fprovider-usage.fetch.minimax.ts?ref=18b4575e4dcd53f700202d665f038326fe775742",
+      "patch": "@@ -0,0 +1,259 @@\n+import { fetchJson } from \"./provider-usage.fetch.shared.js\";\n+import { clampPercent, PROVIDER_LABELS } from \"./provider-usage.shared.js\";\n+import type {\n+  ProviderUsageSnapshot,\n+  UsageWindow,\n+} from \"./provider-usage.types.js\";\n+\n+type MinimaxBaseResp = {\n+  status_code?: number;\n+  status_msg?: string;\n+};\n+\n+type MinimaxUsageResponse = {\n+  base_resp?: MinimaxBaseResp;\n+  data?: Record<string, unknown>;\n+  [key: string]: unknown;\n+};\n+\n+const RESET_KEYS = [\n+  \"reset_at\",\n+  \"resetAt\",\n+  \"reset_time\",\n+  \"resetTime\",\n+  \"expires_at\",\n+  \"expiresAt\",\n+  \"expire_at\",\n+  \"expireAt\",\n+  \"end_time\",\n+  \"endTime\",\n+  \"window_end\",\n+  \"windowEnd\",\n+] as const;\n+\n+const PERCENT_KEYS = [\n+  \"used_percent\",\n+  \"usedPercent\",\n+  \"usage_percent\",\n+  \"usagePercent\",\n+  \"used_rate\",\n+  \"usage_rate\",\n+  \"used_ratio\",\n+  \"usage_ratio\",\n+  \"usedRatio\",\n+  \"usageRatio\",\n+] as const;\n+\n+const USED_KEYS = [\n+  \"used\",\n+  \"usage\",\n+  \"used_amount\",\n+  \"usedAmount\",\n+  \"used_tokens\",\n+  \"usedTokens\",\n+  \"used_quota\",\n+  \"usedQuota\",\n+  \"used_times\",\n+  \"usedTimes\",\n+  \"consumed\",\n+] as const;\n+\n+const TOTAL_KEYS = [\n+  \"total\",\n+  \"total_amount\",\n+  \"totalAmount\",\n+  \"total_tokens\",\n+  \"totalTokens\",\n+  \"total_quota\",\n+  \"totalQuota\",\n+  \"total_times\",\n+  \"totalTimes\",\n+  \"limit\",\n+  \"quota\",\n+  \"quota_limit\",\n+  \"quotaLimit\",\n+  \"max\",\n+] as const;\n+\n+const REMAINING_KEYS = [\n+  \"remain\",\n+  \"remaining\",\n+  \"remain_amount\",\n+  \"remainingAmount\",\n+  \"remaining_amount\",\n+  \"remain_tokens\",\n+  \"remainingTokens\",\n+  \"remaining_tokens\",\n+  \"remain_quota\",\n+  \"remainingQuota\",\n+  \"remaining_quota\",\n+  \"remain_times\",\n+  \"remainingTimes\",\n+  \"remaining_times\",\n+  \"left\",\n+] as const;\n+\n+const PLAN_KEYS = [\"plan\", \"plan_name\", \"planName\", \"product\", \"tier\"] as const;\n+\n+const WINDOW_HOUR_KEYS = [\n+  \"window_hours\",\n+  \"windowHours\",\n+  \"duration_hours\",\n+  \"durationHours\",\n+  \"hours\",\n+] as const;\n+\n+const WINDOW_MINUTE_KEYS = [\n+  \"window_minutes\",\n+  \"windowMinutes\",\n+  \"duration_minutes\",\n+  \"durationMinutes\",\n+  \"minutes\",\n+] as const;\n+\n+function isRecord(value: unknown): value is Record<string, unknown> {\n+  return Boolean(value && typeof value === \"object\" && !Array.isArray(value));\n+}\n+\n+function pickNumber(\n+  record: Record<string, unknown>,\n+  keys: readonly string[],\n+): number | undefined {\n+  for (const key of keys) {\n+    const value = record[key];\n+    if (typeof value === \"number\" && Number.isFinite(value)) return value;\n+    if (typeof value === \"string\") {\n+      const parsed = Number.parseFloat(value);\n+      if (Number.isFinite(parsed)) return parsed;\n+    }\n+  }\n+  return undefined;\n+}\n+\n+function pickString(\n+  record: Record<string, unknown>,\n+  keys: readonly string[],\n+): string | undefined {\n+  for (const key of keys) {\n+    const value = record[key];\n+    if (typeof value === \"string\" && value.trim()) return value.trim();\n+  }\n+  return undefined;\n+}\n+\n+function parseEpoch(value: unknown): number | undefined {\n+  if (typeof value === \"number\" && Number.isFinite(value)) {\n+    if (value < 1e12) return Math.floor(value * 1000);\n+    return Math.floor(value);\n+  }\n+  if (typeof value === \"string\" && value.trim()) {\n+    const parsed = Date.parse(value);\n+    if (Number.isFinite(parsed)) return parsed;\n+  }\n+  return undefined;\n+}\n+\n+function deriveWindowLabel(payload: Record<string, unknown>): string {\n+  const hours = pickNumber(payload, WINDOW_HOUR_KEYS);\n+  if (hours && Number.isFinite(hours)) return `${hours}h`;\n+  const minutes = pickNumber(payload, WINDOW_MINUTE_KEYS);\n+  if (minutes && Number.isFinite(minutes)) return `${minutes}m`;\n+  return \"5h\";\n+}\n+\n+function deriveUsedPercent(payload: Record<string, unknown>): number | null {\n+  const percentRaw = pickNumber(payload, PERCENT_KEYS);\n+  if (percentRaw !== undefined) {\n+    const normalized = percentRaw <= 1 ? percentRaw * 100 : percentRaw;\n+    return clampPercent(normalized);\n+  }\n+\n+  const total = pickNumber(payload, TOTAL_KEYS);\n+  if (!total || total <= 0) return null;\n+  let used = pickNumber(payload, USED_KEYS);\n+  if (used === undefined) {\n+    const remaining = pickNumber(payload, REMAINING_KEYS);\n+    if (remaining !== undefined) used = total - remaining;\n+  }\n+  if (used === undefined || !Number.isFinite(used)) return null;\n+  return clampPercent((used / total) * 100);\n+}\n+\n+export async function fetchMinimaxUsage(\n+  apiKey: string,\n+  timeoutMs: number,\n+  fetchFn: typeof fetch,\n+): Promise<ProviderUsageSnapshot> {\n+  const res = await fetchJson(\n+    \"https://api.minimax.io/v1/coding_plan/remains\",\n+    {\n+      method: \"GET\",\n+      headers: {\n+        Authorization: `Bearer ${apiKey}`,\n+        \"Content-Type\": \"application/json\",\n+        \"MM-API-Source\": \"Clawdbot\",\n+      },\n+    },\n+    timeoutMs,\n+    fetchFn,\n+  );\n+\n+  if (!res.ok) {\n+    return {\n+      provider: \"minimax\",\n+      displayName: PROVIDER_LABELS.minimax,\n+      windows: [],\n+      error: `HTTP ${res.status}`,\n+    };\n+  }\n+\n+  const data = (await res.json().catch(() => null)) as MinimaxUsageResponse;\n+  if (!isRecord(data)) {\n+    return {\n+      provider: \"minimax\",\n+      displayName: PROVIDER_LABELS.minimax,\n+      windows: [],\n+      error: \"Invalid JSON\",\n+    };\n+  }\n+\n+  const baseResp = isRecord(data.base_resp)\n+    ? (data.base_resp as MinimaxBaseResp)\n+    : undefined;\n+  if (baseResp && baseResp.status_code && baseResp.status_code !== 0) {\n+    return {\n+      provider: \"minimax\",\n+      displayName: PROVIDER_LABELS.minimax,\n+      windows: [],\n+      error: baseResp.status_msg?.trim() || \"API error\",\n+    };\n+  }\n+\n+  const payload = isRecord(data.data) ? data.data : data;\n+  const usedPercent = deriveUsedPercent(payload);\n+  if (usedPercent === null) {\n+    return {\n+      provider: \"minimax\",\n+      displayName: PROVIDER_LABELS.minimax,\n+      windows: [],\n+      error: \"Unsupported response shape\",\n+    };\n+  }\n+\n+  const resetAt = parseEpoch(pickString(payload, RESET_KEYS)) ??\n+    parseEpoch(pickNumber(payload, RESET_KEYS));\n+  const windows: UsageWindow[] = [\n+    {\n+      label: deriveWindowLabel(payload),\n+      usedPercent,\n+      resetAt,\n+    },\n+  ];\n+\n+  return {\n+    provider: \"minimax\",\n+    displayName: PROVIDER_LABELS.minimax,\n+    windows,\n+    plan: pickString(payload, PLAN_KEYS),\n+  };\n+}"
+    },
+    {
+      "sha": "e0bcd60c94b9325123b09b3fff643b9d8940b40f",
+      "filename": "src/infra/provider-usage.fetch.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/18b4575e4dcd53f700202d665f038326fe775742/src%2Finfra%2Fprovider-usage.fetch.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/18b4575e4dcd53f700202d665f038326fe775742/src%2Finfra%2Fprovider-usage.fetch.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Fprovider-usage.fetch.ts?ref=18b4575e4dcd53f700202d665f038326fe775742",
+      "patch": "@@ -2,4 +2,5 @@ export { fetchClaudeUsage } from \"./provider-usage.fetch.claude.js\";\n export { fetchCodexUsage } from \"./provider-usage.fetch.codex.js\";\n export { fetchCopilotUsage } from \"./provider-usage.fetch.copilot.js\";\n export { fetchGeminiUsage } from \"./provider-usage.fetch.gemini.js\";\n+export { fetchMinimaxUsage } from \"./provider-usage.fetch.minimax.js\";\n export { fetchZaiUsage } from \"./provider-usage.fetch.zai.js\";"
+    },
+    {
+      "sha": "23f4f1de7134609064d970dad94ddeb7183332a5",
+      "filename": "src/infra/provider-usage.load.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/18b4575e4dcd53f700202d665f038326fe775742/src%2Finfra%2Fprovider-usage.load.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/18b4575e4dcd53f700202d665f038326fe775742/src%2Finfra%2Fprovider-usage.load.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Fprovider-usage.load.ts?ref=18b4575e4dcd53f700202d665f038326fe775742",
+      "patch": "@@ -7,6 +7,7 @@ import {\n   fetchCodexUsage,\n   fetchCopilotUsage,\n   fetchGeminiUsage,\n+  fetchMinimaxUsage,\n   fetchZaiUsage,\n } from \"./provider-usage.fetch.js\";\n import {\n@@ -70,6 +71,8 @@ export async function loadProviderUsageSummary(\n               timeoutMs,\n               fetchFn,\n             );\n+          case \"minimax\":\n+            return await fetchMinimaxUsage(auth.token, timeoutMs, fetchFn);\n           case \"zai\":\n             return await fetchZaiUsage(auth.token, timeoutMs, fetchFn);\n           default:"
+    },
+    {
+      "sha": "ecf7bfea750ef8711d3f8a929a9ef88eb511b877",
+      "filename": "src/infra/provider-usage.shared.ts",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/18b4575e4dcd53f700202d665f038326fe775742/src%2Finfra%2Fprovider-usage.shared.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/18b4575e4dcd53f700202d665f038326fe775742/src%2Finfra%2Fprovider-usage.shared.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Fprovider-usage.shared.ts?ref=18b4575e4dcd53f700202d665f038326fe775742",
+      "patch": "@@ -8,6 +8,7 @@ export const PROVIDER_LABELS: Record<UsageProviderId, string> = {\n   \"github-copilot\": \"Copilot\",\n   \"google-gemini-cli\": \"Gemini\",\n   \"google-antigravity\": \"Antigravity\",\n+  minimax: \"MiniMax\",\n   \"openai-codex\": \"Codex\",\n   zai: \"z.ai\",\n };\n@@ -17,6 +18,7 @@ export const usageProviders: UsageProviderId[] = [\n   \"github-copilot\",\n   \"google-gemini-cli\",\n   \"google-antigravity\",\n+  \"minimax\",\n   \"openai-codex\",\n   \"zai\",\n ];"
+    },
+    {
+      "sha": "8de3f61e96372dbfb8baabd44f9ca62c012ca35e",
+      "filename": "src/infra/provider-usage.test.ts",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 1,
+      "changes": 16,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/18b4575e4dcd53f700202d665f038326fe775742/src%2Finfra%2Fprovider-usage.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/18b4575e4dcd53f700202d665f038326fe775742/src%2Finfra%2Fprovider-usage.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Fprovider-usage.test.ts?ref=18b4575e4dcd53f700202d665f038326fe775742",
+      "patch": "@@ -114,6 +114,17 @@ describe(\"provider usage loading\", () => {\n             },\n           });\n         }\n+        if (url.includes(\"api.minimax.io/v1/coding_plan/remains\")) {\n+          return makeResponse(200, {\n+            base_resp: { status_code: 0, status_msg: \"ok\" },\n+            data: {\n+              total: 200,\n+              remain: 50,\n+              reset_at: \"2026-01-07T05:00:00Z\",\n+              plan_name: \"Coding Plan\",\n+            },\n+          });\n+        }\n         return makeResponse(404, \"not found\");\n       },\n     );\n@@ -122,15 +133,18 @@ describe(\"provider usage loading\", () => {\n       now: Date.UTC(2026, 0, 7, 0, 0, 0),\n       auth: [\n         { provider: \"anthropic\", token: \"token-1\" },\n+        { provider: \"minimax\", token: \"token-1b\" },\n         { provider: \"zai\", token: \"token-2\" },\n       ],\n       fetch: mockFetch,\n     });\n \n-    expect(summary.providers).toHaveLength(2);\n+    expect(summary.providers).toHaveLength(3);\n     const claude = summary.providers.find((p) => p.provider === \"anthropic\");\n+    const minimax = summary.providers.find((p) => p.provider === \"minimax\");\n     const zai = summary.providers.find((p) => p.provider === \"zai\");\n     expect(claude?.windows[0]?.label).toBe(\"5h\");\n+    expect(minimax?.windows[0]?.usedPercent).toBe(75);\n     expect(zai?.plan).toBe(\"Pro\");\n     expect(mockFetch).toHaveBeenCalled();\n   });"
+    },
+    {
+      "sha": "cef446ceb406b604134659a681a7f372cf8ea3de",
+      "filename": "src/infra/provider-usage.types.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/18b4575e4dcd53f700202d665f038326fe775742/src%2Finfra%2Fprovider-usage.types.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/18b4575e4dcd53f700202d665f038326fe775742/src%2Finfra%2Fprovider-usage.types.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Fprovider-usage.types.ts?ref=18b4575e4dcd53f700202d665f038326fe775742",
+      "patch": "@@ -22,5 +22,6 @@ export type UsageProviderId =\n   | \"github-copilot\"\n   | \"google-gemini-cli\"\n   | \"google-antigravity\"\n+  | \"minimax\"\n   | \"openai-codex\"\n   | \"zai\";"
+    }
+  ]
+}

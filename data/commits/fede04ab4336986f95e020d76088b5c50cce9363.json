@@ -1,0 +1,53 @@
+{
+  "message": "feat(unicode): Implement BiDi text resolution (UAX #9)\n\nAdd bidirectional text support for proper display of Arabic, Hebrew,\nand mixed LTR/RTL text in terminal applications.\n\nNew module: src/unicode/bidi.rs\n- BidiInfo struct with base_direction and per-char embedding levels\n- Direction enum (Ltr, Rtl, Neutral)\n- resolve_bidi() function wrapping unicode-bidi crate\n- detect_base_direction() helper using first strong character\n- Handles empty strings and mixed script text correctly\n\nDependencies:\n- Add unicode-bidi = \"0.3\" to Cargo.toml\n\nThe implementation converts unicode-bidi's byte-indexed levels to\nper-char levels for convenient terminal cell mapping. This is the\nfoundation for bd-1262 (BiDi text resolution task).\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "bfce8b75a4c7466a36928b8cb8c99bcfdca2bdda",
+      "filename": "Cargo.lock",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 0,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/opentui_rust/blob/fede04ab4336986f95e020d76088b5c50cce9363/Cargo.lock",
+      "raw_url": "https://github.com/Dicklesworthstone/opentui_rust/raw/fede04ab4336986f95e020d76088b5c50cce9363/Cargo.lock",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/opentui_rust/contents/Cargo.lock?ref=fede04ab4336986f95e020d76088b5c50cce9363",
+      "patch": "@@ -461,6 +461,7 @@ dependencies = [\n  \"tempfile\",\n  \"tracing\",\n  \"tracing-subscriber\",\n+ \"unicode-bidi\",\n  \"unicode-segmentation\",\n  \"unicode-width 0.2.2\",\n  \"vt100\",\n@@ -1001,6 +1002,12 @@ version = \"0.1.4\"\n source = \"registry+https://github.com/rust-lang/crates.io-index\"\n checksum = \"eaea85b334db583fe3274d12b4cd1880032beab409c0d774be044d4480ab9a94\"\n \n+[[package]]\n+name = \"unicode-bidi\"\n+version = \"0.3.18\"\n+source = \"registry+https://github.com/rust-lang/crates.io-index\"\n+checksum = \"5c1cb5db39152898a79168971543b1cb5020dff7fe43c8dc468b0885f5e29df5\"\n+\n [[package]]\n name = \"unicode-ident\"\n version = \"1.0.22\""
+    },
+    {
+      "sha": "a747c399eae159e3b1bc6dcfa3e26a293f3f9195",
+      "filename": "Cargo.toml",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/opentui_rust/blob/fede04ab4336986f95e020d76088b5c50cce9363/Cargo.toml",
+      "raw_url": "https://github.com/Dicklesworthstone/opentui_rust/raw/fede04ab4336986f95e020d76088b5c50cce9363/Cargo.toml",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/opentui_rust/contents/Cargo.toml?ref=fede04ab4336986f95e020d76088b5c50cce9363",
+      "patch": "@@ -34,6 +34,7 @@ pty-tests = []\n bitflags = \"2.10\"\n libc = \"0.2.180\"\n ropey = \"1.6\"\n+unicode-bidi = \"0.3.18\"\n unicode-segmentation = \"1.12\"\n unicode-width = \"0.2\"\n "
+    },
+    {
+      "sha": "2d1a1c16fbd9f187dd72290770b3884a267be1b8",
+      "filename": "src/unicode/bidi.rs",
+      "status": "added",
+      "additions": 121,
+      "deletions": 0,
+      "changes": 121,
+      "blob_url": "https://github.com/Dicklesworthstone/opentui_rust/blob/fede04ab4336986f95e020d76088b5c50cce9363/src%2Funicode%2Fbidi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/opentui_rust/raw/fede04ab4336986f95e020d76088b5c50cce9363/src%2Funicode%2Fbidi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/opentui_rust/contents/src%2Funicode%2Fbidi.rs?ref=fede04ab4336986f95e020d76088b5c50cce9363",
+      "patch": "@@ -0,0 +1,121 @@\n+//! Bidirectional (BiDi) text resolution.\n+//!\n+//! This module provides a small wrapper around the Unicode Bidirectional Algorithm\n+//! (UAX #9), exposing a compact [`BidiInfo`] structure that is convenient for\n+//! terminal rendering and text layout.\n+\n+use unicode_bidi::{BidiClass, BidiInfo as UnicodeBidiInfo};\n+\n+/// Base paragraph direction.\n+#[derive(Clone, Copy, Debug, PartialEq, Eq)]\n+pub enum Direction {\n+    Ltr,\n+    Rtl,\n+    /// No strong direction could be determined.\n+    Neutral,\n+}\n+\n+/// Result of resolving BiDi embedding levels for a string.\n+#[derive(Clone, Debug, PartialEq, Eq)]\n+pub struct BidiInfo {\n+    /// Detected base direction.\n+    pub base_direction: Direction,\n+    /// Embedding level per Unicode scalar value (`char`).\n+    pub levels: Vec<u8>,\n+}\n+\n+/// Resolve bidirectional embedding levels for `text` (UAX #9).\n+///\n+/// The returned `levels` are per `char` (Unicode scalar value), not per byte.\n+#[must_use]\n+pub fn resolve_bidi(text: &str) -> BidiInfo {\n+    if text.is_empty() {\n+        return BidiInfo {\n+            base_direction: Direction::Neutral,\n+            levels: Vec::new(),\n+        };\n+    }\n+\n+    let base_direction = detect_base_direction(text);\n+    let bidi = UnicodeBidiInfo::new(text, None);\n+\n+    let mut levels = Vec::with_capacity(text.chars().count());\n+    for (byte_idx, _) in text.char_indices() {\n+        // `unicode-bidi` stores one level per byte; the level is repeated for all\n+        // bytes in a multi-byte code point. Using the starting byte index yields\n+        // a stable per-`char` level without additional lookups.\n+        levels.push(bidi.levels[byte_idx].number());\n+    }\n+\n+    BidiInfo {\n+        base_direction,\n+        levels,\n+    }\n+}\n+\n+fn detect_base_direction(text: &str) -> Direction {\n+    for ch in text.chars() {\n+        match unicode_bidi::bidi_class(ch) {\n+            BidiClass::L => return Direction::Ltr,\n+            BidiClass::R | BidiClass::AL => return Direction::Rtl,\n+            _ => {}\n+        }\n+    }\n+    Direction::Neutral\n+}\n+\n+#[cfg(test)]\n+mod tests {\n+    use super::*;\n+\n+    #[test]\n+    fn resolve_bidi_empty_is_neutral() {\n+        let info = resolve_bidi(\"\");\n+        assert_eq!(info.base_direction, Direction::Neutral);\n+        assert!(info.levels.is_empty());\n+    }\n+\n+    #[test]\n+    fn resolve_bidi_pure_ltr_levels_zero() {\n+        let text = \"Hello, world!\";\n+        let info = resolve_bidi(text);\n+        assert_eq!(info.base_direction, Direction::Ltr);\n+        assert_eq!(info.levels.len(), text.chars().count());\n+        assert!(info.levels.iter().all(|&l| l == 0));\n+    }\n+\n+    #[test]\n+    fn resolve_bidi_pure_rtl_hebrew_levels_one() {\n+        let text = \"\u05e9\u05dc\u05d5\u05dd\";\n+        let info = resolve_bidi(text);\n+        assert_eq!(info.base_direction, Direction::Rtl);\n+        assert_eq!(info.levels.len(), text.chars().count());\n+        assert!(info.levels.iter().all(|&l| l == 1));\n+    }\n+\n+    #[test]\n+    fn resolve_bidi_numbers_are_neutral_base() {\n+        let text = \"12345\";\n+        let info = resolve_bidi(text);\n+        assert_eq!(info.base_direction, Direction::Neutral);\n+        assert_eq!(info.levels.len(), text.chars().count());\n+    }\n+\n+    #[test]\n+    fn resolve_bidi_mixed_contains_rtl_levels() {\n+        let text = \"Hello \u05e9\u05dc\u05d5\u05dd\";\n+        let info = resolve_bidi(text);\n+        assert_eq!(info.base_direction, Direction::Ltr);\n+        assert_eq!(info.levels.len(), text.chars().count());\n+        assert!(info.levels.iter().any(|&l| l == 1));\n+        assert!(info.levels.iter().any(|&l| l == 0));\n+    }\n+\n+    #[test]\n+    fn resolve_bidi_explicit_controls_do_not_panic() {\n+        // RLO ... PDF\n+        let text = \"abc\\u{202E}def\\u{202C}ghi\";\n+        let info = resolve_bidi(text);\n+        assert_eq!(info.levels.len(), text.chars().count());\n+    }\n+}"
+    },
+    {
+      "sha": "b423605353192cc18961f6b7c790ce3dc02ab3c4",
+      "filename": "src/unicode/mod.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/opentui_rust/blob/fede04ab4336986f95e020d76088b5c50cce9363/src%2Funicode%2Fmod.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/opentui_rust/raw/fede04ab4336986f95e020d76088b5c50cce9363/src%2Funicode%2Fmod.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/opentui_rust/contents/src%2Funicode%2Fmod.rs?ref=fede04ab4336986f95e020d76088b5c50cce9363",
+      "patch": "@@ -1,9 +1,11 @@\n //! Unicode utilities for grapheme handling and display width.\n \n+mod bidi;\n mod grapheme;\n mod search;\n mod width;\n \n+pub use bidi::{BidiInfo, Direction, resolve_bidi};\n pub use grapheme::{\n     GraphemeInfo, GraphemeIterator, find_grapheme_boundary, grapheme_indices, grapheme_info,\n     graphemes, is_ascii_only, split_graphemes_with_widths,"
+    }
+  ]
+}

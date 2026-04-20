@@ -1,0 +1,137 @@
+{
+  "message": "Allow HMAC functions to accept string keys",
+  "files": [
+    {
+      "sha": "523700aaeef3b4ae822fb09c2dfbbb883d3799ed",
+      "filename": "libtenzir/builtins/functions/hash.cpp",
+      "status": "modified",
+      "additions": 30,
+      "deletions": 65,
+      "changes": 95,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/dca7992e6de183f268f75b04a25415b1c21f6c53/libtenzir%2Fbuiltins%2Ffunctions%2Fhash.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/dca7992e6de183f268f75b04a25415b1c21f6c53/libtenzir%2Fbuiltins%2Ffunctions%2Fhash.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Fbuiltins%2Ffunctions%2Fhash.cpp?ref=dca7992e6de183f268f75b04a25415b1c21f6c53",
+      "patch": "@@ -6,6 +6,7 @@\n // SPDX-FileCopyrightText: (c) 2021 The Tenzir Contributors\n // SPDX-License-Identifier: BSD-3-Clause\n \n+#include <tenzir/argument_parser2.hpp>\n #include <tenzir/arrow_table_slice.hpp>\n #include <tenzir/arrow_utils.hpp>\n #include <tenzir/as_bytes.hpp>\n@@ -14,6 +15,7 @@\n #include <tenzir/concept/parseable/core.hpp>\n #include <tenzir/concept/parseable/tenzir/option_set.hpp>\n #include <tenzir/concept/parseable/tenzir/pipeline.hpp>\n+#include <tenzir/cast.hpp>\n #include <tenzir/detail/base64.hpp>\n #include <tenzir/detail/coding.hpp>\n #include <tenzir/detail/inspection_common.hpp>\n@@ -23,9 +25,11 @@\n #include <tenzir/hash/md5.hpp>\n #include <tenzir/hash/sha.hpp>\n #include <tenzir/hash/xxhash.hpp>\n+#include <tenzir/location.hpp>\n #include <tenzir/optional.hpp>\n #include <tenzir/plugin.hpp>\n #include <tenzir/secret.hpp>\n+#include <tenzir/tql2/eval.hpp>\n #include <tenzir/tql2/plugin.hpp>\n \n #include <arrow/scalar.h>\n@@ -37,13 +41,13 @@ namespace tenzir::plugins::hash {\n \n namespace hash_detail {\n \n-auto flatten_secret(const secret_view& secret, session ctx,\n-                    const ast::expression& expr, std::string_view function_name)\n+auto flatten_secret(const secret_view& secret, session ctx, location where,\n+                    std::string_view function_name)\n   -> std::optional<std::string> {\n   auto& dh = ctx.dh();\n   struct visitor {\n     diagnostic_handler& dh;\n-    const ast::expression& expr;\n+    location where;\n     std::string_view function_name;\n \n     auto operator()(const fbs::data::SecretLiteral& lit) const\n@@ -57,7 +61,7 @@ auto flatten_secret(const secret_view& secret, session ctx,\n       diagnostic::error(\"`{}` requires literal secrets; got managed secret \"\n                         \"`{}`\",\n                         function_name, name.value()->string_view())\n-        .primary(expr)\n+        .primary(where)\n         .emit(dh);\n       return std::nullopt;\n     }\n@@ -90,7 +94,7 @@ auto flatten_secret(const secret_view& secret, session ctx,\n           if (not decoded) {\n             diagnostic::error(\"`{}` failed to decode base64 secret value\",\n                               function_name)\n-              .primary(expr)\n+              .primary(where)\n               .emit(dh);\n             return std::nullopt;\n           }\n@@ -101,7 +105,7 @@ auto flatten_secret(const secret_view& secret, session ctx,\n     }\n   };\n \n-  return match(*secret.buffer, visitor{dh, expr, function_name});\n+  return match(*secret.buffer, visitor{dh, where, function_name});\n }\n \n } // namespace hash_detail\n@@ -351,72 +355,31 @@ class fun : public virtual function_plugin {\n   auto make_function(invocation inv, session ctx) const\n     -> failure_or<function_ptr> override {\n     auto value_expr = ast::expression{};\n-    auto key_expr = ast::expression{};\n+    auto key = located<secret>{};\n     TRY(argument_parser2::function(name())\n           .positional(\"value\", value_expr, \"any\")\n-          .positional(\"key\", key_expr, \"secret\")\n+          .positional(\"key\", key, \"secret\")\n           .parse(inv, ctx));\n-    auto fn_name = std::string{name()};\n+    const auto fn_name = std::string{name()};\n+    auto key_material = hash::hash_detail::flatten_secret(\n+      secret_view{key.inner}, ctx, key.source, fn_name);\n+    if (not key_material) {\n+      return failure::promise();\n+    }\n+    auto key_bytes = std::string{*key_material};\n     return function_use::make(\n-      [value_expr = std::move(value_expr), key_expr = std::move(key_expr),\n-       fn_name\n-       = std::move(fn_name)](evaluator eval, session ctx) -> multi_series {\n-        auto compute = [&, fn_name = std::string_view{fn_name}](\n-                         series value, series key) -> series {\n-          if (value.length() != key.length()) {\n-            diagnostic::warning(\"`{}` requires the key expression to produce \"\n-                                \"the same number of rows as the value \"\n-                                \"expression ({} vs {})\",\n-                                fn_name, value.length(), key.length())\n-              .primary(value_expr)\n-              .emit(ctx);\n-            return series::null(string_type{}, value.length());\n-          }\n+      [value_expr = std::move(value_expr), key_bytes = std::move(key_bytes)](\n+        evaluator eval, session ctx) -> multi_series {\n+        (void)ctx;\n+        auto compute = [&, key_bytes = std::string_view{key_bytes}](\n+                         series value) -> series {\n           auto builder = string_type::make_arrow_builder(arrow_memory_pool());\n-          auto warned_invalid_type = false;\n-          auto get_secret = [&](int64_t row) -> std::optional<secret> {\n-            auto dv = value_at(key.type, *key.array, row);\n-            auto f = detail::overload{\n-              [](const caf::none_t&) -> std::optional<secret> {\n-                return std::nullopt;\n-              },\n-              [](const secret_view& view) -> std::optional<secret> {\n-                return materialize(view);\n-              },\n-              [](std::string_view str) -> std::optional<secret> {\n-                return secret::make_literal(str);\n-              },\n-              [&](const auto&) -> std::optional<secret> {\n-                if (not warned_invalid_type) {\n-                  diagnostic::warning(\"`{}` expected `secret`, but got `{}`\",\n-                                      fn_name, key.type.kind())\n-                    .primary(key_expr)\n-                    .emit(ctx);\n-                  warned_invalid_type = true;\n-                }\n-                return std::nullopt;\n-              },\n-            };\n-            return match(dv, f);\n-          };\n           for (auto row = int64_t{0}; row < value.length(); ++row) {\n             if (value.array->IsNull(row)) {\n               check(builder->AppendNull());\n               continue;\n             }\n-            auto key_secret = get_secret(row);\n-            if (not key_secret) {\n-              check(builder->AppendNull());\n-              continue;\n-            }\n-            auto key_material = hash::hash_detail::flatten_secret(\n-              secret_view{*key_secret}, ctx, key_expr, fn_name);\n-            if (not key_material) {\n-              check(builder->AppendNull());\n-              continue;\n-            }\n-            auto key_bytes = as_bytes(std::string_view{*key_material});\n-            auto hasher = HmacAlgorithm{key_bytes};\n+            auto hasher = HmacAlgorithm{as_bytes(key_bytes)};\n             auto append_value = detail::overload{\n               [&](const auto& data) {\n                 hash_append(hasher, data);\n@@ -425,15 +388,17 @@ class fun : public virtual function_plugin {\n                 hasher.add(as_bytes(str));\n               },\n             };\n-            auto dv = value_at(value.type, *value.array, row);\n-            match(dv, append_value);\n+            match(value_at(value.type, *value.array, row), append_value);\n             auto digest = std::move(hasher).finish();\n             auto hex = detail::hexify(as_bytes(digest));\n             check(builder->Append(hex));\n           }\n           return series{string_type{}, finish(*builder)};\n         };\n-        return map_series(eval(value_expr), eval(key_expr), compute);\n+        return map_series(eval(value_expr),\n+                          [&](series value) -> multi_series {\n+                            return multi_series{compute(std::move(value))};\n+                          });\n       });\n   }\n };"
+    },
+    {
+      "sha": "226d69d0d7f858bef726f51ae591ea507a567808",
+      "filename": "test/tests/functions/hash/hmac_md5.tql",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/dca7992e6de183f268f75b04a25415b1c21f6c53/test%2Ftests%2Ffunctions%2Fhash%2Fhmac_md5.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/dca7992e6de183f268f75b04a25415b1c21f6c53/test%2Ftests%2Ffunctions%2Fhash%2Fhmac_md5.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Ffunctions%2Fhash%2Fhmac_md5.tql?ref=dca7992e6de183f268f75b04a25415b1c21f6c53",
+      "patch": "@@ -1,4 +1,4 @@\n from {x: \"foo\"},\n      {x: b\"foo\"},\n      {x: {a: 1.2.3.4, b: 10.0.0.0/8, c: 2024-12-24}}\n-select digest = hmac_md5(x, secret(\"supersecret\", _literal=true))\n+select digest = hmac_md5(x, \"supersecret\")"
+    },
+    {
+      "sha": "c3eb69252b3ae3c16be4abf855c7bdd57a6f7f74",
+      "filename": "test/tests/functions/hash/hmac_sha1.tql",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/dca7992e6de183f268f75b04a25415b1c21f6c53/test%2Ftests%2Ffunctions%2Fhash%2Fhmac_sha1.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/dca7992e6de183f268f75b04a25415b1c21f6c53/test%2Ftests%2Ffunctions%2Fhash%2Fhmac_sha1.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Ffunctions%2Fhash%2Fhmac_sha1.tql?ref=dca7992e6de183f268f75b04a25415b1c21f6c53",
+      "patch": "@@ -1,4 +1,4 @@\n from {x: \"foo\"},\n      {x: b\"foo\"},\n      {x: {a: 1.2.3.4, b: 10.0.0.0/8, c: 2024-12-24}}\n-select digest = hmac_sha1(x, secret(\"supersecret\", _literal=true))\n+select digest = hmac_sha1(x, \"supersecret\")"
+    },
+    {
+      "sha": "7478ec2f48f8f9b38e7523231490e37684a3c4b9",
+      "filename": "test/tests/functions/hash/hmac_sha224.tql",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/dca7992e6de183f268f75b04a25415b1c21f6c53/test%2Ftests%2Ffunctions%2Fhash%2Fhmac_sha224.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/dca7992e6de183f268f75b04a25415b1c21f6c53/test%2Ftests%2Ffunctions%2Fhash%2Fhmac_sha224.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Ffunctions%2Fhash%2Fhmac_sha224.tql?ref=dca7992e6de183f268f75b04a25415b1c21f6c53",
+      "patch": "@@ -1,4 +1,4 @@\n from {x: \"foo\"},\n      {x: b\"foo\"},\n      {x: {a: 1.2.3.4, b: 10.0.0.0/8, c: 2024-12-24}}\n-select digest = hmac_sha224(x, secret(\"supersecret\", _literal=true))\n+select digest = hmac_sha224(x, \"supersecret\")"
+    },
+    {
+      "sha": "9d6ca7062bfa20db590f18c07c996861558b6452",
+      "filename": "test/tests/functions/hash/hmac_sha256.tql",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/dca7992e6de183f268f75b04a25415b1c21f6c53/test%2Ftests%2Ffunctions%2Fhash%2Fhmac_sha256.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/dca7992e6de183f268f75b04a25415b1c21f6c53/test%2Ftests%2Ffunctions%2Fhash%2Fhmac_sha256.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Ffunctions%2Fhash%2Fhmac_sha256.tql?ref=dca7992e6de183f268f75b04a25415b1c21f6c53",
+      "patch": "@@ -1,4 +1,4 @@\n from {x: \"foo\"},\n      {x: b\"foo\"},\n      {x: {a: 1.2.3.4, b: 10.0.0.0/8, c: 2024-12-24}}\n-select digest = hmac_sha256(x, secret(\"supersecret\", _literal=true))\n+select digest = hmac_sha256(x, \"supersecret\")"
+    },
+    {
+      "sha": "e81f3208c4ffd3360a1258ce980b4387697267b3",
+      "filename": "test/tests/functions/hash/hmac_sha384.tql",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/dca7992e6de183f268f75b04a25415b1c21f6c53/test%2Ftests%2Ffunctions%2Fhash%2Fhmac_sha384.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/dca7992e6de183f268f75b04a25415b1c21f6c53/test%2Ftests%2Ffunctions%2Fhash%2Fhmac_sha384.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Ffunctions%2Fhash%2Fhmac_sha384.tql?ref=dca7992e6de183f268f75b04a25415b1c21f6c53",
+      "patch": "@@ -1,4 +1,4 @@\n from {x: \"foo\"},\n      {x: b\"foo\"},\n      {x: {a: 1.2.3.4, b: 10.0.0.0/8, c: 2024-12-24}}\n-select digest = hmac_sha384(x, secret(\"supersecret\", _literal=true))\n+select digest = hmac_sha384(x, \"supersecret\")"
+    },
+    {
+      "sha": "f726af488193958d1e35fbf13afbd379039c3c62",
+      "filename": "test/tests/functions/hash/hmac_sha3_224.tql",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/dca7992e6de183f268f75b04a25415b1c21f6c53/test%2Ftests%2Ffunctions%2Fhash%2Fhmac_sha3_224.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/dca7992e6de183f268f75b04a25415b1c21f6c53/test%2Ftests%2Ffunctions%2Fhash%2Fhmac_sha3_224.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Ffunctions%2Fhash%2Fhmac_sha3_224.tql?ref=dca7992e6de183f268f75b04a25415b1c21f6c53",
+      "patch": "@@ -1,4 +1,4 @@\n from {x: \"foo\"},\n      {x: b\"foo\"},\n      {x: {a: 1.2.3.4, b: 10.0.0.0/8, c: 2024-12-24}}\n-select digest = hmac_sha3_224(x, secret(\"supersecret\", _literal=true))\n+select digest = hmac_sha3_224(x, \"supersecret\")"
+    },
+    {
+      "sha": "6abe8b379ab492187a4676e3a185444c8a4fc4b0",
+      "filename": "test/tests/functions/hash/hmac_sha3_256.tql",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/dca7992e6de183f268f75b04a25415b1c21f6c53/test%2Ftests%2Ffunctions%2Fhash%2Fhmac_sha3_256.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/dca7992e6de183f268f75b04a25415b1c21f6c53/test%2Ftests%2Ffunctions%2Fhash%2Fhmac_sha3_256.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Ffunctions%2Fhash%2Fhmac_sha3_256.tql?ref=dca7992e6de183f268f75b04a25415b1c21f6c53",
+      "patch": "@@ -1,4 +1,4 @@\n from {x: \"foo\"},\n      {x: b\"foo\"},\n      {x: {a: 1.2.3.4, b: 10.0.0.0/8, c: 2024-12-24}}\n-select digest = hmac_sha3_256(x, secret(\"supersecret\", _literal=true))\n+select digest = hmac_sha3_256(x, \"supersecret\")"
+    },
+    {
+      "sha": "864027e8d5db87bb1799f7eb79bb1614ab617830",
+      "filename": "test/tests/functions/hash/hmac_sha3_384.tql",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/dca7992e6de183f268f75b04a25415b1c21f6c53/test%2Ftests%2Ffunctions%2Fhash%2Fhmac_sha3_384.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/dca7992e6de183f268f75b04a25415b1c21f6c53/test%2Ftests%2Ffunctions%2Fhash%2Fhmac_sha3_384.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Ffunctions%2Fhash%2Fhmac_sha3_384.tql?ref=dca7992e6de183f268f75b04a25415b1c21f6c53",
+      "patch": "@@ -1,4 +1,4 @@\n from {x: \"foo\"},\n      {x: b\"foo\"},\n      {x: {a: 1.2.3.4, b: 10.0.0.0/8, c: 2024-12-24}}\n-select digest = hmac_sha3_384(x, secret(\"supersecret\", _literal=true))\n+select digest = hmac_sha3_384(x, \"supersecret\")"
+    },
+    {
+      "sha": "9df1a2b9fe4129f83f1b64c75afc7881d37ad903",
+      "filename": "test/tests/functions/hash/hmac_sha3_512.tql",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/dca7992e6de183f268f75b04a25415b1c21f6c53/test%2Ftests%2Ffunctions%2Fhash%2Fhmac_sha3_512.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/dca7992e6de183f268f75b04a25415b1c21f6c53/test%2Ftests%2Ffunctions%2Fhash%2Fhmac_sha3_512.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Ffunctions%2Fhash%2Fhmac_sha3_512.tql?ref=dca7992e6de183f268f75b04a25415b1c21f6c53",
+      "patch": "@@ -1,4 +1,4 @@\n from {x: \"foo\"},\n      {x: b\"foo\"},\n      {x: {a: 1.2.3.4, b: 10.0.0.0/8, c: 2024-12-24}}\n-select digest = hmac_sha3_512(x, secret(\"supersecret\", _literal=true))\n+select digest = hmac_sha3_512(x, \"supersecret\")"
+    },
+    {
+      "sha": "7291bdeb8d9ae9835a098dad8f41599f53323872",
+      "filename": "test/tests/functions/hash/hmac_sha512.tql",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/dca7992e6de183f268f75b04a25415b1c21f6c53/test%2Ftests%2Ffunctions%2Fhash%2Fhmac_sha512.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/dca7992e6de183f268f75b04a25415b1c21f6c53/test%2Ftests%2Ffunctions%2Fhash%2Fhmac_sha512.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Ffunctions%2Fhash%2Fhmac_sha512.tql?ref=dca7992e6de183f268f75b04a25415b1c21f6c53",
+      "patch": "@@ -1,4 +1,4 @@\n from {x: \"foo\"},\n      {x: b\"foo\"},\n      {x: {a: 1.2.3.4, b: 10.0.0.0/8, c: 2024-12-24}}\n-select digest = hmac_sha512(x, secret(\"supersecret\", _literal=true))\n+select digest = hmac_sha512(x, \"supersecret\")"
+    }
+  ]
+}

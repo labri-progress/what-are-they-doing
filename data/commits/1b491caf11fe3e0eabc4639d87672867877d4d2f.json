@@ -1,0 +1,173 @@
+{
+  "message": "Add hmac function\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "3dd67a1b7d885e35649a9528e3f67510561559b9",
+      "filename": "libtenzir/builtins/functions/hash.cpp",
+      "status": "modified",
+      "additions": 146,
+      "deletions": 0,
+      "changes": 146,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/1b491caf11fe3e0eabc4639d87672867877d4d2f/libtenzir%2Fbuiltins%2Ffunctions%2Fhash.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/1b491caf11fe3e0eabc4639d87672867877d4d2f/libtenzir%2Fbuiltins%2Ffunctions%2Fhash.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Fbuiltins%2Ffunctions%2Fhash.cpp?ref=1b491caf11fe3e0eabc4639d87672867877d4d2f",
+      "patch": "@@ -20,6 +20,7 @@\n #include <tenzir/detail/coding.hpp>\n #include <tenzir/detail/inspection_common.hpp>\n #include <tenzir/detail/narrow.hpp>\n+#include <tenzir/detail/type_traits.hpp>\n #include <tenzir/error.hpp>\n #include <tenzir/hash/concepts.hpp>\n #include <tenzir/hash/hash_append.hpp>\n@@ -33,6 +34,7 @@\n #include <tenzir/tql2/eval.hpp>\n #include <tenzir/tql2/plugin.hpp>\n \n+#include <arrow/array/array_binary.h>\n #include <arrow/scalar.h>\n #include <fmt/format.h>\n \n@@ -266,9 +268,153 @@ class fun : public virtual function_plugin {\n   }\n };\n \n+enum class hmac_algorithm {\n+  sha256,\n+  sha512,\n+  sha384,\n+  sha1,\n+  md5,\n+};\n+\n+auto parse_hmac_algorithm(std::string_view algorithm)\n+  -> std::optional<hmac_algorithm> {\n+  if (algorithm == \"sha256\") {\n+    return hmac_algorithm::sha256;\n+  }\n+  if (algorithm == \"sha512\") {\n+    return hmac_algorithm::sha512;\n+  }\n+  if (algorithm == \"sha384\") {\n+    return hmac_algorithm::sha384;\n+  }\n+  if (algorithm == \"sha1\") {\n+    return hmac_algorithm::sha1;\n+  }\n+  if (algorithm == \"md5\") {\n+    return hmac_algorithm::md5;\n+  }\n+  return std::nullopt;\n+}\n+\n+template <class Hmac>\n+auto hmac_digest(const data_view& data, std::span<const std::byte> key)\n+  -> std::string {\n+  auto mac = Hmac{key};\n+  auto f = detail::overload{\n+    [&](std::string_view str) {\n+      mac.add(as_bytes(str));\n+    },\n+    [&](blob_view blob) {\n+      mac.add(blob);\n+    },\n+    [&](const auto& value) {\n+      hash_append(mac, value);\n+    },\n+  };\n+  match(data, f);\n+  return detail::hexify(as_bytes(mac.finish()));\n+}\n+\n+auto compute_hmac(const data_view& data, std::span<const std::byte> key,\n+                  hmac_algorithm algorithm) -> std::string {\n+  switch (algorithm) {\n+    case hmac_algorithm::sha256:\n+      return hmac_digest<tenzir::hmac_sha256>(data, key);\n+    case hmac_algorithm::sha512:\n+      return hmac_digest<tenzir::hmac_sha512>(data, key);\n+    case hmac_algorithm::sha384:\n+      return hmac_digest<tenzir::hmac_sha384>(data, key);\n+    case hmac_algorithm::sha1:\n+      return hmac_digest<tenzir::hmac_sha1>(data, key);\n+    case hmac_algorithm::md5:\n+      return hmac_digest<tenzir::hmac_md5>(data, key);\n+  }\n+  TENZIR_UNREACHABLE();\n+}\n+\n+class hmac final : public virtual function_plugin {\n+public:\n+  auto name() const -> std::string override {\n+    return \"hmac\";\n+  }\n+\n+  auto is_deterministic() const -> bool override {\n+    return true;\n+  }\n+\n+  auto make_function(invocation inv, session ctx) const\n+    -> failure_or<function_ptr> override {\n+    auto data = ast::expression{};\n+    auto key = ast::expression{};\n+    auto algorithm = located<std::string>{\"sha256\", location::unknown};\n+    TRY(argument_parser2::function(name())\n+          .positional(\"data\", data, \"any\")\n+          .positional(\"key\", key, \"string\")\n+          .named_optional(\"algorithm\", algorithm)\n+          .parse(inv, ctx));\n+    auto parsed_algorithm = parse_hmac_algorithm(algorithm.inner);\n+    if (not parsed_algorithm) {\n+      diagnostic::error(\"`algorithm` must be one of \"\n+                        \"`sha256`, `sha512`, `sha384`, `sha1`, `md5`\")\n+        .primary(algorithm)\n+        .emit(ctx);\n+      return failure::promise();\n+    }\n+    return function_use::make(\n+      [data = std::move(data), key = std::move(key),\n+       algorithm = *parsed_algorithm](evaluator eval, session ctx) {\n+        return map_series(eval(data), eval(key), [&](series data_values,\n+                                                     series key_values)\n+                            -> multi_series {\n+          TENZIR_ASSERT(data_values.length() == key_values.length());\n+          auto builder = arrow::StringBuilder{tenzir::arrow_memory_pool()};\n+          check(builder.Reserve(data_values.length()));\n+          auto f = detail::overload{\n+            [&]<class DataArray>(const DataArray& data_array,\n+                                 const arrow::StringArray& key_array) {\n+              for (auto i = int64_t{0}; i < data_array.length(); ++i) {\n+                if (key_array.IsNull(i)) {\n+                  check(builder.AppendNull());\n+                  continue;\n+                }\n+                auto value = value_at(data_values.type,\n+                                      static_cast<const arrow::Array&>(data_array), i);\n+                if (is<caf::none_t>(value)) {\n+                  check(builder.AppendNull());\n+                  continue;\n+                }\n+                auto digest = compute_hmac(value, as_bytes(key_array.GetView(i)),\n+                                           algorithm);\n+                check(builder.Append(digest));\n+              }\n+            },\n+            [&]<class DataArray>(const DataArray& data_array,\n+                                 const arrow::NullArray&) {\n+              check(builder.AppendNulls(data_array.length()));\n+            },\n+            [&]<class DataArray, class KeyArray>(\n+              const DataArray& data_array,\n+              const KeyArray&) -> void {\n+              if constexpr (not detail::is_any_v<KeyArray, arrow::NullArray>) {\n+                diagnostic::warning(\"expected `string`, but got `{}`\",\n+                                    key_values.type.kind())\n+                  .primary(key)\n+                  .emit(ctx);\n+              }\n+              check(builder.AppendNulls(data_array.length()));\n+            },\n+          };\n+          match(std::tie(*data_values.array, *key_values.array), f);\n+          return series{string_type{}, finish(builder)};\n+        });\n+      });\n+  }\n+};\n+\n } // namespace tenzir::plugins::hash\n \n TENZIR_REGISTER_PLUGIN(tenzir::plugins::hash::plugin)\n+TENZIR_REGISTER_PLUGIN(tenzir::plugins::hash::hmac)\n TENZIR_REGISTER_PLUGIN(tenzir::plugins::hash::fun<tenzir::md5, \"md5\">)\n TENZIR_REGISTER_PLUGIN(tenzir::plugins::hash::fun<tenzir::sha1, \"sha1\">)\n TENZIR_REGISTER_PLUGIN(tenzir::plugins::hash::fun<tenzir::sha224, \"sha224\">)"
+    },
+    {
+      "sha": "d916139dd0e9105878c91b2f3d4a41e35b0f4691",
+      "filename": "test/functions/hmac/alg_variants.tql",
+      "status": "added",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/1b491caf11fe3e0eabc4639d87672867877d4d2f/test%2Ffunctions%2Fhmac%2Falg_variants.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/1b491caf11fe3e0eabc4639d87672867877d4d2f/test%2Ffunctions%2Fhmac%2Falg_variants.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ffunctions%2Fhmac%2Falg_variants.tql?ref=1b491caf11fe3e0eabc4639d87672867877d4d2f",
+      "patch": "@@ -0,0 +1,4 @@\n+from {payload: \"payload\", key: \"my_key\"}\n+select sha384 = hmac(payload, key, algorithm=\"sha384\"),\n+       sha1 = hmac(payload, key, algorithm=\"sha1\"),\n+       md5 = hmac(payload, key, algorithm=\"md5\")"
+    },
+    {
+      "sha": "87f1085305ee5a4837f67ac398933c51219686b3",
+      "filename": "test/functions/hmac/alg_variants.txt",
+      "status": "added",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/1b491caf11fe3e0eabc4639d87672867877d4d2f/test%2Ffunctions%2Fhmac%2Falg_variants.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/1b491caf11fe3e0eabc4639d87672867877d4d2f/test%2Ffunctions%2Fhmac%2Falg_variants.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ffunctions%2Fhmac%2Falg_variants.txt?ref=1b491caf11fe3e0eabc4639d87672867877d4d2f",
+      "patch": "@@ -0,0 +1,5 @@\n+{\n+  sha384: \"d09b920c32ed1226e433465406eabce670cce77f8c01e751bd329454f65d222ab30688f783697af0f41c19a47c962cda\",\n+  sha1: \"dd706c0635a534dac15333040304c9a342cf26d7\",\n+  md5: \"ee2574bef7dbab9995a9a5ea4b486c99\",\n+}"
+    },
+    {
+      "sha": "37a60f8d62680b3611a6fd0bbf5edd775292fdcc",
+      "filename": "test/functions/hmac/blob_input.tql",
+      "status": "added",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/1b491caf11fe3e0eabc4639d87672867877d4d2f/test%2Ffunctions%2Fhmac%2Fblob_input.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/1b491caf11fe3e0eabc4639d87672867877d4d2f/test%2Ffunctions%2Fhmac%2Fblob_input.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ffunctions%2Fhmac%2Fblob_input.tql?ref=1b491caf11fe3e0eabc4639d87672867877d4d2f",
+      "patch": "@@ -0,0 +1,2 @@\n+from {payload: decode_hex(\"68656c6c6f\"), key: \"secret\"}\n+select digest = hmac(payload, key)"
+    },
+    {
+      "sha": "abf7a9a15ea0127180c6e0553faaefba5911851a",
+      "filename": "test/functions/hmac/blob_input.txt",
+      "status": "added",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/1b491caf11fe3e0eabc4639d87672867877d4d2f/test%2Ffunctions%2Fhmac%2Fblob_input.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/1b491caf11fe3e0eabc4639d87672867877d4d2f/test%2Ffunctions%2Fhmac%2Fblob_input.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ffunctions%2Fhmac%2Fblob_input.txt?ref=1b491caf11fe3e0eabc4639d87672867877d4d2f",
+      "patch": "@@ -0,0 +1,3 @@\n+{\n+  digest: \"88aab3ede8d3adf94d26ab90d3bafd4a2083070c3bcce9c014ee04a443847c0b\",\n+}"
+    },
+    {
+      "sha": "5fe810f17c85234333e69458fefb13d8d10a6968",
+      "filename": "test/functions/hmac/default_sha256.tql",
+      "status": "added",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/1b491caf11fe3e0eabc4639d87672867877d4d2f/test%2Ffunctions%2Fhmac%2Fdefault_sha256.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/1b491caf11fe3e0eabc4639d87672867877d4d2f/test%2Ffunctions%2Fhmac%2Fdefault_sha256.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ffunctions%2Fhmac%2Fdefault_sha256.tql?ref=1b491caf11fe3e0eabc4639d87672867877d4d2f",
+      "patch": "@@ -0,0 +1,2 @@\n+from {value: \"The quick brown fox jumps over the lazy dog\", key: \"key\"}\n+select digest = hmac(value, key)"
+    },
+    {
+      "sha": "e9aaa3325bd1813c2fc38fdb99b1c7115ab40659",
+      "filename": "test/functions/hmac/default_sha256.txt",
+      "status": "added",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/1b491caf11fe3e0eabc4639d87672867877d4d2f/test%2Ffunctions%2Fhmac%2Fdefault_sha256.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/1b491caf11fe3e0eabc4639d87672867877d4d2f/test%2Ffunctions%2Fhmac%2Fdefault_sha256.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ffunctions%2Fhmac%2Fdefault_sha256.txt?ref=1b491caf11fe3e0eabc4639d87672867877d4d2f",
+      "patch": "@@ -0,0 +1,3 @@\n+{\n+  digest: \"f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8\",\n+}"
+    },
+    {
+      "sha": "91f4e5edc90e74806d8e01121b020a476351ee5b",
+      "filename": "test/functions/hmac/event_input.tql",
+      "status": "added",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/1b491caf11fe3e0eabc4639d87672867877d4d2f/test%2Ffunctions%2Fhmac%2Fevent_input.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/1b491caf11fe3e0eabc4639d87672867877d4d2f/test%2Ffunctions%2Fhmac%2Fevent_input.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ffunctions%2Fhmac%2Fevent_input.tql?ref=1b491caf11fe3e0eabc4639d87672867877d4d2f",
+      "patch": "@@ -0,0 +1,2 @@\n+from {x: 42, y: \"abc\"}\n+select digest = hmac(this, \"secret\")"
+    },
+    {
+      "sha": "c0defcff71e40a18d5da145602bc92cbcff53afb",
+      "filename": "test/functions/hmac/event_input.txt",
+      "status": "added",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/1b491caf11fe3e0eabc4639d87672867877d4d2f/test%2Ffunctions%2Fhmac%2Fevent_input.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/1b491caf11fe3e0eabc4639d87672867877d4d2f/test%2Ffunctions%2Fhmac%2Fevent_input.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ffunctions%2Fhmac%2Fevent_input.txt?ref=1b491caf11fe3e0eabc4639d87672867877d4d2f",
+      "patch": "@@ -0,0 +1,3 @@\n+{\n+  digest: \"fcce945a4ad8b3937fcfedd9f807209df44ba66e2f9eabf47ff18e1a22f36a65\",\n+}"
+    },
+    {
+      "sha": "24671f2461d59194533df3cf6a391bb0b0e7646c",
+      "filename": "test/functions/hmac/invalid_algorithm.tql",
+      "status": "added",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/1b491caf11fe3e0eabc4639d87672867877d4d2f/test%2Ffunctions%2Fhmac%2Finvalid_algorithm.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/1b491caf11fe3e0eabc4639d87672867877d4d2f/test%2Ffunctions%2Fhmac%2Finvalid_algorithm.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ffunctions%2Fhmac%2Finvalid_algorithm.tql?ref=1b491caf11fe3e0eabc4639d87672867877d4d2f",
+      "patch": "@@ -0,0 +1,6 @@\n+---\n+error: true\n+---\n+\n+from {payload: \"payload\", key: \"my_key\"}\n+select digest = hmac(payload, key, algorithm=\"sha3_256\")"
+    },
+    {
+      "sha": "c4ba6ed95a32efb495d0d044f555ffcebc145993",
+      "filename": "test/functions/hmac/invalid_algorithm.txt",
+      "status": "added",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/1b491caf11fe3e0eabc4639d87672867877d4d2f/test%2Ffunctions%2Fhmac%2Finvalid_algorithm.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/1b491caf11fe3e0eabc4639d87672867877d4d2f/test%2Ffunctions%2Fhmac%2Finvalid_algorithm.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ffunctions%2Fhmac%2Finvalid_algorithm.txt?ref=1b491caf11fe3e0eabc4639d87672867877d4d2f",
+      "patch": "@@ -0,0 +1,6 @@\n+error: `algorithm` must be one of `sha256`, `sha512`, `sha384`, `sha1`, `md5`\n+ --> functions/hmac/invalid_algorithm.tql:6:46\n+  |\n+6 | select digest = hmac(payload, key, algorithm=\"sha3_256\")\n+  |                                              ^^^^^^^^^^ \n+  |"
+    },
+    {
+      "sha": "0804084b69cfcefbdfc037b2df6fb912fdae982a",
+      "filename": "test/functions/hmac/named_algorithm_sha512.tql",
+      "status": "added",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/1b491caf11fe3e0eabc4639d87672867877d4d2f/test%2Ffunctions%2Fhmac%2Fnamed_algorithm_sha512.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/1b491caf11fe3e0eabc4639d87672867877d4d2f/test%2Ffunctions%2Fhmac%2Fnamed_algorithm_sha512.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ffunctions%2Fhmac%2Fnamed_algorithm_sha512.tql?ref=1b491caf11fe3e0eabc4639d87672867877d4d2f",
+      "patch": "@@ -0,0 +1,2 @@\n+from {value: \"The quick brown fox jumps over the lazy dog\", key: \"key\"}\n+select digest = hmac(value, key, algorithm=\"sha512\")"
+    },
+    {
+      "sha": "d95d448b23c639b518c1d07b80ca54657f33e064",
+      "filename": "test/functions/hmac/named_algorithm_sha512.txt",
+      "status": "added",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/1b491caf11fe3e0eabc4639d87672867877d4d2f/test%2Ffunctions%2Fhmac%2Fnamed_algorithm_sha512.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/1b491caf11fe3e0eabc4639d87672867877d4d2f/test%2Ffunctions%2Fhmac%2Fnamed_algorithm_sha512.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ffunctions%2Fhmac%2Fnamed_algorithm_sha512.txt?ref=1b491caf11fe3e0eabc4639d87672867877d4d2f",
+      "patch": "@@ -0,0 +1,3 @@\n+{\n+  digest: \"b42af09057bac1e2d41708e48a902e09b5ff7f12ab428a4fe86653c73dd248fb82f948a549f7b791a5b41915ee4d1ec3935357e4e2317250d0372afa2ebeeb3a\",\n+}"
+    },
+    {
+      "sha": "c19485433b317b266b6f1e34b3d5d3e0fe762d58",
+      "filename": "test/functions/test.yaml",
+      "status": "added",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/1b491caf11fe3e0eabc4639d87672867877d4d2f/test%2Ffunctions%2Ftest.yaml",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/1b491caf11fe3e0eabc4639d87672867877d4d2f/test%2Ffunctions%2Ftest.yaml",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ffunctions%2Ftest.yaml?ref=1b491caf11fe3e0eabc4639d87672867877d4d2f",
+      "patch": "@@ -0,0 +1 @@\n+runner: neo"
+    }
+  ]
+}

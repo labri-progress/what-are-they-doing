@@ -1,0 +1,65 @@
+{
+  "message": "test(matrix,discord,sandbox): expand breakage regression coverage",
+  "files": [
+    {
+      "sha": "3754cfd178e77873d3383e72211457d6a1554c63",
+      "filename": "extensions/matrix/src/matrix/monitor/events.test.ts",
+      "status": "modified",
+      "additions": 48,
+      "deletions": 3,
+      "changes": 51,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/a2529c25ffb15eb2b3102cb06959d06f5d9a4054/extensions%2Fmatrix%2Fsrc%2Fmatrix%2Fmonitor%2Fevents.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/a2529c25ffb15eb2b3102cb06959d06f5d9a4054/extensions%2Fmatrix%2Fsrc%2Fmatrix%2Fmonitor%2Fevents.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fmatrix%2Fsrc%2Fmatrix%2Fmonitor%2Fevents.test.ts?ref=a2529c25ffb15eb2b3102cb06959d06f5d9a4054",
+      "patch": "@@ -16,13 +16,14 @@ describe(\"registerMatrixMonitorEvents\", () => {\n     sendReadReceiptMatrixMock.mockClear();\n   });\n \n-  function createHarness() {\n+  function createHarness(options?: { getUserId?: ReturnType<typeof vi.fn> }) {\n     const handlers = new Map<string, (...args: unknown[]) => void>();\n+    const getUserId = options?.getUserId ?? vi.fn().mockResolvedValue(\"@bot:example.org\");\n     const client = {\n       on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {\n         handlers.set(event, handler);\n       }),\n-      getUserId: vi.fn().mockResolvedValue(\"@bot:example.org\"),\n+      getUserId,\n       crypto: undefined,\n     } as unknown as MatrixClient;\n \n@@ -49,7 +50,7 @@ describe(\"registerMatrixMonitorEvents\", () => {\n       throw new Error(\"missing room.message handler\");\n     }\n \n-    return { client, onRoomMessage, roomMessageHandler };\n+    return { client, getUserId, onRoomMessage, roomMessageHandler, logVerboseMessage };\n   }\n \n   it(\"sends read receipt immediately for non-self messages\", async () => {\n@@ -93,4 +94,48 @@ describe(\"registerMatrixMonitorEvents\", () => {\n     });\n     expect(sendReadReceiptMatrixMock).not.toHaveBeenCalled();\n   });\n+\n+  it(\"caches self user id across messages\", async () => {\n+    const { getUserId, roomMessageHandler } = createHarness();\n+    const first = { event_id: \"$e3\", sender: \"@alice:example.org\" } as MatrixRawEvent;\n+    const second = { event_id: \"$e4\", sender: \"@bob:example.org\" } as MatrixRawEvent;\n+\n+    roomMessageHandler(\"!room:example.org\", first);\n+    roomMessageHandler(\"!room:example.org\", second);\n+\n+    await vi.waitFor(() => {\n+      expect(sendReadReceiptMatrixMock).toHaveBeenCalledTimes(2);\n+    });\n+    expect(getUserId).toHaveBeenCalledTimes(1);\n+  });\n+\n+  it(\"logs and continues when sending read receipt fails\", async () => {\n+    sendReadReceiptMatrixMock.mockRejectedValueOnce(new Error(\"network boom\"));\n+    const { roomMessageHandler, onRoomMessage, logVerboseMessage } = createHarness();\n+    const event = { event_id: \"$e5\", sender: \"@alice:example.org\" } as MatrixRawEvent;\n+\n+    roomMessageHandler(\"!room:example.org\", event);\n+\n+    await vi.waitFor(() => {\n+      expect(onRoomMessage).toHaveBeenCalledWith(\"!room:example.org\", event);\n+      expect(logVerboseMessage).toHaveBeenCalledWith(\n+        expect.stringContaining(\"matrix: early read receipt failed\"),\n+      );\n+    });\n+  });\n+\n+  it(\"skips read receipts if self-user lookup fails\", async () => {\n+    const { roomMessageHandler, onRoomMessage, getUserId } = createHarness({\n+      getUserId: vi.fn().mockRejectedValue(new Error(\"cannot resolve self\")),\n+    });\n+    const event = { event_id: \"$e6\", sender: \"@alice:example.org\" } as MatrixRawEvent;\n+\n+    roomMessageHandler(\"!room:example.org\", event);\n+\n+    await vi.waitFor(() => {\n+      expect(onRoomMessage).toHaveBeenCalledWith(\"!room:example.org\", event);\n+    });\n+    expect(getUserId).toHaveBeenCalledTimes(1);\n+    expect(sendReadReceiptMatrixMock).not.toHaveBeenCalled();\n+  });\n });"
+    },
+    {
+      "sha": "1f64f95585195a4a47c86a3f3bef7c0da9d3a2ff",
+      "filename": "extensions/matrix/src/matrix/monitor/events.ts",
+      "status": "modified",
+      "additions": 23,
+      "deletions": 8,
+      "changes": 31,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/a2529c25ffb15eb2b3102cb06959d06f5d9a4054/extensions%2Fmatrix%2Fsrc%2Fmatrix%2Fmonitor%2Fevents.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/a2529c25ffb15eb2b3102cb06959d06f5d9a4054/extensions%2Fmatrix%2Fsrc%2Fmatrix%2Fmonitor%2Fevents.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fmatrix%2Fsrc%2Fmatrix%2Fmonitor%2Fevents.ts?ref=a2529c25ffb15eb2b3102cb06959d06f5d9a4054",
+      "patch": "@@ -27,19 +27,34 @@ export function registerMatrixMonitorEvents(params: {\n   } = params;\n \n   let selfUserId: string | undefined;\n+  let selfUserIdLookup: Promise<string | undefined> | undefined;\n+  const resolveSelfUserId = async (): Promise<string | undefined> => {\n+    if (selfUserId) {\n+      return selfUserId;\n+    }\n+    if (!selfUserIdLookup) {\n+      selfUserIdLookup = client\n+        .getUserId()\n+        .then((userId) => {\n+          selfUserId = userId;\n+          return userId;\n+        })\n+        .catch(() => undefined)\n+        .finally(() => {\n+          if (!selfUserId) {\n+            selfUserIdLookup = undefined;\n+          }\n+        });\n+    }\n+    return await selfUserIdLookup;\n+  };\n   client.on(\"room.message\", (roomId: string, event: MatrixRawEvent) => {\n     const eventId = event?.event_id;\n     const senderId = event?.sender;\n     if (eventId && senderId) {\n       void (async () => {\n-        if (!selfUserId) {\n-          try {\n-            selfUserId = await client.getUserId();\n-          } catch {\n-            return;\n-          }\n-        }\n-        if (senderId === selfUserId) {\n+        const currentSelfUserId = await resolveSelfUserId();\n+        if (!currentSelfUserId || senderId === currentSelfUserId) {\n           return;\n         }\n         await sendReadReceiptMatrix(roomId, eventId, client).catch((err) => {"
+    },
+    {
+      "sha": "508a01d301e6fe6e5836736a898adf954a03b18c",
+      "filename": "extensions/matrix/src/matrix/send-queue.test.ts",
+      "status": "modified",
+      "additions": 30,
+      "deletions": 0,
+      "changes": 30,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/a2529c25ffb15eb2b3102cb06959d06f5d9a4054/extensions%2Fmatrix%2Fsrc%2Fmatrix%2Fsend-queue.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/a2529c25ffb15eb2b3102cb06959d06f5d9a4054/extensions%2Fmatrix%2Fsrc%2Fmatrix%2Fsend-queue.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fmatrix%2Fsrc%2Fmatrix%2Fsend-queue.test.ts?ref=a2529c25ffb15eb2b3102cb06959d06f5d9a4054",
+      "patch": "@@ -86,4 +86,34 @@ describe(\"enqueueSend\", () => {\n     await vi.advanceTimersByTimeAsync(150);\n     await expect(second).resolves.toBe(\"ok\");\n   });\n+\n+  it(\"continues queued work when the head task fails\", async () => {\n+    const gate = deferred<void>();\n+    const events: string[] = [];\n+\n+    const first = enqueueSend(\"!room:example.org\", async () => {\n+      events.push(\"start1\");\n+      await gate.promise;\n+      throw new Error(\"boom\");\n+    }).then(\n+      () => ({ ok: true as const }),\n+      (error) => ({ ok: false as const, error }),\n+    );\n+    const second = enqueueSend(\"!room:example.org\", async () => {\n+      events.push(\"start2\");\n+      return \"two\";\n+    });\n+\n+    await vi.advanceTimersByTimeAsync(150);\n+    expect(events).toEqual([\"start1\"]);\n+\n+    gate.resolve();\n+    const firstResult = await first;\n+    expect(firstResult.ok).toBe(false);\n+    expect(firstResult.error).toBeInstanceOf(Error);\n+\n+    await vi.advanceTimersByTimeAsync(150);\n+    await expect(second).resolves.toBe(\"two\");\n+    expect(events).toEqual([\"start1\", \"start2\"]);\n+  });\n });"
+    },
+    {
+      "sha": "a4ae727b330bfda40b0cd44ab783da2567386976",
+      "filename": "src/agents/sandbox/fs-bridge.test.ts",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 0,
+      "changes": 16,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/a2529c25ffb15eb2b3102cb06959d06f5d9a4054/src%2Fagents%2Fsandbox%2Ffs-bridge.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/a2529c25ffb15eb2b3102cb06959d06f5d9a4054/src%2Fagents%2Fsandbox%2Ffs-bridge.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fagents%2Fsandbox%2Ffs-bridge.test.ts?ref=a2529c25ffb15eb2b3102cb06959d06f5d9a4054",
+      "patch": "@@ -91,6 +91,22 @@ describe(\"sandbox fs bridge shell compatibility\", () => {\n     expect(canonicalScript).toBeDefined();\n     // \"; \" joining can create \"do; cmd\", which is invalid in POSIX sh.\n     expect(canonicalScript).not.toMatch(/\\bdo;/);\n+    // Keep command on the next line after \"do\" for POSIX-sh safety.\n+    expect(canonicalScript).toMatch(/\\bdo\\n\\s*parent=/);\n+  });\n+\n+  it(\"reads inbound media-style filenames with triple-dash ids\", async () => {\n+    const bridge = createSandboxFsBridge({ sandbox: createSandbox() });\n+    const inboundPath = \"media/inbound/file_1095---f00a04a2-99a0-4d98-99b0-dfe61c5a4198.ogg\";\n+\n+    await bridge.readFile({ filePath: inboundPath });\n+\n+    const readCall = mockedExecDockerRaw.mock.calls.find(([args]) =>\n+      String(args[5] ?? \"\").includes('cat -- \"$1\"'),\n+    );\n+    expect(readCall).toBeDefined();\n+    const readPath = String(readCall?.[0].at(-1) ?? \"\");\n+    expect(readPath).toContain(\"file_1095---\");\n   });\n \n   it(\"resolves bind-mounted absolute container paths for reads\", async () => {"
+    },
+    {
+      "sha": "60eade41f3db6e1df082856ea08a5eec0e12ef5e",
+      "filename": "src/discord/monitor/message-handler.process.test.ts",
+      "status": "modified",
+      "additions": 18,
+      "deletions": 0,
+      "changes": 18,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/a2529c25ffb15eb2b3102cb06959d06f5d9a4054/src%2Fdiscord%2Fmonitor%2Fmessage-handler.process.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/a2529c25ffb15eb2b3102cb06959d06f5d9a4054/src%2Fdiscord%2Fmonitor%2Fmessage-handler.process.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fdiscord%2Fmonitor%2Fmessage-handler.process.test.ts?ref=a2529c25ffb15eb2b3102cb06959d06f5d9a4054",
+      "patch": "@@ -444,6 +444,24 @@ describe(\"processDiscordMessage draft streaming\", () => {\n     expect(deliverDiscordReply).not.toHaveBeenCalled();\n   });\n \n+  it(\"suppresses reasoning-tagged final payload delivery to Discord\", async () => {\n+    dispatchInboundMessage.mockImplementationOnce(async (params?: DispatchInboundParams) => {\n+      await params?.dispatcher.sendFinalReply({\n+        text: \"Reasoning:\\nthis should stay internal\",\n+        isReasoning: true,\n+      } as never);\n+      return { queuedFinal: true, counts: { final: 1, tool: 0, block: 0 } };\n+    });\n+\n+    const ctx = await createBaseContext({ discordConfig: { streamMode: \"off\" } });\n+\n+    // oxlint-disable-next-line typescript/no-explicit-any\n+    await processDiscordMessage(ctx as any);\n+\n+    expect(deliverDiscordReply).not.toHaveBeenCalled();\n+    expect(editMessageDiscord).not.toHaveBeenCalled();\n+  });\n+\n   it(\"delivers non-reasoning block payloads to Discord\", async () => {\n     dispatchInboundMessage.mockImplementationOnce(async (params?: DispatchInboundParams) => {\n       await params?.dispatcher.sendBlockReply({ text: \"hello from block stream\" });"
+    }
+  ]
+}

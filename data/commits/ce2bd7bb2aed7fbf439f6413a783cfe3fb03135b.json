@@ -1,0 +1,29 @@
+{
+  "message": "fix: make pull resume passively",
+  "files": [
+    {
+      "sha": "833afd0cd35175d2d0bbdad14ebcd8473a950dff",
+      "filename": "src/commands/pull.ts",
+      "status": "modified",
+      "additions": 24,
+      "deletions": 12,
+      "changes": 36,
+      "blob_url": "https://github.com/obra/external-subagents/blob/ce2bd7bb2aed7fbf439f6413a783cfe3fb03135b/src%2Fcommands%2Fpull.ts",
+      "raw_url": "https://github.com/obra/external-subagents/raw/ce2bd7bb2aed7fbf439f6413a783cfe3fb03135b/src%2Fcommands%2Fpull.ts",
+      "contents_url": "https://api.github.com/repos/obra/external-subagents/contents/src%2Fcommands%2Fpull.ts?ref=ce2bd7bb2aed7fbf439f6413a783cfe3fb03135b",
+      "patch": "@@ -16,10 +16,16 @@ export interface PullCommandOptions {\n   stdout?: Writable;\n }\n \n-async function createEmptyPromptFile(): Promise<{ dir: string; file: string }> {\n+async function createPullPromptFile(lastMessageId?: string): Promise<{ dir: string; file: string }> {\n   const dir = await mkdtemp(path.join(os.tmpdir(), 'codex-subagent-pull-'));\n   const file = path.join(dir, 'prompt.txt');\n-  await writeFile(file, '', 'utf8');\n+  const text =\n+    'System ping from codex-subagent: do not take new actions or run commands. ' +\n+    (lastMessageId\n+      ? `If you have produced any assistant output after fingerprint ${lastMessageId}, restate the newest assistant message verbatim. `\n+      : 'Restate your most recent assistant message verbatim. ') +\n+    'If nothing is new, respond exactly with NO_NEW_MESSAGES.';\n+  await writeFile(file, text, 'utf8');\n   return { dir, file };\n }\n \n@@ -44,9 +50,10 @@ export async function pullCommand(options: PullCommandOptions): Promise<void> {\n   const registry = new Registry(paths);\n   const thread = await registry.get(options.threadId);\n   ensureThread(options.threadId, thread);\n-  const policyConfig = resolvePolicy(thread!.policy!);\n+  const safeThread = thread!;\n+  const policyConfig = resolvePolicy(safeThread.policy!);\n \n-  const { dir, file } = await createEmptyPromptFile();\n+  const { dir, file } = await createPullPromptFile(safeThread.last_message_id);\n   try {\n     const execResult = await runExec({\n       promptFile: file,\n@@ -55,19 +62,24 @@ export async function pullCommand(options: PullCommandOptions): Promise<void> {\n       ...policyConfig,\n     });\n \n-    const latestId = execResult.last_message_id;\n-    if (!latestId || latestId === thread!.last_message_id) {\n+    const messages = execResult.messages ?? [];\n+    const filtered =\n+      safeThread.last_message_id == null\n+        ? messages\n+        : messages.filter((message) => message.id !== safeThread.last_message_id);\n+    const newMessages = filtered.filter(\n+      (message) => message.text?.trim().toUpperCase() !== 'NO_NEW_MESSAGES'\n+    );\n+\n+    if (newMessages.length === 0) {\n       stdout.write(`No new messages for thread ${options.threadId}\\n`);\n       return;\n     }\n \n-    const appended = await appendMessages(\n-      paths.logFile(options.threadId),\n-      execResult.messages ?? []\n-    );\n+    const appended = await appendMessages(paths.logFile(options.threadId), newMessages);\n     await registry.updateThread(options.threadId, {\n-      status: execResult.status ?? thread!.status,\n-      last_message_id: latestId,\n+      status: execResult.status ?? safeThread.status,\n+      last_message_id: newMessages.at(-1)?.id,\n     });\n \n     stdout.write("
+    },
+    {
+      "sha": "078c17c0fabdd5ddc9bc66ec62db27b6e442a6b0",
+      "filename": "tests/pull-command.test.ts",
+      "status": "modified",
+      "additions": 18,
+      "deletions": 3,
+      "changes": 21,
+      "blob_url": "https://github.com/obra/external-subagents/blob/ce2bd7bb2aed7fbf439f6413a783cfe3fb03135b/tests%2Fpull-command.test.ts",
+      "raw_url": "https://github.com/obra/external-subagents/raw/ce2bd7bb2aed7fbf439f6413a783cfe3fb03135b/tests%2Fpull-command.test.ts",
+      "contents_url": "https://api.github.com/repos/obra/external-subagents/contents/tests%2Fpull-command.test.ts?ref=ce2bd7bb2aed7fbf439f6413a783cfe3fb03135b",
+      "patch": "@@ -41,7 +41,11 @@ describe('pull command', () => {\n     });\n \n     const fixture = await readFixture('exec-resume-new.json');\n-    vi.mocked(runExec).mockResolvedValueOnce(fixture);\n+    const promptBodies: string[] = [];\n+    vi.mocked(runExec).mockImplementationOnce(async (options) => {\n+      promptBodies.push(await readFile(options.promptFile, 'utf8'));\n+      return fixture;\n+    });\n \n     const outputLastPath = path.join(root, 'last.txt');\n     const { stdout, output } = captureOutput();\n@@ -57,6 +61,8 @@ describe('pull command', () => {\n     expect(call.outputLastPath).toBe(outputLastPath);\n     expect(call.promptFile).toBeTruthy();\n     expect(call.sandbox).toBe('workspace-write');\n+    expect(promptBodies[0]).toContain('NO_NEW_MESSAGES');\n+    expect(promptBodies[0]).toContain('fingerprint msg-old');\n \n     const logPath = path.join(codexRoot, 'logs', 'thread-123.ndjson');\n     const logRaw = await readFile(logPath, 'utf8');\n@@ -82,8 +88,17 @@ describe('pull command', () => {\n       last_message_id: 'msg-old',\n     });\n \n-    const fixture = await readFixture('exec-resume-same.json');\n-    vi.mocked(runExec).mockResolvedValueOnce(fixture);\n+    vi.mocked(runExec).mockResolvedValueOnce({\n+      thread_id: 'thread-123',\n+      last_message_id: 'msg-old',\n+      messages: [\n+        {\n+          id: 'msg-old',\n+          role: 'assistant',\n+          text: 'NO_NEW_MESSAGES',\n+        },\n+      ],\n+    });\n \n     const { stdout, output } = captureOutput();\n     await pullCommand({"
+    }
+  ]
+}

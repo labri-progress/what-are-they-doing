@@ -1,0 +1,40 @@
+{
+  "message": "Fix WASM stack overflow in GROUP BY NEAR and update demo query",
+  "files": [
+    {
+      "sha": "16c83398cbbbb37c1743ade222001d0ab0ecfba6",
+      "filename": "examples/wasm/index.html",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/teamchong/lanceql/blob/1ed1f801f7a8166c6ce8d44673310700d3a7dcce/examples%2Fwasm%2Findex.html",
+      "raw_url": "https://github.com/teamchong/lanceql/raw/1ed1f801f7a8166c6ce8d44673310700d3a7dcce/examples%2Fwasm%2Findex.html",
+      "contents_url": "https://api.github.com/repos/teamchong/lanceql/contents/examples%2Fwasm%2Findex.html?ref=1ed1f801f7a8166c6ce8d44673310700d3a7dcce",
+      "patch": "@@ -6538,7 +6538,7 @@ <h3>Searching...</h3>\n                 if (!silent) {\n                     const sqlInput = document.getElementById('sql-input');\n                     sqlInput.value = `-- \ud83c\udfaf Shadow column demo: LIKE (text) + GROUP BY NEAR (vector) on same column\n-SELECT emoji, description FROM read_lance('opfs://emoji.lance')\n+SELECT MAX(emoji), description FROM read_lance('opfs://emoji.lance')\n WHERE description LIKE '%sun%'\n GROUP BY NEAR description TOPK 3`;\n                     document.getElementById('sql-highlight').innerHTML = highlightSQL(sqlInput.value) + '\\n';"
+    },
+    {
+      "sha": "60983e13ead87d12e316fa3a6568c7ecd85c1967",
+      "filename": "examples/wasm/lanceql.wasm",
+      "status": "modified",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/teamchong/lanceql/blob/1ed1f801f7a8166c6ce8d44673310700d3a7dcce/examples%2Fwasm%2Flanceql.wasm",
+      "raw_url": "https://github.com/teamchong/lanceql/raw/1ed1f801f7a8166c6ce8d44673310700d3a7dcce/examples%2Fwasm%2Flanceql.wasm",
+      "contents_url": "https://api.github.com/repos/teamchong/lanceql/contents/examples%2Fwasm%2Flanceql.wasm?ref=1ed1f801f7a8166c6ce8d44673310700d3a7dcce"
+    },
+    {
+      "sha": "14d5b68f7cfcc8752405a5429e4709703b79ee8b",
+      "filename": "src/wasm/sql_executor.zig",
+      "status": "modified",
+      "additions": 17,
+      "deletions": 8,
+      "changes": 25,
+      "blob_url": "https://github.com/teamchong/lanceql/blob/1ed1f801f7a8166c6ce8d44673310700d3a7dcce/src%2Fwasm%2Fsql_executor.zig",
+      "raw_url": "https://github.com/teamchong/lanceql/raw/1ed1f801f7a8166c6ce8d44673310700d3a7dcce/src%2Fwasm%2Fsql_executor.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/lanceql/contents/src%2Fwasm%2Fsql_executor.zig?ref=1ed1f801f7a8166c6ce8d44673310700d3a7dcce",
+      "patch": "@@ -9979,8 +9979,9 @@ fn executeGroupByNearQuery(table: *const TableInfo, query: *const ParsedQuery, m\n \n     const dim = near_col.vector_dim;\n \n-    // Use first K rows as centroids (simple seeding)\n-    var centroids: [MAX_CLUSTERS][MAX_VECTOR_DIM]f32 = undefined;\n+    // Allocate centroids on heap to avoid stack overflow (384KB)\n+    const centroids = try memory.wasm_allocator.alloc(f32, num_clusters * MAX_VECTOR_DIM);\n+    defer memory.wasm_allocator.free(centroids);\n     var centroid_count: usize = 0;\n \n     const indices = maybe_indices orelse blk: {\n@@ -9995,7 +9996,9 @@ fn executeGroupByNearQuery(table: *const TableInfo, query: *const ParsedQuery, m\n     for (indices) |idx| {\n         if (centroid_count >= num_clusters) break;\n         var ctx: ?FragmentContext = null;\n-        const got_dim = getVectorData(table, near_col, idx, &centroids[centroid_count], &ctx);\n+        // Point to slice within flat centroids buffer\n+        const centroid_ptr: *[MAX_VECTOR_DIM]f32 = @ptrCast(centroids[centroid_count * MAX_VECTOR_DIM..]);\n+        const got_dim = getVectorData(table, near_col, idx, centroid_ptr, &ctx);\n         if (got_dim > 0) {\n             centroid_count += 1;\n         }\n@@ -10016,11 +10019,14 @@ fn executeGroupByNearQuery(table: *const TableInfo, query: *const ParsedQuery, m\n \n     // Assign each row to nearest centroid\n     var cluster_counts: [MAX_CLUSTERS]usize = undefined;\n-    // Manual init for WASM compatibility\n     for (0..MAX_CLUSTERS) |ci| {\n         cluster_counts[ci] = 0;\n     }\n-    var cluster_indices: [MAX_CLUSTERS][MAX_ROWS]u32 = undefined;\n+\n+    // Allocate cluster indices on heap to avoid stack overflow (~51MB)\n+    // Flattened array: [cluster_idx * MAX_ROWS + row_idx]\n+    const cluster_indices = try memory.wasm_allocator.alloc(u32, MAX_CLUSTERS * MAX_ROWS);\n+    defer memory.wasm_allocator.free(cluster_indices);\n \n     for (indices) |idx| {\n         var ctx: ?FragmentContext = null;\n@@ -10031,7 +10037,8 @@ fn executeGroupByNearQuery(table: *const TableInfo, query: *const ParsedQuery, m\n         var best_cluster: usize = 0;\n         var best_score: f32 = -2.0;\n         for (0..centroid_count) |ci| {\n-            const score = simd_search.simdDotProduct(&vec_buf_1, &centroids[ci], dim);\n+            const centroid_ptr: *[MAX_VECTOR_DIM]f32 = @ptrCast(centroids[ci * MAX_VECTOR_DIM..]);\n+            const score = simd_search.simdDotProduct(&vec_buf_1, centroid_ptr, dim);\n             if (score > best_score) {\n                 best_score = score;\n                 best_cluster = ci;\n@@ -10040,7 +10047,8 @@ fn executeGroupByNearQuery(table: *const TableInfo, query: *const ParsedQuery, m\n \n         // Add to cluster\n         if (cluster_counts[best_cluster] < MAX_ROWS) {\n-            cluster_indices[best_cluster][cluster_counts[best_cluster]] = idx;\n+            const count = cluster_counts[best_cluster];\n+            cluster_indices[best_cluster * MAX_ROWS + count] = idx;\n             cluster_counts[best_cluster] += 1;\n         }\n     }\n@@ -10052,7 +10060,8 @@ fn executeGroupByNearQuery(table: *const TableInfo, query: *const ParsedQuery, m\n \n     for (0..centroid_count) |ci| {\n         const cluster_row_count = cluster_counts[ci];\n-        const cluster_row_indices = cluster_indices[ci][0..cluster_row_count];\n+        const start_idx = ci * MAX_ROWS;\n+        const cluster_row_indices = cluster_indices[start_idx..][0..cluster_row_count];\n \n         for (query.aggregates[0..num_aggs], 0..) |agg, ai| {\n             const result = computeAggregate(table, agg, cluster_row_indices);"
+    }
+  ]
+}

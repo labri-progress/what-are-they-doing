@@ -1,0 +1,53 @@
+{
+  "message": "Fix crashes during gRPC operator shutdown\n\nFixed critical use-after-free bugs in `from_google_cloud_pubsub`,\n`to_google_cloud_pubsub`, and `from_velociraptor` operators that caused\nSIGSEGV crashes during shutdown.\n\nThe root cause was gRPC background threads continuing to access destroyed\nresources after operator completion. The fixes ensure proper synchronization:\n\n- `from_google_cloud_pubsub`: Always wait for subscription session to fully\n  stop via session.get() after cancel() to block until gRPC threads finish.\n- `to_google_cloud_pubsub`: Call publisher.Flush() before destruction to\n  ensure all pending publishes complete.\n- `from_velociraptor`: Properly shutdown the completion queue and drain\n  remaining events before destruction.\n\nThese changes eliminate NULL pointer dereferences that could occur during\npipeline shutdown, particularly in production with high-throughput gRPC.\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "feecf137cb18a16c58c623d51694bb9670274ac0",
+      "filename": "changelog/unreleased/crashes-during-grpc-operator-shutdown.md",
+      "status": "added",
+      "additions": 14,
+      "deletions": 0,
+      "changes": 14,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/5c11be4d54e3224bee66b1300d61d3bc65abb066/changelog%2Funreleased%2Fcrashes-during-grpc-operator-shutdown.md",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/5c11be4d54e3224bee66b1300d61d3bc65abb066/changelog%2Funreleased%2Fcrashes-during-grpc-operator-shutdown.md",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/changelog%2Funreleased%2Fcrashes-during-grpc-operator-shutdown.md?ref=5c11be4d54e3224bee66b1300d61d3bc65abb066",
+      "patch": "@@ -0,0 +1,14 @@\n+---\n+title: Crashes during gRPC operator shutdown\n+type: bugfix\n+authors:\n+  - mavam\n+  - claude\n+created: 2026-01-14T16:26:58.265149Z\n+---\n+\n+We fixed critical use-after-free bugs in the `from_google_cloud_pubsub`, `to_google_cloud_pubsub`, and `from_velociraptor` operators that could cause crashes during shutdown.\n+\n+The issues occurred when gRPC background threads continued accessing destroyed resources after operators completed. The `from_google_cloud_pubsub` operator now waits for the subscription session to fully stop before cleaning up. The `to_google_cloud_pubsub` operator now flushes all pending publishes before destruction. The `from_velociraptor` operator now properly shuts down its completion queue and drains remaining events.\n+\n+These fixes eliminate SIGSEGV crashes (signal 11, NULL pointer dereference) that could occur during pipeline shutdown, particularly in production environments with high-throughput gRPC operations."
+    },
+    {
+      "sha": "3553ed532937f2f1170c69b956cd55b8aa43b837",
+      "filename": "plugins/from_velociraptor/src/plugin.cpp",
+      "status": "modified",
+      "additions": 23,
+      "deletions": 1,
+      "changes": 24,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/5c11be4d54e3224bee66b1300d61d3bc65abb066/plugins%2Ffrom_velociraptor%2Fsrc%2Fplugin.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/5c11be4d54e3224bee66b1300d61d3bc65abb066/plugins%2Ffrom_velociraptor%2Fsrc%2Fplugin.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/plugins%2Ffrom_velociraptor%2Fsrc%2Fplugin.cpp?ref=5c11be4d54e3224bee66b1300d61d3bc65abb066",
+      "patch": "@@ -343,13 +343,35 @@ class velociraptor_operator final\n         }\n       }\n     }\n+    // Properly finish the gRPC stream and wait for completion.\n     auto status = grpc::Status{};\n-    reader->Finish(&status, nullptr);\n+    constexpr auto finish_tag = uintptr_t{0xFFFFFFFF};\n+    reader->Finish(&status, reinterpret_cast<void*>(finish_tag));\n+    // Wait for the Finish operation to complete.\n+    {\n+      void* output_tag = nullptr;\n+      auto ok = false;\n+      while (completion_queue.Next(&output_tag, &ok)) {\n+        if (reinterpret_cast<uintptr_t>(output_tag) == finish_tag) {\n+          break;\n+        }\n+      }\n+    }\n     if (not status.ok()) {\n       diagnostic::warning(\"failed to finish Velociraptor gRPC stream\")\n         .note(\"{}\", status.error_message())\n         .emit(ctrl.diagnostics());\n     }\n+    // Shutdown the completion queue and drain remaining events to ensure\n+    // gRPC threads are no longer accessing the queue before destruction.\n+    completion_queue.Shutdown();\n+    {\n+      void* ignored_tag = nullptr;\n+      bool ignored_ok = false;\n+      while (completion_queue.Next(&ignored_tag, &ignored_ok)) {\n+        // Drain remaining events.\n+      }\n+    }\n   }\n \n   auto name() const -> std::string override {"
+    },
+    {
+      "sha": "f03415fdb107696ba331a2feeb3bb6f6e1e4f347",
+      "filename": "plugins/google-cloud-pubsub/builtins/from_plugin.cpp",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 4,
+      "changes": 14,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/5c11be4d54e3224bee66b1300d61d3bc65abb066/plugins%2Fgoogle-cloud-pubsub%2Fbuiltins%2Ffrom_plugin.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/5c11be4d54e3224bee66b1300d61d3bc65abb066/plugins%2Fgoogle-cloud-pubsub%2Fbuiltins%2Ffrom_plugin.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/plugins%2Fgoogle-cloud-pubsub%2Fbuiltins%2Ffrom_plugin.cpp?ref=5c11be4d54e3224bee66b1300d61d3bc65abb066",
+      "patch": "@@ -131,15 +131,21 @@ class from_google_cloud_pubsub_operator final\n         co_yield {};\n       }\n     }\n-    if (session.is_ready()) {\n+    if (session.valid()) {\n+      if (not session.is_ready()) {\n+        // Initiate cancellation of the subscription.\n+        session.cancel();\n+      }\n+      // Always wait for the session to fully stop. This is critical to ensure\n+      // that gRPC background threads are no longer accessing captured locals\n+      // (builder_mut, msb, args_) before they are destroyed.\n       auto status = session.get();\n-      if (not status.ok()) {\n+      if (not status.ok()\n+          and status.code() != google::cloud::StatusCode::kCancelled) {\n         diagnostic::error(\"google-cloud-subscriber: {}\", status.message())\n           .primary(args_.operator_location)\n           .emit(ctrl.diagnostics());\n       }\n-    } else if (session.valid()) {\n-      session.cancel();\n     }\n     for (auto&& s : msb.finalize_as_table_slice()) {\n       co_yield std::move(s);"
+    },
+    {
+      "sha": "ef6dc68db968f34406e69752d49ba04d7161152d",
+      "filename": "plugins/google-cloud-pubsub/builtins/to_plugin.cpp",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/5c11be4d54e3224bee66b1300d61d3bc65abb066/plugins%2Fgoogle-cloud-pubsub%2Fbuiltins%2Fto_plugin.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/5c11be4d54e3224bee66b1300d61d3bc65abb066/plugins%2Fgoogle-cloud-pubsub%2Fbuiltins%2Fto_plugin.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/plugins%2Fgoogle-cloud-pubsub%2Fbuiltins%2Fto_plugin.cpp?ref=5c11be4d54e3224bee66b1300d61d3bc65abb066",
+      "patch": "@@ -132,6 +132,9 @@ class to_google_cloud_pubsub_operator final\n       flush_pending(std::chrono::steady_clock::now());\n       co_yield {};\n     }\n+    // Flush all pending publishes before destruction. This ensures that gRPC\n+    // has completed all in-flight operations before the publisher is destroyed.\n+    publisher.Flush();\n     for (auto& [future, _] : pending) {\n       auto s = future.wait_for(timeout);\n       if (s != std::future_status::ready) {"
+    }
+  ]
+}

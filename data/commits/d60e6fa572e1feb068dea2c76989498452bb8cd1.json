@@ -1,0 +1,65 @@
+{
+  "message": "feat(smapi): add --wait polling for auth complete",
+  "files": [
+    {
+      "sha": "17068bc5341e2c3cb4f67a0be26ed804fd69d05e",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/steipete/sonoscli/blob/d60e6fa572e1feb068dea2c76989498452bb8cd1/CHANGELOG.md",
+      "raw_url": "https://github.com/steipete/sonoscli/raw/d60e6fa572e1feb068dea2c76989498452bb8cd1/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/steipete/sonoscli/contents/CHANGELOG.md?ref=d60e6fa572e1feb068dea2c76989498452bb8cd1",
+      "patch": "@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.\n \n The format is based on \u201cKeep a Changelog\u201d, and this project aims to follow Semantic Versioning.\n \n+## [0.1.23] - 2025-12-13\n+\n+### Added\n+- `--debug` now enables detailed trace logs for SSDP discovery, topology queries, and SOAP calls to help diagnose flaky networks.\n+- `sonos smapi auth complete --wait <duration>` to poll for account-link completion (handles Spotify `NOT_LINKED_RETRY`).\n+\n ## [0.1.22] - 2025-12-13\n \n ### Fixed"
+    },
+    {
+      "sha": "3b2a17a85c7e0b7ab8fcc62a9659231c5ab1effa",
+      "filename": "docs/testing.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/steipete/sonoscli/blob/d60e6fa572e1feb068dea2c76989498452bb8cd1/docs%2Ftesting.md",
+      "raw_url": "https://github.com/steipete/sonoscli/raw/d60e6fa572e1feb068dea2c76989498452bb8cd1/docs%2Ftesting.md",
+      "contents_url": "https://api.github.com/repos/steipete/sonoscli/contents/docs%2Ftesting.md?ref=d60e6fa572e1feb068dea2c76989498452bb8cd1",
+      "patch": "@@ -169,7 +169,7 @@ SMAPI is Sonos-side browsing/search for linked services (e.g. Spotify). It may r\n \n If auth is required:\n - `sonos smapi auth begin --service \"Spotify\"` (follow the `regUrl` and link code)\n-- `sonos smapi auth complete --service \"Spotify\" --code \"<linkCode>\"`\n+- `sonos smapi auth complete --service \"Spotify\" --code \"<linkCode>\" --wait 2m`\n \n Expected:\n - Categories show at least `tracks`, `albums`, `artists`, `playlists` for Spotify."
+    },
+    {
+      "sha": "8bef77d237efa57503e14a77319fc6ccb6b0d166",
+      "filename": "internal/cli/smapi.go",
+      "status": "modified",
+      "additions": 67,
+      "deletions": 1,
+      "changes": 68,
+      "blob_url": "https://github.com/steipete/sonoscli/blob/d60e6fa572e1feb068dea2c76989498452bb8cd1/internal%2Fcli%2Fsmapi.go",
+      "raw_url": "https://github.com/steipete/sonoscli/raw/d60e6fa572e1feb068dea2c76989498452bb8cd1/internal%2Fcli%2Fsmapi.go",
+      "contents_url": "https://api.github.com/repos/steipete/sonoscli/contents/internal%2Fcli%2Fsmapi.go?ref=d60e6fa572e1feb068dea2c76989498452bb8cd1",
+      "patch": "@@ -4,9 +4,11 @@ import (\n \t\"context\"\n \t\"errors\"\n \t\"fmt\"\n+\t\"log/slog\"\n \t\"sort\"\n \t\"strings\"\n \t\"text/tabwriter\"\n+\t\"time\"\n \n \t\"github.com/spf13/cobra\"\n \t\"github.com/steipete/sonoscli/internal/sonos\"\n@@ -255,6 +257,7 @@ func newSMAPIAuthCompleteCmd(flags *rootFlags) *cobra.Command {\n \t\tserviceName  string\n \t\tlinkCode     string\n \t\tlinkDeviceID string\n+\t\twait         time.Duration\n \t)\n \tcmd := &cobra.Command{\n \t\tUse:   \"complete\",\n@@ -282,7 +285,9 @@ func newSMAPIAuthCompleteCmd(flags *rootFlags) *cobra.Command {\n \t\t\tif err != nil {\n \t\t\t\treturn err\n \t\t\t}\n-\t\t\tpair, err := sm.CompleteAuthentication(ctx, linkCode, linkDeviceID)\n+\t\t\tpair, err := completeSMAPIAuth(ctx, wait, func(ctx context.Context) (sonos.SMAPITokenPair, error) {\n+\t\t\t\treturn sm.CompleteAuthentication(ctx, linkCode, linkDeviceID)\n+\t\t\t})\n \t\t\tif err != nil {\n \t\t\t\treturn err\n \t\t\t}\n@@ -305,10 +310,71 @@ func newSMAPIAuthCompleteCmd(flags *rootFlags) *cobra.Command {\n \tcmd.Flags().StringVar(&serviceName, \"service\", \"Spotify\", \"Music service name (as shown in `sonos smapi services`)\")\n \tcmd.Flags().StringVar(&linkCode, \"code\", \"\", \"Link code from `sonos smapi auth begin`\")\n \tcmd.Flags().StringVar(&linkDeviceID, \"link-device-id\", \"\", \"Optional link device id (returned by begin; usually not needed)\")\n+\tcmd.Flags().DurationVar(&wait, \"wait\", 0, \"Wait up to this duration for linking to complete (polls every 2s)\")\n \t_ = cmd.MarkFlagRequired(\"code\")\n \treturn cmd\n }\n \n+func completeSMAPIAuth(\n+\tctx context.Context,\n+\twait time.Duration,\n+\tattempt func(context.Context) (sonos.SMAPITokenPair, error),\n+) (sonos.SMAPITokenPair, error) {\n+\tif wait <= 0 {\n+\t\treturn attempt(ctx)\n+\t}\n+\n+\tdeadline := time.Now().Add(wait)\n+\n+\tinterval := 2 * time.Second\n+\tif wait < interval {\n+\t\t// If the user is waiting only a short time, poll more frequently so the\n+\t\t// command can still succeed before the deadline.\n+\t\tinterval = wait / 5\n+\t\tif interval < 10*time.Millisecond {\n+\t\t\tinterval = 10 * time.Millisecond\n+\t\t}\n+\t}\n+\n+\tfor {\n+\t\tpair, err := attempt(ctx)\n+\t\tif err == nil {\n+\t\t\treturn pair, nil\n+\t\t}\n+\t\tif !isSMAPILinkPending(err) {\n+\t\t\treturn sonos.SMAPITokenPair{}, err\n+\t\t}\n+\t\tnow := time.Now()\n+\t\tif now.After(deadline) {\n+\t\t\treturn sonos.SMAPITokenPair{}, fmt.Errorf(\"timed out waiting for service link to complete: %w\", err)\n+\t\t}\n+\n+\t\tslog.Debug(\"smapi auth: waiting for link completion\", \"err\", err.Error())\n+\n+\t\tsleep := interval\n+\t\tif remaining := deadline.Sub(now); remaining < sleep {\n+\t\t\tsleep = remaining\n+\t\t}\n+\t\ttimer := time.NewTimer(sleep)\n+\t\tselect {\n+\t\tcase <-ctx.Done():\n+\t\t\ttimer.Stop()\n+\t\t\treturn sonos.SMAPITokenPair{}, ctx.Err()\n+\t\tcase <-timer.C:\n+\t\t}\n+\t}\n+}\n+\n+func isSMAPILinkPending(err error) bool {\n+\tif err == nil {\n+\t\treturn false\n+\t}\n+\t// Common error from Spotify (and other services) before the user completes linking.\n+\t// Example: \"smapi fault: SOAP-ENV:Server: NOT_LINKED_RETRY\"\n+\tmsg := err.Error()\n+\treturn strings.Contains(msg, \"NOT_LINKED_RETRY\") || strings.Contains(msg, \"NOT_LINKED\")\n+}\n+\n func newSMAPISearchCmd(flags *rootFlags) *cobra.Command {\n \tvar (\n \t\tserviceName string"
+    },
+    {
+      "sha": "8631fb7eb09dc136e363b0ca88197007ef515d60",
+      "filename": "internal/cli/smapi_auth_wait_test.go",
+      "status": "added",
+      "additions": 64,
+      "deletions": 0,
+      "changes": 64,
+      "blob_url": "https://github.com/steipete/sonoscli/blob/d60e6fa572e1feb068dea2c76989498452bb8cd1/internal%2Fcli%2Fsmapi_auth_wait_test.go",
+      "raw_url": "https://github.com/steipete/sonoscli/raw/d60e6fa572e1feb068dea2c76989498452bb8cd1/internal%2Fcli%2Fsmapi_auth_wait_test.go",
+      "contents_url": "https://api.github.com/repos/steipete/sonoscli/contents/internal%2Fcli%2Fsmapi_auth_wait_test.go?ref=d60e6fa572e1feb068dea2c76989498452bb8cd1",
+      "patch": "@@ -0,0 +1,64 @@\n+package cli\n+\n+import (\n+\t\"context\"\n+\t\"errors\"\n+\t\"testing\"\n+\t\"time\"\n+\n+\t\"github.com/steipete/sonoscli/internal/sonos\"\n+)\n+\n+func TestCompleteSMAPIAuth_NoWaitAttemptsOnce(t *testing.T) {\n+\tt.Parallel()\n+\n+\tcalls := 0\n+\t_, err := completeSMAPIAuth(context.Background(), 0, func(context.Context) (sonos.SMAPITokenPair, error) {\n+\t\tcalls++\n+\t\treturn sonos.SMAPITokenPair{}, errors.New(\"smapi fault: SOAP-ENV:Server: NOT_LINKED_RETRY\")\n+\t})\n+\tif err == nil {\n+\t\tt.Fatalf(\"expected error\")\n+\t}\n+\tif calls != 1 {\n+\t\tt.Fatalf(\"expected 1 call, got %d\", calls)\n+\t}\n+}\n+\n+func TestCompleteSMAPIAuth_WaitRetriesUntilSuccess(t *testing.T) {\n+\tt.Parallel()\n+\n+\tcalls := 0\n+\tgot, err := completeSMAPIAuth(context.Background(), 50*time.Millisecond, func(context.Context) (sonos.SMAPITokenPair, error) {\n+\t\tcalls++\n+\t\tif calls < 3 {\n+\t\t\treturn sonos.SMAPITokenPair{}, errors.New(\"smapi fault: SOAP-ENV:Server: NOT_LINKED_RETRY\")\n+\t\t}\n+\t\treturn sonos.SMAPITokenPair{AuthToken: \"t\", PrivateKey: \"k\"}, nil\n+\t})\n+\tif err != nil {\n+\t\tt.Fatalf(\"unexpected error: %v\", err)\n+\t}\n+\tif got.AuthToken != \"t\" || got.PrivateKey != \"k\" {\n+\t\tt.Fatalf(\"unexpected token pair: %#v\", got)\n+\t}\n+\tif calls != 3 {\n+\t\tt.Fatalf(\"expected 3 calls, got %d\", calls)\n+\t}\n+}\n+\n+func TestCompleteSMAPIAuth_WaitStopsOnNonPendingError(t *testing.T) {\n+\tt.Parallel()\n+\n+\tcalls := 0\n+\t_, err := completeSMAPIAuth(context.Background(), 50*time.Millisecond, func(context.Context) (sonos.SMAPITokenPair, error) {\n+\t\tcalls++\n+\t\treturn sonos.SMAPITokenPair{}, errors.New(\"boom\")\n+\t})\n+\tif err == nil || err.Error() != \"boom\" {\n+\t\tt.Fatalf(\"expected boom error, got %v\", err)\n+\t}\n+\tif calls != 1 {\n+\t\tt.Fatalf(\"expected 1 call, got %d\", calls)\n+\t}\n+}"
+    },
+    {
+      "sha": "5124a786d4a8cae72ad3cd7cbabe09b12f06276a",
+      "filename": "internal/cli/version.go",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/steipete/sonoscli/blob/d60e6fa572e1feb068dea2c76989498452bb8cd1/internal%2Fcli%2Fversion.go",
+      "raw_url": "https://github.com/steipete/sonoscli/raw/d60e6fa572e1feb068dea2c76989498452bb8cd1/internal%2Fcli%2Fversion.go",
+      "contents_url": "https://api.github.com/repos/steipete/sonoscli/contents/internal%2Fcli%2Fversion.go?ref=d60e6fa572e1feb068dea2c76989498452bb8cd1",
+      "patch": "@@ -2,4 +2,4 @@ package cli\n \n // Version is the CLI version reported by `sonos --version`.\n // Keep in sync with CHANGELOG.md.\n-const Version = \"0.1.22\"\n+const Version = \"0.1.23\""
+    }
+  ]
+}

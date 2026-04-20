@@ -1,0 +1,113 @@
+{
+  "message": "fix: thread accountId through subagent announce delivery\n\nCo-authored-by: Adam Holt <adam91holt@users.noreply.github.com>",
+  "files": [
+    {
+      "sha": "4fc052d3b1cb28e0e7201b014f721cbee375f80d",
+      "filename": "src/agents/subagent-announce.format.test.ts",
+      "status": "modified",
+      "additions": 38,
+      "deletions": 0,
+      "changes": 38,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/02911059132eed5b3799f026f00d771c6b8f8ba6/src%2Fagents%2Fsubagent-announce.format.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/02911059132eed5b3799f026f00d771c6b8f8ba6/src%2Fagents%2Fsubagent-announce.format.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fagents%2Fsubagent-announce.format.test.ts?ref=02911059132eed5b3799f026f00d771c6b8f8ba6",
+      "patch": "@@ -153,4 +153,42 @@ describe(\"subagent announce formatting\", () => {\n     );\n     expect(agentSpy).not.toHaveBeenCalled();\n   });\n+\n+  it(\"queues announce delivery with origin account routing\", async () => {\n+    const { runSubagentAnnounceFlow } = await import(\"./subagent-announce.js\");\n+    embeddedRunMock.isEmbeddedPiRunActive.mockReturnValue(true);\n+    embeddedRunMock.isEmbeddedPiRunStreaming.mockReturnValue(false);\n+    sessionStore = {\n+      \"agent:main:main\": {\n+        sessionId: \"session-456\",\n+        lastChannel: \"whatsapp\",\n+        lastTo: \"+1555\",\n+        lastAccountId: \"kev\",\n+        queueMode: \"collect\",\n+        queueDebounceMs: 0,\n+      },\n+    };\n+\n+    const didAnnounce = await runSubagentAnnounceFlow({\n+      childSessionKey: \"agent:main:subagent:test\",\n+      childRunId: \"run-999\",\n+      requesterSessionKey: \"main\",\n+      requesterDisplayKey: \"main\",\n+      task: \"do thing\",\n+      timeoutMs: 1000,\n+      cleanup: \"keep\",\n+      waitForCompletion: false,\n+      startedAt: 10,\n+      endedAt: 20,\n+      outcome: { status: \"ok\" },\n+    });\n+\n+    expect(didAnnounce).toBe(true);\n+    await new Promise((r) => setTimeout(r, 5));\n+\n+    const call = agentSpy.mock.calls[0]?.[0] as { params?: Record<string, unknown> };\n+    expect(call?.params?.channel).toBe(\"whatsapp\");\n+    expect(call?.params?.to).toBe(\"+1555\");\n+    expect(call?.params?.accountId).toBe(\"kev\");\n+  });\n });"
+    },
+    {
+      "sha": "c7801610f9348774585178b13035a9a6320c341b",
+      "filename": "src/agents/subagent-announce.ts",
+      "status": "modified",
+      "additions": 25,
+      "deletions": 14,
+      "changes": 39,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/02911059132eed5b3799f026f00d771c6b8f8ba6/src%2Fagents%2Fsubagent-announce.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/02911059132eed5b3799f026f00d771c6b8f8ba6/src%2Fagents%2Fsubagent-announce.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fagents%2Fsubagent-announce.ts?ref=02911059132eed5b3799f026f00d771c6b8f8ba6",
+      "patch": "@@ -16,6 +16,10 @@ import {\n } from \"../auto-reply/reply/queue.js\";\n import { callGateway } from \"../gateway/call.js\";\n import { defaultRuntime } from \"../runtime.js\";\n+import {\n+  type DeliveryContext,\n+  normalizeDeliveryContext,\n+} from \"../utils/delivery-context.js\";\n import { isEmbeddedPiRunActive, queueEmbeddedPiMessage } from \"./pi-embedded.js\";\n import { readLatestAssistantReply } from \"./tools/agent-step.js\";\n \n@@ -89,9 +93,7 @@ type AnnounceQueueItem = {\n   summaryLine?: string;\n   enqueuedAt: number;\n   sessionKey: string;\n-  originatingChannel?: string;\n-  originatingTo?: string;\n-  originatingAccountId?: string;\n+  origin?: DeliveryContext;\n };\n \n type AnnounceQueueState = {\n@@ -225,9 +227,10 @@ function hasCrossChannelItems(items: AnnounceQueueItem[]): boolean {\n   const keys = new Set<string>();\n   let hasUnkeyed = false;\n   for (const item of items) {\n-    const channel = item.originatingChannel;\n-    const to = item.originatingTo;\n-    const accountId = item.originatingAccountId;\n+    const origin = item.origin;\n+    const channel = origin?.channel;\n+    const to = origin?.to;\n+    const accountId = origin?.accountId;\n     if (!channel && !to && !accountId) {\n       hasUnkeyed = true;\n       continue;\n@@ -301,14 +304,15 @@ function scheduleAnnounceDrain(key: string) {\n }\n \n async function sendAnnounce(item: AnnounceQueueItem) {\n+  const origin = item.origin;\n   await callGateway({\n     method: \"agent\",\n     params: {\n       sessionKey: item.sessionKey,\n       message: item.prompt,\n-      channel: item.originatingChannel,\n-      accountId: item.originatingAccountId,\n-      to: item.originatingTo,\n+      channel: origin?.channel,\n+      accountId: origin?.accountId,\n+      to: origin?.to,\n       deliver: true,\n       idempotencyKey: crypto.randomUUID(),\n     },\n@@ -377,16 +381,19 @@ async function maybeQueueSubagentAnnounce(params: {\n     queueSettings.mode === \"steer-backlog\" ||\n     queueSettings.mode === \"interrupt\";\n   if (isActive && (shouldFollowup || queueSettings.mode === \"steer\")) {\n+    const origin = normalizeDeliveryContext({\n+      channel: entry?.lastChannel,\n+      to: entry?.lastTo,\n+      accountId: entry?.lastAccountId ?? params.requesterAccountId,\n+    });\n     enqueueAnnounce(\n       canonicalKey,\n       {\n         prompt: params.triggerMessage,\n         summaryLine: params.summaryLine,\n         enqueuedAt: Date.now(),\n         sessionKey: canonicalKey,\n-        originatingChannel: entry?.lastChannel,\n-        originatingTo: entry?.lastTo,\n-        originatingAccountId: entry?.lastAccountId ?? params.requesterAccountId,\n+        origin,\n       },\n       queueSettings,\n     );\n@@ -617,14 +624,18 @@ export async function runSubagentAnnounceFlow(params: {\n     }\n \n     // Send to main agent - it will respond in its own voice\n+    const directOrigin = normalizeDeliveryContext({\n+      channel: params.requesterChannel,\n+      accountId: params.requesterAccountId,\n+    });\n     await callGateway({\n       method: \"agent\",\n       params: {\n         sessionKey: params.requesterSessionKey,\n         message: triggerMessage,\n         deliver: true,\n-        channel: params.requesterChannel,\n-        accountId: params.requesterAccountId,\n+        channel: directOrigin?.channel,\n+        accountId: directOrigin?.accountId,\n         idempotencyKey: crypto.randomUUID(),\n       },\n       expectFinal: true,"
+    },
+    {
+      "sha": "e449573745d3414a72ef461227183c962c7f044c",
+      "filename": "src/agents/subagent-registry.persistence.test.ts",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/02911059132eed5b3799f026f00d771c6b8f8ba6/src%2Fagents%2Fsubagent-registry.persistence.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/02911059132eed5b3799f026f00d771c6b8f8ba6/src%2Fagents%2Fsubagent-registry.persistence.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fagents%2Fsubagent-registry.persistence.test.ts?ref=02911059132eed5b3799f026f00d771c6b8f8ba6",
+      "patch": "@@ -52,6 +52,7 @@ describe(\"subagent registry persistence\", () => {\n       runId: \"run-1\",\n       childSessionKey: \"agent:main:subagent:test\",\n       requesterSessionKey: \"agent:main:main\",\n+      requesterAccountId: \"acct-main\",\n       requesterDisplayKey: \"main\",\n       task: \"do the thing\",\n       cleanup: \"keep\",\n@@ -61,6 +62,8 @@ describe(\"subagent registry persistence\", () => {\n     const raw = await fs.readFile(registryPath, \"utf8\");\n     const parsed = JSON.parse(raw) as { runs?: Record<string, unknown> };\n     expect(parsed.runs && Object.keys(parsed.runs)).toContain(\"run-1\");\n+    const run = parsed.runs?.[\"run-1\"] as { requesterAccountId?: string } | undefined;\n+    expect(run?.requesterAccountId).toBe(\"acct-main\");\n \n     // Simulate a process restart: module re-import should load persisted runs\n     // and trigger the announce flow once the run resolves.\n@@ -77,12 +80,14 @@ describe(\"subagent registry persistence\", () => {\n       childSessionKey: string;\n       childRunId: string;\n       requesterSessionKey: string;\n+      requesterAccountId?: string;\n       task: string;\n       cleanup: string;\n       label?: string;\n     };\n     const first = announceSpy.mock.calls[0]?.[0] as unknown as AnnounceParams;\n     expect(first.childSessionKey).toBe(\"agent:main:subagent:test\");\n+    expect(first.requesterAccountId).toBe(\"acct-main\");\n   });\n \n   it(\"skips cleanup when cleanupHandled/announceHandled was persisted\", async () => {"
+    },
+    {
+      "sha": "8f5aecd2a5f11da3d408d5b2d206f8cc4f142b77",
+      "filename": "src/commands/agent.delivery.test.ts",
+      "status": "added",
+      "additions": 64,
+      "deletions": 0,
+      "changes": 64,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/02911059132eed5b3799f026f00d771c6b8f8ba6/src%2Fcommands%2Fagent.delivery.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/02911059132eed5b3799f026f00d771c6b8f8ba6/src%2Fcommands%2Fagent.delivery.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fcommands%2Fagent.delivery.test.ts?ref=02911059132eed5b3799f026f00d771c6b8f8ba6",
+      "patch": "@@ -0,0 +1,64 @@\n+import { describe, expect, it, vi } from \"vitest\";\n+\n+import type { CliDeps } from \"../cli/deps.js\";\n+import type { ClawdbotConfig } from \"../config/config.js\";\n+import type { RuntimeEnv } from \"../runtime.js\";\n+import type { SessionEntry } from \"../config/sessions.js\";\n+\n+const mocks = vi.hoisted(() => ({\n+  deliverOutboundPayloads: vi.fn(async () => []),\n+  getChannelPlugin: vi.fn(() => ({})),\n+  resolveOutboundTarget: vi.fn(() => ({ ok: true as const, to: \"+15551234567\" })),\n+}));\n+\n+vi.mock(\"../channels/plugins/index.js\", () => ({\n+  getChannelPlugin: mocks.getChannelPlugin,\n+  normalizeChannelId: (value: string) => value,\n+}));\n+\n+vi.mock(\"../infra/outbound/deliver.js\", () => ({\n+  deliverOutboundPayloads: mocks.deliverOutboundPayloads,\n+}));\n+\n+vi.mock(\"../infra/outbound/targets.js\", () => ({\n+  resolveOutboundTarget: mocks.resolveOutboundTarget,\n+}));\n+\n+describe(\"deliverAgentCommandResult\", () => {\n+  it(\"prefers explicit accountId for outbound delivery\", async () => {\n+    const cfg = {} as ClawdbotConfig;\n+    const deps = {} as CliDeps;\n+    const runtime = {\n+      log: vi.fn(),\n+      error: vi.fn(),\n+    } as unknown as RuntimeEnv;\n+    const sessionEntry = {\n+      lastAccountId: \"default\",\n+    } as SessionEntry;\n+    const result = {\n+      payloads: [{ text: \"hi\" }],\n+      meta: {},\n+    };\n+\n+    const { deliverAgentCommandResult } = await import(\"./agent/delivery.js\");\n+    await deliverAgentCommandResult({\n+      cfg,\n+      deps,\n+      runtime,\n+      opts: {\n+        message: \"hello\",\n+        deliver: true,\n+        channel: \"whatsapp\",\n+        accountId: \"kev\",\n+        to: \"+15551234567\",\n+      },\n+      sessionEntry,\n+      result,\n+      payloads: result.payloads,\n+    });\n+\n+    expect(mocks.deliverOutboundPayloads).toHaveBeenCalledWith(\n+      expect.objectContaining({ accountId: \"kev\" }),\n+    );\n+  });\n+});"
+    },
+    {
+      "sha": "d2bb50137a5beb7c5d0f5747743c364a6b83965e",
+      "filename": "src/commands/agent/delivery.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 5,
+      "changes": 8,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/02911059132eed5b3799f026f00d771c6b8f8ba6/src%2Fcommands%2Fagent%2Fdelivery.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/02911059132eed5b3799f026f00d771c6b8f8ba6/src%2Fcommands%2Fagent%2Fdelivery.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fcommands%2Fagent%2Fdelivery.ts?ref=02911059132eed5b3799f026f00d771c6b8f8ba6",
+      "patch": "@@ -19,6 +19,7 @@ import {\n   isInternalMessageChannel,\n   resolveGatewayMessageChannel,\n } from \"../../utils/message-channel.js\";\n+import { normalizeAccountId } from \"../../utils/account-id.js\";\n import type { AgentCommandOpts } from \"./types.js\";\n \n type RunResult = Awaited<\n@@ -49,11 +50,8 @@ export async function deliverAgentCommandResult(params: {\n   const targetMode: ChannelOutboundTargetMode =\n     opts.deliveryTargetMode ?? (opts.to ? \"explicit\" : \"implicit\");\n   const resolvedAccountId =\n-    typeof opts.accountId === \"string\" && opts.accountId.trim()\n-      ? opts.accountId.trim()\n-      : targetMode === \"implicit\"\n-        ? sessionEntry?.lastAccountId\n-        : undefined;\n+    normalizeAccountId(opts.accountId) ??\n+    (targetMode === \"implicit\" ? normalizeAccountId(sessionEntry?.lastAccountId) : undefined);\n   const resolvedTarget =\n     deliver && isDeliveryChannelKnown && deliveryChannel\n       ? resolveOutboundTarget({"
+    },
+    {
+      "sha": "5f6068f83fbdc2dc668844ed215316536a48793e",
+      "filename": "src/gateway/server-methods/agent.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 3,
+      "changes": 6,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/02911059132eed5b3799f026f00d771c6b8f8ba6/src%2Fgateway%2Fserver-methods%2Fagent.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/02911059132eed5b3799f026f00d771c6b8f8ba6/src%2Fgateway%2Fserver-methods%2Fagent.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fserver-methods%2Fagent.ts?ref=02911059132eed5b3799f026f00d771c6b8f8ba6",
+      "patch": "@@ -12,6 +12,7 @@ import { registerAgentRunContext } from \"../../infra/agent-events.js\";\n import { resolveOutboundTarget } from \"../../infra/outbound/targets.js\";\n import { defaultRuntime } from \"../../runtime.js\";\n import { resolveSendPolicy } from \"../../sessions/send-policy.js\";\n+import { normalizeAccountId } from \"../../utils/account-id.js\";\n import {\n   INTERNAL_MESSAGE_CHANNEL,\n   isDeliverableMessageChannel,\n@@ -201,9 +202,8 @@ export const agentHandlers: GatewayRequestHandlers = {\n     const lastChannel = sessionEntry?.lastChannel;\n     const lastTo = typeof sessionEntry?.lastTo === \"string\" ? sessionEntry.lastTo.trim() : \"\";\n     const resolvedAccountId =\n-      typeof request.accountId === \"string\" && request.accountId.trim()\n-        ? request.accountId.trim()\n-        : sessionEntry?.lastAccountId;\n+      normalizeAccountId(request.accountId) ??\n+      normalizeAccountId(sessionEntry?.lastAccountId);\n \n     const wantsDelivery = request.deliver === true;\n "
+    },
+    {
+      "sha": "bc0f757356ef49dd6b07ca94bdb195e014f22528",
+      "filename": "src/gateway/server.agent.gateway-server-agent-a.test.ts",
+      "status": "modified",
+      "additions": 45,
+      "deletions": 0,
+      "changes": 45,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/02911059132eed5b3799f026f00d771c6b8f8ba6/src%2Fgateway%2Fserver.agent.gateway-server-agent-a.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/02911059132eed5b3799f026f00d771c6b8f8ba6/src%2Fgateway%2Fserver.agent.gateway-server-agent-a.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fserver.agent.gateway-server-agent-a.test.ts?ref=02911059132eed5b3799f026f00d771c6b8f8ba6",
+      "patch": "@@ -107,6 +107,51 @@ describe(\"gateway server agent\", () => {\n     await server.close();\n   });\n \n+  test(\"agent forwards accountId to agentCommand\", async () => {\n+    testState.allowFrom = [\"+1555\"];\n+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), \"clawdbot-gw-\"));\n+    testState.sessionStorePath = path.join(dir, \"sessions.json\");\n+    await fs.writeFile(\n+      testState.sessionStorePath,\n+      JSON.stringify(\n+        {\n+          main: {\n+            sessionId: \"sess-main-account\",\n+            updatedAt: Date.now(),\n+            lastChannel: \"whatsapp\",\n+            lastTo: \"+1555\",\n+            lastAccountId: \"default\",\n+          },\n+        },\n+        null,\n+        2,\n+      ),\n+      \"utf-8\",\n+    );\n+\n+    const { server, ws } = await startServerWithClient();\n+    await connectOk(ws);\n+\n+    const res = await rpcReq(ws, \"agent\", {\n+      message: \"hi\",\n+      sessionKey: \"main\",\n+      deliver: true,\n+      accountId: \"kev\",\n+      idempotencyKey: \"idem-agent-account\",\n+    });\n+    expect(res.ok).toBe(true);\n+\n+    const spy = vi.mocked(agentCommand);\n+    const call = spy.mock.calls.at(-1)?.[0] as Record<string, unknown>;\n+    expectChannels(call, \"whatsapp\");\n+    expect(call.to).toBe(\"+1555\");\n+    expect(call.accountId).toBe(\"kev\");\n+\n+    ws.close();\n+    await server.close();\n+    testState.allowFrom = undefined;\n+  });\n+\n   test(\"agent forwards image attachments as images[]\", async () => {\n     const dir = await fs.mkdtemp(path.join(os.tmpdir(), \"clawdbot-gw-\"));\n     testState.sessionStorePath = path.join(dir, \"sessions.json\");"
+    },
+    {
+      "sha": "e8992cfd3192add5f3b105902ade891ce3911734",
+      "filename": "src/utils/account-id.ts",
+      "status": "added",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/02911059132eed5b3799f026f00d771c6b8f8ba6/src%2Futils%2Faccount-id.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/02911059132eed5b3799f026f00d771c6b8f8ba6/src%2Futils%2Faccount-id.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Futils%2Faccount-id.ts?ref=02911059132eed5b3799f026f00d771c6b8f8ba6",
+      "patch": "@@ -0,0 +1,5 @@\n+export function normalizeAccountId(value?: string): string | undefined {\n+  if (typeof value !== \"string\") return undefined;\n+  const trimmed = value.trim();\n+  return trimmed || undefined;\n+}"
+    },
+    {
+      "sha": "a3a1e3956adb371215afadd8a7f53cfc9eb3012d",
+      "filename": "src/utils/delivery-context.ts",
+      "status": "added",
+      "additions": 21,
+      "deletions": 0,
+      "changes": 21,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/02911059132eed5b3799f026f00d771c6b8f8ba6/src%2Futils%2Fdelivery-context.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/02911059132eed5b3799f026f00d771c6b8f8ba6/src%2Futils%2Fdelivery-context.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Futils%2Fdelivery-context.ts?ref=02911059132eed5b3799f026f00d771c6b8f8ba6",
+      "patch": "@@ -0,0 +1,21 @@\n+import { normalizeAccountId } from \"./account-id.js\";\n+\n+export type DeliveryContext = {\n+  channel?: string;\n+  to?: string;\n+  accountId?: string;\n+};\n+\n+export function normalizeDeliveryContext(context?: DeliveryContext): DeliveryContext | undefined {\n+  if (!context) return undefined;\n+  const channel =\n+    typeof context.channel === \"string\" ? context.channel.trim() : undefined;\n+  const to = typeof context.to === \"string\" ? context.to.trim() : undefined;\n+  const accountId = normalizeAccountId(context.accountId);\n+  if (!channel && !to && !accountId) return undefined;\n+  return {\n+    channel: channel || undefined,\n+    to: to || undefined,\n+    accountId,\n+  };\n+}"
+    }
+  ]
+}

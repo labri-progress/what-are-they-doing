@@ -1,0 +1,113 @@
+{
+  "message": "fix: preserve sessionKey for agent runs",
+  "files": [
+    {
+      "sha": "da414ef0e8b3e7d0be3e5f54e1a6212f5fb5fdd9",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/937e0265a3591287818454735fccfd446c3f11e8/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/937e0265a3591287818454735fccfd446c3f11e8/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=937e0265a3591287818454735fccfd446c3f11e8",
+      "patch": "@@ -33,6 +33,7 @@\n - Agent: trim bootstrap context injections and keep group guidance concise (emoji reactions allowed). Thanks @tobiasbischoff for PR #370.\n - Sub-agents: allow `sessions_spawn` model overrides and error on invalid models. Thanks @azade-c for PR #298.\n - Sub-agents: skip invalid model overrides with a warning and keep the run alive; tool exceptions now return tool errors instead of crashing the agent.\n+- Sessions: forward explicit sessionKey through gateway/chat/node bridge to avoid sub-agent sessionId mixups.\n - Heartbeat: default interval 30m; clarified default prompt usage and HEARTBEAT.md template behavior.\n - Onboarding: write auth profiles to the multi-agent path (`~/.clawdbot/agents/main/agent/`) so the gateway finds credentials on first startup. Thanks @minghinmatthewlam for PR #327.\n - Docs: add missing `ui:install` setup step in the README. Thanks @hugobarauna for PR #300."
+    },
+    {
+      "sha": "8383190f5be8730f8832eea2460731b6b66ead1b",
+      "filename": "src/commands/agent.test.ts",
+      "status": "modified",
+      "additions": 39,
+      "deletions": 0,
+      "changes": 39,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/937e0265a3591287818454735fccfd446c3f11e8/src%2Fcommands%2Fagent.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/937e0265a3591287818454735fccfd446c3f11e8/src%2Fcommands%2Fagent.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fcommands%2Fagent.test.ts?ref=937e0265a3591287818454735fccfd446c3f11e8",
+      "patch": "@@ -168,6 +168,45 @@ describe(\"agentCommand\", () => {\n     });\n   });\n \n+  it(\"keeps explicit sessionKey even when sessionId exists elsewhere\", async () => {\n+    await withTempHome(async (home) => {\n+      const store = path.join(home, \"sessions.json\");\n+      fs.mkdirSync(path.dirname(store), { recursive: true });\n+      fs.writeFileSync(\n+        store,\n+        JSON.stringify(\n+          {\n+            \"agent:main:main\": {\n+              sessionId: \"sess-main\",\n+              updatedAt: Date.now(),\n+            },\n+          },\n+          null,\n+          2,\n+        ),\n+      );\n+      mockConfig(home, store);\n+\n+      await agentCommand(\n+        {\n+          message: \"hi\",\n+          sessionId: \"sess-main\",\n+          sessionKey: \"agent:main:subagent:abc\",\n+        },\n+        runtime,\n+      );\n+\n+      const callArgs = vi.mocked(runEmbeddedPiAgent).mock.calls.at(-1)?.[0];\n+      expect(callArgs?.sessionKey).toBe(\"agent:main:subagent:abc\");\n+\n+      const saved = JSON.parse(fs.readFileSync(store, \"utf-8\")) as Record<\n+        string,\n+        { sessionId?: string }\n+      >;\n+      expect(saved[\"agent:main:subagent:abc\"]?.sessionId).toBe(\"sess-main\");\n+    });\n+  });\n+\n   it(\"defaults thinking to low for reasoning-capable models\", async () => {\n     await withTempHome(async (home) => {\n       const store = path.join(home, \"sessions.json\");"
+    },
+    {
+      "sha": "c425e09e5e8523c381b927c3f4e7b2c97d410622",
+      "filename": "src/commands/agent.ts",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 5,
+      "changes": 19,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/937e0265a3591287818454735fccfd446c3f11e8/src%2Fcommands%2Fagent.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/937e0265a3591287818454735fccfd446c3f11e8/src%2Fcommands%2Fagent.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fcommands%2Fagent.ts?ref=937e0265a3591287818454735fccfd446c3f11e8",
+      "patch": "@@ -34,6 +34,7 @@ import { type ClawdbotConfig, loadConfig } from \"../config/config.js\";\n import {\n   DEFAULT_IDLE_MINUTES,\n   loadSessionStore,\n+  resolveAgentIdFromSessionKey,\n   resolveSessionKey,\n   resolveSessionTranscriptPath,\n   resolveStorePath,\n@@ -61,6 +62,7 @@ type AgentCommandOpts = {\n   message: string;\n   to?: string;\n   sessionId?: string;\n+  sessionKey?: string;\n   thinking?: string;\n   thinkingOnce?: string;\n   verbose?: string;\n@@ -92,6 +94,7 @@ function resolveSession(opts: {\n   cfg: ClawdbotConfig;\n   to?: string;\n   sessionId?: string;\n+  sessionKey?: string;\n }): SessionResolution {\n   const sessionCfg = opts.cfg.session;\n   const scope = sessionCfg?.scope ?? \"per-sender\";\n@@ -101,20 +104,25 @@ function resolveSession(opts: {\n     1,\n   );\n   const idleMs = idleMinutes * 60_000;\n-  const storePath = resolveStorePath(sessionCfg?.store);\n+  const explicitSessionKey = opts.sessionKey?.trim();\n+  const storeAgentId = resolveAgentIdFromSessionKey(explicitSessionKey);\n+  const storePath = resolveStorePath(sessionCfg?.store, {\n+    agentId: storeAgentId,\n+  });\n   const sessionStore = loadSessionStore(storePath);\n   const now = Date.now();\n \n   const ctx: MsgContext | undefined = opts.to?.trim()\n     ? { From: opts.to }\n     : undefined;\n-  let sessionKey: string | undefined = ctx\n-    ? resolveSessionKey(scope, ctx, mainKey)\n-    : undefined;\n+  let sessionKey: string | undefined =\n+    explicitSessionKey ??\n+    (ctx ? resolveSessionKey(scope, ctx, mainKey) : undefined);\n   let sessionEntry = sessionKey ? sessionStore[sessionKey] : undefined;\n \n   // If a session id was provided, prefer to re-use its entry (by id) even when no key was derived.\n   if (\n+    !explicitSessionKey &&\n     opts.sessionId &&\n     (!sessionEntry || sessionEntry.sessionId !== opts.sessionId)\n   ) {\n@@ -162,7 +170,7 @@ export async function agentCommand(\n ) {\n   const body = (opts.message ?? \"\").trim();\n   if (!body) throw new Error(\"Message (--message) is required\");\n-  if (!opts.to && !opts.sessionId) {\n+  if (!opts.to && !opts.sessionId && !opts.sessionKey) {\n     throw new Error(\"Pass --to <E.164> or --session-id to choose a session\");\n   }\n \n@@ -216,6 +224,7 @@ export async function agentCommand(\n     cfg,\n     to: opts.to,\n     sessionId: opts.sessionId,\n+    sessionKey: opts.sessionKey,\n   });\n \n   const {"
+    },
+    {
+      "sha": "2fc6f49af565d7a51143c1cc96add417c3a45d0c",
+      "filename": "src/gateway/server-bridge.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/937e0265a3591287818454735fccfd446c3f11e8/src%2Fgateway%2Fserver-bridge.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/937e0265a3591287818454735fccfd446c3f11e8/src%2Fgateway%2Fserver-bridge.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fserver-bridge.ts?ref=937e0265a3591287818454735fccfd446c3f11e8",
+      "patch": "@@ -1053,6 +1053,7 @@ export function createBridgeHandlers(ctx: BridgeHandlersContext) {\n               {\n                 message: messageWithAttachments,\n                 sessionId,\n+                sessionKey: p.sessionKey,\n                 runId: clientRunId,\n                 thinking: p.thinking,\n                 deliver: p.deliver,\n@@ -1169,6 +1170,7 @@ export function createBridgeHandlers(ctx: BridgeHandlersContext) {\n           {\n             message: text,\n             sessionId,\n+            sessionKey,\n             thinking: \"low\",\n             deliver: false,\n             messageProvider: \"node\",\n@@ -1245,6 +1247,7 @@ export function createBridgeHandlers(ctx: BridgeHandlersContext) {\n           {\n             message,\n             sessionId,\n+            sessionKey,\n             thinking: link?.thinking ?? undefined,\n             deliver,\n             to,"
+    },
+    {
+      "sha": "0419e96963f247f5d2c89c3c5090ba216d061020",
+      "filename": "src/gateway/server-methods/agent.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/937e0265a3591287818454735fccfd446c3f11e8/src%2Fgateway%2Fserver-methods%2Fagent.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/937e0265a3591287818454735fccfd446c3f11e8/src%2Fgateway%2Fserver-methods%2Fagent.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fserver-methods%2Fagent.ts?ref=937e0265a3591287818454735fccfd446c3f11e8",
+      "patch": "@@ -244,6 +244,7 @@ export const agentHandlers: GatewayRequestHandlers = {\n         message,\n         to: sanitizedTo,\n         sessionId: resolvedSessionId,\n+        sessionKey: requestedSessionKey,\n         thinking: request.thinking,\n         deliver,\n         provider: resolvedProvider,"
+    },
+    {
+      "sha": "36b41244243fe2ab00e1c20178dac863a5c0675d",
+      "filename": "src/gateway/server-methods/chat.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/937e0265a3591287818454735fccfd446c3f11e8/src%2Fgateway%2Fserver-methods%2Fchat.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/937e0265a3591287818454735fccfd446c3f11e8/src%2Fgateway%2Fserver-methods%2Fchat.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fserver-methods%2Fchat.ts?ref=937e0265a3591287818454735fccfd446c3f11e8",
+      "patch": "@@ -259,6 +259,7 @@ export const chatHandlers: GatewayRequestHandlers = {\n         {\n           message: messageWithAttachments,\n           sessionId,\n+          sessionKey: p.sessionKey,\n           runId: clientRunId,\n           thinking: p.thinking,\n           deliver: p.deliver,"
+    },
+    {
+      "sha": "3aff8b1256f3fd350c109a85f20595847d2a86b4",
+      "filename": "src/gateway/server.agent.test.ts",
+      "status": "modified",
+      "additions": 37,
+      "deletions": 0,
+      "changes": 37,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/937e0265a3591287818454735fccfd446c3f11e8/src%2Fgateway%2Fserver.agent.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/937e0265a3591287818454735fccfd446c3f11e8/src%2Fgateway%2Fserver.agent.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fserver.agent.test.ts?ref=937e0265a3591287818454735fccfd446c3f11e8",
+      "patch": "@@ -66,6 +66,43 @@ describe(\"gateway server agent\", () => {\n     testState.allowFrom = undefined;\n   });\n \n+  test(\"agent forwards sessionKey to agentCommand\", async () => {\n+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), \"clawdbot-gw-\"));\n+    testState.sessionStorePath = path.join(dir, \"sessions.json\");\n+    await fs.writeFile(\n+      testState.sessionStorePath,\n+      JSON.stringify(\n+        {\n+          \"agent:main:subagent:abc\": {\n+            sessionId: \"sess-sub\",\n+            updatedAt: Date.now(),\n+          },\n+        },\n+        null,\n+        2,\n+      ),\n+      \"utf-8\",\n+    );\n+\n+    const { server, ws } = await startServerWithClient();\n+    await connectOk(ws);\n+\n+    const res = await rpcReq(ws, \"agent\", {\n+      message: \"hi\",\n+      sessionKey: \"agent:main:subagent:abc\",\n+      idempotencyKey: \"idem-agent-subkey\",\n+    });\n+    expect(res.ok).toBe(true);\n+\n+    const spy = vi.mocked(agentCommand);\n+    const call = spy.mock.calls.at(-1)?.[0] as Record<string, unknown>;\n+    expect(call.sessionKey).toBe(\"agent:main:subagent:abc\");\n+    expect(call.sessionId).toBe(\"sess-sub\");\n+\n+    ws.close();\n+    await server.close();\n+  });\n+\n   test(\"agent routes main last-channel whatsapp\", async () => {\n     const dir = await fs.mkdtemp(path.join(os.tmpdir(), \"clawdbot-gw-\"));\n     testState.sessionStorePath = path.join(dir, \"sessions.json\");"
+    },
+    {
+      "sha": "2c4a72af20aff25a0b01ac4fbba72336102e22f7",
+      "filename": "src/gateway/server.chat.test.ts",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 0,
+      "changes": 20,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/937e0265a3591287818454735fccfd446c3f11e8/src%2Fgateway%2Fserver.chat.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/937e0265a3591287818454735fccfd446c3f11e8/src%2Fgateway%2Fserver.chat.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fserver.chat.test.ts?ref=937e0265a3591287818454735fccfd446c3f11e8",
+      "patch": "@@ -61,6 +61,26 @@ describe(\"gateway server chat\", () => {\n     await server.close();\n   });\n \n+  test(\"chat.send forwards sessionKey to agentCommand\", async () => {\n+    const { server, ws } = await startServerWithClient();\n+    await connectOk(ws);\n+\n+    const res = await rpcReq(ws, \"chat.send\", {\n+      sessionKey: \"agent:main:subagent:abc\",\n+      message: \"hello\",\n+      idempotencyKey: \"idem-session-key-1\",\n+    });\n+    expect(res.ok).toBe(true);\n+\n+    const call = vi.mocked(agentCommand).mock.calls.at(-1)?.[0] as\n+      | { sessionKey?: string }\n+      | undefined;\n+    expect(call?.sessionKey).toBe(\"agent:main:subagent:abc\");\n+\n+    ws.close();\n+    await server.close();\n+  });\n+\n   test(\"chat.send blocked by send policy\", async () => {\n     const dir = await fs.mkdtemp(path.join(os.tmpdir(), \"clawdbot-gw-\"));\n     testState.sessionStorePath = path.join(dir, \"sessions.json\");"
+    },
+    {
+      "sha": "a885014dfb43dc57036b627f9ec75f02ec51a332",
+      "filename": "src/gateway/server.node-bridge.test.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/937e0265a3591287818454735fccfd446c3f11e8/src%2Fgateway%2Fserver.node-bridge.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/937e0265a3591287818454735fccfd446c3f11e8/src%2Fgateway%2Fserver.node-bridge.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fserver.node-bridge.test.ts?ref=937e0265a3591287818454735fccfd446c3f11e8",
+      "patch": "@@ -758,6 +758,7 @@ describe(\"gateway server node/bridge\", () => {\n     expect(spy.mock.calls.length).toBe(beforeCalls + 1);\n     const call = spy.mock.calls.at(-1)?.[0] as Record<string, unknown>;\n     expect(call.sessionId).toBe(\"sess-main\");\n+    expect(call.sessionKey).toBe(\"main\");\n     expect(call.deliver).toBe(false);\n     expect(call.messageProvider).toBe(\"node\");\n "
+    }
+  ]
+}

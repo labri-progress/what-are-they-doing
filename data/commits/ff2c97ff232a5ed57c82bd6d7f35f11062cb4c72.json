@@ -1,0 +1,77 @@
+{
+  "message": "fix: Add GPTSynaptic compatibility across evaluation and inference paths\n\nEnsure consistent handling of GPTSynaptic return signature (logits, loss)\nacross all evaluation, inference, and training scripts. GPTSynaptic.forward()\nreturns a tuple (logits, loss) when targets are provided, unlike GPT which\nreturns logits directly.\n\nChanges:\n- engine.py: Handle tuple return in prefill and decode paths for text\n  generation. Extract logits from tuple when model returns (logits, None).\n- checkpoint_manager.py: Fix SynapticConfig initialization when loading\n  synaptic models from checkpoints. Ensure syn_cfg is properly passed to\n  GPTSynapticConfig constructor.\n- base_eval.py: Wrap ModelWrapper to handle both GPT and GPTSynaptic return\n  signatures. Return LogitsWrapper object for HuggingFace-style .logits access.\n- base_loss.py: Add forward wrapper for GPTSynaptic during BPB evaluation.\n  Wraps forward to compute loss_per_token when loss_reduction='none' is\n  requested, maintaining compatibility with existing evaluation code.\n- chat_eval.py: Extract logits from tuple return in categorical evaluation\n  when model is GPTSynaptic.\n- chat_rl.py: Handle GPTSynaptic signature in RL training loop. Compute\n  log probabilities from logits when model is GPTSynaptic, maintaining\n  compatibility with policy gradient objective calculation.\n\nAll changes maintain backward compatibility with GPT models while properly\nsupporting GPTSynaptic's dual return signature. Detection uses hasattr()\nchecks on model.config.synapses to determine model type.",
+  "files": [
+    {
+      "sha": "85c58def0b49fe5f26673ee932fa1d0482008005",
+      "filename": "nanochat/checkpoint_manager.py",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/bio_inspired_nanochat/blob/ff2c97ff232a5ed57c82bd6d7f35f11062cb4c72/nanochat%2Fcheckpoint_manager.py",
+      "raw_url": "https://github.com/Dicklesworthstone/bio_inspired_nanochat/raw/ff2c97ff232a5ed57c82bd6d7f35f11062cb4c72/nanochat%2Fcheckpoint_manager.py",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/bio_inspired_nanochat/contents/nanochat%2Fcheckpoint_manager.py?ref=ff2c97ff232a5ed57c82bd6d7f35f11062cb4c72",
+      "patch": "@@ -94,13 +94,16 @@ def build_model(checkpoint_dir, step, device, phase):\n     # Check if this is a synaptic model\n     if meta_data.get(\"synapses\", False):\n         assert GPTSynaptic is not None, \"gpt_synaptic not found but synapses=True in metadata\"\n+        from nanochat.synaptic import SynapticConfig\n+        syn_cfg = SynapticConfig()  # Use defaults; could load from meta_data if saved\n         model_config = GPTSynapticConfig(\n             sequence_len=model_config_kwargs[\"sequence_len\"],\n             vocab_size=model_config_kwargs[\"vocab_size\"],\n             n_layer=model_config_kwargs[\"n_layer\"],\n             n_head=model_config_kwargs[\"n_head\"],\n             n_kv_head=model_config_kwargs.get(\"n_kv_head\", model_config_kwargs[\"n_head\"]),\n             n_embd=model_config_kwargs[\"n_embd\"],\n+            syn_cfg=syn_cfg,\n         )\n         with torch.device(\"meta\"):\n             model = GPTSynaptic(model_config)"
+    },
+    {
+      "sha": "f837d3b0a3a47bb1e907db64cb9ebfd7f479dc34",
+      "filename": "nanochat/engine.py",
+      "status": "modified",
+      "additions": 12,
+      "deletions": 2,
+      "changes": 14,
+      "blob_url": "https://github.com/Dicklesworthstone/bio_inspired_nanochat/blob/ff2c97ff232a5ed57c82bd6d7f35f11062cb4c72/nanochat%2Fengine.py",
+      "raw_url": "https://github.com/Dicklesworthstone/bio_inspired_nanochat/raw/ff2c97ff232a5ed57c82bd6d7f35f11062cb4c72/nanochat%2Fengine.py",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/bio_inspired_nanochat/contents/nanochat%2Fengine.py?ref=ff2c97ff232a5ed57c82bd6d7f35f11062cb4c72",
+      "patch": "@@ -216,7 +216,12 @@ def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_\n             **kv_model_kwargs,\n         )\n         ids = torch.tensor([tokens], dtype=torch.long, device=device)\n-        logits = self.model.forward(ids, kv_cache=kv_cache_prefill)\n+        result = self.model.forward(ids, kv_cache=kv_cache_prefill)\n+        # Handle both GPT (returns logits) and GPTSynaptic (returns (logits, None))\n+        if isinstance(result, tuple):\n+            logits, _ = result\n+        else:\n+            logits = result\n         logits = logits[:, -1, :]\n         next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1)\n         sampled_tokens = next_ids[:, 0].tolist()\n@@ -253,7 +258,12 @@ def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_\n                 first_iteration = False\n             else:\n                 # Forward the model and get the next token for each row\n-                logits = self.model.forward(ids, kv_cache=kv_cache_decode)  # (B, T, vocab_size)\n+                result = self.model.forward(ids, kv_cache=kv_cache_decode)  # (B, T, vocab_size) or (logits, None)\n+                # Handle both GPT (returns logits) and GPTSynaptic (returns (logits, None))\n+                if isinstance(result, tuple):\n+                    logits, _ = result\n+                else:\n+                    logits = result\n                 logits = logits[:, -1, :]  # (B, vocab_size) at last time step\n                 next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1)\n                 sampled_tokens = next_ids[:, 0].tolist()"
+    },
+    {
+      "sha": "1fd7e132f9f3028862299ce43f508fb3cc055970",
+      "filename": "scripts/base_eval.py",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 3,
+      "changes": 14,
+      "blob_url": "https://github.com/Dicklesworthstone/bio_inspired_nanochat/blob/ff2c97ff232a5ed57c82bd6d7f35f11062cb4c72/scripts%2Fbase_eval.py",
+      "raw_url": "https://github.com/Dicklesworthstone/bio_inspired_nanochat/raw/ff2c97ff232a5ed57c82bd6d7f35f11062cb4c72/scripts%2Fbase_eval.py",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/bio_inspired_nanochat/contents/scripts%2Fbase_eval.py?ref=ff2c97ff232a5ed57c82bd6d7f35f11062cb4c72",
+      "patch": "@@ -126,9 +126,17 @@ def __init__(self, model, max_seq_len=None):\n         self.max_seq_len = max_seq_len\n \n     def __call__(self, input_ids):\n-        outputs = self.model(input_ids)\n-        logits = outputs.logits\n-        return logits\n+        result = self.model(input_ids)\n+        # Handle both GPT (returns logits) and GPTSynaptic (returns (logits, None))\n+        if isinstance(result, tuple):\n+            logits, _ = result\n+        else:\n+            logits = result\n+        # Wrap in a simple object for compatibility with HuggingFace-style access\n+        class LogitsWrapper:\n+            def __init__(self, logits):\n+                self.logits = logits\n+        return LogitsWrapper(logits)\n \n def load_hf_model(hf_path: str, device):\n     print0(f\"Loading model from: {hf_path}\")"
+    },
+    {
+      "sha": "2d0c66c9a698f1293d28c794295302514e8fd640",
+      "filename": "scripts/base_loss.py",
+      "status": "modified",
+      "additions": 23,
+      "deletions": 0,
+      "changes": 23,
+      "blob_url": "https://github.com/Dicklesworthstone/bio_inspired_nanochat/blob/ff2c97ff232a5ed57c82bd6d7f35f11062cb4c72/scripts%2Fbase_loss.py",
+      "raw_url": "https://github.com/Dicklesworthstone/bio_inspired_nanochat/raw/ff2c97ff232a5ed57c82bd6d7f35f11062cb4c72/scripts%2Fbase_loss.py",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/bio_inspired_nanochat/contents/scripts%2Fbase_loss.py?ref=ff2c97ff232a5ed57c82bd6d7f35f11062cb4c72",
+      "patch": "@@ -37,13 +37,36 @@\n steps = split_tokens // tokens_per_step\n token_bytes = get_token_bytes(device=device)\n bpb_results = {}\n+# Handle GPTSynaptic return signature for evaluate_bpb\n+is_synaptic = hasattr(model, 'config') and getattr(model.config, 'synapses', False)\n+if is_synaptic:\n+    import torch.nn.functional as F\n+    orig_forward = model.forward\n+    def syn_forward_wrapper(idx, targets=None, kv_cache=None, loss_reduction='mean', **kwargs):\n+        if targets is not None:\n+            logits, loss = orig_forward(idx, targets, kv_cache, train_mode=False)\n+            if loss_reduction == 'none':\n+                logits_flat = logits.view(-1, logits.size(-1))\n+                targets_flat = targets.view(-1)\n+                loss_per_token = F.cross_entropy(logits_flat, targets_flat, reduction='none', ignore_index=-1)\n+                return loss_per_token.view(targets.shape)\n+            return loss\n+        else:\n+            logits, _ = orig_forward(idx, None, kv_cache, train_mode=False)\n+            return logits\n+    model.forward = syn_forward_wrapper\n+\n for split_name in [\"train\", \"val\"]:\n     loader = tokenizing_distributed_data_loader(device_batch_size, sequence_len, split_name, device=device)\n     with autocast_ctx:\n         bpb = evaluate_bpb(model, loader, steps, token_bytes)\n     print0(f\"{split_name} bpb: {bpb:.4f}\")\n     bpb_results[split_name] = bpb\n \n+# Restore original forward if we wrapped it\n+if is_synaptic:\n+    model.forward = orig_forward\n+\n # Master process also samples from the model\n samples = []\n if ddp_rank == 0:"
+    },
+    {
+      "sha": "d3798f01686b12f6385465f99aaa3de57b7ce5f8",
+      "filename": "scripts/chat_eval.py",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 1,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/bio_inspired_nanochat/blob/ff2c97ff232a5ed57c82bd6d7f35f11062cb4c72/scripts%2Fchat_eval.py",
+      "raw_url": "https://github.com/Dicklesworthstone/bio_inspired_nanochat/raw/ff2c97ff232a5ed57c82bd6d7f35f11062cb4c72/scripts%2Fchat_eval.py",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/bio_inspired_nanochat/contents/scripts%2Fchat_eval.py?ref=ff2c97ff232a5ed57c82bd6d7f35f11062cb4c72",
+      "patch": "@@ -114,7 +114,12 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems\n \n         # Get the logits for the whole batch of conversations in parallel (efficiency win here)\n         with torch.no_grad():\n-            logits = model(prompt_ids) # (B, T, V)\n+            result = model(prompt_ids) # (B, T, V) or (logits, None)\n+            # Handle both GPT (returns logits) and GPTSynaptic (returns (logits, None))\n+            if isinstance(result, tuple):\n+                logits, _ = result\n+            else:\n+                logits = result\n \n         # Focus on the available answer on just the letters corresponding to choices\n         # Note that this helps the evaluation a lot because it specifically narrows the focus to only the available letters"
+    },
+    {
+      "sha": "614d4d73705377cbef120855cc731c1455719643",
+      "filename": "scripts/chat_rl.py",
+      "status": "modified",
+      "additions": 12,
+      "deletions": 1,
+      "changes": 13,
+      "blob_url": "https://github.com/Dicklesworthstone/bio_inspired_nanochat/blob/ff2c97ff232a5ed57c82bd6d7f35f11062cb4c72/scripts%2Fchat_rl.py",
+      "raw_url": "https://github.com/Dicklesworthstone/bio_inspired_nanochat/raw/ff2c97ff232a5ed57c82bd6d7f35f11062cb4c72/scripts%2Fchat_rl.py",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/bio_inspired_nanochat/contents/scripts%2Fchat_rl.py?ref=ff2c97ff232a5ed57c82bd6d7f35f11062cb4c72",
+      "patch": "@@ -21,6 +21,7 @@\n import re\n import wandb\n import torch\n+import torch.nn.functional as F\n import torch.distributed as dist\n \n from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb\n@@ -258,7 +259,17 @@ def get_lr_multiplier(it):\n             advantages = advantages_all[b0:b1]\n             # Calculate log probabilities. Note that the loss calculates NLL = -logp, so we negate\n             with autocast_ctx:\n-                logp = -model(inputs, targets, loss_reduction='none').view_as(inputs) # (B, T)\n+                # Handle both GPT and GPTSynaptic signatures\n+                if hasattr(model, 'config') and getattr(model.config, 'synapses', False):\n+                    # GPTSynaptic: forward returns (logits, loss), need to compute loss ourselves\n+                    logits, _ = model(inputs, targets, train_mode=True)\n+                    logits_flat = logits.view(-1, logits.size(-1))\n+                    targets_flat = targets.view(-1)\n+                    loss_per_token = F.cross_entropy(logits_flat, targets_flat, reduction='none', ignore_index=-1)\n+                    logp = -loss_per_token.view_as(inputs)\n+                else:\n+                    # GPT: forward accepts loss_reduction='none'\n+                    logp = -model(inputs, targets, loss_reduction='none').view_as(inputs) # (B, T)\n             # Calculate the PG objective. Note that ignore_index=-1 ensures that invalid tokens have loss 0.\n             pg_obj = (logp * advantages.unsqueeze(-1)).sum()\n             # normalize by the number of valid tokens, number of passes, and examples_per_rank"
+    }
+  ]
+}

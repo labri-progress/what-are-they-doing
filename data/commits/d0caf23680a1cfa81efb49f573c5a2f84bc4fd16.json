@@ -1,0 +1,65 @@
+{
+  "message": "fix(linux): enable screencast over SSH by using desktop display\n\n- On Linux via SSH, skip headless mode and use DISPLAY=:0 to connect\n  to the desktop's X server (Chrome headless doesn't support screencast)\n- Disable SHM over SSH (remote SHM not accessible by local terminal)\n- Add explicit PNG dimensions for Kitty graphics over SSH\n- Default terminal detection to true for SSH compatibility\n- Add TERMWEB_DEBUG conditional logging for WebSocket\n\nThis allows termweb to work over SSH when the Linux desktop is running,\nby rendering Chrome to the desktop's display and streaming via CDP.",
+  "files": [
+    {
+      "sha": "1b95f8acee7819a09c0555538b6fd8ead4969c25",
+      "filename": "src/chrome/launcher.zig",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 5,
+      "changes": 27,
+      "blob_url": "https://github.com/teamchong/termweb/blob/d0caf23680a1cfa81efb49f573c5a2f84bc4fd16/src%2Fchrome%2Flauncher.zig",
+      "raw_url": "https://github.com/teamchong/termweb/raw/d0caf23680a1cfa81efb49f573c5a2f84bc4fd16/src%2Fchrome%2Flauncher.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/termweb/contents/src%2Fchrome%2Flauncher.zig?ref=d0caf23680a1cfa81efb49f573c5a2f84bc4fd16",
+      "patch": "@@ -404,7 +404,21 @@ pub fn launchChromePipe(\n     try args_list.append(allocator, chrome_bin.path);\n \n     if (options.headless) {\n-        try args_list.append(allocator, \"--headless=new\");\n+        // On Linux via SSH, skip headless mode and use the desktop's display instead\n+        // Chrome headless on Linux doesn't support screencast\n+        const is_ssh = std.posix.getenv(\"SSH_CONNECTION\") != null or std.posix.getenv(\"SSH_CLIENT\") != null;\n+        const has_display = std.posix.getenv(\"DISPLAY\") != null;\n+\n+        if (builtin.os.tag == .linux and is_ssh and has_display) {\n+            // SSH with display available - don't use headless, Chrome will use DISPLAY\n+            // This allows screencast to work over SSH when desktop is running\n+        } else if (builtin.os.tag == .linux and is_ssh) {\n+            // SSH without display - set DISPLAY=:0 to use desktop's display\n+            const setenv = @extern(*const fn ([*:0]const u8, [*:0]const u8, c_int) callconv(.c) c_int, .{ .name = \"setenv\" });\n+            _ = setenv(\"DISPLAY\", \":0\", 1);\n+        } else {\n+            try args_list.append(allocator, \"--headless=new\");\n+        }\n     }\n \n     // NOTE: Using WebSocket only (no pipe) to allow extensions in headless mode\n@@ -455,9 +469,8 @@ pub fn launchChromePipe(\n         try args_list.append(allocator, \"--disable-software-rasterizer\");\n     }\n \n-    // Linux headless: disable GPU to force software rendering for screencast\n+    // Linux headless: minimal flags (avoid --disable-gpu which blocks screencast)\n     if (builtin.os.tag == .linux and options.headless) {\n-        try args_list.append(allocator, \"--disable-gpu\");\n         try args_list.append(allocator, \"--disable-dev-shm-usage\");\n     }\n \n@@ -516,8 +529,12 @@ pub fn launchChromePipe(\n         const path = path_z;\n \n         // Unset DISPLAY to prevent X11 connection attempts in headless mode\n-        const unsetenv = @extern(*const fn ([*:0]const u8) callconv(.c) c_int, .{ .name = \"unsetenv\" });\n-        _ = unsetenv(\"DISPLAY\");\n+        // But keep DISPLAY on Linux via SSH so Chrome can use the desktop's display\n+        const is_ssh_child = std.posix.getenv(\"SSH_CONNECTION\") != null or std.posix.getenv(\"SSH_CLIENT\") != null;\n+        if (!(builtin.os.tag == .linux and is_ssh_child)) {\n+            const unsetenv = @extern(*const fn ([*:0]const u8) callconv(.c) c_int, .{ .name = \"unsetenv\" });\n+            _ = unsetenv(\"DISPLAY\");\n+        }\n \n         const envp = std.c.environ;\n "
+    },
+    {
+      "sha": "6d8ccfa29152dd7f0297a2f25e4525c4ce580df7",
+      "filename": "src/chrome/websocket_cdp.zig",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 1,
+      "changes": 10,
+      "blob_url": "https://github.com/teamchong/termweb/blob/d0caf23680a1cfa81efb49f573c5a2f84bc4fd16/src%2Fchrome%2Fwebsocket_cdp.zig",
+      "raw_url": "https://github.com/teamchong/termweb/raw/d0caf23680a1cfa81efb49f573c5a2f84bc4fd16/src%2Fchrome%2Fwebsocket_cdp.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/termweb/contents/src%2Fchrome%2Fwebsocket_cdp.zig?ref=d0caf23680a1cfa81efb49f573c5a2f84bc4fd16",
+      "patch": "@@ -520,15 +520,23 @@ pub const WebSocketCdpClient = struct {\n \n     /// Handle Page.screencastFrame event\n     fn handleScreencastFrame(self: *WebSocketCdpClient, payload: []const u8) !void {\n-        const pool = self.frame_pool orelse return; // No pool = not initialized\n+        const pool = self.frame_pool orelse {\n+            logToFile(\"[WS] handleScreencastFrame: frame_pool is null!\\n\", .{});\n+            return; // No pool = not initialized\n+        };\n \n         const frame_sid = try self.extractFrameSessionId(payload);\n         const data = try self.extractScreencastData(payload);\n         const device_width = self.extractMetadataInt(payload, \"deviceWidth\") catch 0;\n         const device_height = self.extractMetadataInt(payload, \"deviceHeight\") catch 0;\n \n+        logToFile(\"[WS] handleScreencastFrame: writing frame sid={} data_len={} {}x{}\\n\", .{ frame_sid, data.len, device_width, device_height });\n+\n         if (try pool.writeFrame(data, frame_sid, device_width, device_height)) |_| {\n             _ = self.frame_count.fetchAdd(1, .monotonic);\n+            logToFile(\"[WS] handleScreencastFrame: frame written, count={}\\n\", .{self.frame_count.load(.monotonic)});\n+        } else {\n+            logToFile(\"[WS] handleScreencastFrame: writeFrame returned null\\n\", .{});\n         }\n \n         // ACK immediately - don't block reader thread"
+    },
+    {
+      "sha": "19c76036a00a57e5d3bf51a58841c5212f8750d9",
+      "filename": "src/viewer.zig",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 1,
+      "changes": 6,
+      "blob_url": "https://github.com/teamchong/termweb/blob/d0caf23680a1cfa81efb49f573c5a2f84bc4fd16/src%2Fviewer.zig",
+      "raw_url": "https://github.com/teamchong/termweb/raw/d0caf23680a1cfa81efb49f573c5a2f84bc4fd16/src%2Fviewer.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/termweb/contents/src%2Fviewer.zig?ref=d0caf23680a1cfa81efb49f573c5a2f84bc4fd16",
+      "patch": "@@ -136,6 +136,7 @@ pub const Viewer = struct {\n \n     // Screencast streaming\n     screencast_mode: bool,\n+    screenshot_polling_mode: bool, // Fallback when screencast doesn't work (Linux headless)\n     screencast_format: screenshot_api.ScreenshotFormat,\n     last_frame_time: i128,\n     last_frame_width: u32,  // Current frame width from screencast\n@@ -281,8 +282,10 @@ pub const Viewer = struct {\n \n         // Initialize SHM buffer for zero-copy Kitty rendering\n         // Size: max viewport * 4 bytes (RGBA)\n+        // Disable SHM over SSH - remote SHM can't be read by local terminal\n+        const is_ssh = std.posix.getenv(\"SSH_CONNECTION\") != null or std.posix.getenv(\"SSH_CLIENT\") != null;\n         const shm_size = viewport_width * viewport_height * 4;\n-        const shm_buffer = ShmBuffer.init(shm_size) catch null;\n+        const shm_buffer = if (is_ssh) null else ShmBuffer.init(shm_size) catch null;\n         const screencast_format: screenshot_api.ScreenshotFormat = if (shm_buffer == null) .png else .jpeg;\n \n         // Frame dimensions from screencast are the source of truth for coordinate mapping\n@@ -314,6 +317,7 @@ pub const Viewer = struct {\n             .coord_mapper = null,\n             .last_click = null,\n             .screencast_mode = false,\n+            .screenshot_polling_mode = false,\n             .screencast_format = screencast_format,\n             .last_frame_time = 0,\n             .last_frame_width = viewport_width,"
+    },
+    {
+      "sha": "7e38bfd7dd680b8ba4fb91123f33db9deb5b677d",
+      "filename": "src/viewer/helpers.zig",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 2,
+      "changes": 11,
+      "blob_url": "https://github.com/teamchong/termweb/blob/d0caf23680a1cfa81efb49f573c5a2f84bc4fd16/src%2Fviewer%2Fhelpers.zig",
+      "raw_url": "https://github.com/teamchong/termweb/raw/d0caf23680a1cfa81efb49f573c5a2f84bc4fd16/src%2Fviewer%2Fhelpers.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/termweb/contents/src%2Fviewer%2Fhelpers.zig?ref=d0caf23680a1cfa81efb49f573c5a2f84bc4fd16",
+      "patch": "@@ -148,21 +148,28 @@ pub fn envVarTruthy(allocator: std.mem.Allocator, name: []const u8) bool {\n         std.mem.eql(u8, value, \"yes\");\n }\n \n-/// Check if running in Ghostty terminal\n+/// Check if running in Ghostty terminal (or compatible Kitty graphics terminal)\n+/// Defaults to true for SSH connections or unknown terminals to support remote usage\n pub fn isGhosttyTerminal(allocator: std.mem.Allocator) bool {\n     const term_program = std.process.getEnvVarOwned(allocator, \"TERM_PROGRAM\") catch null;\n     if (term_program) |tp| {\n         defer allocator.free(tp);\n         if (std.mem.eql(u8, tp, \"ghostty\")) return true;\n+        if (std.mem.eql(u8, tp, \"WezTerm\")) return true;\n     }\n \n     const term = std.process.getEnvVarOwned(allocator, \"TERM\") catch null;\n     if (term) |t| {\n         defer allocator.free(t);\n         if (std.mem.indexOf(u8, t, \"ghostty\") != null) return true;\n+        if (std.mem.indexOf(u8, t, \"kitty\") != null) return true;\n+        if (std.mem.indexOf(u8, t, \"wezterm\") != null) return true;\n     }\n \n-    return false;\n+    // Default to true: assume Kitty graphics support\n+    // This enables SSH usage where TERM may be \"dumb\" or \"xterm-256color\"\n+    // but the local terminal (Ghostty/Kitty/WezTerm) supports graphics\n+    return true;\n }\n \n /// Detect if macOS natural scrolling is enabled"
+    },
+    {
+      "sha": "023d795406bb29dc809ed4449c511c7503629f4d",
+      "filename": "src/viewer/render.zig",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/teamchong/termweb/blob/d0caf23680a1cfa81efb49f573c5a2f84bc4fd16/src%2Fviewer%2Frender.zig",
+      "raw_url": "https://github.com/teamchong/termweb/raw/d0caf23680a1cfa81efb49f573c5a2f84bc4fd16/src%2Fviewer%2Frender.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/termweb/contents/src%2Fviewer%2Frender.zig?ref=d0caf23680a1cfa81efb49f573c5a2f84bc4fd16",
+      "patch": "@@ -337,6 +337,9 @@ pub fn displayFrameWithDimensions(viewer: anytype, base64_png: []const u8) !void\n         .y_offset = @intCast(y_offset),\n         .image_id = 100, // Fixed ID for content\n         .z = z_index,\n+        // Explicit dimensions for PNG (required for some terminals over SSH)\n+        .width = frame_width,\n+        .height = frame_height,\n     };\n \n     const render_t1 = std.time.nanoTimestamp();"
+    }
+  ]
+}

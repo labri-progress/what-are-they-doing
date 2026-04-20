@@ -1,0 +1,53 @@
+{
+  "message": "fix(nextcloud-talk): keep startAccount pending until abort (#27897)",
+  "files": [
+    {
+      "sha": "0973119584f7a9fab8e0f1f3da78e91f4b7f4248",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/31c0b04c49b536f87f6e29104693c0f245a80e91/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/31c0b04c49b536f87f6e29104693c0f245a80e91/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=31c0b04c49b536f87f6e29104693c0f245a80e91",
+      "patch": "@@ -20,6 +20,7 @@ Docs: https://docs.openclaw.ai\n - Delivery queue/recovery backoff: prevent retry starvation by persisting `lastAttemptAt` on failed sends and deferring recovery retries until each entry's `lastAttemptAt + backoff` window is eligible, while continuing to recover ready entries behind deferred ones. Landed from contributor PR #27710 by @Jimmy-xuzimo. Thanks @Jimmy-xuzimo.\n - Google Chat/Lifecycle: keep Google Chat `startAccount` pending until abort in webhook mode so startup is no longer interpreted as immediate exit, preventing auto-restart loops and webhook-target churn. (#27384) thanks @junsuwhy.\n - Temp dirs/Linux umask: force `0700` permissions after temp-dir creation and self-heal existing writable temp dirs before trust checks so `umask 0002` installs no longer crash-loop on startup. Landed from contributor PR #27860 by @stakeswky. (#27853) Thanks @stakeswky.\n+- Nextcloud Talk/Lifecycle: keep `startAccount` pending until abort and stop the webhook monitor on shutdown, preventing `EADDRINUSE` restart loops when the gateway manages account lifecycle. (#27897)\n - Microsoft Teams/File uploads: acknowledge `fileConsent/invoke` immediately (`invokeResponse` before upload + file card send) so Teams no longer shows false \"Something went wrong\" timeout banners while upload completion continues asynchronously; includes updated async regression coverage. Landed from contributor PR #27641 by @scz2011.\n - Queue/Drain/Cron reliability: harden lane draining with guaranteed `draining` flag reset on synchronous pump failures, reject new queue enqueues during gateway restart drain windows (instead of silently killing accepted tasks), add `/stop` queued-backlog cutoff metadata with stale-message skipping (while avoiding cross-session native-stop cutoff bleed), and raise isolated cron `agentTurn` outer safety timeout to avoid false 10-minute timeout races against longer agent session timeouts. (#27407, #27332, #27427)\n - Typing/Main reply pipeline: always mark dispatch idle in `agent-runner` finalization so typing cleanup runs even when dispatcher `onIdle` does not fire, preventing stuck typing indicators after run completion. (#27250) Thanks @Sid-Qin."
+    },
+    {
+      "sha": "68f8490efb9784dc79b82eec16f05965bab23f3e",
+      "filename": "extensions/nextcloud-talk/src/channel.startup.test.ts",
+      "status": "added",
+      "additions": 115,
+      "deletions": 0,
+      "changes": 115,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/31c0b04c49b536f87f6e29104693c0f245a80e91/extensions%2Fnextcloud-talk%2Fsrc%2Fchannel.startup.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/31c0b04c49b536f87f6e29104693c0f245a80e91/extensions%2Fnextcloud-talk%2Fsrc%2Fchannel.startup.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fnextcloud-talk%2Fsrc%2Fchannel.startup.test.ts?ref=31c0b04c49b536f87f6e29104693c0f245a80e91",
+      "patch": "@@ -0,0 +1,115 @@\n+import type {\n+  ChannelAccountSnapshot,\n+  ChannelGatewayContext,\n+  OpenClawConfig,\n+} from \"openclaw/plugin-sdk\";\n+import { afterEach, describe, expect, it, vi } from \"vitest\";\n+import { createRuntimeEnv } from \"../../test-utils/runtime-env.js\";\n+import type { ResolvedNextcloudTalkAccount } from \"./accounts.js\";\n+\n+const hoisted = vi.hoisted(() => ({\n+  monitorNextcloudTalkProvider: vi.fn(),\n+}));\n+\n+vi.mock(\"./monitor.js\", async () => {\n+  const actual = await vi.importActual<typeof import(\"./monitor.js\")>(\"./monitor.js\");\n+  return {\n+    ...actual,\n+    monitorNextcloudTalkProvider: hoisted.monitorNextcloudTalkProvider,\n+  };\n+});\n+\n+import { nextcloudTalkPlugin } from \"./channel.js\";\n+\n+function createStartAccountCtx(params: {\n+  account: ResolvedNextcloudTalkAccount;\n+  abortSignal: AbortSignal;\n+}): ChannelGatewayContext<ResolvedNextcloudTalkAccount> {\n+  const snapshot: ChannelAccountSnapshot = {\n+    accountId: params.account.accountId,\n+    configured: true,\n+    enabled: true,\n+    running: false,\n+  };\n+  return {\n+    accountId: params.account.accountId,\n+    account: params.account,\n+    cfg: {} as OpenClawConfig,\n+    runtime: createRuntimeEnv(),\n+    abortSignal: params.abortSignal,\n+    log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },\n+    getStatus: () => snapshot,\n+    setStatus: (next) => {\n+      Object.assign(snapshot, next);\n+    },\n+  };\n+}\n+\n+function buildAccount(): ResolvedNextcloudTalkAccount {\n+  return {\n+    accountId: \"default\",\n+    enabled: true,\n+    baseUrl: \"https://nextcloud.example.com\",\n+    secret: \"secret\",\n+    secretSource: \"config\",\n+    config: {\n+      baseUrl: \"https://nextcloud.example.com\",\n+      botSecret: \"secret\",\n+      webhookPath: \"/nextcloud-talk-webhook\",\n+      webhookPort: 8788,\n+    },\n+  };\n+}\n+\n+describe(\"nextcloudTalkPlugin gateway.startAccount\", () => {\n+  afterEach(() => {\n+    vi.clearAllMocks();\n+  });\n+\n+  it(\"keeps startAccount pending until abort, then stops the monitor\", async () => {\n+    const stop = vi.fn();\n+    hoisted.monitorNextcloudTalkProvider.mockResolvedValue({ stop });\n+    const abort = new AbortController();\n+\n+    const task = nextcloudTalkPlugin.gateway!.startAccount!(\n+      createStartAccountCtx({\n+        account: buildAccount(),\n+        abortSignal: abort.signal,\n+      }),\n+    );\n+\n+    await new Promise((resolve) => setTimeout(resolve, 20));\n+\n+    let settled = false;\n+    void task.then(() => {\n+      settled = true;\n+    });\n+\n+    await new Promise((resolve) => setTimeout(resolve, 20));\n+    expect(settled).toBe(false);\n+    expect(hoisted.monitorNextcloudTalkProvider).toHaveBeenCalledOnce();\n+    expect(stop).not.toHaveBeenCalled();\n+\n+    abort.abort();\n+    await task;\n+\n+    expect(stop).toHaveBeenCalledOnce();\n+  });\n+\n+  it(\"stops immediately when startAccount receives an already-aborted signal\", async () => {\n+    const stop = vi.fn();\n+    hoisted.monitorNextcloudTalkProvider.mockResolvedValue({ stop });\n+    const abort = new AbortController();\n+    abort.abort();\n+\n+    await nextcloudTalkPlugin.gateway!.startAccount!(\n+      createStartAccountCtx({\n+        account: buildAccount(),\n+        abortSignal: abort.signal,\n+      }),\n+    );\n+\n+    expect(hoisted.monitorNextcloudTalkProvider).toHaveBeenCalledOnce();\n+    expect(stop).toHaveBeenCalledOnce();\n+  });\n+});"
+    },
+    {
+      "sha": "e49f057878cd3d33280cc03606bada2392e62ec2",
+      "filename": "extensions/nextcloud-talk/src/channel.ts",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 1,
+      "changes": 5,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/31c0b04c49b536f87f6e29104693c0f245a80e91/extensions%2Fnextcloud-talk%2Fsrc%2Fchannel.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/31c0b04c49b536f87f6e29104693c0f245a80e91/extensions%2Fnextcloud-talk%2Fsrc%2Fchannel.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fnextcloud-talk%2Fsrc%2Fchannel.ts?ref=31c0b04c49b536f87f6e29104693c0f245a80e91",
+      "patch": "@@ -12,6 +12,7 @@ import {\n   type OpenClawConfig,\n   type ChannelSetupInput,\n } from \"openclaw/plugin-sdk\";\n+import { waitForAbortSignal } from \"../../../src/infra/abort-signal.js\";\n import {\n   listNextcloudTalkAccountIds,\n   resolveDefaultNextcloudTalkAccountId,\n@@ -332,7 +333,9 @@ export const nextcloudTalkPlugin: ChannelPlugin<ResolvedNextcloudTalkAccount> =\n         statusSink: (patch) => ctx.setStatus({ accountId: ctx.accountId, ...patch }),\n       });\n \n-      return { stop };\n+      // Keep webhook channels pending for the account lifecycle.\n+      await waitForAbortSignal(ctx.abortSignal);\n+      stop();\n     },\n     logoutAccount: async ({ accountId, cfg }) => {\n       const nextCfg = { ...cfg } as OpenClawConfig;"
+    },
+    {
+      "sha": "2de886864b7575b708375aa572fad76e45669df3",
+      "filename": "extensions/nextcloud-talk/src/monitor.ts",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 2,
+      "changes": 24,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/31c0b04c49b536f87f6e29104693c0f245a80e91/extensions%2Fnextcloud-talk%2Fsrc%2Fmonitor.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/31c0b04c49b536f87f6e29104693c0f245a80e91/extensions%2Fnextcloud-talk%2Fsrc%2Fmonitor.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fnextcloud-talk%2Fsrc%2Fmonitor.ts?ref=31c0b04c49b536f87f6e29104693c0f245a80e91",
+      "patch": "@@ -276,12 +276,25 @@ export function createNextcloudTalkWebhookServer(opts: NextcloudTalkWebhookServe\n     });\n   };\n \n+  let stopped = false;\n   const stop = () => {\n-    server.close();\n+    if (stopped) {\n+      return;\n+    }\n+    stopped = true;\n+    try {\n+      server.close();\n+    } catch {\n+      // ignore close races while shutting down\n+    }\n   };\n \n   if (abortSignal) {\n-    abortSignal.addEventListener(\"abort\", stop, { once: true });\n+    if (abortSignal.aborted) {\n+      stop();\n+    } else {\n+      abortSignal.addEventListener(\"abort\", stop, { once: true });\n+    }\n   }\n \n   return { server, start, stop };\n@@ -384,7 +397,14 @@ export async function monitorNextcloudTalkProvider(\n     abortSignal: opts.abortSignal,\n   });\n \n+  if (opts.abortSignal?.aborted) {\n+    return { stop };\n+  }\n   await start();\n+  if (opts.abortSignal?.aborted) {\n+    stop();\n+    return { stop };\n+  }\n \n   const publicUrl =\n     account.config.webhookPublicUrl ??"
+    }
+  ]
+}

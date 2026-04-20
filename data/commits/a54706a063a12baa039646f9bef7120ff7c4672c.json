@@ -1,0 +1,65 @@
+{
+  "message": "fix: throttle cli credential sync",
+  "files": [
+    {
+      "sha": "8c0f45586a5c4c62122d41bebf2a219783ea6180",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/a54706a063a12baa039646f9bef7120ff7c4672c/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/a54706a063a12baa039646f9bef7120ff7c4672c/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=a54706a063a12baa039646f9bef7120ff7c4672c",
+      "patch": "@@ -11,6 +11,7 @@\n - Auto-reply: prefer `RawBody` for command/directive parsing (WhatsApp + Discord) and prevent fallback runs from clobbering concurrent session updates. (#643) \u2014 thanks @mcinteerj.\n - Agents/OpenAI: fix Responses tool-only \u2192 follow-up turn handling (avoid standalone `reasoning` items that trigger 400 \u201crequired following item\u201d).\n - Auth: update Claude Code keychain credentials in-place during refresh sync; share JSON file helpers; add CLI fallback coverage.\n+- Auth: throttle external CLI credential syncs (Claude/Codex), reduce Keychain reads, and skip sync when cached credentials are still fresh.\n - Onboarding/Gateway: persist non-interactive gateway token auth in config; add WS wizard + gateway tool-calling regression coverage.\n - Gateway/Control UI: make `chat.send` non-blocking, wire Stop to `chat.abort`, and treat `/stop` as an out-of-band abort. (#653)\n - Gateway/Control UI: allow `chat.abort` without `runId` (abort active runs), suppress post-abort chat streaming, and prune stuck chat runs. (#653)"
+    },
+    {
+      "sha": "4016cde2f3d01fee3de34d2ceb6692290a07d1b0",
+      "filename": "src/agents/auth-profiles.ts",
+      "status": "modified",
+      "additions": 38,
+      "deletions": 4,
+      "changes": 42,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/a54706a063a12baa039646f9bef7120ff7c4672c/src%2Fagents%2Fauth-profiles.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/a54706a063a12baa039646f9bef7120ff7c4672c/src%2Fagents%2Fauth-profiles.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fagents%2Fauth-profiles.ts?ref=a54706a063a12baa039646f9bef7120ff7c4672c",
+      "patch": "@@ -16,8 +16,8 @@ import { createSubsystemLogger } from \"../logging.js\";\n import { resolveUserPath } from \"../utils.js\";\n import { resolveClawdbotAgentDir } from \"./agent-paths.js\";\n import {\n-  readClaudeCliCredentials,\n-  readCodexCliCredentials,\n+  readClaudeCliCredentialsCached,\n+  readCodexCliCredentialsCached,\n   writeClaudeCliCredentials,\n } from \"./cli-credentials.js\";\n import { normalizeProviderId } from \"./model-selection.js\";\n@@ -40,6 +40,9 @@ const AUTH_STORE_LOCK_OPTIONS = {\n   stale: 30_000,\n } as const;\n \n+const EXTERNAL_CLI_SYNC_TTL_MS = 15 * 60 * 1000;\n+const EXTERNAL_CLI_NEAR_EXPIRY_MS = 10 * 60 * 1000;\n+\n const log = createSubsystemLogger(\"agents/auth-profiles\");\n \n export type ApiKeyCredential = {\n@@ -363,6 +366,19 @@ function shallowEqualTokenCredentials(\n   );\n }\n \n+function isExternalProfileFresh(\n+  cred: AuthProfileCredential | undefined,\n+  now: number,\n+): boolean {\n+  if (!cred) return false;\n+  if (cred.type !== \"oauth\" && cred.type !== \"token\") return false;\n+  if (cred.provider !== \"anthropic\" && cred.provider !== \"openai-codex\") {\n+    return false;\n+  }\n+  if (typeof cred.expires !== \"number\") return true;\n+  return cred.expires > now + EXTERNAL_CLI_NEAR_EXPIRY_MS;\n+}\n+\n /**\n  * Sync OAuth credentials from external CLI tools (Claude CLI, Codex CLI) into the store.\n  * This allows clawdbot to use the same credentials as these tools without requiring\n@@ -378,7 +394,18 @@ function syncExternalCliCredentials(\n   const now = Date.now();\n \n   // Sync from Claude CLI (supports both OAuth and Token credentials)\n-  const claudeCreds = readClaudeCliCredentials(options);\n+  const existingClaude = store.profiles[CLAUDE_CLI_PROFILE_ID];\n+  const shouldSyncClaude =\n+    !existingClaude ||\n+    existingClaude.provider !== \"anthropic\" ||\n+    existingClaude.type === \"token\" ||\n+    !isExternalProfileFresh(existingClaude, now);\n+  const claudeCreds = shouldSyncClaude\n+    ? readClaudeCliCredentialsCached({\n+        allowKeychainPrompt: options?.allowKeychainPrompt,\n+        ttlMs: EXTERNAL_CLI_SYNC_TTL_MS,\n+      })\n+    : null;\n   if (claudeCreds) {\n     const existing = store.profiles[CLAUDE_CLI_PROFILE_ID];\n     const claudeCredsExpires = claudeCreds.expires ?? 0;\n@@ -438,7 +465,14 @@ function syncExternalCliCredentials(\n   }\n \n   // Sync from Codex CLI\n-  const codexCreds = readCodexCliCredentials();\n+  const existingCodex = store.profiles[CODEX_CLI_PROFILE_ID];\n+  const shouldSyncCodex =\n+    !existingCodex ||\n+    existingCodex.provider !== (\"openai-codex\" as OAuthProvider) ||\n+    !isExternalProfileFresh(existingCodex, now);\n+  const codexCreds = shouldSyncCodex\n+    ? readCodexCliCredentialsCached({ ttlMs: EXTERNAL_CLI_SYNC_TTL_MS })\n+    : null;\n   if (codexCreds) {\n     const existing = store.profiles[CODEX_CLI_PROFILE_ID];\n     const existingOAuth = existing?.type === \"oauth\" ? existing : undefined;"
+    },
+    {
+      "sha": "ff6f6c4dd29be4ac893644f14c32b6d2eb645256",
+      "filename": "src/agents/cli-credentials.test.ts",
+      "status": "modified",
+      "additions": 72,
+      "deletions": 1,
+      "changes": 73,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/a54706a063a12baa039646f9bef7120ff7c4672c/src%2Fagents%2Fcli-credentials.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/a54706a063a12baa039646f9bef7120ff7c4672c/src%2Fagents%2Fcli-credentials.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fagents%2Fcli-credentials.test.ts?ref=a54706a063a12baa039646f9bef7120ff7c4672c",
+      "patch": "@@ -2,7 +2,7 @@ import fs from \"node:fs\";\n import os from \"node:os\";\n import path from \"node:path\";\n \n-import { afterEach, describe, expect, it, vi } from \"vitest\";\n+import { afterEach, beforeEach, describe, expect, it, vi } from \"vitest\";\n \n const execSyncMock = vi.hoisted(() => vi.fn());\n \n@@ -11,7 +11,13 @@ vi.mock(\"node:child_process\", () => ({\n }));\n \n describe(\"cli credentials\", () => {\n+  beforeEach(() => {\n+    vi.useFakeTimers();\n+  });\n+\n   afterEach(() => {\n+    vi.useRealTimers();\n+    vi.resetModules();\n     execSyncMock.mockReset();\n   });\n \n@@ -109,4 +115,69 @@ describe(\"cli credentials\", () => {\n     expect(updated.claudeAiOauth?.refreshToken).toBe(\"new-refresh\");\n     expect(updated.claudeAiOauth?.expiresAt).toBeTypeOf(\"number\");\n   });\n+\n+  it(\"caches Claude CLI credentials within the TTL window\", async () => {\n+    execSyncMock.mockImplementation(() =>\n+      JSON.stringify({\n+        claudeAiOauth: {\n+          accessToken: \"cached-access\",\n+          refreshToken: \"cached-refresh\",\n+          expiresAt: Date.now() + 60_000,\n+        },\n+      }),\n+    );\n+\n+    vi.setSystemTime(new Date(\"2025-01-01T00:00:00Z\"));\n+\n+    const { readClaudeCliCredentialsCached } = await import(\n+      \"./cli-credentials.js\"\n+    );\n+\n+    const first = readClaudeCliCredentialsCached({\n+      allowKeychainPrompt: true,\n+      ttlMs: 15 * 60 * 1000,\n+    });\n+    const second = readClaudeCliCredentialsCached({\n+      allowKeychainPrompt: false,\n+      ttlMs: 15 * 60 * 1000,\n+    });\n+\n+    expect(first).toBeTruthy();\n+    expect(second).toEqual(first);\n+    expect(execSyncMock).toHaveBeenCalledTimes(1);\n+  });\n+\n+  it(\"refreshes Claude CLI credentials after the TTL window\", async () => {\n+    execSyncMock.mockImplementation(() =>\n+      JSON.stringify({\n+        claudeAiOauth: {\n+          accessToken: `token-${Date.now()}`,\n+          refreshToken: \"refresh\",\n+          expiresAt: Date.now() + 60_000,\n+        },\n+      }),\n+    );\n+\n+    vi.setSystemTime(new Date(\"2025-01-01T00:00:00Z\"));\n+\n+    const { readClaudeCliCredentialsCached } = await import(\n+      \"./cli-credentials.js\"\n+    );\n+\n+    const first = readClaudeCliCredentialsCached({\n+      allowKeychainPrompt: true,\n+      ttlMs: 15 * 60 * 1000,\n+    });\n+\n+    vi.advanceTimersByTime(15 * 60 * 1000 + 1);\n+\n+    const second = readClaudeCliCredentialsCached({\n+      allowKeychainPrompt: true,\n+      ttlMs: 15 * 60 * 1000,\n+    });\n+\n+    expect(first).toBeTruthy();\n+    expect(second).toBeTruthy();\n+    expect(execSyncMock).toHaveBeenCalledTimes(2);\n+  });\n });"
+    },
+    {
+      "sha": "8ce0f8758fbf1dc7d248169ffbeef2c7ccfc54db",
+      "filename": "src/agents/cli-credentials.ts",
+      "status": "modified",
+      "additions": 54,
+      "deletions": 0,
+      "changes": 54,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/a54706a063a12baa039646f9bef7120ff7c4672c/src%2Fagents%2Fcli-credentials.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/a54706a063a12baa039646f9bef7120ff7c4672c/src%2Fagents%2Fcli-credentials.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fagents%2Fcli-credentials.ts?ref=a54706a063a12baa039646f9bef7120ff7c4672c",
+      "patch": "@@ -16,6 +16,15 @@ const CODEX_CLI_AUTH_RELATIVE_PATH = \".codex/auth.json\";\n const CLAUDE_CLI_KEYCHAIN_SERVICE = \"Claude Code-credentials\";\n const CLAUDE_CLI_KEYCHAIN_ACCOUNT = \"Claude Code\";\n \n+type CachedValue<T> = {\n+  value: T | null;\n+  readAt: number;\n+  cacheKey: string;\n+};\n+\n+let claudeCliCache: CachedValue<ClaudeCliCredential> | null = null;\n+let codexCliCache: CachedValue<CodexCliCredential> | null = null;\n+\n export type ClaudeCliCredential =\n   | {\n       type: \"oauth\";\n@@ -146,6 +155,30 @@ export function readClaudeCliCredentials(options?: {\n   };\n }\n \n+export function readClaudeCliCredentialsCached(options?: {\n+  allowKeychainPrompt?: boolean;\n+  ttlMs?: number;\n+}): ClaudeCliCredential | null {\n+  const ttlMs = options?.ttlMs ?? 0;\n+  const now = Date.now();\n+  const cacheKey = resolveClaudeCliCredentialsPath();\n+  if (\n+    ttlMs > 0 &&\n+    claudeCliCache &&\n+    claudeCliCache.cacheKey === cacheKey &&\n+    now - claudeCliCache.readAt < ttlMs\n+  ) {\n+    return claudeCliCache.value;\n+  }\n+  const value = readClaudeCliCredentials({\n+    allowKeychainPrompt: options?.allowKeychainPrompt,\n+  });\n+  if (ttlMs > 0) {\n+    claudeCliCache = { value, readAt: now, cacheKey };\n+  }\n+  return value;\n+}\n+\n export function writeClaudeCliKeychainCredentials(\n   newCredentials: OAuthCredentials,\n ): boolean {\n@@ -280,3 +313,24 @@ export function readCodexCliCredentials(): CodexCliCredential | null {\n     expires,\n   };\n }\n+\n+export function readCodexCliCredentialsCached(options?: {\n+  ttlMs?: number;\n+}): CodexCliCredential | null {\n+  const ttlMs = options?.ttlMs ?? 0;\n+  const now = Date.now();\n+  const cacheKey = resolveCodexCliAuthPath();\n+  if (\n+    ttlMs > 0 &&\n+    codexCliCache &&\n+    codexCliCache.cacheKey === cacheKey &&\n+    now - codexCliCache.readAt < ttlMs\n+  ) {\n+    return codexCliCache.value;\n+  }\n+  const value = readCodexCliCredentials();\n+  if (ttlMs > 0) {\n+    codexCliCache = { value, readAt: now, cacheKey };\n+  }\n+  return value;\n+}"
+    },
+    {
+      "sha": "d0733e2739650233b0adb54de11264f0a6ff5260",
+      "filename": "src/auto-reply/reply/model-selection.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 1,
+      "changes": 4,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/a54706a063a12baa039646f9bef7120ff7c4672c/src%2Fauto-reply%2Freply%2Fmodel-selection.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/a54706a063a12baa039646f9bef7120ff7c4672c/src%2Fauto-reply%2Freply%2Fmodel-selection.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fauto-reply%2Freply%2Fmodel-selection.ts?ref=a54706a063a12baa039646f9bef7120ff7c4672c",
+      "patch": "@@ -124,7 +124,9 @@ export async function createModelSelectionState(params: {\n     const { ensureAuthProfileStore } = await import(\n       \"../../agents/auth-profiles.js\"\n     );\n-    const store = ensureAuthProfileStore();\n+    const store = ensureAuthProfileStore(undefined, {\n+      allowKeychainPrompt: false,\n+    });\n     const profile = store.profiles[sessionEntry.authProfileOverride];\n     if (!profile || profile.provider !== provider) {\n       delete sessionEntry.authProfileOverride;"
+    }
+  ]
+}

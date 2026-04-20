@@ -1,0 +1,29 @@
+{
+  "message": "Implement graceful shutdown: subagent cleanup, state in SESSION_END per spec Appendix B\n\nClose() now iterates and closes all active subagents before shutting down,\nand emits state + turns in the SESSION_END event data. Subagent map is\ncollected under the lock but sessions are closed outside to avoid deadlock.",
+  "files": [
+    {
+      "sha": "98d13896db4575fa1908494f88b2a07faed159e3",
+      "filename": "internal/agent/session.go",
+      "status": "modified",
+      "additions": 17,
+      "deletions": 1,
+      "changes": 18,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/19b897ccb390d4e2aab5f9c90c2765f513a08a25/internal%2Fagent%2Fsession.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/19b897ccb390d4e2aab5f9c90c2765f513a08a25/internal%2Fagent%2Fsession.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/internal%2Fagent%2Fsession.go?ref=19b897ccb390d4e2aab5f9c90c2765f513a08a25",
+      "patch": "@@ -413,15 +413,31 @@ func (s *Session) Close() {\n \t\treturn\n \t}\n \ts.state = SessionClosed\n+\n+\t// Collect subagents and clear the map under the lock, then close outside\n+\t// the lock to avoid deadlock (sub.sess.Close() also acquires its own mu).\n+\tsubs := make([]*subagent, 0, len(s.subagents))\n+\tfor id, sub := range s.subagents {\n+\t\tsubs = append(subs, sub)\n+\t\tdelete(s.subagents, id)\n+\t}\n+\tturns := s.turns\n \ts.mu.Unlock()\n \n+\tfor _, sub := range subs {\n+\t\tsub.sess.Close()\n+\t}\n+\n \tif s.mcpMgr != nil {\n \t\ts.mcpMgr.Close()\n \t}\n \n \ts.env.Cleanup()\n \n-\ts.emit(EventSessionEnd, map[string]any{})\n+\ts.emit(EventSessionEnd, map[string]any{\n+\t\t\"state\": string(SessionClosed),\n+\t\t\"turns\": turns,\n+\t})\n \tclose(s.events)\n }\n "
+    },
+    {
+      "sha": "761a808e3bd61e2caeed0af05897557222dd3449",
+      "filename": "internal/agent/session_dod_test.go",
+      "status": "modified",
+      "additions": 91,
+      "deletions": 0,
+      "changes": 91,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/19b897ccb390d4e2aab5f9c90c2765f513a08a25/internal%2Fagent%2Fsession_dod_test.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/19b897ccb390d4e2aab5f9c90c2765f513a08a25/internal%2Fagent%2Fsession_dod_test.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/internal%2Fagent%2Fsession_dod_test.go?ref=19b897ccb390d4e2aab5f9c90c2765f513a08a25",
+      "patch": "@@ -1928,6 +1928,97 @@ func TestAssistantTurn_CapturesUsageAndResponseID(t *testing.T) {\n \tt.Fatal(\"no assistant turn found\")\n }\n \n+func TestSession_GracefulShutdown_ClosesSubagents(t *testing.T) {\n+\tc := llm.NewClient()\n+\tf := &fakeAdapter{\n+\t\tname: \"openai\",\n+\t\tsteps: []func(req llm.Request) llm.Response{\n+\t\t\tfunc(req llm.Request) llm.Response {\n+\t\t\t\treturn llm.Response{Message: llm.Assistant(\"done\"), Finish: llm.FinishReason{Reason: \"stop\"}}\n+\t\t\t},\n+\t\t},\n+\t}\n+\tc.Register(f)\n+\n+\tdir := t.TempDir()\n+\tsess, err := NewSession(c, NewOpenAIProfile(\"gpt-5.2\"), NewLocalExecutionEnvironment(dir), SessionConfig{})\n+\tif err != nil {\n+\t\tt.Fatalf(\"NewSession: %v\", err)\n+\t}\n+\tgo func() { for range sess.Events() {} }()\n+\n+\t// Create a sub-session and manually register it as a subagent.\n+\tsubSess, err := NewSession(c, NewOpenAIProfile(\"gpt-5.2\"), NewLocalExecutionEnvironment(dir), SessionConfig{})\n+\tif err != nil {\n+\t\tt.Fatalf(\"NewSession (sub): %v\", err)\n+\t}\n+\tgo func() { for range subSess.Events() {} }()\n+\n+\tsub := &subagent{\n+\t\tid:   \"test-sub\",\n+\t\tsess: subSess,\n+\t\tdone: make(chan struct{}),\n+\t}\n+\tsess.mu.Lock()\n+\tsess.subagents[\"test-sub\"] = sub\n+\tsess.mu.Unlock()\n+\n+\tsess.Close()\n+\n+\t// Verify subagent was cleaned up from the map.\n+\tsess.mu.Lock()\n+\tremaining := len(sess.subagents)\n+\tsess.mu.Unlock()\n+\tif remaining != 0 {\n+\t\tt.Fatalf(\"expected 0 subagents after Close, got %d\", remaining)\n+\t}\n+\n+\t// Verify sub-session was closed.\n+\tif subSess.State() != SessionClosed {\n+\t\tt.Fatalf(\"subagent session state: got %q want %q\", subSess.State(), SessionClosed)\n+\t}\n+}\n+\n+func TestSession_GracefulShutdown_SessionEndIncludesStateAndTurns(t *testing.T) {\n+\tc := llm.NewClient()\n+\tc.Register(&fakeAdapter{\n+\t\tname: \"openai\",\n+\t\tsteps: []func(req llm.Request) llm.Response{\n+\t\t\tfunc(req llm.Request) llm.Response {\n+\t\t\t\treturn llm.Response{Message: llm.Assistant(\"hello\"), Finish: llm.FinishReason{Reason: \"stop\"}}\n+\t\t\t},\n+\t\t},\n+\t})\n+\n+\tdir := t.TempDir()\n+\tsess, err := NewSession(c, NewOpenAIProfile(\"gpt-5.2\"), NewLocalExecutionEnvironment(dir), SessionConfig{})\n+\tif err != nil {\n+\t\tt.Fatalf(\"NewSession: %v\", err)\n+\t}\n+\tctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)\n+\tdefer cancel()\n+\tif _, err := sess.ProcessInput(ctx, \"hi\"); err != nil {\n+\t\tt.Fatalf(\"ProcessInput: %v\", err)\n+\t}\n+\tsess.Close()\n+\n+\tvar endData map[string]any\n+\tfor ev := range sess.Events() {\n+\t\tif ev.Kind == EventSessionEnd {\n+\t\t\tendData = ev.Data\n+\t\t}\n+\t}\n+\tif endData == nil {\n+\t\tt.Fatal(\"expected SESSION_END event\")\n+\t}\n+\tif state, ok := endData[\"state\"].(string); !ok || state != string(SessionClosed) {\n+\t\tt.Fatalf(\"SESSION_END state: got %v\", endData[\"state\"])\n+\t}\n+\tif turns, ok := endData[\"turns\"].(int); !ok || turns < 1 {\n+\t\tt.Fatalf(\"SESSION_END turns: got %v\", endData[\"turns\"])\n+\t}\n+}\n+\n func TestDetectLoop_Patterns(t *testing.T) {\n \ttests := []struct {\n \t\tname   string"
+    }
+  ]
+}

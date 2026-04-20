@@ -1,0 +1,100 @@
+{
+  "message": "Fix code review findings for read_tql and slice operators\n\n- Add recursion depth limits to prevent stack overflow (SEC-1, SEC-2)\n- Eliminate quadratic buffer operations with offset tracking (PRF-1)\n- Extract common buffer processing logic (PRF-3, ARC-2)\n- Add string reserve optimization in json_string_parser (PRF-2)\n- Add docs URL to ReversePlugin (ARC-3)\n- Add boundary tests for stride=0, empty reverse, single reverse\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "0161cd4d94109b7c17aac4f3d0ca76ad8b023110",
+      "filename": "libtenzir/builtins/formats/tql.cpp",
+      "status": "modified",
+      "additions": 102,
+      "deletions": 99,
+      "changes": 201,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/545c72354205005671e31cee95fada944469471d/libtenzir%2Fbuiltins%2Fformats%2Ftql.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/545c72354205005671e31cee95fada944469471d/libtenzir%2Fbuiltins%2Fformats%2Ftql.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Fbuiltins%2Fformats%2Ftql.cpp?ref=545c72354205005671e31cee95fada944469471d",
+      "patch": "@@ -30,6 +30,9 @@ namespace {\n // Maximum buffer size to prevent DoS from malformed input (64 MiB).\n constexpr auto max_record_size = size_t{64} * 1024 * 1024;\n \n+// Maximum nesting depth to prevent stack overflow from deeply nested structures.\n+constexpr auto max_nesting_depth = size_t{256};\n+\n /// Parser for JSON-escaped strings that produces unescaped output.\n /// This handles the standard JSON escape sequences: \\\\, \\\", \\/, \\b, \\f, \\n,\n /// \\r, \\t, and \\uXXXX.\n@@ -47,6 +50,10 @@ struct json_string_parser : parser_base<json_string_parser> {\n       return false;\n     }\n     ++f; // Skip opening quote\n+    // Reserve capacity to minimize reallocations (escaped strings are shorter)\n+    if constexpr (not skip_result) {\n+      result.reserve(static_cast<size_t>(std::distance(f, l)));\n+    }\n     while (f != l && *f != '\"') {\n       if (*f == '\\\\') {\n         // Handle escape sequence\n@@ -218,43 +225,38 @@ auto find_record_end(std::string_view input) -> std::optional<size_t> {\n   if (input.size() > max_record_size) {\n     return std::nullopt; // Too large\n   }\n-\n-  int depth = 0;\n+  size_t depth = 0;\n   bool in_string = false;\n   bool escape = false;\n-\n   for (size_t i = 0; i < input.size(); ++i) {\n     char c = input[i];\n-\n     if (escape) {\n       escape = false;\n       continue;\n     }\n-\n     if (c == '\\\\' && in_string) {\n       escape = true;\n       continue;\n     }\n-\n     if (c == '\"') {\n       in_string = not in_string;\n       continue;\n     }\n-\n     if (in_string) {\n       continue;\n     }\n-\n     if (c == '{' || c == '[') {\n       ++depth;\n+      if (depth > max_nesting_depth) {\n+        return std::nullopt; // Too deeply nested\n+      }\n     } else if (c == '}' || c == ']') {\n       --depth;\n       if (depth == 0) {\n         return i + 1; // Position after closing brace\n       }\n     }\n   }\n-\n   return std::nullopt; // Incomplete record\n }\n \n@@ -265,32 +267,36 @@ auto parse_tql_record(std::string_view input, diagnostic_handler& dh)\n   const auto* f = input.begin();\n   const auto* l = input.end();\n   data result;\n-\n   // Skip leading whitespace\n   while (f != l && std::isspace(static_cast<unsigned char>(*f)) != 0) {\n     ++f;\n   }\n-\n   if (f == l) {\n     return std::nullopt;\n   }\n-\n   if (not parser.parse(f, l, result)) {\n     diagnostic::warning(\"failed to parse TQL record\").emit(dh);\n     return std::nullopt;\n   }\n-\n   return result;\n }\n \n /// Recursively adds data to a multi_series_builder.\n+/// The depth parameter tracks recursion depth to prevent stack overflow.\n void add_data_to_object(const data& d,\n-                        detail::multi_series_builder::object_generator& obj);\n+                        detail::multi_series_builder::object_generator& obj,\n+                        size_t depth = 0);\n void add_data_to_list(const data& d,\n-                      detail::multi_series_builder::list_generator& list_gen);\n+                      detail::multi_series_builder::list_generator& list_gen,\n+                      size_t depth = 0);\n \n void add_data_to_object(const data& d,\n-                        detail::multi_series_builder::object_generator& obj) {\n+                        detail::multi_series_builder::object_generator& obj,\n+                        size_t depth) {\n+  if (depth > max_nesting_depth) {\n+    obj.null();\n+    return;\n+  }\n   auto f = detail::overload{\n     [&](caf::none_t) {\n       obj.null();\n@@ -331,14 +337,14 @@ void add_data_to_object(const data& d,\n     [&](const list& x) {\n       auto list_gen = obj.list();\n       for (const auto& elem : x) {\n-        add_data_to_list(elem, list_gen);\n+        add_data_to_list(elem, list_gen, depth + 1);\n       }\n     },\n     [&](const record& x) {\n       auto rec = obj.record();\n       for (const auto& [key, value] : x) {\n         auto field = rec.exact_field(key);\n-        add_data_to_object(value, field);\n+        add_data_to_object(value, field, depth + 1);\n       }\n     },\n     [&](const auto&) {\n@@ -350,7 +356,12 @@ void add_data_to_object(const data& d,\n }\n \n void add_data_to_list(const data& d,\n-                      detail::multi_series_builder::list_generator& list_gen) {\n+                      detail::multi_series_builder::list_generator& list_gen,\n+                      size_t depth) {\n+  if (depth > max_nesting_depth) {\n+    list_gen.null();\n+    return;\n+  }\n   auto f = detail::overload{\n     [&](caf::none_t) {\n       list_gen.null();\n@@ -391,14 +402,14 @@ void add_data_to_list(const data& d,\n     [&](const list& x) {\n       auto nested = list_gen.list();\n       for (const auto& elem : x) {\n-        add_data_to_list(elem, nested);\n+        add_data_to_list(elem, nested, depth + 1);\n       }\n     },\n     [&](const record& x) {\n       auto rec = list_gen.record();\n       for (const auto& [key, value] : x) {\n         auto field = rec.exact_field(key);\n-        add_data_to_object(value, field);\n+        add_data_to_object(value, field, depth + 1);\n       }\n     },\n     [&](const auto&) {\n@@ -429,122 +440,114 @@ class ReadTql final : public Operator<chunk_ptr, table_slice> {\n     if (not input || input->size() == 0) {\n       co_return;\n     }\n-\n     // Lazily construct the builder on first use (it needs diagnostic_handler)\n     if (not builder_) {\n       builder_.emplace(multi_series_builder::options{}, ctx);\n     }\n-\n     // Append new data to buffer\n     buffer_.append(reinterpret_cast<const char*>(input->data()), input->size());\n-\n     // Check buffer size limit\n-    if (buffer_.size() > max_record_size) {\n+    if (buffer_.size() - buffer_offset_ > max_record_size) {\n       diagnostic::error(\"input buffer exceeds maximum size of 64 MiB\").emit(ctx);\n       co_return;\n     }\n-\n     // Process complete records from buffer\n-    while (not buffer_.empty()) {\n-      // Skip leading whitespace\n-      size_t start = 0;\n-      while (start < buffer_.size()\n-             && std::isspace(static_cast<unsigned char>(buffer_[start])) != 0) {\n-        ++start;\n-      }\n-\n-      if (start > 0) {\n-        buffer_.erase(0, start);\n-      }\n-\n-      if (buffer_.empty()) {\n-        break;\n-      }\n-\n-      // Find end of record\n-      auto end = find_record_end(buffer_);\n-      if (not end) {\n-        // Incomplete record, wait for more data\n-        break;\n-      }\n-\n-      // Parse the complete record\n-      auto record_str = std::string_view{buffer_.data(), *end};\n-      auto parsed = parse_tql_record(record_str, ctx);\n-\n-      if (parsed) {\n-        if (const auto* r = try_as<record>(*parsed)) {\n-          add_record_to_builder(*r, *builder_);\n-        } else {\n-          diagnostic::warning(\"expected record at top level, got other type\")\n-            .emit(ctx);\n-        }\n-      }\n-\n-      // Remove processed record from buffer\n-      buffer_.erase(0, *end);\n-\n-      // Yield any ready slices\n-      for (auto& slice : builder_->yield_ready_as_table_slice()) {\n-        co_await push(std::move(slice));\n-      }\n-    }\n+    co_await process_buffer(push, ctx, false);\n   }\n \n   auto finalize(Push<table_slice>& push, OpCtx& ctx) -> Task<void> override {\n     // Ensure builder exists even if no data was processed\n     if (not builder_) {\n       builder_.emplace(multi_series_builder::options{}, ctx);\n     }\n-\n     // Process any remaining complete records in buffer\n-    while (not buffer_.empty()) {\n-      size_t start = 0;\n-      while (start < buffer_.size()\n-             && std::isspace(static_cast<unsigned char>(buffer_[start])) != 0) {\n-        ++start;\n-      }\n+    co_await process_buffer(push, ctx, true);\n+    // Finalize and yield remaining slices\n+    for (auto& slice : builder_->finalize_as_table_slice()) {\n+      co_await push(std::move(slice));\n+    }\n+  }\n \n-      if (start > 0) {\n-        buffer_.erase(0, start);\n-      }\n+  auto snapshot(Serde& serde) -> void override {\n+    // Note: The multi_series_builder state is not serialized. Records that\n+    // have been parsed but not yet yielded (via yield_ready_as_table_slice)\n+    // may be lost on restore. This is acceptable because yield_ready is called\n+    // after each parsed record, so any pending state is minimal.\n+    // Before serializing, compact the buffer to remove already-processed data.\n+    compact_buffer();\n+    serde(\"buffer\", buffer_);\n+  }\n+\n+private:\n+  /// Compacts the buffer by removing already-processed data at the front.\n+  void compact_buffer() {\n+    if (buffer_offset_ > 0) {\n+      buffer_.erase(0, buffer_offset_);\n+      buffer_offset_ = 0;\n+    }\n+  }\n \n-      if (buffer_.empty()) {\n+  /// Returns a view of the unprocessed portion of the buffer.\n+  auto buffer_view() const -> std::string_view {\n+    return std::string_view{buffer_}.substr(buffer_offset_);\n+  }\n+\n+  /// Advances the buffer offset, compacting periodically to avoid unbounded\n+  /// memory growth. The compaction threshold is set at half the buffer size.\n+  void advance_buffer(size_t n) {\n+    buffer_offset_ += n;\n+    // Compact when offset exceeds half the buffer size\n+    if (buffer_offset_ > buffer_.size() / 2) {\n+      compact_buffer();\n+    }\n+  }\n+\n+  /// Processes complete records from the buffer.\n+  /// If is_final is true, emits a warning for incomplete trailing records.\n+  auto process_buffer(Push<table_slice>& push, OpCtx& ctx, bool is_final)\n+    -> Task<void> {\n+    while (buffer_offset_ < buffer_.size()) {\n+      // Skip leading whitespace\n+      while (\n+        buffer_offset_ < buffer_.size()\n+        && std::isspace(static_cast<unsigned char>(buffer_[buffer_offset_]))\n+             != 0) {\n+        ++buffer_offset_;\n+      }\n+      auto view = buffer_view();\n+      if (view.empty()) {\n         break;\n       }\n-\n-      auto end = find_record_end(buffer_);\n+      // Find end of record\n+      auto end = find_record_end(view);\n       if (not end) {\n-        if (not buffer_.empty()) {\n+        if (is_final && not view.empty()) {\n           diagnostic::warning(\"incomplete record at end of input\").emit(ctx);\n         }\n         break;\n       }\n-\n-      auto record_str = std::string_view{buffer_.data(), *end};\n+      // Parse the complete record\n+      auto record_str = view.substr(0, *end);\n       auto parsed = parse_tql_record(record_str, ctx);\n-\n       if (parsed) {\n         if (const auto* r = try_as<record>(*parsed)) {\n           add_record_to_builder(*r, *builder_);\n+        } else {\n+          diagnostic::warning(\"expected record at top level, got other type\")\n+            .emit(ctx);\n         }\n       }\n-\n-      buffer_.erase(0, *end);\n-    }\n-\n-    // Finalize and yield remaining slices\n-    for (auto& slice : builder_->finalize_as_table_slice()) {\n-      co_await push(std::move(slice));\n+      // Advance past the processed record\n+      advance_buffer(*end);\n+      // Yield any ready slices\n+      for (auto& slice : builder_->yield_ready_as_table_slice()) {\n+        co_await push(std::move(slice));\n+      }\n     }\n   }\n \n-  auto snapshot(Serde& serde) -> void override {\n-    serde(\"buffer\", buffer_);\n-  }\n-\n-private:\n   std::string buffer_;\n+  size_t buffer_offset_ = 0;\n   std::optional<multi_series_builder> builder_;\n };\n "
+    },
+    {
+      "sha": "d7a332b73ab557905452a63004bfc4f84e8317d3",
+      "filename": "libtenzir/builtins/operators/slice.cpp",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/545c72354205005671e31cee95fada944469471d/libtenzir%2Fbuiltins%2Foperators%2Fslice.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/545c72354205005671e31cee95fada944469471d/libtenzir%2Fbuiltins%2Foperators%2Fslice.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Fbuiltins%2Foperators%2Fslice.cpp?ref=545c72354205005671e31cee95fada944469471d",
+      "patch": "@@ -609,7 +609,8 @@ class reverse_plugin final : public virtual operator_plugin2<slice_operator>,\n   }\n \n   auto describe() const -> Description override {\n-    auto d = Describer<SliceArgs, Slice>{SliceArgs{.stride = -1}};\n+    auto d = Describer<SliceArgs, Slice>{\n+      SliceArgs{.stride = -1}, \"https://docs.tenzir.com/operators/reverse\"};\n     return d.without_optimize();\n   }\n };"
+    },
+    {
+      "sha": "833aaac079af782c69b7d4ee299288365adf1751",
+      "filename": "test/tests/operators/reverse/empty.tql",
+      "status": "added",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/545c72354205005671e31cee95fada944469471d/test%2Ftests%2Foperators%2Freverse%2Fempty.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/545c72354205005671e31cee95fada944469471d/test%2Ftests%2Foperators%2Freverse%2Fempty.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Freverse%2Fempty.tql?ref=545c72354205005671e31cee95fada944469471d",
+      "patch": "@@ -0,0 +1,3 @@\n+from {}\n+where false\n+reverse"
+    },
+    {
+      "sha": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "filename": "test/tests/operators/reverse/empty.txt",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/545c72354205005671e31cee95fada944469471d/test%2Ftests%2Foperators%2Freverse%2Fempty.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/545c72354205005671e31cee95fada944469471d/test%2Ftests%2Foperators%2Freverse%2Fempty.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Freverse%2Fempty.txt?ref=545c72354205005671e31cee95fada944469471d"
+    },
+    {
+      "sha": "37f79b93a9a308ad0d3f63bfef4fe9fc72461349",
+      "filename": "test/tests/operators/reverse/single.tql",
+      "status": "added",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/545c72354205005671e31cee95fada944469471d/test%2Ftests%2Foperators%2Freverse%2Fsingle.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/545c72354205005671e31cee95fada944469471d/test%2Ftests%2Foperators%2Freverse%2Fsingle.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Freverse%2Fsingle.tql?ref=545c72354205005671e31cee95fada944469471d",
+      "patch": "@@ -0,0 +1,2 @@\n+from {x: 42}\n+reverse"
+    },
+    {
+      "sha": "2090374a7310a508704255739be5725913f224d3",
+      "filename": "test/tests/operators/reverse/single.txt",
+      "status": "added",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/545c72354205005671e31cee95fada944469471d/test%2Ftests%2Foperators%2Freverse%2Fsingle.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/545c72354205005671e31cee95fada944469471d/test%2Ftests%2Foperators%2Freverse%2Fsingle.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Freverse%2Fsingle.txt?ref=545c72354205005671e31cee95fada944469471d",
+      "patch": "@@ -0,0 +1,3 @@\n+{\n+  x: 42,\n+}"
+    },
+    {
+      "sha": "48acc8b7c8f73abb44186253db02d4adba6152ba",
+      "filename": "test/tests/operators/slice/stride_zero.tql",
+      "status": "added",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/545c72354205005671e31cee95fada944469471d/test%2Ftests%2Foperators%2Fslice%2Fstride_zero.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/545c72354205005671e31cee95fada944469471d/test%2Ftests%2Foperators%2Fslice%2Fstride_zero.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fslice%2Fstride_zero.tql?ref=545c72354205005671e31cee95fada944469471d",
+      "patch": "@@ -0,0 +1,5 @@\n+---\n+error: true\n+---\n+from {x: 1}, {x: 2}, {x: 3}\n+slice stride=0"
+    },
+    {
+      "sha": "3b3fb11ec702ec27dbde468fe1f9f89b43f152a0",
+      "filename": "test/tests/operators/slice/stride_zero.txt",
+      "status": "added",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/545c72354205005671e31cee95fada944469471d/test%2Ftests%2Foperators%2Fslice%2Fstride_zero.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/545c72354205005671e31cee95fada944469471d/test%2Ftests%2Foperators%2Fslice%2Fstride_zero.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fslice%2Fstride_zero.txt?ref=545c72354205005671e31cee95fada944469471d",
+      "patch": "@@ -0,0 +1,6 @@\n+error: stride must not be zero\n+ --> tests/operators/slice/stride_zero.tql:5:14\n+  |\n+5 | slice stride=0\n+  |              ^ \n+  |"
+    }
+  ]
+}

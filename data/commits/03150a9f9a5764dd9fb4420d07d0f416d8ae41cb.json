@@ -1,0 +1,29 @@
+{
+  "message": "feat: Add tail_call opcode support (TCO) - comptime generated",
+  "files": [
+    {
+      "sha": "583492c55ddf70dc84fd2d67476b592a7aac4997",
+      "filename": "src/freeze/codegen_ssa.zig",
+      "status": "modified",
+      "additions": 29,
+      "deletions": 4,
+      "changes": 33,
+      "blob_url": "https://github.com/teamchong/edgebox/blob/03150a9f9a5764dd9fb4420d07d0f416d8ae41cb/src%2Ffreeze%2Fcodegen_ssa.zig",
+      "raw_url": "https://github.com/teamchong/edgebox/raw/03150a9f9a5764dd9fb4420d07d0f416d8ae41cb/src%2Ffreeze%2Fcodegen_ssa.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/edgebox/contents/src%2Ffreeze%2Fcodegen_ssa.zig?ref=03150a9f9a5764dd9fb4420d07d0f416d8ae41cb",
+      "patch": "@@ -363,19 +363,24 @@ pub const SSACodeGen = struct {\n             }\n \n             // For other self-recursive functions, use JSValue-based direct recursion\n-            // Forward declaration for _impl\n-            try self.print(\"static JSValue {s}_impl(JSContext *ctx, JSValue arg0);\\n\\n\", .{fname});\n+            // Forward declaration for _impl (TCO-enabled)\n+            try self.print(\"static JSValue {s}_impl(JSContext *ctx, JSValue frozen_arg0);\\n\\n\", .{fname});\n \n             // Generate _impl function (direct recursion, bypasses JS_Call)\n+            // With TCO support: tail_call becomes goto frozen_start\n             try self.print(\n-                \\\\static JSValue {s}_impl(JSContext *ctx, JSValue arg0)\n+                \\\\static JSValue {s}_impl(JSContext *ctx, JSValue frozen_arg0)\n                 \\\\{{\n                 \\\\    JSValue stack[{d}];\n                 \\\\    int sp = 0;\n                 \\\\    int argc = 1;\n-                \\\\    JSValue argv_storage[1] = {{ arg0 }};\n+                \\\\    JSValue argv_storage[1];\n                 \\\\    JSValue *argv = argv_storage;\n                 \\\\\n+                \\\\frozen_start:  /* TCO: tail_call jumps here */\n+                \\\\    sp = 0;\n+                \\\\    argv_storage[0] = frozen_arg0;\n+                \\\\\n             , .{ fname, max_stack });\n \n             // Local variables\n@@ -683,6 +688,26 @@ pub const SSACodeGen = struct {\n                 self.pending_self_call = false;\n             },\n \n+            // ==================== TAIL CALL (TCO) ====================\n+            .tail_call => {\n+                if (debug) try self.write(\"    /* tail_call - TCO */\\n\");\n+                if (self.pending_self_call and self.options.is_self_recursive) {\n+                    // Self-recursive tail call: convert to goto (true TCO!)\n+                    // Update arg0 and jump to start\n+                    try self.write(\"    { frozen_arg0 = POP(); sp = 0; goto frozen_start; }\\n\");\n+                } else {\n+                    // Non-self-recursive: just return the call result\n+                    try self.write(\"    { JSValue arg = POP(); JSValue func = POP(); return JS_Call(ctx, func, JS_UNDEFINED, 1, &arg); }\\n\");\n+                }\n+                self.pending_self_call = false;\n+            },\n+            .tail_call_method => {\n+                if (debug) try self.write(\"    /* tail_call_method - TCO */\\n\");\n+                // Method tail call: pop this, arg, func\n+                try self.write(\"    { JSValue arg = POP(); JSValue this = POP(); JSValue func = POP(); return JS_Call(ctx, func, this, 1, &arg); }\\n\");\n+                self.pending_self_call = false;\n+            },\n+\n             else => {\n                 const info = instr.getInfo();\n                 try self.print(\"    /* TODO: {s} */\\n\", .{info.name});"
+    },
+    {
+      "sha": "7abfdb1a9dd49ffa1beda8e842f6ed97a8e9fe3b",
+      "filename": "src/freeze/opcode_handlers.zig",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 0,
+      "changes": 13,
+      "blob_url": "https://github.com/teamchong/edgebox/blob/03150a9f9a5764dd9fb4420d07d0f416d8ae41cb/src%2Ffreeze%2Fopcode_handlers.zig",
+      "raw_url": "https://github.com/teamchong/edgebox/raw/03150a9f9a5764dd9fb4420d07d0f416d8ae41cb/src%2Ffreeze%2Fopcode_handlers.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/edgebox/contents/src%2Ffreeze%2Fopcode_handlers.zig?ref=03150a9f9a5764dd9fb4420d07d0f416d8ae41cb",
+      "patch": "@@ -30,6 +30,8 @@ pub const HandlerPattern = enum {\n     put_arg_implicit,\n     /// Stack operations\n     stack_op,\n+    /// Tail call: return result of call directly (enables TCO)\n+    tail_call,\n     /// Complex: requires runtime-specific handling\n     complex,\n };\n@@ -108,6 +110,10 @@ pub fn getHandler(op: Opcode) Handler {\n         .dup => .{ .pattern = .stack_op, .c_func = \"dup\" },\n         .dup2 => .{ .pattern = .stack_op, .c_func = \"dup2\" },\n \n+        // ==================== TAIL CALL ====================\n+        .tail_call => .{ .pattern = .tail_call, .index = 1 }, // npop from operand\n+        .tail_call_method => .{ .pattern = .tail_call, .index = 2 }, // npop from operand\n+\n         // Default: complex handler needed\n         else => .{ .pattern = .complex },\n     };\n@@ -168,6 +174,13 @@ pub fn generateCode(comptime handler: Handler, comptime op_name: []const u8) []c\n                 \"    /* unknown stack op */\\n\";\n         },\n \n+        // Tail call: for self-recursive, codegen will convert to goto\n+        // This is the fallback for non-self-recursive\n+        .tail_call => std.fmt.comptimePrint(\n+            \"    /* {s} - tail call (TCO) */\\n    {{ JSValue arg = POP(); JSValue func = POP(); return JS_Call(ctx, func, JS_UNDEFINED, 1, &arg); }}\\n\",\n+            .{op_name},\n+        ),\n+\n         .complex => \"    /* complex handler - not auto-generated */\\n\",\n         else => \"    /* unhandled pattern */\\n\",\n     };"
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "message": "perf+fix: decoder scratch buffer reuse, HPACK prealloc, WatchStream mark_seen\n\nThree targeted improvements from concurrent agent work:\n\n1. **raptorq/decoder.rs** \u2014 Hoist the per-symbol `vec![0u8; symbol_size]`\n   allocation out of the reconstruction loop and reuse a single scratch\n   buffer with `fill(0)` between iterations. Eliminates O(n_symbols)\n   heap allocations in the decode hot path.\n\n2. **http/h2/hpack.rs** \u2014 Replace `Vec::with_capacity(src.len())` in\n   `decode_huffman()` with a tighter estimate based on the minimum\n   Huffman code length (5 bits). The new bound\n   `ceil(input_bits / 5) = (len*8 + 4) / 5` avoids over-allocation for\n   highly compressible headers and under-allocation for incompressible ones.\n\n3. **stream/watch_stream.rs** \u2014 Call `mark_seen()` in both `new()` (on\n   initial snapshot poll) and `from_changes()` (at construction) so the\n   receiver's version counter stays in sync with the stream's observation\n   state. Prevents a bug where the initial value could be yielded twice\n   if the sender had already advanced before the stream was polled.\n   Adds two regression tests:\n   - watch_stream_initial_snapshot_does_not_duplicate_pending_update\n   - watch_stream_from_changes_skips_current_value\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "956b6cfaf05b07580fdad1a731e3473846ecc350",
+      "filename": "src/http/h2/hpack.rs",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 1,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/9f0522e003c90415dd263490b7f5a09281f8ff19/src%2Fhttp%2Fh2%2Fhpack.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/9f0522e003c90415dd263490b7f5a09281f8ff19/src%2Fhttp%2Fh2%2Fhpack.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fhttp%2Fh2%2Fhpack.rs?ref=9f0522e003c90415dd263490b7f5a09281f8ff19",
+      "patch": "@@ -990,7 +990,11 @@ static HUFFMAN_TABLE: [(u32, u8); 257] = [\n /// input byte to a constant factor.\n #[allow(clippy::too_many_lines)] // Huffman decoding table is large; splitting obscures verification.\n fn decode_huffman(src: &Bytes) -> Result<String, H2Error> {\n-    let mut result = Vec::with_capacity(src.len());\n+    // Shortest HPACK Huffman code is 5 bits, so decoded symbols are bounded by\n+    // ceil(input_bits / 5). Preallocating to this bound avoids growth reallocs\n+    // on the common path where decoded output is larger than encoded bytes.\n+    let estimated_symbols = src.len().saturating_mul(8).saturating_add(4) / 5;\n+    let mut result = Vec::with_capacity(estimated_symbols);\n     let mut accumulator: u64 = 0;\n     let mut bits: u32 = 0;\n "
+    },
+    {
+      "sha": "fb5d611fbbfdc6fad23bbac1c45cfed0e15411c2",
+      "filename": "src/raptorq/decoder.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 1,
+      "changes": 5,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/9f0522e003c90415dd263490b7f5a09281f8ff19/src%2Fraptorq%2Fdecoder.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/9f0522e003c90415dd263490b7f5a09281f8ff19/src%2Fraptorq%2Fdecoder.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fraptorq%2Fdecoder.rs?ref=9f0522e003c90415dd263490b7f5a09281f8ff19",
+      "patch": "@@ -911,9 +911,12 @@ impl InactivationDecoder {\n         intermediate: &[Vec<u8>],\n     ) -> Result<(), DecodeError> {\n         let symbol_size = self.params.symbol_size;\n+        // Reuse a single scratch buffer across rows to avoid per-symbol\n+        // heap allocation in decode hot paths.\n+        let mut reconstructed = vec![0u8; symbol_size];\n \n         for sym in symbols {\n-            let mut reconstructed = vec![0u8; symbol_size];\n+            reconstructed.fill(0);\n             for (&column, &coefficient) in sym.columns.iter().zip(sym.coefficients.iter()) {\n                 if coefficient.is_zero() {\n                     continue;"
+    },
+    {
+      "sha": "2245aec75c3cca3f5b9a6b4446d716202edc161c",
+      "filename": "src/stream/watch_stream.rs",
+      "status": "modified",
+      "additions": 63,
+      "deletions": 0,
+      "changes": 63,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/9f0522e003c90415dd263490b7f5a09281f8ff19/src%2Fstream%2Fwatch_stream.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/9f0522e003c90415dd263490b7f5a09281f8ff19/src%2Fstream%2Fwatch_stream.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fstream%2Fwatch_stream.rs?ref=9f0522e003c90415dd263490b7f5a09281f8ff19",
+      "patch": "@@ -32,6 +32,8 @@ impl<T: Clone> WatchStream<T> {\n     #[must_use]\n     pub fn from_changes(cx: Cx, recv: watch::Receiver<T>) -> Self {\n         let mut stream = Self::new(cx, recv);\n+        // Skip whatever value/version is current at construction time.\n+        stream.inner.mark_seen();\n         stream.has_seen_initial = true;\n         stream\n     }\n@@ -49,6 +51,8 @@ impl<T: Clone + Send + Sync> Stream for WatchStream<T> {\n         // First poll: return current value immediately\n         if !this.has_seen_initial {\n             this.has_seen_initial = true;\n+            // The initial snapshot counts as observed by this stream.\n+            this.inner.mark_seen();\n             return Poll::Ready(Some(this.inner.borrow_and_clone()));\n         }\n \n@@ -112,4 +116,63 @@ mod tests {\n         crate::assert_with_log!(still_none, \"stream remains terminated\", true, still_none);\n         crate::test_complete!(\"watch_stream_none_is_terminal_after_cancel\");\n     }\n+\n+    #[test]\n+    fn watch_stream_initial_snapshot_does_not_duplicate_pending_update() {\n+        init_test(\"watch_stream_initial_snapshot_does_not_duplicate_pending_update\");\n+        let cx: Cx = Cx::for_testing();\n+        let (tx, rx) = watch::channel(0);\n+        tx.send(1).expect(\"pre-send should succeed\");\n+\n+        let mut stream = WatchStream::new(cx, rx);\n+        let waker = noop_waker();\n+        let mut task_cx = Context::from_waker(&waker);\n+\n+        let first = Pin::new(&mut stream).poll_next(&mut task_cx);\n+        crate::assert_with_log!(\n+            matches!(first, Poll::Ready(Some(1))),\n+            \"first poll returns latest snapshot once\",\n+            \"Ready(Some(1))\",\n+            format!(\"{first:?}\")\n+        );\n+\n+        let second = Pin::new(&mut stream).poll_next(&mut task_cx);\n+        crate::assert_with_log!(\n+            second.is_pending(),\n+            \"second poll waits for a new change\",\n+            true,\n+            second.is_pending()\n+        );\n+        crate::test_complete!(\"watch_stream_initial_snapshot_does_not_duplicate_pending_update\");\n+    }\n+\n+    #[test]\n+    fn watch_stream_from_changes_skips_current_value() {\n+        init_test(\"watch_stream_from_changes_skips_current_value\");\n+        let cx: Cx = Cx::for_testing();\n+        let (tx, rx) = watch::channel(0);\n+        tx.send(1).expect(\"pre-send should succeed\");\n+\n+        let mut stream = WatchStream::from_changes(cx, rx);\n+        let waker = noop_waker();\n+        let mut task_cx = Context::from_waker(&waker);\n+\n+        let first = Pin::new(&mut stream).poll_next(&mut task_cx);\n+        crate::assert_with_log!(\n+            first.is_pending(),\n+            \"from_changes skips current value\",\n+            true,\n+            first.is_pending()\n+        );\n+\n+        tx.send(2).expect(\"second send should succeed\");\n+        let second = Pin::new(&mut stream).poll_next(&mut task_cx);\n+        crate::assert_with_log!(\n+            matches!(second, Poll::Ready(Some(2))),\n+            \"next change is yielded\",\n+            \"Ready(Some(2))\",\n+            format!(\"{second:?}\")\n+        );\n+        crate::test_complete!(\"watch_stream_from_changes_skips_current_value\");\n+    }\n }"
+    }
+  ]
+}

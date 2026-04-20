@@ -1,0 +1,53 @@
+{
+  "message": "feat(type-inference): Add dict widening and None value type fixes\n\n- InferDictValueType now returns ?void for all-None dicts instead of\n  @TypeOf(null) which has no size and can't be stored in hash maps\n- Add dict literal codegen handling for null to ?void conversion\n- Add widenDictAware() in TypeInferrer for special dict widening:\n  when two dicts have same key type but different value types,\n  widen to dict with pyvalue values instead of returning .unknown\n- nativeTypeToZigStr() now returns \"?void\" for .none type\n\nThis is infrastructure for handling Python's dynamic dict reassignment\nwhere the same variable can hold dicts with different value types.\nFull codegen support for widened types is future work.",
+  "files": [
+    {
+      "sha": "c4b9dc64cbc83eee4114c60befcfaa879a4ec6f2",
+      "filename": "packages/runtime/src/runtime/comptime_helpers.zig",
+      "status": "modified",
+      "additions": 12,
+      "deletions": 0,
+      "changes": 12,
+      "blob_url": "https://github.com/teamchong/metal0/blob/72ebeb195c54dae9edb5e9cb0e8d8c6575f5afdc/packages%2Fruntime%2Fsrc%2Fruntime%2Fcomptime_helpers.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/72ebeb195c54dae9edb5e9cb0e8d8c6575f5afdc/packages%2Fruntime%2Fsrc%2Fruntime%2Fcomptime_helpers.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/packages%2Fruntime%2Fsrc%2Fruntime%2Fcomptime_helpers.zig?ref=72ebeb195c54dae9edb5e9cb0e8d8c6575f5afdc",
+      "patch": "@@ -393,6 +393,8 @@ pub fn InferDictValueType(comptime TupleType: type) type {\n     comptime var has_bool = false;\n     comptime var has_tuple = false;\n     comptime var has_array = false;\n+    comptime var has_null = false;\n+    comptime var has_int = false;\n     comptime var tuple_type: ?type = null;\n     comptime var array_type: ?type = null;\n \n@@ -421,6 +423,10 @@ pub fn InferDictValueType(comptime TupleType: type) type {\n             has_string = true;\n         } else if (V == bool) {\n             has_bool = true;\n+        } else if (V == @TypeOf(null)) {\n+            has_null = true;\n+        } else if (V == i64 or V == comptime_int) {\n+            has_int = true;\n         }\n     }\n \n@@ -435,6 +441,12 @@ pub fn InferDictValueType(comptime TupleType: type) type {\n         result_type = f64;\n     } else if (has_bool) {\n         result_type = bool;\n+    } else if (has_int) {\n+        result_type = i64;\n+    } else if (has_null) {\n+        // All values are null - use ?void as it's a concrete type that can store null\n+        // @TypeOf(null) is zero-sized and can't be stored in hash maps\n+        result_type = ?void;\n     } else {\n         result_type = i64;\n     }"
+    },
+    {
+      "sha": "81ca2f433556c41f42048f344418c414fdeb8011",
+      "filename": "src/analysis/native_types/inferrer.zig",
+      "status": "modified",
+      "additions": 43,
+      "deletions": 3,
+      "changes": 46,
+      "blob_url": "https://github.com/teamchong/metal0/blob/72ebeb195c54dae9edb5e9cb0e8d8c6575f5afdc/src%2Fanalysis%2Fnative_types%2Finferrer.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/72ebeb195c54dae9edb5e9cb0e8d8c6575f5afdc/src%2Fanalysis%2Fnative_types%2Finferrer.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/src%2Fanalysis%2Fnative_types%2Finferrer.zig?ref=72ebeb195c54dae9edb5e9cb0e8d8c6575f5afdc",
+      "patch": "@@ -168,11 +168,14 @@ pub const TypeInferrer = struct {\n     }\n \n     /// Widen a variable type in current scope (for reassignments)\n+    /// Special handling for dict types: when value types differ, widen to dict with pyvalue values\n     pub fn widenScopedVar(self: *TypeInferrer, name: []const u8, new_type: NativeType) !void {\n+        const arena_alloc = self.arena.allocator();\n+\n         if (self.current_scope_name) |scope| {\n-            const scoped_key = try std.fmt.allocPrint(self.arena.allocator(), \"{s}:{s}\", .{ scope, name });\n+            const scoped_key = try std.fmt.allocPrint(arena_alloc, \"{s}:{s}\", .{ scope, name });\n             if (self.scoped_var_types.get(scoped_key)) |existing| {\n-                const widened = existing.widen(new_type);\n+                const widened = try self.widenDictAware(existing, new_type, arena_alloc);\n                 try self.scoped_var_types.put(scoped_key, widened);\n                 // Also update legacy var_types\n                 try self.var_types.put(name, widened);\n@@ -183,14 +186,51 @@ pub const TypeInferrer = struct {\n         } else {\n             // Global scope - use legacy var_types with widening\n             if (self.var_types.get(name)) |existing| {\n-                const widened = existing.widen(new_type);\n+                const widened = try self.widenDictAware(existing, new_type, arena_alloc);\n                 try self.var_types.put(name, widened);\n             } else {\n                 try self.var_types.put(name, new_type);\n             }\n         }\n     }\n \n+    /// Widen types with special handling for dicts\n+    /// When two dicts have different value types, create a dict with pyvalue values\n+    /// instead of falling back to .unknown\n+    fn widenDictAware(self: *TypeInferrer, existing: NativeType, new_type: NativeType, alloc: std.mem.Allocator) !NativeType {\n+        _ = self;\n+\n+        // Check if both are dict types\n+        const existing_tag = @as(std.meta.Tag(NativeType), existing);\n+        const new_tag = @as(std.meta.Tag(NativeType), new_type);\n+\n+        if (existing_tag == .dict and new_tag == .dict) {\n+            const existing_key = existing.dict.key.*;\n+            const new_key = new_type.dict.key.*;\n+            const existing_val = existing.dict.value.*;\n+            const new_val = new_type.dict.value.*;\n+\n+            // If key types match but value types differ, widen to dict with pyvalue values\n+            const existing_key_tag = @as(std.meta.Tag(NativeType), existing_key);\n+            const new_key_tag = @as(std.meta.Tag(NativeType), new_key);\n+            const existing_val_tag = @as(std.meta.Tag(NativeType), existing_val);\n+            const new_val_tag = @as(std.meta.Tag(NativeType), new_val);\n+\n+            if (existing_key_tag == new_key_tag and existing_val_tag != new_val_tag) {\n+                // Same key type, different value types -> use pyvalue for values\n+                const pyvalue_type = try alloc.create(NativeType);\n+                pyvalue_type.* = .pyvalue;\n+                return NativeType{ .dict = .{\n+                    .key = existing.dict.key, // Reuse existing key type\n+                    .value = pyvalue_type,\n+                } };\n+            }\n+        }\n+\n+        // Fall back to standard widening for non-dict or compatible dict types\n+        return existing.widen(new_type);\n+    }\n+\n     /// Analyze a module to infer all variable types\n     pub fn analyze(self: *TypeInferrer, module: ast.Node.Module) InferError!void {\n         // Register __name__ as a string constant (for if __name__ == \"__main__\" support)"
+    },
+    {
+      "sha": "8d259297699f0c460c2ade7e602aa0b774c298d8",
+      "filename": "src/codegen/native/expressions/comprehensions.zig",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/teamchong/metal0/blob/72ebeb195c54dae9edb5e9cb0e8d8c6575f5afdc/src%2Fcodegen%2Fnative%2Fexpressions%2Fcomprehensions.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/72ebeb195c54dae9edb5e9cb0e8d8c6575f5afdc/src%2Fcodegen%2Fnative%2Fexpressions%2Fcomprehensions.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/src%2Fcodegen%2Fnative%2Fexpressions%2Fcomprehensions.zig?ref=72ebeb195c54dae9edb5e9cb0e8d8c6575f5afdc",
+      "patch": "@@ -1649,7 +1649,7 @@ fn nativeTypeToZigStr(native_type: @import(\"../../../analysis/native_types/core.\n         .string => \"[]const u8\",\n         .bytes => \"runtime.builtins.PyBytes\",\n         .complex => \"runtime.complex.PyComplex\",\n-        .none => \"@TypeOf(null)\",\n+        .none => \"?void\",\n         // All other types fall back to PyValue for heterogeneous dicts\n         else => \"runtime.PyValue\",\n     };"
+    },
+    {
+      "sha": "5bb972b92509aae77c1f273b57b781860bc525ef",
+      "filename": "src/codegen/native/expressions/dict.zig",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 0,
+      "changes": 10,
+      "blob_url": "https://github.com/teamchong/metal0/blob/72ebeb195c54dae9edb5e9cb0e8d8c6575f5afdc/src%2Fcodegen%2Fnative%2Fexpressions%2Fdict.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/72ebeb195c54dae9edb5e9cb0e8d8c6575f5afdc/src%2Fcodegen%2Fnative%2Fexpressions%2Fdict.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/src%2Fcodegen%2Fnative%2Fexpressions%2Fdict.zig?ref=72ebeb195c54dae9edb5e9cb0e8d8c6575f5afdc",
+      "patch": "@@ -306,6 +306,16 @@ fn genDictComptime(self: *NativeCodegen, dict: ast.Node.Dict, alloc_name: []cons\n     try self.emitIndent();\n     try self.emit(\"}\\n\");\n \n+    // Null to ?void cast (for dict values that are all None)\n+    try self.emitIndent();\n+    try self.emit(\"if (V == ?void and @TypeOf(kv[1]) == @TypeOf(null)) {\\n\");\n+    self.indent();\n+    try self.emitIndent();\n+    try self.emit(\"break :cast_blk null;\\n\");\n+    self.dedent();\n+    try self.emitIndent();\n+    try self.emit(\"}\\n\");\n+\n     // Default fallback\n     try self.emitIndent();\n     try self.emit(\"break :cast_blk kv[1];\\n\");"
+    }
+  ]
+}

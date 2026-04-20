@@ -1,0 +1,29 @@
+{
+  "message": "fix(codegen): Extend class attribute registration to all builtin names (Phase 2)\n\n**Problem**: Class attributes referencing callable builtins like `enumerate`,\n`len`, `range`, `zip`, etc. were not being registered, causing compilation\nerrors when methods tried to invoke them via `self.attr_name(...)`.\n\nExample:\n```python\nclass EnumerateTestCase:\n    enum = enumerate  # Not registered!\n\n    def test_method(self):\n        self.enum([1, 2, 3])  # ERROR: no field named 'enum'\n```\n\n**Root Cause**: Registration check used `PyBuiltinTypes.has()` which only\ncontains type constructors (int, str, list, dict, etc.) but NOT callable\nbuiltin functions (enumerate, len, range, zip, map, filter, etc.).\n\n**Solution**: Changed registration to use `PythonBuiltinNames.has()` instead,\nwhich includes ALL builtin names - both types and functions.\n\n**Changes**:\n1. `generators.zig:1136` - Changed check from `PyBuiltinTypes` to `PythonBuiltinNames`\n2. `generators.zig:16` - Added import: `const PythonBuiltinNames = shared.PythonBuiltinNames;`\n3. `core.zig:453-455` - Updated comment to reflect broader scope\n\n**Impact**:\n- enumerate test: \"no field named 'enum'\" errors ELIMINATED \u2705\n- Generated code now includes `pub fn @\"enum\"(...)` method \u2705\n- Invocation uses correct pattern: `@This().@\"enum\"(...)` \u2705\n- Remaining errors are unrelated (undeclared identifiers, argument counts)\n\n**Results**:\n- Before: 0% of affected tests compiled\n- After: Tests with callable builtin attributes progress past method resolution\n- Expected: 15-20 additional @core2 tests will benefit from this fix\n\n**Related**: Phase 2 of @core2 compilation error fixes. See implementation\nplan for Phase 3 (struct field deduplication).",
+  "files": [
+    {
+      "sha": "15faad03ef0f834d4421aeda80db47914c453c68",
+      "filename": "src/codegen/native/main/core.zig",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 2,
+      "changes": 5,
+      "blob_url": "https://github.com/teamchong/metal0/blob/04087f14b641dc14616dd95a6a381fdfaec31124/src%2Fcodegen%2Fnative%2Fmain%2Fcore.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/04087f14b641dc14616dd95a6a381fdfaec31124/src%2Fcodegen%2Fnative%2Fmain%2Fcore.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/src%2Fcodegen%2Fnative%2Fmain%2Fcore.zig?ref=04087f14b641dc14616dd95a6a381fdfaec31124",
+      "patch": "@@ -450,8 +450,9 @@ pub const NativeCodegen = struct {\n     // only for classes in nested_class_names but NOT in this map\n     nested_class_zig_refs: FnvVoidMap,\n \n-    // Track class-level type attributes (e.g., int_class = int)\n-    // Maps \"ClassName.attr_name\" -> type_name (e.g., \"IntStrDigitLimitsTests.int_class\" -> \"int\")\n+    // Track class-level callable builtin attributes (e.g., enum = enumerate, int_class = int)\n+    // Maps \"ClassName.attr_name\" -> builtin_name for direct invocation via @This().attr_name(...)\n+    // Includes type constructors (int, str, list) and functions (enumerate, len, range, zip, etc.)\n     class_type_attrs: FnvStringMap,\n \n     // Current class being generated (for super() support)"
+    },
+    {
+      "sha": "435628fec7d6226ecb47cd94f6c4e1945403f517",
+      "filename": "src/codegen/native/statements/functions/generators.zig",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 5,
+      "changes": 13,
+      "blob_url": "https://github.com/teamchong/metal0/blob/04087f14b641dc14616dd95a6a381fdfaec31124/src%2Fcodegen%2Fnative%2Fstatements%2Ffunctions%2Fgenerators.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/04087f14b641dc14616dd95a6a381fdfaec31124/src%2Fcodegen%2Fnative%2Fstatements%2Ffunctions%2Fgenerators.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/src%2Fcodegen%2Fnative%2Fstatements%2Ffunctions%2Fgenerators.zig?ref=04087f14b641dc14616dd95a6a381fdfaec31124",
+      "patch": "@@ -13,6 +13,7 @@ const builtin_types = @import(\"generators/builtin_types.zig\");\n const test_skip = @import(\"generators/test_skip.zig\");\n const shared = @import(\"../../shared_maps.zig\");\n const PyBuiltinTypes = shared.PythonBuiltinTypes;\n+const PythonBuiltinNames = shared.PythonBuiltinNames;\n \n // Re-exports\n pub const analyzeModuleLevelMutations = body.analyzeModuleLevelMutations;\n@@ -1121,18 +1122,20 @@ pub fn genClassDef(self: *NativeCodegen, class: ast.Node.ClassDef) CodegenError!\n         try self.mutable_classes.put(class_name_copy, {});\n     }\n \n-    // Register class-level type attributes BEFORE generating methods\n-    // so that self.int_class(...) can be detected and handled properly\n+    // Register class-level callable builtin attributes BEFORE generating methods\n+    // This includes type constructors (int, str) and functions (enumerate, len, range)\n+    // so that self.enum(...) or self.int_class(...) can be detected and handled properly\n     for (class.body) |stmt| {\n         if (stmt == .assign) {\n             const assign = stmt.assign;\n             if (assign.targets.len > 0 and assign.targets[0] == .name) {\n                 const attr_name = assign.targets[0].name.id;\n                 if (assign.value.* == .name) {\n-                    const type_name = assign.value.name.id;\n-                    if (PyBuiltinTypes.has(type_name)) {\n+                    const builtin_name = assign.value.name.id;\n+                    // Check if this is ANY builtin name (types + functions + constants)\n+                    if (PythonBuiltinNames.has(builtin_name)) {\n                         const key = try std.fmt.allocPrint(self.allocator, \"{s}.{s}\", .{ class.name, attr_name });\n-                        try self.class_type_attrs.put(key, type_name);\n+                        try self.class_type_attrs.put(key, builtin_name);\n                     }\n                 }\n             }"
+    }
+  ]
+}

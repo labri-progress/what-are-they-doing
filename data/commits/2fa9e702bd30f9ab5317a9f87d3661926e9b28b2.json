@@ -1,0 +1,41 @@
+{
+  "message": "Inject ToolCallContext into tool handler context\n\nTool handlers can now call ToolCallContextFromCtx(ctx) to access the\nconversation Messages and ToolCallID. Uses Go's context.WithValue pattern\nso the existing Execute signature is unchanged.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "c18a09c29b8780f7210b56225545dd66127f4d05",
+      "filename": "internal/llm/generate.go",
+      "status": "modified",
+      "additions": 21,
+      "deletions": 3,
+      "changes": 24,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/2fa9e702bd30f9ab5317a9f87d3661926e9b28b2/internal%2Fllm%2Fgenerate.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/2fa9e702bd30f9ab5317a9f87d3661926e9b28b2/internal%2Fllm%2Fgenerate.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/internal%2Fllm%2Fgenerate.go?ref=2fa9e702bd30f9ab5317a9f87d3661926e9b28b2",
+      "patch": "@@ -18,6 +18,20 @@ type Tool struct {\n \tschema     *jsonschema.Schema\n }\n \n+// ToolCallContext provides additional context to tool handlers via context.Value.\n+type ToolCallContext struct {\n+\tMessages   []Message\n+\tToolCallID string\n+}\n+\n+type toolCallContextKey struct{}\n+\n+// ToolCallContextFromCtx extracts the ToolCallContext from a context, if present.\n+func ToolCallContextFromCtx(ctx context.Context) (ToolCallContext, bool) {\n+\tv, ok := ctx.Value(toolCallContextKey{}).(ToolCallContext)\n+\treturn v, ok\n+}\n+\n type GenerateOptions struct {\n \tClient *Client\n \n@@ -217,7 +231,7 @@ func Generate(ctx context.Context, opts GenerateOptions) (*GenerateResult, error\n \t\t}\n \n \t\t// Execute tools (in parallel) and continue.\n-\t\tresults := executeToolCalls(ctx, toolIndex, calls)\n+\t\tresults := executeToolCalls(ctx, toolIndex, calls, history)\n \t\tstep.ToolResults = results\n \t\tsteps = append(steps, step)\n \n@@ -268,7 +282,7 @@ func compileSchema(params map[string]any) (*jsonschema.Schema, error) {\n \treturn c.Compile(\"schema.json\")\n }\n \n-func executeToolCalls(ctx context.Context, toolIndex map[string]Tool, calls []ToolCallData) []ToolResultData {\n+func executeToolCalls(ctx context.Context, toolIndex map[string]Tool, calls []ToolCallData, messages []Message) []ToolResultData {\n \tresults := make([]ToolResultData, len(calls))\n \tvar wg sync.WaitGroup\n \twg.Add(len(calls))\n@@ -298,7 +312,11 @@ func executeToolCalls(ctx context.Context, toolIndex map[string]Tool, calls []To\n \t\t\t\treturn\n \t\t\t}\n \n-\t\t\tout, err := t.Execute(ctx, args)\n+\t\t\ttcCtx := context.WithValue(ctx, toolCallContextKey{}, ToolCallContext{\n+\t\t\t\tMessages:   messages,\n+\t\t\t\tToolCallID: call.ID,\n+\t\t\t})\n+\t\t\tout, err := t.Execute(tcCtx, args)\n \t\t\tif err != nil {\n \t\t\t\tr.IsError = true\n \t\t\t\tr.Content = err.Error()"
+    },
+    {
+      "sha": "d0f3b97d9111f4f7aeae7e34e7d3c656f83bda42",
+      "filename": "internal/llm/generate_test.go",
+      "status": "modified",
+      "additions": 49,
+      "deletions": 0,
+      "changes": 49,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/2fa9e702bd30f9ab5317a9f87d3661926e9b28b2/internal%2Fllm%2Fgenerate_test.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/2fa9e702bd30f9ab5317a9f87d3661926e9b28b2/internal%2Fllm%2Fgenerate_test.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/internal%2Fllm%2Fgenerate_test.go?ref=2fa9e702bd30f9ab5317a9f87d3661926e9b28b2",
+      "patch": "@@ -652,6 +652,55 @@ func TestGenerate_RetriesApplyPerStep_NotWholeOperation(t *testing.T) {\n \t}\n }\n \n+func TestGenerate_ToolCallContext_AvailableInHandler(t *testing.T) {\n+\tc := NewClient()\n+\ta := &scriptedAdapter{\n+\t\tname: \"openai\",\n+\t\tsteps: []func(req Request) (Response, error){\n+\t\t\tfunc(req Request) (Response, error) {\n+\t\t\t\tcall := ToolCallData{ID: \"call1\", Name: \"t1\", Arguments: json.RawMessage(`{}`), Type: \"function\"}\n+\t\t\t\treturn Response{Message: Message{Role: RoleAssistant, Content: []ContentPart{{Kind: ContentToolCall, ToolCall: &call}}}}, nil\n+\t\t\t},\n+\t\t\tfunc(req Request) (Response, error) {\n+\t\t\t\treturn Response{Message: Assistant(\"ok\")}, nil\n+\t\t\t},\n+\t\t},\n+\t}\n+\tc.Register(a)\n+\n+\tvar gotCtx ToolCallContext\n+\tvar gotOK bool\n+\tprompt := \"do\"\n+\trounds := 1\n+\t_, err := Generate(context.Background(), GenerateOptions{\n+\t\tClient:        c,\n+\t\tModel:         \"m\",\n+\t\tPrompt:        &prompt,\n+\t\tMaxToolRounds: &rounds,\n+\t\tTools: []Tool{\n+\t\t\t{\n+\t\t\t\tDefinition: ToolDefinition{Name: \"t1\"},\n+\t\t\t\tExecute: func(ctx context.Context, args any) (any, error) {\n+\t\t\t\t\tgotCtx, gotOK = ToolCallContextFromCtx(ctx)\n+\t\t\t\t\treturn \"done\", nil\n+\t\t\t\t},\n+\t\t\t},\n+\t\t},\n+\t})\n+\tif err != nil {\n+\t\tt.Fatalf(\"Generate: %v\", err)\n+\t}\n+\tif !gotOK {\n+\t\tt.Fatalf(\"ToolCallContextFromCtx returned ok=false\")\n+\t}\n+\tif gotCtx.ToolCallID != \"call1\" {\n+\t\tt.Fatalf(\"ToolCallID: %q, want %q\", gotCtx.ToolCallID, \"call1\")\n+\t}\n+\tif len(gotCtx.Messages) == 0 {\n+\t\tt.Fatalf(\"Messages is empty\")\n+\t}\n+}\n+\n func TestGenerate_UnknownToolCall_SendsErrorResultToModel(t *testing.T) {\n \tc := NewClient()\n \tvar sawErrorResult atomic.Bool"
+    },
+    {
+      "sha": "31c771137a501e32b71465dda7792a2123f6d6c0",
+      "filename": "internal/llm/stream_generate.go",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/2fa9e702bd30f9ab5317a9f87d3661926e9b28b2/internal%2Fllm%2Fstream_generate.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/2fa9e702bd30f9ab5317a9f87d3661926e9b28b2/internal%2Fllm%2Fstream_generate.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/internal%2Fllm%2Fstream_generate.go?ref=2fa9e702bd30f9ab5317a9f87d3661926e9b28b2",
+      "patch": "@@ -272,7 +272,7 @@ func StreamGenerate(ctx context.Context, opts GenerateOptions) (*StreamResult, e\n \t\t\t// Continue the tool loop.\n \t\t\thistory = append(history, stepResp.Message)\n \n-\t\t\tresults := executeToolCalls(sctx, toolIndex, calls)\n+\t\t\tresults := executeToolCalls(sctx, toolIndex, calls, history)\n \t\t\tfor _, r := range results {\n \t\t\t\thistory = append(history, ToolResultNamed(r.ToolCallID, r.Name, r.Content, r.IsError))\n \t\t\t}"
+    }
+  ]
+}

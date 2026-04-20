@@ -1,0 +1,41 @@
+{
+  "message": "perf(test262): implement parallel test execution and fix Node/Bun compatibility\n\n- Add thread pool with atomic work queue for parallel test execution\n- Make temp_counter thread-safe using std.atomic.Value\n- Fix process.exit() safety check in Node/Bun polyfill\n- Node.js: 771s \u2192 222s (3.5x faster with --threads=8)\n- Bun: 387s \u2192 139s (2.8x faster with --threads=8)\n\nResults with parallel execution:\n- EdgeBox: 138s (fastest) \ud83c\udfc6\n- Bun: 139s\n- QuickJS: 153s\n- Node.js: 222s",
+  "files": [
+    {
+      "sha": "5834867e145b826c002ed0d789c6898e2a94c523",
+      "filename": "src/test262/harness.zig",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/teamchong/edgebox/blob/5da218c8a3280113fd623affde37a596bd53fea1/src%2Ftest262%2Fharness.zig",
+      "raw_url": "https://github.com/teamchong/edgebox/raw/5da218c8a3280113fd623affde37a596bd53fea1/src%2Ftest262%2Fharness.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/edgebox/contents/src%2Ftest262%2Fharness.zig?ref=5da218c8a3280113fd623affde37a596bd53fea1",
+      "patch": "@@ -137,7 +137,7 @@ const node_bun_polyfill =\n     \\\\var $DONE = function(err) {\n     \\\\  if (err) {\n     \\\\    print('Test262:AsyncTestFailure:' + err);\n-    \\\\    process.exit(1);\n+    \\\\    if (typeof process !== 'undefined' && process.exit) process.exit(1);\n     \\\\  } else {\n     \\\\    print('Test262:AsyncTestComplete');\n     \\\\  }"
+    },
+    {
+      "sha": "bef90bcb75e33a48a12490669e08d42a742ffaa1",
+      "filename": "src/test262/main.zig",
+      "status": "modified",
+      "additions": 93,
+      "deletions": 16,
+      "changes": 109,
+      "blob_url": "https://github.com/teamchong/edgebox/blob/5da218c8a3280113fd623affde37a596bd53fea1/src%2Ftest262%2Fmain.zig",
+      "raw_url": "https://github.com/teamchong/edgebox/raw/5da218c8a3280113fd623affde37a596bd53fea1/src%2Ftest262%2Fmain.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/edgebox/contents/src%2Ftest262%2Fmain.zig?ref=5da218c8a3280113fd623affde37a596bd53fea1",
+      "patch": "@@ -113,6 +113,79 @@ fn parseArgs(allocator: std.mem.Allocator) !?Options {\n     return opts;\n }\n \n+const WorkerContext = struct {\n+    runner: *runner.Runner,\n+    test_files: []const []const u8,\n+    results: *results.ResultCollector,\n+    next_idx: *std.atomic.Value(usize),\n+    mutex: *std.Thread.Mutex,\n+    verbose: bool,\n+};\n+\n+fn workerThread(ctx: *WorkerContext) void {\n+    while (true) {\n+        const idx = ctx.next_idx.fetchAdd(1, .monotonic);\n+        if (idx >= ctx.test_files.len) break;\n+\n+        const test_file = ctx.test_files[idx];\n+        const result = ctx.runner.runTest(test_file) catch |err| {\n+            ctx.mutex.lock();\n+            defer ctx.mutex.unlock();\n+            ctx.results.addError(test_file, err);\n+            continue;\n+        };\n+\n+        ctx.mutex.lock();\n+        defer ctx.mutex.unlock();\n+        ctx.results.addResult(test_file, result);\n+\n+        if (ctx.verbose) {\n+            const status_char: u8 = switch (result.status) {\n+                .pass => '.',\n+                .fail => 'F',\n+                .skip => 'S',\n+                .timeout => 'T',\n+                .error_ => 'E',\n+            };\n+            std.debug.print(\"{c}\", .{status_char});\n+        }\n+    }\n+}\n+\n+fn runTestsParallel(\n+    allocator: std.mem.Allocator,\n+    test_runner: *runner.Runner,\n+    test_files: []const []const u8,\n+    result_collector: *results.ResultCollector,\n+    num_threads: u32,\n+    verbose: bool,\n+) !void {\n+    var next_idx = std.atomic.Value(usize).init(0);\n+    var mutex = std.Thread.Mutex{};\n+\n+    var ctx = WorkerContext{\n+        .runner = test_runner,\n+        .test_files = test_files,\n+        .results = result_collector,\n+        .next_idx = &next_idx,\n+        .mutex = &mutex,\n+        .verbose = verbose,\n+    };\n+\n+    // Create worker threads\n+    const threads = try allocator.alloc(std.Thread, num_threads);\n+    defer allocator.free(threads);\n+\n+    for (threads) |*thread| {\n+        thread.* = try std.Thread.spawn(.{}, workerThread, .{&ctx});\n+    }\n+\n+    // Wait for all threads to complete\n+    for (threads) |thread| {\n+        thread.join();\n+    }\n+}\n+\n pub fn main() !void {\n     var gpa = std.heap.GeneralPurposeAllocator(.{}){};\n     defer _ = gpa.deinit();\n@@ -172,23 +245,27 @@ pub fn main() !void {\n \n     const start_time = std.time.milliTimestamp();\n \n-    // Run tests\n-    for (test_files.items) |test_file| {\n-        const result = test_runner.runTest(test_file) catch |err| {\n-            result_collector.addError(test_file, err);\n-            continue;\n-        };\n-        result_collector.addResult(test_file, result);\n-\n-        if (opts.verbose) {\n-            const status_char: u8 = switch (result.status) {\n-                .pass => '.',\n-                .fail => 'F',\n-                .skip => 'S',\n-                .timeout => 'T',\n-                .error_ => 'E',\n+    // Run tests (with parallelism if threads > 1)\n+    if (opts.threads > 1) {\n+        try runTestsParallel(allocator, &test_runner, test_files.items, &result_collector, opts.threads, opts.verbose);\n+    } else {\n+        for (test_files.items) |test_file| {\n+            const result = test_runner.runTest(test_file) catch |err| {\n+                result_collector.addError(test_file, err);\n+                continue;\n             };\n-            std.debug.print(\"{c}\", .{status_char});\n+            result_collector.addResult(test_file, result);\n+\n+            if (opts.verbose) {\n+                const status_char: u8 = switch (result.status) {\n+                    .pass => '.',\n+                    .fail => 'F',\n+                    .skip => 'S',\n+                    .timeout => 'T',\n+                    .error_ => 'E',\n+                };\n+                std.debug.print(\"{c}\", .{status_char});\n+            }\n         }\n     }\n "
+    },
+    {
+      "sha": "c2dc554b71c349a00adc8ae63b7a088ab77187e9",
+      "filename": "src/test262/runner.zig",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 5,
+      "changes": 10,
+      "blob_url": "https://github.com/teamchong/edgebox/blob/5da218c8a3280113fd623affde37a596bd53fea1/src%2Ftest262%2Frunner.zig",
+      "raw_url": "https://github.com/teamchong/edgebox/raw/5da218c8a3280113fd623affde37a596bd53fea1/src%2Ftest262%2Frunner.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/edgebox/contents/src%2Ftest262%2Frunner.zig?ref=5da218c8a3280113fd623affde37a596bd53fea1",
+      "patch": "@@ -24,7 +24,7 @@ pub const Runner = struct {\n     harness_loader: *harness.HarnessLoader,\n     timeout_ms: u32,\n     temp_dir: []const u8,\n-    temp_counter: u64,\n+    temp_counter: std.atomic.Value(u64),\n \n     pub fn init(\n         allocator: std.mem.Allocator,\n@@ -38,7 +38,7 @@ pub const Runner = struct {\n             .harness_loader = harness_loader,\n             .timeout_ms = timeout_ms,\n             .temp_dir = \"/tmp/test262\",\n-            .temp_counter = 0,\n+            .temp_counter = std.atomic.Value(u64).init(0),\n         };\n     }\n \n@@ -129,12 +129,12 @@ pub const Runner = struct {\n         // Ensure temp directory exists\n         std.fs.cwd().makePath(self.temp_dir) catch {};\n \n-        // Generate unique filename\n-        self.temp_counter += 1;\n+        // Generate unique filename (thread-safe)\n+        const counter = self.temp_counter.fetchAdd(1, .monotonic);\n         const filename = try std.fmt.allocPrint(\n             self.allocator,\n             \"{s}/test_{d}_{d}.js\",\n-            .{ self.temp_dir, std.time.milliTimestamp(), self.temp_counter },\n+            .{ self.temp_dir, std.time.milliTimestamp(), counter },\n         );\n \n         // Write file"
+    }
+  ]
+}

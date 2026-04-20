@@ -1,0 +1,41 @@
+{
+  "message": "feat(runtime): integrate fr-persist AOF capture into command dispatch pipeline\n\nWire the fr-persist crate into fr-runtime so that every successfully\ndispatched mutating command is captured as an AofRecord. This is the\nruntime-side integration for append-only file persistence (FR-P2C-005).\n\nConcrete changes:\n\n- Add fr-persist as a dependency of fr-runtime (Cargo.toml + Cargo.lock).\n- Import AofRecord and encode_aof_stream from fr-persist in lib.rs.\n- Extend the Runtime struct with a new `aof_records: Vec<AofRecord>` field,\n  initialized empty in the constructor.\n- After a successful `dispatch_argv` in `execute_frame`, call the new\n  private method `capture_aof_record` to push the command's argv into the\n  in-memory AOF log. Failed/unknown commands are intentionally excluded so\n  only state-mutating successes are persisted.\n- Expose two public accessors:\n    - `aof_records() -> &[AofRecord]` for inspecting the captured log.\n    - `encoded_aof_stream() -> Vec<u8>` for serializing the full AOF log\n      via fr-persist's wire format encoder.\n- Add two unit tests:\n    - fr_p2c_005_u001: verifies that SET and DEL are captured while an\n      unknown command (NOPE) is not, asserting correct argv contents.\n    - fr_p2c_005_u002: round-trips the encoded AOF stream through\n      decode_aof_stream and asserts lossless fidelity.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "6c2fe8f655f5bb3784f58056cb680d2055ec6a10",
+      "filename": "Cargo.lock",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/e705c1b9f2c140f4817e0402cf241a3ff1653b53/Cargo.lock",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/e705c1b9f2c140f4817e0402cf241a3ff1653b53/Cargo.lock",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/Cargo.lock?ref=e705c1b9f2c140f4817e0402cf241a3ff1653b53",
+      "patch": "@@ -57,6 +57,7 @@ dependencies = [\n  \"fr-command\",\n  \"fr-config\",\n  \"fr-eventloop\",\n+ \"fr-persist\",\n  \"fr-protocol\",\n  \"fr-store\",\n ]"
+    },
+    {
+      "sha": "a8216d71dcb7107fabbe9f7986a0f024d3e6533c",
+      "filename": "crates/fr-runtime/Cargo.toml",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/e705c1b9f2c140f4817e0402cf241a3ff1653b53/crates%2Ffr-runtime%2FCargo.toml",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/e705c1b9f2c140f4817e0402cf241a3ff1653b53/crates%2Ffr-runtime%2FCargo.toml",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/crates%2Ffr-runtime%2FCargo.toml?ref=e705c1b9f2c140f4817e0402cf241a3ff1653b53",
+      "patch": "@@ -7,5 +7,6 @@ edition = \"2024\"\n fr-command = { version = \"0.1.0\", path = \"../fr-command\" }\n fr-config = { version = \"0.1.0\", path = \"../fr-config\" }\n fr-eventloop = { version = \"0.1.0\", path = \"../fr-eventloop\" }\n+fr-persist = { version = \"0.1.0\", path = \"../fr-persist\" }\n fr-protocol = { version = \"0.1.0\", path = \"../fr-protocol\" }\n fr-store = { version = \"0.1.0\", path = \"../fr-store\" }"
+    },
+    {
+      "sha": "71c825dc3d8c54d953d25830779d4b630db37be7",
+      "filename": "crates/fr-runtime/src/lib.rs",
+      "status": "modified",
+      "additions": 65,
+      "deletions": 1,
+      "changes": 66,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/e705c1b9f2c140f4817e0402cf241a3ff1653b53/crates%2Ffr-runtime%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/e705c1b9f2c140f4817e0402cf241a3ff1653b53/crates%2Ffr-runtime%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/crates%2Ffr-runtime%2Fsrc%2Flib.rs?ref=e705c1b9f2c140f4817e0402cf241a3ff1653b53",
+      "patch": "@@ -16,6 +16,7 @@ use fr_eventloop::{\n     validate_ae_barrier_order, validate_bootstrap, validate_fd_registration_bounds,\n     validate_pending_write_delivery, validate_read_path,\n };\n+use fr_persist::{AofRecord, encode_aof_stream};\n use fr_protocol::{RespFrame, RespParseError, parse_frame};\n use fr_store::Store;\n \n@@ -235,6 +236,7 @@ impl EvidenceLedger {\n pub struct Runtime {\n     policy: RuntimePolicy,\n     store: Store,\n+    aof_records: Vec<AofRecord>,\n     evidence: EvidenceLedger,\n     tls_state: TlsRuntimeState,\n     auth_state: AuthState,\n@@ -261,6 +263,7 @@ impl Runtime {\n         Self {\n             policy,\n             store: Store::new(),\n+            aof_records: Vec::new(),\n             evidence: EvidenceLedger::default(),\n             tls_state: TlsRuntimeState::default(),\n             auth_state: AuthState::default(),\n@@ -390,6 +393,16 @@ impl Runtime {\n         &self.evidence\n     }\n \n+    #[must_use]\n+    pub fn aof_records(&self) -> &[AofRecord] {\n+        &self.aof_records\n+    }\n+\n+    #[must_use]\n+    pub fn encoded_aof_stream(&self) -> Vec<u8> {\n+        encode_aof_stream(&self.aof_records)\n+    }\n+\n     #[must_use]\n     pub fn tls_runtime_state(&self) -> &TlsRuntimeState {\n         &self.tls_state\n@@ -535,7 +548,10 @@ impl Runtime {\n         }\n \n         match dispatch_argv(&argv, &mut self.store, now_ms) {\n-            Ok(reply) => reply,\n+            Ok(reply) => {\n+                self.capture_aof_record(&argv);\n+                reply\n+            }\n             Err(err) => command_error_to_resp(err),\n         }\n     }\n@@ -567,6 +583,15 @@ impl Runtime {\n         }\n     }\n \n+    fn capture_aof_record(&mut self, argv: &[Vec<u8>]) {\n+        if argv.is_empty() {\n+            return;\n+        }\n+        self.aof_records.push(AofRecord {\n+            argv: argv.to_vec(),\n+        });\n+    }\n+\n     fn handle_auth_command(&mut self, argv: &[Vec<u8>]) -> RespFrame {\n         if argv.len() != 2 && argv.len() != 3 {\n             return command_error_to_resp(CommandError::WrongArity(\"AUTH\"));\n@@ -976,6 +1001,7 @@ mod tests {\n         FdRegistrationError, LoopBootstrap, PendingWriteError, ReadPathError, ReadinessCallback,\n         TickBudget,\n     };\n+    use fr_persist::decode_aof_stream;\n     use fr_protocol::{RespFrame, parse_frame};\n \n     use super::{\n@@ -1295,6 +1321,44 @@ mod tests {\n         );\n     }\n \n+    #[test]\n+    fn fr_p2c_005_u001_runtime_captures_successful_dispatched_commands_for_aof() {\n+        let mut rt = Runtime::default_strict();\n+\n+        let set = rt.execute_frame(command(&[b\"SET\", b\"k\", b\"v\"]), 0);\n+        assert_eq!(set, RespFrame::SimpleString(\"OK\".to_string()));\n+\n+        let del = rt.execute_frame(command(&[b\"DEL\", b\"k\"]), 1);\n+        assert_eq!(del, RespFrame::Integer(1));\n+\n+        let unknown = rt.execute_frame(command(&[b\"NOPE\"]), 2);\n+        assert!(matches!(unknown, RespFrame::Error(_)));\n+\n+        let records = rt.aof_records();\n+        assert_eq!(records.len(), 2);\n+        assert_eq!(\n+            records[0].argv,\n+            vec![b\"SET\".to_vec(), b\"k\".to_vec(), b\"v\".to_vec()]\n+        );\n+        assert_eq!(records[1].argv, vec![b\"DEL\".to_vec(), b\"k\".to_vec()]);\n+    }\n+\n+    #[test]\n+    fn fr_p2c_005_u002_runtime_aof_stream_export_round_trips() {\n+        let mut rt = Runtime::default_strict();\n+        let _ = rt.execute_frame(command(&[b\"SET\", b\"k\", b\"v\"]), 0);\n+        let _ = rt.execute_frame(command(&[b\"DEL\", b\"k\"]), 1);\n+\n+        let encoded = rt.encoded_aof_stream();\n+        let decoded = decode_aof_stream(&encoded).expect(\"decode aof stream\");\n+        assert_eq!(decoded.len(), 2);\n+        assert_eq!(\n+            decoded[0].argv,\n+            vec![b\"SET\".to_vec(), b\"k\".to_vec(), b\"v\".to_vec()]\n+        );\n+        assert_eq!(decoded[1].argv, vec![b\"DEL\".to_vec(), b\"k\".to_vec()]);\n+    }\n+\n     #[test]\n     fn fr_p2c_004_runtime_special_command_classifier_matches_linear_reference() {\n         let samples: &[&[u8]] = &["
+    }
+  ]
+}

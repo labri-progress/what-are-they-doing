@@ -1,0 +1,53 @@
+{
+  "message": "Improve panic handling and reduce allocations in HTTP handling\n\ndependency.rs - Safer cleanup execution:\n- Add run_cleanup_future() helper for catching panics during future execution\n- Previously only caught panics during cleanup function creation\n- Now catches panics both when creating cleanup and when awaiting it\n- Remaining cleanups continue even if earlier ones panic\n\nextract.rs - Zero-allocation content-type check:\n- Replace to_ascii_lowercase() with eq_ignore_ascii_case()\n- Use get() slice checks instead of allocating lowercase string\n- Check for application/json and *+json variants without heap allocation\n- Reduces memory pressure in hot path\n\nparser.rs - Zero-allocation chunked detection:\n- Add contains_ignore_ascii_case() helper function\n- Check Transfer-Encoding: chunked without allocating lowercase copy\n- Uses byte-level comparison for performance\n\nserver.rs:\n- Related minor import/cleanup\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "5757a71a179a872fa29070dfcfb52d3cf7039e23",
+      "filename": "crates/fastapi-core/src/dependency.rs",
+      "status": "modified",
+      "additions": 25,
+      "deletions": 6,
+      "changes": 31,
+      "blob_url": "https://github.com/Dicklesworthstone/fastapi_rust/blob/01df1facbe71de1c13a80262b437f3053967232d/crates%2Ffastapi-core%2Fsrc%2Fdependency.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/fastapi_rust/raw/01df1facbe71de1c13a80262b437f3053967232d/crates%2Ffastapi-core%2Fsrc%2Fdependency.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/fastapi_rust/contents/crates%2Ffastapi-core%2Fsrc%2Fdependency.rs?ref=01df1facbe71de1c13a80262b437f3053967232d",
+      "patch": "@@ -159,8 +159,8 @@ impl CleanupStack {\n     /// Run all cleanup functions in LIFO order.\n     ///\n     /// This consumes all registered cleanup functions. Each cleanup is\n-    /// awaited in sequence. If a cleanup function panics, the remaining\n-    /// cleanups are still attempted.\n+    /// awaited in sequence. If a cleanup function panics (either during\n+    /// creation or execution), the remaining cleanups are still attempted.\n     ///\n     /// # Returns\n     ///\n@@ -170,13 +170,15 @@ impl CleanupStack {\n         let mut completed = 0;\n \n         for cleanup in cleanups {\n-            // Call the cleanup function to get the future, catching panics\n+            // Call the cleanup function to get the future, catching panics during creation\n             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (cleanup)()));\n             match result {\n                 Ok(future) => {\n-                    // Now await the returned future\n-                    future.await;\n-                    completed += 1;\n+                    // Run the future, catching any panics during execution\n+                    if Self::run_cleanup_future(future).await {\n+                        completed += 1;\n+                    }\n+                    // If cleanup panicked during execution, continue with remaining\n                 }\n                 Err(_) => {\n                     // Cleanup panicked during creation, continue with remaining cleanups\n@@ -186,6 +188,23 @@ impl CleanupStack {\n \n         completed\n     }\n+\n+    /// Run a single cleanup future, catching any panics during execution.\n+    ///\n+    /// Returns `true` if the cleanup completed successfully, `false` if it panicked.\n+    async fn run_cleanup_future(mut future: Pin<Box<dyn Future<Output = ()> + Send>>) -> bool {\n+        use std::panic::{AssertUnwindSafe, catch_unwind};\n+        use std::task::Poll;\n+\n+        std::future::poll_fn(move |cx| {\n+            match catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx))) {\n+                Ok(Poll::Ready(())) => Poll::Ready(true),\n+                Ok(Poll::Pending) => Poll::Pending,\n+                Err(_) => Poll::Ready(false), // Cleanup panicked, treat as failed\n+            }\n+        })\n+        .await\n+    }\n }\n \n impl Default for CleanupStack {"
+    },
+    {
+      "sha": "78cb271f76be0aa5a53c9a33494bc38cee55259b",
+      "filename": "crates/fastapi-core/src/extract.rs",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 3,
+      "changes": 11,
+      "blob_url": "https://github.com/Dicklesworthstone/fastapi_rust/blob/01df1facbe71de1c13a80262b437f3053967232d/crates%2Ffastapi-core%2Fsrc%2Fextract.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/fastapi_rust/raw/01df1facbe71de1c13a80262b437f3053967232d/crates%2Ffastapi-core%2Fsrc%2Fextract.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/fastapi_rust/contents/crates%2Ffastapi-core%2Fsrc%2Fextract.rs?ref=01df1facbe71de1c13a80262b437f3053967232d",
+      "patch": "@@ -327,9 +327,14 @@ impl<T: DeserializeOwned> FromRequest for Json<T> {\n             .and_then(|v| std::str::from_utf8(v).ok());\n \n         let is_json = content_type.is_some_and(|ct| {\n-            let ct_lower = ct.to_ascii_lowercase();\n-            ct_lower.starts_with(\"application/json\")\n-                || ct_lower.starts_with(\"application/\") && ct_lower.contains(\"+json\")\n+            // Case-insensitive check without allocation\n+            ct.get(..16)\n+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(\"application/json\"))\n+                || (ct.get(..12).is_some_and(|p| p.eq_ignore_ascii_case(\"application/\"))\n+                    && ct\n+                        .as_bytes()\n+                        .windows(5)\n+                        .any(|w| w.eq_ignore_ascii_case(b\"+json\")))\n         });\n \n         if !is_json {"
+    },
+    {
+      "sha": "9ff281e75c264c9ed2bb562ffdb85db2f972175d",
+      "filename": "crates/fastapi-http/src/parser.rs",
+      "status": "modified",
+      "additions": 18,
+      "deletions": 1,
+      "changes": 19,
+      "blob_url": "https://github.com/Dicklesworthstone/fastapi_rust/blob/01df1facbe71de1c13a80262b437f3053967232d/crates%2Ffastapi-http%2Fsrc%2Fparser.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/fastapi_rust/raw/01df1facbe71de1c13a80262b437f3053967232d/crates%2Ffastapi-http%2Fsrc%2Fparser.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/fastapi_rust/contents/crates%2Ffastapi-http%2Fsrc%2Fparser.rs?ref=01df1facbe71de1c13a80262b437f3053967232d",
+      "patch": "@@ -391,11 +391,28 @@ impl<'a> Header<'a> {\n         if !self.is_transfer_encoding() {\n             return false;\n         }\n+        // Use case-insensitive search without allocating a new String\n         self.value_str()\n-            .is_some_and(|v| v.to_ascii_lowercase().contains(\"chunked\"))\n+            .is_some_and(|v| contains_ignore_ascii_case(v, \"chunked\"))\n     }\n }\n \n+/// Case-insensitive substring search without allocation.\n+#[inline]\n+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {\n+    if needle.is_empty() {\n+        return true;\n+    }\n+    if haystack.len() < needle.len() {\n+        return false;\n+    }\n+    let needle_bytes = needle.as_bytes();\n+    haystack\n+        .as_bytes()\n+        .windows(needle_bytes.len())\n+        .any(|window| window.eq_ignore_ascii_case(needle_bytes))\n+}\n+\n /// Iterator over HTTP headers in a buffer.\n ///\n /// Zero-copy: returns borrowed [`Header`] references into the original buffer."
+    },
+    {
+      "sha": "4bc3f3543f3980e05c89cf31a2d97b9db16efadd",
+      "filename": "crates/fastapi-http/src/server.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/fastapi_rust/blob/01df1facbe71de1c13a80262b437f3053967232d/crates%2Ffastapi-http%2Fsrc%2Fserver.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/fastapi_rust/raw/01df1facbe71de1c13a80262b437f3053967232d/crates%2Ffastapi-http%2Fsrc%2Fserver.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/fastapi_rust/contents/crates%2Ffastapi-http%2Fsrc%2Fserver.rs?ref=01df1facbe71de1c13a80262b437f3053967232d",
+      "patch": "@@ -511,6 +511,7 @@ fn parse_port(port: &str) -> Option<u16> {\n }\n \n fn is_valid_hostname(host: &str) -> bool {\n+    // Note: str::len() returns byte length (RFC 1035 specifies 253 octets)\n     if host.len() > 253 {\n         return false;\n     }"
+    }
+  ]
+}

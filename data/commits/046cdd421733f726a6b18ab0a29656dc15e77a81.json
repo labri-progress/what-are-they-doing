@@ -1,0 +1,77 @@
+{
+  "message": "feat: add session retention controls",
+  "files": [
+    {
+      "sha": "5594277be7e9fdbb3237f90d8de382df3c6079d0",
+      "filename": "bin/oracle-cli.ts",
+      "status": "modified",
+      "additions": 24,
+      "deletions": 1,
+      "changes": 25,
+      "blob_url": "https://github.com/steipete/oracle/blob/046cdd421733f726a6b18ab0a29656dc15e77a81/bin%2Foracle-cli.ts",
+      "raw_url": "https://github.com/steipete/oracle/raw/046cdd421733f726a6b18ab0a29656dc15e77a81/bin%2Foracle-cli.ts",
+      "contents_url": "https://api.github.com/repos/steipete/oracle/contents/bin%2Foracle-cli.ts?ref=046cdd421733f726a6b18ab0a29656dc15e77a81",
+      "patch": "@@ -9,7 +9,7 @@ import { resolveEngine, type EngineMode, defaultWaitPreference } from '../src/cl\n import { shouldRequirePrompt } from '../src/cli/promptRequirement.js';\n import chalk from 'chalk';\n import type { SessionMetadata, SessionMode, BrowserSessionConfig } from '../src/sessionStore.js';\n-import { sessionStore } from '../src/sessionStore.js';\n+import { sessionStore, pruneOldSessions } from '../src/sessionStore.js';\n import { runOracle, renderPromptMarkdown, readFiles } from '../src/oracle.js';\n import type { ModelName, PreviewMode, RunOracleOptions } from '../src/oracle.js';\n import { CHATGPT_URL } from '../src/browserMode.js';\n@@ -103,6 +103,7 @@ interface CliOptions extends OptionValues {\n   azureDeployment?: string;\n   azureApiVersion?: string;\n   showModelId?: boolean;\n+  retainHours?: number;\n }\n \n type ResolvedCliOptions = Omit<CliOptions, 'model'> & { model: ModelName; models?: ModelName[] };\n@@ -269,6 +270,11 @@ program\n     new Option('--browser-inline-files', 'Paste files directly into the ChatGPT composer instead of uploading attachments.').default(false),\n   )\n   .addOption(new Option('--browser-bundle-files', 'Bundle all attachments into a single archive before uploading.').default(false))\n+  .option(\n+    '--retain-hours <hours>',\n+    'Prune stored sessions older than this many hours before running (set 0 to disable).',\n+    parseFloatOption,\n+  )\n   .option('--debug-help', 'Show the advanced/debug option set and exit.', false)\n   .option('--heartbeat <seconds>', 'Emit periodic in-progress updates (0 to disable).', parseHeartbeatOption, 30)\n   .addOption(new Option('--wait').default(undefined))\n@@ -483,6 +489,20 @@ async function runRootCommand(options: CliOptions): Promise<void> {\n   }\n   const previewMode = resolvePreviewMode(options.dryRun || options.preview);\n \n+  const applyRetentionOption = (): void => {\n+    if (optionUsesDefault('retainHours') && typeof userConfig.sessionRetentionHours === 'number') {\n+      options.retainHours = userConfig.sessionRetentionHours;\n+    }\n+    const envRetention = process.env.ORACLE_RETAIN_HOURS;\n+    if (optionUsesDefault('retainHours') && envRetention) {\n+      const parsed = Number.parseFloat(envRetention);\n+      if (!Number.isNaN(parsed)) {\n+        options.retainHours = parsed;\n+      }\n+    }\n+  };\n+  applyRetentionOption();\n+\n   if (userCliArgs.length === 0) {\n     if (tuiEnabled()) {\n       await launchTui({ version: VERSION });\n@@ -492,6 +512,9 @@ async function runRootCommand(options: CliOptions): Promise<void> {\n     program.help({ error: false });\n     return;\n   }\n+  const retentionHours = typeof options.retainHours === 'number' ? options.retainHours : undefined;\n+  await sessionStore.ensureStorage();\n+  await pruneOldSessions(retentionHours, (message) => console.log(chalk.dim(message)));\n \n   if (options.debugHelp) {\n     printDebugHelp(program.name());"
+    },
+    {
+      "sha": "0419015cdae980ddbc8f90cf84af3a4d94ab840a",
+      "filename": "src/cli/tui/index.ts",
+      "status": "modified",
+      "additions": 43,
+      "deletions": 5,
+      "changes": 48,
+      "blob_url": "https://github.com/steipete/oracle/blob/046cdd421733f726a6b18ab0a29656dc15e77a81/src%2Fcli%2Ftui%2Findex.ts",
+      "raw_url": "https://github.com/steipete/oracle/raw/046cdd421733f726a6b18ab0a29656dc15e77a81/src%2Fcli%2Ftui%2Findex.ts",
+      "contents_url": "https://api.github.com/repos/steipete/oracle/contents/src%2Fcli%2Ftui%2Findex.ts?ref=046cdd421733f726a6b18ab0a29656dc15e77a81",
+      "patch": "@@ -6,8 +6,8 @@ import os from 'node:os';\n import fs from 'node:fs/promises';\n import { MODEL_CONFIGS, type ModelName, type RunOracleOptions } from '../../oracle.js';\n import { renderMarkdownAnsi } from '../markdownRenderer.js';\n-import type { SessionMetadata, SessionMode, BrowserSessionConfig } from '../../sessionStore.js';\n-import { sessionStore } from '../../sessionStore.js';\n+import type { SessionMetadata, SessionMode, BrowserSessionConfig, SessionModelRun } from '../../sessionStore.js';\n+import { sessionStore, pruneOldSessions } from '../../sessionStore.js';\n import { performSessionRun } from '../sessionRunner.js';\n import { MAX_RENDER_BYTES, trimBeforeFirstAnswer } from '../sessionDisplay.js';\n import { buildBrowserConfig, resolveBrowserModelLabel } from '../browserConfig.js';\n@@ -228,6 +228,9 @@ async function showSessionDetail(sessionId: string): Promise<void> {\n     }\n     console.clear();\n     printSessionHeader(meta);\n+    if (meta.models && meta.models.length > 0) {\n+      printModelSummaries(meta.models);\n+    }\n     const prompt = await readStoredPrompt(sessionId);\n     if (prompt) {\n       console.log(chalk.bold('Prompt:'));\n@@ -243,7 +246,14 @@ async function showSessionDetail(sessionId: string): Promise<void> {\n     await renderSessionLog(sessionId);\n \n     const isRunning = meta.status === 'running';\n+    const modelActions =\n+      meta.models?.map((run) => ({\n+        name: `View ${run.model} log (${run.status})`,\n+        value: `log:${run.model}`,\n+      })) ?? [];\n     const actions: Array<{ name: string; value: string }> = [\n+      { name: 'View combined log', value: 'log:__all__' },\n+      ...modelActions,\n       ...(isRunning ? [{ name: 'Refresh', value: 'refresh' }] : []),\n       { name: 'Back', value: 'back' },\n     ];\n@@ -259,12 +269,20 @@ async function showSessionDetail(sessionId: string): Promise<void> {\n     if (next === 'back') {\n       return;\n     }\n-    // refresh loops\n+    if (next === 'refresh') {\n+      continue;\n+    }\n+    if (next.startsWith('log:')) {\n+      const [, target] = next.split(':');\n+      await renderSessionLog(sessionId, target === '__all__' ? undefined : target);\n+    }\n   }\n }\n \n-async function renderSessionLog(sessionId: string): Promise<void> {\n-  const raw = await sessionStore.readLog(sessionId);\n+async function renderSessionLog(sessionId: string, model?: string): Promise<void> {\n+  const raw = model ? await sessionStore.readModelLog(sessionId, model) : await sessionStore.readLog(sessionId);\n+  const headerLabel = model ? `Log (${model})` : 'Log';\n+  console.log(chalk.bold(headerLabel));\n   const text = trimBeforeFirstAnswer(raw);\n   const size = Buffer.byteLength(text, 'utf8');\n   if (size > MAX_RENDER_BYTES) {\n@@ -277,6 +295,11 @@ async function renderSessionLog(sessionId: string): Promise<void> {\n     console.log('');\n     return;\n   }\n+  if (!text.trim()) {\n+    console.log(dim('(log is empty)'));\n+    console.log('');\n+    return;\n+  }\n   process.stdout.write(renderMarkdownAnsi(text));\n   console.log('');\n }\n@@ -306,6 +329,20 @@ function printSessionHeader(meta: SessionMetadata): void {\n   }\n }\n \n+function printModelSummaries(models: SessionModelRun[]): void {\n+  if (models.length === 0) {\n+    return;\n+  }\n+  console.log(chalk.bold('Models:'));\n+  for (const run of models) {\n+    const usage = run.usage\n+      ? ` tok=${run.usage.outputTokens?.toLocaleString() ?? 0}/${run.usage.totalTokens?.toLocaleString() ?? 0}`\n+      : '';\n+    console.log(` - ${chalk.cyan(run.model)} \u2014 ${run.status}${usage}`);\n+  }\n+  console.log('');\n+}\n+\n interface WizardAnswers {\n   promptInput: string;\n   slug?: string;\n@@ -435,6 +472,7 @@ async function askOracleFlow(version: string, userConfig: UserConfig): Promise<v\n   }\n   const promptWithSuffix = userConfig.promptSuffix ? `${prompt.trim()}\\n${userConfig.promptSuffix}` : prompt;\n   await sessionStore.ensureStorage();\n+  await pruneOldSessions(userConfig.sessionRetentionHours, (message) => console.log(chalk.dim(message)));\n   const normalizedMultiModels =\n     Array.isArray(answers.models) && answers.models.length > 0\n       ? Array.from("
+    },
+    {
+      "sha": "b428fc673f1c1b52acd3b55e70aa1ed8662f7aa5",
+      "filename": "src/config.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/steipete/oracle/blob/046cdd421733f726a6b18ab0a29656dc15e77a81/src%2Fconfig.ts",
+      "raw_url": "https://github.com/steipete/oracle/raw/046cdd421733f726a6b18ab0a29656dc15e77a81/src%2Fconfig.ts",
+      "contents_url": "https://api.github.com/repos/steipete/oracle/contents/src%2Fconfig.ts?ref=046cdd421733f726a6b18ab0a29656dc15e77a81",
+      "patch": "@@ -41,6 +41,7 @@ export interface UserConfig {\n   promptSuffix?: string;\n   apiBaseUrl?: string;\n   azure?: AzureConfig;\n+  sessionRetentionHours?: number;\n }\n \n function resolveConfigPath(): string {"
+    },
+    {
+      "sha": "8d83eb9ae60993861c83528b6a502e5a108374e1",
+      "filename": "src/sessionStore.ts",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 0,
+      "changes": 13,
+      "blob_url": "https://github.com/steipete/oracle/blob/046cdd421733f726a6b18ab0a29656dc15e77a81/src%2FsessionStore.ts",
+      "raw_url": "https://github.com/steipete/oracle/raw/046cdd421733f726a6b18ab0a29656dc15e77a81/src%2FsessionStore.ts",
+      "contents_url": "https://api.github.com/repos/steipete/oracle/contents/src%2FsessionStore.ts?ref=046cdd421733f726a6b18ab0a29656dc15e77a81",
+      "patch": "@@ -118,3 +118,16 @@ export type {\n   SessionStatus,\n   SessionModelRun,\n } from './sessionManager.js';\n+\n+export async function pruneOldSessions(\n+  hours?: number,\n+  log?: (message: string) => void,\n+): Promise<void> {\n+  if (typeof hours !== 'number' || Number.isNaN(hours) || hours <= 0) {\n+    return;\n+  }\n+  const result = await sessionStore.deleteOlderThan({ hours });\n+  if (result.deleted > 0) {\n+    log?.(`Pruned ${result.deleted} stored sessions older than ${hours}h.`);\n+  }\n+}"
+    },
+    {
+      "sha": "2f2f7bf1315dcc7cefe22842d8d28aed313e39b4",
+      "filename": "tests/cli/tui/index.test.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/steipete/oracle/blob/046cdd421733f726a6b18ab0a29656dc15e77a81/tests%2Fcli%2Ftui%2Findex.test.ts",
+      "raw_url": "https://github.com/steipete/oracle/raw/046cdd421733f726a6b18ab0a29656dc15e77a81/tests%2Fcli%2Ftui%2Findex.test.ts",
+      "contents_url": "https://api.github.com/repos/steipete/oracle/contents/tests%2Fcli%2Ftui%2Findex.test.ts?ref=046cdd421733f726a6b18ab0a29656dc15e77a81",
+      "patch": "@@ -31,6 +31,7 @@ vi.mock('../../../src/sessionStore.ts', () => ({\n     readRequest: readRequestMock,\n     readLog: readLogMock,\n     listSessions: listSessionsMock,\n+    deleteOlderThan: vi.fn(),\n     getPaths: getPathsMock,\n     sessionsDir: vi.fn().mockReturnValue('/tmp/.oracle/sessions'),\n   },"
+    },
+    {
+      "sha": "10b806f8141b2122e82930d0dc97ab9f6cef34cd",
+      "filename": "tests/sessionStore.prune.test.ts",
+      "status": "added",
+      "additions": 22,
+      "deletions": 0,
+      "changes": 22,
+      "blob_url": "https://github.com/steipete/oracle/blob/046cdd421733f726a6b18ab0a29656dc15e77a81/tests%2FsessionStore.prune.test.ts",
+      "raw_url": "https://github.com/steipete/oracle/raw/046cdd421733f726a6b18ab0a29656dc15e77a81/tests%2FsessionStore.prune.test.ts",
+      "contents_url": "https://api.github.com/repos/steipete/oracle/contents/tests%2FsessionStore.prune.test.ts?ref=046cdd421733f726a6b18ab0a29656dc15e77a81",
+      "patch": "@@ -0,0 +1,22 @@\n+import { describe, expect, test, vi } from 'vitest';\n+import { pruneOldSessions, sessionStore } from '../src/sessionStore.ts';\n+\n+describe('pruneOldSessions', () => {\n+  test('skips invalid or missing hour values', async () => {\n+    const spy = vi.spyOn(sessionStore, 'deleteOlderThan').mockResolvedValue({ deleted: 0, remaining: 0 });\n+    await pruneOldSessions(undefined);\n+    await pruneOldSessions(NaN);\n+    await pruneOldSessions(-5);\n+    expect(spy).not.toHaveBeenCalled();\n+    spy.mockRestore();\n+  });\n+\n+  test('prunes sessions and logs when deletions occur', async () => {\n+    const spy = vi.spyOn(sessionStore, 'deleteOlderThan').mockResolvedValue({ deleted: 2, remaining: 3 });\n+    const logger = vi.fn();\n+    await pruneOldSessions(12, logger);\n+    expect(spy).toHaveBeenCalledWith({ hours: 12 });\n+    expect(logger).toHaveBeenCalledWith('Pruned 2 stored sessions older than 12h.');\n+    spy.mockRestore();\n+  });\n+});"
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "message": "Harden PTY runner shutdown",
+  "files": [
+    {
+      "sha": "d6570fe87911dad2bb4918adad89a5a15800c220",
+      "filename": "Sources/CodexBar/TTYCommandRunner.swift",
+      "status": "modified",
+      "additions": 21,
+      "deletions": 0,
+      "changes": 21,
+      "blob_url": "https://github.com/steipete/CodexBar/blob/9fe489e8f04f6fdeae97f49eb528cc185ee00b68/Sources%2FCodexBar%2FTTYCommandRunner.swift",
+      "raw_url": "https://github.com/steipete/CodexBar/raw/9fe489e8f04f6fdeae97f49eb528cc185ee00b68/Sources%2FCodexBar%2FTTYCommandRunner.swift",
+      "contents_url": "https://api.github.com/repos/steipete/CodexBar/contents/Sources%2FCodexBar%2FTTYCommandRunner.swift?ref=9fe489e8f04f6fdeae97f49eb528cc185ee00b68",
+      "patch": "@@ -55,6 +55,15 @@ struct TTYCommandRunner {\n \n         try proc.run()\n \n+        // Isolate the child into its own process group so descendant helpers can be\n+        // terminated together. If this fails (e.g. process already exec'ed), we\n+        // continue and fall back to single-PID termination.\n+        let pid = proc.processIdentifier\n+        var processGroup: pid_t?\n+        if setpgid(pid, pid) == 0 {\n+            processGroup = pid\n+        }\n+\n         func send(_ text: String) throws {\n             guard let data = text.data(using: .utf8) else { return }\n             try primaryHandle.write(contentsOf: data)\n@@ -297,12 +306,24 @@ struct TTYCommandRunner {\n         // try to exit gracefully\n         let exitData = Data(\"/exit\\n\".utf8)\n         try? primaryHandle.write(contentsOf: exitData)\n+\n+        // Closing the PTY ends any blocked reads and nudges the child toward exit.\n+        try? primaryHandle.close()\n+        try? secondaryHandle.close()\n+\n         proc.terminate()\n+        if let pgid = processGroup {\n+            // Deliver SIGTERM to the entire process group in case the CLI spawned helpers.\n+            kill(-pgid, SIGTERM)\n+        }\n         let waitDeadline = Date().addingTimeInterval(2.0)\n         while proc.isRunning, Date() < waitDeadline {\n             usleep(100_000)\n         }\n         if proc.isRunning {\n+            if let pgid = processGroup {\n+                kill(-pgid, SIGKILL)\n+            }\n             kill(proc.processIdentifier, SIGKILL)\n         }\n         proc.waitUntilExit()"
+    },
+    {
+      "sha": "a3f3a29917998e1b1a927c804b28554763cd7de5",
+      "filename": "Tests/CodexBarTests/LiveAccountTests.swift",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/steipete/CodexBar/blob/9fe489e8f04f6fdeae97f49eb528cc185ee00b68/Tests%2FCodexBarTests%2FLiveAccountTests.swift",
+      "raw_url": "https://github.com/steipete/CodexBar/raw/9fe489e8f04f6fdeae97f49eb528cc185ee00b68/Tests%2FCodexBarTests%2FLiveAccountTests.swift",
+      "contents_url": "https://api.github.com/repos/steipete/CodexBar/contents/Tests%2FCodexBarTests%2FLiveAccountTests.swift?ref=9fe489e8f04f6fdeae97f49eb528cc185ee00b68",
+      "patch": "@@ -5,7 +5,7 @@ import XCTest\n \n @Suite(\"Live RPC account checks\", .serialized)\n struct LiveAccountTests {\n-    @Test\n+    @Test(.disabled(\"Set LIVE_TEST=1 to run live Codex account checks.\"))\n     func codexAccountEmailIsPresent() async throws {\n         guard ProcessInfo.processInfo.environment[\"LIVE_TEST\"] == \"1\" else { return }\n "
+    },
+    {
+      "sha": "9acc8daaad7545a8bfd42861c4b5ed058d9d6d4c",
+      "filename": "Tests/CodexBarTests/TTYCommandRunnerTests.swift",
+      "status": "added",
+      "additions": 51,
+      "deletions": 0,
+      "changes": 51,
+      "blob_url": "https://github.com/steipete/CodexBar/blob/9fe489e8f04f6fdeae97f49eb528cc185ee00b68/Tests%2FCodexBarTests%2FTTYCommandRunnerTests.swift",
+      "raw_url": "https://github.com/steipete/CodexBar/raw/9fe489e8f04f6fdeae97f49eb528cc185ee00b68/Tests%2FCodexBarTests%2FTTYCommandRunnerTests.swift",
+      "contents_url": "https://api.github.com/repos/steipete/CodexBar/contents/Tests%2FCodexBarTests%2FTTYCommandRunnerTests.swift?ref=9fe489e8f04f6fdeae97f49eb528cc185ee00b68",
+      "patch": "@@ -0,0 +1,51 @@\n+import Darwin\n+import XCTest\n+@testable import CodexBar\n+\n+final class TTYCommandRunnerTests: XCTestCase {\n+    func testKillsProcessGroupChildren() throws {\n+        // Spawn a helper script that launches a long-lived child (sleep 60) and waits for it.\n+        // Without process-group termination, the background sleep would survive after the parent dies.\n+        let tmp = FileManager.default.temporaryDirectory\n+            .appendingPathComponent(\"tty-runner-tests-\\(UUID().uuidString)\")\n+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)\n+\n+        let scriptURL = tmp.appendingPathComponent(\"spawn_child.sh\")\n+        let script = \"\"\"\n+        #!/bin/bash\n+        set -e\n+        sleep 60 &\n+        child=$!\n+        echo CHILD_PID=$child\n+        wait $child\n+        \"\"\"\n+        try script.write(to: scriptURL, atomically: true, encoding: .utf8)\n+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)\n+\n+        let runner = TTYCommandRunner()\n+        let result = try runner.run(\n+            binary: scriptURL.path,\n+            send: \"\",\n+            options: .init(rows: 5, cols: 40, timeout: 1.5, extraArgs: []))\n+\n+        guard let childPID = Self.extractChildPID(result.text) else {\n+            XCTFail(\"Did not capture child PID from PTY output. Output: \\(result.text)\")\n+            return\n+        }\n+\n+        // Give the termination path a brief moment to deliver signals.\n+        usleep(150_000)\n+\n+        let stillAlive = kill(childPID, 0) == 0\n+        XCTAssertFalse(stillAlive, \"Child process (pid: \\(childPID)) is still alive; process-group kill failed\")\n+    }\n+\n+    private static func extractChildPID(_ text: String) -> pid_t? {\n+        let pattern = #\"CHILD_PID=([0-9]+)\"#\n+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }\n+        let range = NSRange(text.startIndex..<text.endIndex, in: text)\n+        guard let match = regex.firstMatch(in: text, options: [], range: range), match.numberOfRanges >= 2,\n+              let pidRange = Range(match.range(at: 1), in: text) else { return nil }\n+        return pid_t(text[pidRange])\n+    }\n+}"
+    }
+  ]
+}

@@ -1,0 +1,77 @@
+{
+  "message": "web: extract reconnect helpers and add tests",
+  "files": [
+    {
+      "sha": "91072117944dd1863b67df2cc834abe2e317ff32",
+      "filename": "docs/refactor/web-provider-split.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/765d67cd1868a6067f2584eb3101165c5a18b27a/docs%2Frefactor%2Fweb-provider-split.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/765d67cd1868a6067f2584eb3101165c5a18b27a/docs%2Frefactor%2Fweb-provider-split.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/docs%2Frefactor%2Fweb-provider-split.md?ref=765d67cd1868a6067f2584eb3101165c5a18b27a",
+      "patch": "@@ -10,6 +10,7 @@ Context: `src/provider-web.ts` was a 900+ line ball of mud mixing session manage\n - Structured logging + heartbeats: web relay now emits structured logs with `runId`/`connectionId` plus periodic heartbeats (default every 60s) that include auth age and message counts.\n - Bounded reconnects: web relay uses capped exponential backoff (default 2s\u219230s, max 12 attempts). CLI knobs `--web-retries`, `--web-retry-initial`, `--web-retry-max`, `--web-heartbeat` and config `web.reconnect`/`web.heartbeatSeconds` tune the behavior.\n - Backoff reset after healthy uptime; logged-out state still exits immediately.\n+- Extracted reconnect/heartbeat helpers to `src/web/reconnect.ts` with unit tests.\n \n ## How to use\n - Link: `warelay login --provider web`"
+    },
+    {
+      "sha": "522e871f769b63e0315659f14a9b6b2df09cb22b",
+      "filename": "src/web/auto-reply.test.ts",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 1,
+      "changes": 5,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/765d67cd1868a6067f2584eb3101165c5a18b27a/src%2Fweb%2Fauto-reply.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/765d67cd1868a6067f2584eb3101165c5a18b27a/src%2Fweb%2Fauto-reply.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fweb%2Fauto-reply.test.ts?ref=765d67cd1868a6067f2584eb3101165c5a18b27a",
+      "patch": "@@ -61,7 +61,10 @@ describe(\"web auto-reply\", () => {\n     closeResolvers[0]?.();\n     const waitForSecondCall = async () => {\n       const started = Date.now();\n-      while (listenerFactory.mock.calls.length < 2 && Date.now() - started < 200) {\n+      while (\n+        listenerFactory.mock.calls.length < 2 &&\n+        Date.now() - started < 200\n+      ) {\n         await new Promise((resolve) => setTimeout(resolve, 10));\n       }\n     };"
+    },
+    {
+      "sha": "5629b6707574f0582df3d045da413d494211f533",
+      "filename": "src/web/auto-reply.ts",
+      "status": "modified",
+      "additions": 21,
+      "deletions": 87,
+      "changes": 108,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/765d67cd1868a6067f2584eb3101165c5a18b27a/src%2Fweb%2Fauto-reply.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/765d67cd1868a6067f2584eb3101165c5a18b27a/src%2Fweb%2Fauto-reply.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fweb%2Fauto-reply.ts?ref=765d67cd1868a6067f2584eb3101165c5a18b27a",
+      "patch": "@@ -1,33 +1,23 @@\n-import { randomUUID } from \"node:crypto\";\n-\n import { getReplyFromConfig } from \"../auto-reply/reply.js\";\n import { waitForever } from \"../cli/wait.js\";\n-import { loadConfig, type WarelayConfig } from \"../config/config.js\";\n+import { loadConfig } from \"../config/config.js\";\n import { danger, isVerbose, logVerbose, success } from \"../globals.js\";\n import { logInfo } from \"../logger.js\";\n import { getChildLogger } from \"../logging.js\";\n import { defaultRuntime, type RuntimeEnv } from \"../runtime.js\";\n import { monitorWebInbox } from \"./inbound.js\";\n import { loadWebMedia } from \"./media.js\";\n-import { getWebAuthAgeMs, newConnectionId } from \"./session.js\";\n+import {\n+  computeBackoff,\n+  newConnectionId,\n+  type ReconnectPolicy,\n+  resolveHeartbeatSeconds,\n+  resolveReconnectPolicy,\n+  sleepWithAbort,\n+} from \"./reconnect.js\";\n+import { getWebAuthAgeMs } from \"./session.js\";\n \n const DEFAULT_WEB_MEDIA_BYTES = 5 * 1024 * 1024;\n-const DEFAULT_HEARTBEAT_SECONDS = 60;\n-const DEFAULT_RECONNECT_POLICY: ReconnectPolicy = {\n-  initialMs: 2_000,\n-  maxMs: 30_000,\n-  factor: 1.8,\n-  jitter: 0.25,\n-  maxAttempts: 12,\n-};\n-\n-type ReconnectPolicy = {\n-  initialMs: number;\n-  maxMs: number;\n-  factor: number;\n-  jitter: number;\n-  maxAttempts: number;\n-};\n \n export type WebMonitorTuning = {\n   reconnect?: Partial<ReconnectPolicy>;\n@@ -38,68 +28,6 @@ export type WebMonitorTuning = {\n const formatDuration = (ms: number) =>\n   ms >= 1000 ? `${(ms / 1000).toFixed(2)}s` : `${ms}ms`;\n \n-const clamp = (val: number, min: number, max: number) =>\n-  Math.max(min, Math.min(max, val));\n-\n-function resolveHeartbeatSeconds(\n-  cfg: WarelayConfig,\n-  tuning?: WebMonitorTuning,\n-): number {\n-  const candidate = tuning?.heartbeatSeconds ?? cfg.web?.heartbeatSeconds;\n-  if (typeof candidate === \"number\" && candidate > 0) return candidate;\n-  return DEFAULT_HEARTBEAT_SECONDS;\n-}\n-\n-function resolveReconnectPolicy(\n-  cfg: WarelayConfig,\n-  tuning?: WebMonitorTuning,\n-): ReconnectPolicy {\n-  const merged = {\n-    ...DEFAULT_RECONNECT_POLICY,\n-    ...(cfg.web?.reconnect ?? {}),\n-    ...(tuning?.reconnect ?? {}),\n-  } as ReconnectPolicy;\n-\n-  // Keep the values sane to avoid runaway retries.\n-  merged.initialMs = Math.max(250, merged.initialMs);\n-  merged.maxMs = Math.max(merged.initialMs, merged.maxMs);\n-  merged.factor = clamp(merged.factor, 1.1, 10);\n-  merged.jitter = clamp(merged.jitter, 0, 1);\n-  merged.maxAttempts = Math.max(0, Math.floor(merged.maxAttempts));\n-  return merged;\n-}\n-\n-function computeBackoff(policy: ReconnectPolicy, attempt: number) {\n-  // attempt is 1-based.\n-  const base = policy.initialMs * policy.factor ** (attempt - 1);\n-  const jitter = base * policy.jitter * Math.random();\n-  return Math.min(policy.maxMs, Math.round(base + jitter));\n-}\n-\n-function sleepWithAbort(ms: number, abortSignal?: AbortSignal) {\n-  if (ms <= 0) return Promise.resolve();\n-  return new Promise<void>((resolve, reject) => {\n-    const timer = setTimeout(() => {\n-      cleanup();\n-      resolve();\n-    }, ms);\n-\n-    const onAbort = () => {\n-      cleanup();\n-      reject(new Error(\"aborted\"));\n-    };\n-\n-    const cleanup = () => {\n-      clearTimeout(timer);\n-      abortSignal?.removeEventListener(\"abort\", onAbort);\n-    };\n-\n-    if (abortSignal) {\n-      abortSignal.addEventListener(\"abort\", onAbort, { once: true });\n-    }\n-  });\n-}\n-\n export async function monitorWebProvider(\n   verbose: boolean,\n   listenerFactory: typeof monitorWebInbox | undefined = monitorWebInbox,\n@@ -109,7 +37,7 @@ export async function monitorWebProvider(\n   abortSignal?: AbortSignal,\n   tuning: WebMonitorTuning = {},\n ) {\n-  const runId = randomUUID();\n+  const runId = newConnectionId();\n   const replyLogger = getChildLogger({ module: \"web-auto-reply\", runId });\n   const heartbeatLogger = getChildLogger({ module: \"web-heartbeat\", runId });\n   const cfg = loadConfig();\n@@ -118,9 +46,15 @@ export async function monitorWebProvider(\n     typeof configuredMaxMb === \"number\" && configuredMaxMb > 0\n       ? configuredMaxMb * 1024 * 1024\n       : DEFAULT_WEB_MEDIA_BYTES;\n-  const heartbeatSeconds = resolveHeartbeatSeconds(cfg, tuning);\n-  const reconnectPolicy = resolveReconnectPolicy(cfg, tuning);\n-  const sleep = tuning.sleep ?? ((ms: number, signal?: AbortSignal) => sleepWithAbort(ms, signal ?? abortSignal));\n+  const heartbeatSeconds = resolveHeartbeatSeconds(\n+    cfg,\n+    tuning.heartbeatSeconds,\n+  );\n+  const reconnectPolicy = resolveReconnectPolicy(cfg, tuning.reconnect);\n+  const sleep =\n+    tuning.sleep ??\n+    ((ms: number, signal?: AbortSignal) =>\n+      sleepWithAbort(ms, signal ?? abortSignal));\n   const stopRequested = () => abortSignal?.aborted === true;\n   const abortPromise =\n     abortSignal &&\n@@ -155,7 +89,7 @@ export async function monitorWebProvider(\n         const ts = msg.timestamp\n           ? new Date(msg.timestamp).toISOString()\n           : new Date().toISOString();\n-        const correlationId = msg.id ?? randomUUID();\n+        const correlationId = msg.id ?? newConnectionId();\n         replyLogger.info(\n           {\n             connectionId,"
+    },
+    {
+      "sha": "3d7d548cfe048391834a77af54c8ccee1bd13f55",
+      "filename": "src/web/reconnect.test.ts",
+      "status": "added",
+      "additions": 52,
+      "deletions": 0,
+      "changes": 52,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/765d67cd1868a6067f2584eb3101165c5a18b27a/src%2Fweb%2Freconnect.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/765d67cd1868a6067f2584eb3101165c5a18b27a/src%2Fweb%2Freconnect.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fweb%2Freconnect.test.ts?ref=765d67cd1868a6067f2584eb3101165c5a18b27a",
+      "patch": "@@ -0,0 +1,52 @@\n+import { describe, expect, it } from \"vitest\";\n+\n+import type { WarelayConfig } from \"../config/config.js\";\n+import {\n+  computeBackoff,\n+  DEFAULT_HEARTBEAT_SECONDS,\n+  DEFAULT_RECONNECT_POLICY,\n+  resolveHeartbeatSeconds,\n+  resolveReconnectPolicy,\n+  sleepWithAbort,\n+} from \"./reconnect.js\";\n+\n+describe(\"web reconnect helpers\", () => {\n+  const cfg: WarelayConfig = {};\n+\n+  it(\"resolves sane reconnect defaults with clamps\", () => {\n+    const policy = resolveReconnectPolicy(cfg, {\n+      initialMs: 100,\n+      maxMs: 5,\n+      factor: 20,\n+      jitter: 2,\n+      maxAttempts: -1,\n+    });\n+\n+    expect(policy.initialMs).toBe(250); // clamped to minimum\n+    expect(policy.maxMs).toBeGreaterThanOrEqual(policy.initialMs);\n+    expect(policy.factor).toBeLessThanOrEqual(10);\n+    expect(policy.jitter).toBeLessThanOrEqual(1);\n+    expect(policy.maxAttempts).toBeGreaterThanOrEqual(0);\n+  });\n+\n+  it(\"computes increasing backoff with jitter\", () => {\n+    const policy = { ...DEFAULT_RECONNECT_POLICY, jitter: 0 };\n+    const first = computeBackoff(policy, 1);\n+    const second = computeBackoff(policy, 2);\n+    expect(first).toBe(policy.initialMs);\n+    expect(second).toBeGreaterThan(first);\n+    expect(second).toBeLessThanOrEqual(policy.maxMs);\n+  });\n+\n+  it(\"returns heartbeat default when unset\", () => {\n+    expect(resolveHeartbeatSeconds(cfg)).toBe(DEFAULT_HEARTBEAT_SECONDS);\n+    expect(resolveHeartbeatSeconds(cfg, 5)).toBe(5);\n+  });\n+\n+  it(\"sleepWithAbort rejects on abort\", async () => {\n+    const controller = new AbortController();\n+    const promise = sleepWithAbort(50, controller.signal);\n+    controller.abort();\n+    await expect(promise).rejects.toThrow(\"aborted\");\n+  });\n+});"
+    },
+    {
+      "sha": "d0ea8080c858cf0cd508e56c4d6e77ff87db09b3",
+      "filename": "src/web/reconnect.ts",
+      "status": "added",
+      "additions": 84,
+      "deletions": 0,
+      "changes": 84,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/765d67cd1868a6067f2584eb3101165c5a18b27a/src%2Fweb%2Freconnect.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/765d67cd1868a6067f2584eb3101165c5a18b27a/src%2Fweb%2Freconnect.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fweb%2Freconnect.ts?ref=765d67cd1868a6067f2584eb3101165c5a18b27a",
+      "patch": "@@ -0,0 +1,84 @@\n+import { randomUUID } from \"node:crypto\";\n+\n+import type { WarelayConfig } from \"../config/config.js\";\n+\n+export type ReconnectPolicy = {\n+  initialMs: number;\n+  maxMs: number;\n+  factor: number;\n+  jitter: number;\n+  maxAttempts: number;\n+};\n+\n+export const DEFAULT_HEARTBEAT_SECONDS = 60;\n+export const DEFAULT_RECONNECT_POLICY: ReconnectPolicy = {\n+  initialMs: 2_000,\n+  maxMs: 30_000,\n+  factor: 1.8,\n+  jitter: 0.25,\n+  maxAttempts: 12,\n+};\n+\n+const clamp = (val: number, min: number, max: number) =>\n+  Math.max(min, Math.min(max, val));\n+\n+export function resolveHeartbeatSeconds(\n+  cfg: WarelayConfig,\n+  overrideSeconds?: number,\n+): number {\n+  const candidate = overrideSeconds ?? cfg.web?.heartbeatSeconds;\n+  if (typeof candidate === \"number\" && candidate > 0) return candidate;\n+  return DEFAULT_HEARTBEAT_SECONDS;\n+}\n+\n+export function resolveReconnectPolicy(\n+  cfg: WarelayConfig,\n+  overrides?: Partial<ReconnectPolicy>,\n+): ReconnectPolicy {\n+  const merged = {\n+    ...DEFAULT_RECONNECT_POLICY,\n+    ...(cfg.web?.reconnect ?? {}),\n+    ...(overrides ?? {}),\n+  } as ReconnectPolicy;\n+\n+  merged.initialMs = Math.max(250, merged.initialMs);\n+  merged.maxMs = Math.max(merged.initialMs, merged.maxMs);\n+  merged.factor = clamp(merged.factor, 1.1, 10);\n+  merged.jitter = clamp(merged.jitter, 0, 1);\n+  merged.maxAttempts = Math.max(0, Math.floor(merged.maxAttempts));\n+  return merged;\n+}\n+\n+export function computeBackoff(policy: ReconnectPolicy, attempt: number) {\n+  const base = policy.initialMs * policy.factor ** Math.max(attempt - 1, 0);\n+  const jitter = base * policy.jitter * Math.random();\n+  return Math.min(policy.maxMs, Math.round(base + jitter));\n+}\n+\n+export function sleepWithAbort(ms: number, abortSignal?: AbortSignal) {\n+  if (ms <= 0) return Promise.resolve();\n+  return new Promise<void>((resolve, reject) => {\n+    const timer = setTimeout(() => {\n+      cleanup();\n+      resolve();\n+    }, ms);\n+\n+    const onAbort = () => {\n+      cleanup();\n+      reject(new Error(\"aborted\"));\n+    };\n+\n+    const cleanup = () => {\n+      clearTimeout(timer);\n+      abortSignal?.removeEventListener(\"abort\", onAbort);\n+    };\n+\n+    if (abortSignal) {\n+      abortSignal.addEventListener(\"abort\", onAbort, { once: true });\n+    }\n+  });\n+}\n+\n+export function newConnectionId() {\n+  return randomUUID();\n+}"
+    },
+    {
+      "sha": "ae012b916306444b80de0bf44619ec5f9af3e11f",
+      "filename": "src/web/session.test.ts",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 6,
+      "changes": 11,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/765d67cd1868a6067f2584eb3101165c5a18b27a/src%2Fweb%2Fsession.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/765d67cd1868a6067f2584eb3101165c5a18b27a/src%2Fweb%2Fsession.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fweb%2Fsession.test.ts?ref=765d67cd1868a6067f2584eb3101165c5a18b27a",
+      "patch": "@@ -1,18 +1,17 @@\n import { EventEmitter } from \"node:events\";\n import fsSync from \"node:fs\";\n import { afterEach, beforeEach, describe, expect, it, vi } from \"vitest\";\n+import { resetLogger, setLoggerOverride } from \"../logging.js\";\n import {\n   baileys,\n   getLastSocket,\n   resetBaileysMocks,\n   resetLoadConfigMock,\n } from \"./test-helpers.js\";\n-import { resetLogger, setLoggerOverride } from \"../logging.js\";\n-import {\n-  createWaSocket,\n-  logWebSelfId,\n-  waitForWaConnection,\n-} from \"./session.js\";\n+\n+const { createWaSocket, logWebSelfId, waitForWaConnection } = await import(\n+  \"./session.js\"\n+);\n \n describe(\"web session\", () => {\n   beforeEach(() => {"
+    }
+  ]
+}

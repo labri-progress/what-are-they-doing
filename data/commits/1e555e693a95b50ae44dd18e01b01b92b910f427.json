@@ -1,0 +1,53 @@
+{
+  "message": "fix: dedupe canvas host watcher",
+  "files": [
+    {
+      "sha": "9c4616ac446e23465cb51f742820f5d4053b2bb9",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/1e555e693a95b50ae44dd18e01b01b92b910f427/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/1e555e693a95b50ae44dd18e01b01b92b910f427/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=1e555e693a95b50ae44dd18e01b01b92b910f427",
+      "patch": "@@ -59,6 +59,7 @@\n - Build: drop stale ClawdisCLI product from macOS build-and-run script.\n - Auto-reply: add run-level telemetry + typing TTL guardrails to diagnose stuck replies.\n - WhatsApp: honor per-group mention gating overrides when group ids are stored as session keys.\n+- Canvas host: reuse shared handler to avoid double file watchers and close watchers on error (EMFILE resilience).\n - Dependencies: bump pi-mono packages to 0.32.3.\n \n ### Docs"
+    },
+    {
+      "sha": "ec4f6ec9c8cfb02983a50bccc9ca8e453e8c6e5b",
+      "filename": "src/canvas-host/server.test.ts",
+      "status": "modified",
+      "additions": 38,
+      "deletions": 1,
+      "changes": 39,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/1e555e693a95b50ae44dd18e01b01b92b910f427/src%2Fcanvas-host%2Fserver.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/1e555e693a95b50ae44dd18e01b01b92b910f427/src%2Fcanvas-host%2Fserver.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fcanvas-host%2Fserver.test.ts?ref=1e555e693a95b50ae44dd18e01b01b92b910f427",
+      "patch": "@@ -3,7 +3,7 @@ import { createServer } from \"node:http\";\n import type { AddressInfo } from \"node:net\";\n import os from \"node:os\";\n import path from \"node:path\";\n-import { describe, expect, it } from \"vitest\";\n+import { describe, expect, it, vi } from \"vitest\";\n import { WebSocket } from \"ws\";\n import { rawDataToString } from \"../infra/ws.js\";\n import { defaultRuntime } from \"../runtime.js\";\n@@ -100,6 +100,43 @@ describe(\"canvas host\", () => {\n     }\n   });\n \n+  it(\"reuses a handler without closing it twice\", async () => {\n+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), \"clawdis-canvas-\"));\n+    await fs.writeFile(\n+      path.join(dir, \"index.html\"),\n+      \"<html><body>v1</body></html>\",\n+      \"utf8\",\n+    );\n+\n+    const handler = await createCanvasHostHandler({\n+      runtime: defaultRuntime,\n+      rootDir: dir,\n+      basePath: CANVAS_HOST_PATH,\n+      allowInTests: true,\n+    });\n+    const originalClose = handler.close;\n+    const closeSpy = vi.fn(async () => originalClose());\n+    handler.close = closeSpy;\n+\n+    const server = await startCanvasHost({\n+      runtime: defaultRuntime,\n+      handler,\n+      ownsHandler: false,\n+      port: 0,\n+      listenHost: \"127.0.0.1\",\n+      allowInTests: true,\n+    });\n+\n+    try {\n+      expect(server.port).toBeGreaterThan(0);\n+    } finally {\n+      await server.close();\n+      expect(closeSpy).not.toHaveBeenCalled();\n+      await originalClose();\n+      await fs.rm(dir, { recursive: true, force: true });\n+    }\n+  });\n+\n   it(\"serves HTML with injection and broadcasts reload on file changes\", async () => {\n     const dir = await fs.mkdtemp(path.join(os.tmpdir(), \"clawdis-canvas-\"));\n     const index = path.join(dir, \"index.html\");"
+    },
+    {
+      "sha": "00dc1f83e1c5b26729a20c0757d05568f25b0aaa",
+      "filename": "src/canvas-host/server.ts",
+      "status": "modified",
+      "additions": 24,
+      "deletions": 8,
+      "changes": 32,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/1e555e693a95b50ae44dd18e01b01b92b910f427/src%2Fcanvas-host%2Fserver.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/1e555e693a95b50ae44dd18e01b01b92b910f427/src%2Fcanvas-host%2Fserver.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fcanvas-host%2Fserver.ts?ref=1e555e693a95b50ae44dd18e01b01b92b910f427",
+      "patch": "@@ -29,6 +29,11 @@ export type CanvasHostOpts = {\n   allowInTests?: boolean;\n };\n \n+export type CanvasHostServerOpts = CanvasHostOpts & {\n+  handler?: CanvasHostHandler;\n+  ownsHandler?: boolean;\n+};\n+\n export type CanvasHostServer = {\n   port: number;\n   rootDir: string;\n@@ -255,6 +260,7 @@ export async function createCanvasHostHandler(\n     debounce.unref?.();\n   };\n \n+  let watcherClosed = false;\n   const watcher = chokidar.watch(rootReal, {\n     ignoreInitial: true,\n     awaitWriteFinish: { stabilityThreshold: 75, pollInterval: 10 },\n@@ -264,6 +270,12 @@ export async function createCanvasHostHandler(\n     ],\n   });\n   watcher.on(\"all\", () => scheduleReload());\n+  watcher.on(\"error\", (err) => {\n+    if (watcherClosed) return;\n+    watcherClosed = true;\n+    opts.runtime.error(`canvasHost watcher error: ${String(err)}`);\n+    void watcher.close().catch(() => {});\n+  });\n \n   const handleUpgrade = (\n     req: IncomingMessage,\n@@ -361,25 +373,29 @@ export async function createCanvasHostHandler(\n     handleUpgrade,\n     close: async () => {\n       if (debounce) clearTimeout(debounce);\n+      watcherClosed = true;\n       await watcher.close().catch(() => {});\n       await new Promise<void>((resolve) => wss.close(() => resolve()));\n     },\n   };\n }\n \n export async function startCanvasHost(\n-  opts: CanvasHostOpts,\n+  opts: CanvasHostServerOpts,\n ): Promise<CanvasHostServer> {\n   if (isDisabledByEnv() && opts.allowInTests !== true) {\n     return { port: 0, rootDir: \"\", close: async () => {} };\n   }\n \n-  const handler = await createCanvasHostHandler({\n-    runtime: opts.runtime,\n-    rootDir: opts.rootDir,\n-    basePath: CANVAS_HOST_PATH,\n-    allowInTests: opts.allowInTests,\n-  });\n+  const handler =\n+    opts.handler ??\n+    (await createCanvasHostHandler({\n+      runtime: opts.runtime,\n+      rootDir: opts.rootDir,\n+      basePath: CANVAS_HOST_PATH,\n+      allowInTests: opts.allowInTests,\n+    }));\n+  const ownsHandler = opts.ownsHandler ?? opts.handler === undefined;\n \n   const bindHost = opts.listenHost?.trim() || \"0.0.0.0\";\n   const server: Server = http.createServer((req, res) => {\n@@ -430,7 +446,7 @@ export async function startCanvasHost(\n     port: boundPort,\n     rootDir: handler.rootDir,\n     close: async () => {\n-      await handler.close();\n+      if (ownsHandler) await handler.close();\n       await new Promise<void>((resolve, reject) =>\n         server.close((err) => (err ? reject(err) : resolve())),\n       );"
+    },
+    {
+      "sha": "4c9fb42d5bcd1a2c647f53a3e16b2642ca1fa923",
+      "filename": "src/gateway/server.ts",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/1e555e693a95b50ae44dd18e01b01b92b910f427/src%2Fgateway%2Fserver.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/1e555e693a95b50ae44dd18e01b01b92b910f427/src%2Fgateway%2Fserver.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fserver.ts?ref=1e555e693a95b50ae44dd18e01b01b92b910f427",
+      "patch": "@@ -860,6 +860,8 @@ export async function startGatewayServer(\n         port: canvasHostPort,\n         listenHost: bridgeHost,\n         allowInTests: opts.allowCanvasHostInTests,\n+        handler: canvasHost ?? undefined,\n+        ownsHandler: canvasHost ? false : undefined,\n       });\n       if (started.port > 0) {\n         canvasHostServer = started;"
+    }
+  ]
+}

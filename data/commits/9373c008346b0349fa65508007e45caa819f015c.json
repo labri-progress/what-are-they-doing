@@ -1,0 +1,41 @@
+{
+  "message": "refactor(core): improve auth/settings testability",
+  "files": [
+    {
+      "sha": "e0a69c71cf12df1035a8e49051360d10092e7d89",
+      "filename": "Sources/RepoBarCore/Auth/LoopbackServer.swift",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 0,
+      "changes": 10,
+      "blob_url": "https://github.com/steipete/RepoBar/blob/9373c008346b0349fa65508007e45caa819f015c/Sources%2FRepoBarCore%2FAuth%2FLoopbackServer.swift",
+      "raw_url": "https://github.com/steipete/RepoBar/raw/9373c008346b0349fa65508007e45caa819f015c/Sources%2FRepoBarCore%2FAuth%2FLoopbackServer.swift",
+      "contents_url": "https://api.github.com/repos/steipete/RepoBar/contents/Sources%2FRepoBarCore%2FAuth%2FLoopbackServer.swift?ref=9373c008346b0349fa65508007e45caa819f015c",
+      "patch": "@@ -7,6 +7,7 @@ public final class LoopbackServer {\n     private let port: UInt16\n     private var listener: NWListener?\n     private var continuation: CheckedContinuation<(code: String, state: String), Error>?\n+    private var pendingResult: (code: String, state: String)?\n \n     public init(port: Int) {\n         self.port = UInt16(port)\n@@ -25,6 +26,12 @@ public final class LoopbackServer {\n     }\n \n     public func waitForCallback(timeout: TimeInterval = 180) async throws -> (code: String, state: String) {\n+        if let pendingResult {\n+            self.pendingResult = nil\n+            self.stop()\n+            return pendingResult\n+        }\n+\n         let timeoutTask = Task { @MainActor in\n             try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))\n             if let continuation {\n@@ -47,6 +54,7 @@ public final class LoopbackServer {\n         self.listener?.cancel()\n         self.listener = nil\n         self.continuation = nil\n+        self.pendingResult = nil\n     }\n \n     private func handle(connection: NWConnection) {\n@@ -63,6 +71,8 @@ public final class LoopbackServer {\n                 if let continuation {\n                     continuation.resume(returning: parsed)\n                     self.continuation = nil\n+                } else {\n+                    self.pendingResult = parsed\n                 }\n             }\n         }"
+    },
+    {
+      "sha": "3bc4848f25c827fd6c046b1dd24d8bb423aa73ee",
+      "filename": "Sources/RepoBarCore/Auth/OAuthLoginFlow.swift",
+      "status": "modified",
+      "additions": 41,
+      "deletions": 6,
+      "changes": 47,
+      "blob_url": "https://github.com/steipete/RepoBar/blob/9373c008346b0349fa65508007e45caa819f015c/Sources%2FRepoBarCore%2FAuth%2FOAuthLoginFlow.swift",
+      "raw_url": "https://github.com/steipete/RepoBar/raw/9373c008346b0349fa65508007e45caa819f015c/Sources%2FRepoBarCore%2FAuth%2FOAuthLoginFlow.swift",
+      "contents_url": "https://api.github.com/repos/steipete/RepoBar/contents/Sources%2FRepoBarCore%2FAuth%2FOAuthLoginFlow.swift?ref=9373c008346b0349fa65508007e45caa819f015c",
+      "patch": "@@ -1,34 +1,69 @@\n import Foundation\n \n+@MainActor\n+protocol LoopbackServing: AnyObject {\n+    func start() throws -> URL\n+    func waitForCallback(timeout: TimeInterval) async throws -> (code: String, state: String)\n+    func stop()\n+}\n+\n+extension LoopbackServer: LoopbackServing {}\n+\n @MainActor\n public struct OAuthLoginFlow {\n     private let tokenStore: TokenStore\n     private let openURL: @Sendable (URL) throws -> Void\n+    private let dataProvider: @Sendable (URLRequest) async throws -> (Data, URLResponse)\n+    private let makeLoopbackServer: (Int) -> LoopbackServing\n+    private let stateProvider: @Sendable () -> String\n \n     public init(\n         tokenStore: TokenStore = .shared,\n-        openURL: @escaping @Sendable (URL) throws -> Void\n+        openURL: @escaping @Sendable (URL) throws -> Void,\n+        dataProvider: @escaping @Sendable (URLRequest) async throws -> (Data, URLResponse) = { request in\n+            try await URLSession.shared.data(for: request)\n+        }\n+    ) {\n+        self.init(\n+            tokenStore: tokenStore,\n+            openURL: openURL,\n+            dataProvider: dataProvider,\n+            makeLoopbackServer: { port in LoopbackServer(port: port) },\n+            stateProvider: { UUID().uuidString }\n+        )\n+    }\n+\n+    init(\n+        tokenStore: TokenStore,\n+        openURL: @escaping @Sendable (URL) throws -> Void,\n+        dataProvider: @escaping @Sendable (URLRequest) async throws -> (Data, URLResponse),\n+        makeLoopbackServer: @escaping (Int) -> LoopbackServing,\n+        stateProvider: @escaping @Sendable () -> String\n     ) {\n         self.tokenStore = tokenStore\n         self.openURL = openURL\n+        self.dataProvider = dataProvider\n+        self.makeLoopbackServer = makeLoopbackServer\n+        self.stateProvider = stateProvider\n     }\n \n     public func login(\n         clientID: String,\n         clientSecret: String,\n         host: URL,\n         loopbackPort: Int,\n-        scope: String = \"repo read:org\"\n+        scope: String = \"repo read:org\",\n+        timeout: TimeInterval = 180\n     ) async throws -> OAuthTokens {\n         let normalizedHost = try Self.normalizeHost(host)\n         let authBase = normalizedHost.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: \"/\"))\n         let authEndpoint = URL(string: \"\\(authBase)/login/oauth/authorize\")!\n         let tokenEndpoint = URL(string: \"\\(authBase)/login/oauth/access_token\")!\n \n         let pkce = PKCE.generate()\n-        let state = UUID().uuidString\n+        let state = self.stateProvider()\n \n-        let server = LoopbackServer(port: loopbackPort)\n+        let server = self.makeLoopbackServer(loopbackPort)\n         let redirectURL = try server.start()\n \n         var components = URLComponents(url: authEndpoint, resolvingAgainstBaseURL: false)!\n@@ -43,7 +78,7 @@ public struct OAuthLoginFlow {\n         guard let authorizeURL = components.url else { throw URLError(.badURL) }\n         try self.openURL(authorizeURL)\n \n-        let result = try await server.waitForCallback(timeout: 180)\n+        let result = try await server.waitForCallback(timeout: timeout)\n         guard result.state == state else { throw URLError(.badServerResponse) }\n \n         var tokenRequest = URLRequest(url: tokenEndpoint)\n@@ -59,7 +94,7 @@ public struct OAuthLoginFlow {\n             \"code_verifier\": pkce.verifier\n         ])\n \n-        let (data, response) = try await URLSession.shared.data(for: tokenRequest)\n+        let (data, response) = try await self.dataProvider(tokenRequest)\n         guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }\n         let decoded = try JSONDecoder().decode(TokenResponse.self, from: data)\n         let tokens = OAuthTokens("
+    },
+    {
+      "sha": "c2f75af082b65006655c6e4318a1501a272b3b42",
+      "filename": "Sources/RepoBarCore/Support/SettingsStore.swift",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 2,
+      "changes": 6,
+      "blob_url": "https://github.com/steipete/RepoBar/blob/9373c008346b0349fa65508007e45caa819f015c/Sources%2FRepoBarCore%2FSupport%2FSettingsStore.swift",
+      "raw_url": "https://github.com/steipete/RepoBar/raw/9373c008346b0349fa65508007e45caa819f015c/Sources%2FRepoBarCore%2FSupport%2FSettingsStore.swift",
+      "contents_url": "https://api.github.com/repos/steipete/RepoBar/contents/Sources%2FRepoBarCore%2FSupport%2FSettingsStore.swift?ref=9373c008346b0349fa65508007e45caa819f015c",
+      "patch": "@@ -2,10 +2,12 @@ import Foundation\n \n /// Persists simple user settings in UserDefaults.\n public struct SettingsStore {\n-    private let defaults = UserDefaults.standard\n+    private let defaults: UserDefaults\n     private let key = \"com.steipete.repobar.settings\"\n \n-    public init() {}\n+    public init(defaults: UserDefaults = .standard) {\n+        self.defaults = defaults\n+    }\n \n     public func load() -> UserSettings {\n         guard let data = defaults.data(forKey: key),"
+    }
+  ]
+}

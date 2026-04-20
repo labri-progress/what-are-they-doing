@@ -1,0 +1,29 @@
+{
+  "message": "feat(runtime): Add PyValue-only equality functions to reduce monomorphization\n\nAdd pyValueEql and typed fast paths (intEql, floatEql, stringEql, boolEql)\nto equality.zig for comparing values without anytype monomorphization.\n\nThese functions compile ONCE regardless of call sites, providing:\n- pyValueEql: PyValue-based comparison with runtime dispatch\n- intEql/floatEql/stringEql/boolEql: Typed fast paths for known types\n\nFoundation for solving comptime monomorphization explosion in core1 tests.",
+  "files": [
+    {
+      "sha": "d57f55d2768fcd8ae0116c7fd9033bb2ea72ebf5",
+      "filename": "packages/runtime/src/runtime.zig",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 1,
+      "changes": 9,
+      "blob_url": "https://github.com/teamchong/metal0/blob/e0d1b935ef6e388ec6c3ae732fa542e8838a2b73/packages%2Fruntime%2Fsrc%2Fruntime.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/e0d1b935ef6e388ec6c3ae732fa542e8838a2b73/packages%2Fruntime%2Fsrc%2Fruntime.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/packages%2Fruntime%2Fsrc%2Fruntime.zig?ref=e0d1b935ef6e388ec6c3ae732fa542e8838a2b73",
+      "patch": "@@ -132,8 +132,9 @@ pub const pickle_marshal = @import(\"runtime/pickle_marshal.zig\");\n /// String runtime operations\n pub const string_runtime = @import(\"runtime/string_runtime.zig\");\n \n-// Re-export strRepeat for codegen\n+// Re-export string operations for codegen\n pub const strRepeat = string_runtime.strRepeat;\n+pub const stringSplitWhitespace = string_runtime.stringSplitWhitespace;\n \n /// Bltinmodule sequences (len, all, any, etc.)\n const bltinmodule_sequences = @import(\"Python/bltinmodule/sequences.zig\");\n@@ -474,6 +475,12 @@ pub const pyTupleEql = equality_mod.pyTupleEql;\n pub const pyAnyEql = equality_mod.pyAnyEql;\n const pyAnyEqlSameType = equality_mod.pyAnyEqlSameType;\n pub const iterSlice = equality_mod.iterSlice;\n+// PyValue-only equality (no monomorphization) - use for uncertain types\n+pub const pyValueEql = equality_mod.pyValueEql;\n+pub const intEql = equality_mod.intEql;\n+pub const floatEql = equality_mod.floatEql;\n+pub const stringEql = equality_mod.stringEql;\n+pub const boolEql = equality_mod.boolEql;\n \n // Bool operations - re-exported from bool_ops.zig\n pub const toBool = bool_ops.toBool;"
+    },
+    {
+      "sha": "b013a5a4e30175ff228ca829062f9633d18171ad",
+      "filename": "packages/runtime/src/runtime/equality.zig",
+      "status": "modified",
+      "additions": 66,
+      "deletions": 0,
+      "changes": 66,
+      "blob_url": "https://github.com/teamchong/metal0/blob/e0d1b935ef6e388ec6c3ae732fa542e8838a2b73/packages%2Fruntime%2Fsrc%2Fruntime%2Fequality.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/e0d1b935ef6e388ec6c3ae732fa542e8838a2b73/packages%2Fruntime%2Fsrc%2Fruntime%2Fequality.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/packages%2Fruntime%2Fsrc%2Fruntime%2Fequality.zig?ref=e0d1b935ef6e388ec6c3ae732fa542e8838a2b73",
+      "patch": "@@ -118,6 +118,72 @@ pub fn pyTupleEql(a: anytype, b: @TypeOf(a)) bool {\n     return pyAnyEql(a, b);\n }\n \n+// =============================================================================\n+// PyValue-Only Equality Functions (NO MONOMORPHIZATION)\n+// =============================================================================\n+// These functions compile ONCE regardless of how many call sites exist.\n+// Use these for uncertain types where compile time is critical.\n+\n+/// Typed fast path: integer equality (single copy)\n+pub fn intEql(a: i64, b: i64) bool {\n+    return a == b;\n+}\n+\n+/// Typed fast path: float equality with bit-level NaN identity (single copy)\n+pub fn floatEql(a: f64, b: f64) bool {\n+    return @as(u64, @bitCast(a)) == @as(u64, @bitCast(b));\n+}\n+\n+/// Typed fast path: string equality (single copy)\n+pub fn stringEql(a: []const u8, b: []const u8) bool {\n+    return std.mem.eql(u8, a, b);\n+}\n+\n+/// Typed fast path: boolean equality (single copy)\n+pub fn boolEql(a: bool, b: bool) bool {\n+    return a == b;\n+}\n+\n+/// PyValue-only equality - compiles ONCE, handles all types at runtime\n+/// Use this for uncertain types to avoid monomorphization explosion\n+pub fn pyValueEql(a: PyValue, b: PyValue) bool {\n+    // Different tags = not equal (fast path)\n+    if (@as(std.meta.Tag(PyValue), a) != @as(std.meta.Tag(PyValue), b)) return false;\n+\n+    return switch (a) {\n+        .int => |ai| ai == b.int,\n+        .float => |af| @as(u64, @bitCast(af)) == @as(u64, @bitCast(b.float)),\n+        .string => |as| std.mem.eql(u8, as, b.string),\n+        .bool => |ab| ab == b.bool,\n+        .none => true,\n+        .tuple => |at| pyValueTupleEql(at, b.tuple),\n+        .list => |al| pyValueListEql(al.items, b.list.items),\n+        else => false, // Other types not yet supported\n+    };\n+}\n+\n+/// PyValue tuple equality helper\n+fn pyValueTupleEql(a: []const PyValue, b: []const PyValue) bool {\n+    if (a.len != b.len) return false;\n+    for (a, b) |ai, bi| {\n+        if (!pyValueEql(ai, bi)) return false;\n+    }\n+    return true;\n+}\n+\n+/// PyValue list equality helper\n+fn pyValueListEql(a: []const PyValue, b: []const PyValue) bool {\n+    if (a.len != b.len) return false;\n+    for (a, b) |ai, bi| {\n+        if (!pyValueEql(ai, bi)) return false;\n+    }\n+    return true;\n+}\n+\n+// =============================================================================\n+// Anytype Equality Functions (MONOMORPHIZES - use sparingly)\n+// =============================================================================\n+\n /// Python-style generic equality for any two types\n /// SIMPLIFIED VERSION: Avoids recursive calls to prevent comptime explosion\n /// For complex types, use type-specific comparisons at codegen time instead"
+    }
+  ]
+}

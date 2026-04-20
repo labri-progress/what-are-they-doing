@@ -1,0 +1,53 @@
+{
+  "message": "fix: prevent UTF-8 truncation panic, correct activity offset encoding, and always update updated_at\n\nReplace raw string truncation in event identity normalization with\ntruncate_to_char_boundary to avoid panicking when a multi-byte\ncharacter straddles the cut point. Add tests confirming multi-byte\nextracted values hash correctly.\n\nFix the activity tracker offset encoding to use max(1, offset) so\nthat a genuine zero-offset activity is stored as 1 and decoded back\nto epoch, distinguishing \"never recorded\" (0) from \"recorded at\nepoch\" (1\u21920). Add a decode round-trip test.\n\nFix touch_last_applied in both config_profiles and rulesets to\nalways overwrite updated_at instead of preserving a stale value via\n.or() \u2014 the previous behavior meant re-applying a profile would\nnever advance the updated_at timestamp. Add tests for both modules.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "bee094eae2de70d9161a452ce43712ee067d2243",
+      "filename": "crates/wa-core/src/config_profiles.rs",
+      "status": "modified",
+      "additions": 31,
+      "deletions": 1,
+      "changes": 32,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/8c2317dd6ce669e146e3a389bbdb8d004333da06/crates%2Fwa-core%2Fsrc%2Fconfig_profiles.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/8c2317dd6ce669e146e3a389bbdb8d004333da06/crates%2Fwa-core%2Fsrc%2Fconfig_profiles.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Fwa-core%2Fsrc%2Fconfig_profiles.rs?ref=8c2317dd6ce669e146e3a389bbdb8d004333da06",
+      "patch": "@@ -165,7 +165,7 @@ pub fn touch_last_applied(\n         .find(|entry| entry.name == profile_name)\n     {\n         entry.last_applied_at = Some(applied_at);\n-        entry.updated_at = entry.updated_at.or(Some(applied_at));\n+        entry.updated_at = Some(applied_at);\n         return;\n     }\n \n@@ -300,3 +300,33 @@ fn system_time_to_ms(time: SystemTime) -> Option<u64> {\n         .ok()\n         .map(|d| d.as_millis() as u64)\n }\n+\n+#[cfg(test)]\n+mod tests {\n+    use super::*;\n+\n+    #[test]\n+    fn touch_last_applied_updates_existing_entry_timestamps() {\n+        let mut manifest = ConfigProfileManifest {\n+            version: CONFIG_PROFILE_MANIFEST_VERSION,\n+            profiles: vec![ConfigProfileManifestEntry {\n+                name: \"dev\".to_string(),\n+                path: \"dev.toml\".to_string(),\n+                description: Some(\"Dev profile\".to_string()),\n+                created_at: Some(100),\n+                updated_at: Some(200),\n+                last_applied_at: Some(200),\n+            }],\n+            last_applied_profile: None,\n+            last_applied_at: None,\n+        };\n+\n+        touch_last_applied(&mut manifest, \"dev\", \"dev.toml\", 500);\n+\n+        assert_eq!(manifest.last_applied_profile.as_deref(), Some(\"dev\"));\n+        assert_eq!(manifest.last_applied_at, Some(500));\n+        assert_eq!(manifest.profiles[0].last_applied_at, Some(500));\n+        assert_eq!(manifest.profiles[0].updated_at, Some(500));\n+        assert_eq!(manifest.profiles[0].created_at, Some(100));\n+    }\n+}"
+    },
+    {
+      "sha": "b3242caee24dfd3ecf406d90bb461784093b1c50",
+      "filename": "crates/wa-core/src/events.rs",
+      "status": "modified",
+      "additions": 40,
+      "deletions": 1,
+      "changes": 41,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/8c2317dd6ce669e146e3a389bbdb8d004333da06/crates%2Fwa-core%2Fsrc%2Fevents.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/8c2317dd6ce669e146e3a389bbdb8d004333da06/crates%2Fwa-core%2Fsrc%2Fevents.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Fwa-core%2Fsrc%2Fevents.rs?ref=8c2317dd6ce669e146e3a389bbdb8d004333da06",
+      "patch": "@@ -286,7 +286,7 @@ fn normalized_extracted(extracted: &serde_json::Value, redactor: &Redactor) -> O\n \n         rendered = redactor.redact(&rendered);\n         if rendered.len() > IDENTITY_MAX_VALUE_LEN {\n-            rendered.truncate(IDENTITY_MAX_VALUE_LEN);\n+            truncate_to_char_boundary(&mut rendered, IDENTITY_MAX_VALUE_LEN);\n         }\n \n         parts.push(format!(\"{key}={rendered}\"));\n@@ -300,6 +300,19 @@ fn normalized_extracted(extracted: &serde_json::Value, redactor: &Redactor) -> O\n     Some(parts.join(\",\"))\n }\n \n+fn truncate_to_char_boundary(value: &mut String, max_len: usize) {\n+    if value.len() <= max_len {\n+        return;\n+    }\n+    let boundary = value\n+        .char_indices()\n+        .map(|(idx, _)| idx)\n+        .take_while(|idx| *idx <= max_len)\n+        .last()\n+        .unwrap_or(0);\n+    value.truncate(boundary);\n+}\n+\n fn hex_encode(bytes: &[u8]) -> String {\n     bytes\n         .iter()\n@@ -2036,6 +2049,32 @@ mod tests {\n         }\n     }\n \n+    #[test]\n+    fn truncate_to_char_boundary_avoids_utf8_split_panics() {\n+        let mut value = format!(\"{}\u00e9\", \"a\".repeat(119));\n+        assert_eq!(value.len(), 121);\n+\n+        truncate_to_char_boundary(&mut value, IDENTITY_MAX_VALUE_LEN);\n+        assert_eq!(value.len(), 119);\n+        assert!(!value.ends_with('\u00e9'));\n+    }\n+\n+    #[test]\n+    fn event_identity_key_handles_multibyte_extracted_values() {\n+        let mut detection = make_detection(\n+            \"core.codex:usage_reached\",\n+            crate::patterns::Severity::Warning,\n+            crate::patterns::AgentType::Codex,\n+        );\n+        detection.extracted = serde_json::json!({\n+            \"long_text\": format!(\"{}\u00e9\", \"a\".repeat(119))\n+        });\n+\n+        let key = event_identity_key(&detection, 7, None);\n+        assert!(key.starts_with(\"evt:\"));\n+        assert_eq!(key.len(), 68); // \"evt:\" + 64 hex chars\n+    }\n+\n     #[test]\n     fn filter_allow_all_passes_everything() {\n         let f = EventFilter::allow_all();"
+    },
+    {
+      "sha": "df51e4dbd3a314bceb2f4304752ef5da29d7aa0e",
+      "filename": "crates/wa-core/src/rulesets.rs",
+      "status": "modified",
+      "additions": 27,
+      "deletions": 1,
+      "changes": 28,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/8c2317dd6ce669e146e3a389bbdb8d004333da06/crates%2Fwa-core%2Fsrc%2Frulesets.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/8c2317dd6ce669e146e3a389bbdb8d004333da06/crates%2Fwa-core%2Fsrc%2Frulesets.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Fwa-core%2Fsrc%2Frulesets.rs?ref=8c2317dd6ce669e146e3a389bbdb8d004333da06",
+      "patch": "@@ -214,7 +214,7 @@ pub fn touch_last_applied(\n         .find(|entry| entry.name == profile_name)\n     {\n         entry.last_applied_at = Some(applied_at);\n-        entry.updated_at = entry.updated_at.or(Some(applied_at));\n+        entry.updated_at = Some(applied_at);\n         return;\n     }\n \n@@ -450,3 +450,29 @@ fn system_time_to_epoch_ms(ts: SystemTime) -> Option<u64> {\n         .ok()\n         .map(|d| u64::try_from(d.as_millis()).unwrap_or(0))\n }\n+\n+#[cfg(test)]\n+mod tests {\n+    use super::*;\n+\n+    #[test]\n+    fn touch_last_applied_updates_existing_ruleset_timestamps() {\n+        let mut manifest = RulesetManifest {\n+            version: RULESET_MANIFEST_VERSION,\n+            rulesets: vec![RulesetManifestEntry {\n+                name: \"ops\".to_string(),\n+                path: \"ops.toml\".to_string(),\n+                description: Some(\"Ops profile\".to_string()),\n+                created_at: Some(100),\n+                updated_at: Some(200),\n+                last_applied_at: Some(200),\n+            }],\n+        };\n+\n+        touch_last_applied(&mut manifest, \"ops\", \"ops.toml\", 700);\n+\n+        assert_eq!(manifest.rulesets[0].last_applied_at, Some(700));\n+        assert_eq!(manifest.rulesets[0].updated_at, Some(700));\n+        assert_eq!(manifest.rulesets[0].created_at, Some(100));\n+    }\n+}"
+    },
+    {
+      "sha": "9c8f6b98520026552f26d1ef9737fe70e5466f5a",
+      "filename": "crates/wa-core/src/wait.rs",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 2,
+      "changes": 13,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/8c2317dd6ce669e146e3a389bbdb8d004333da06/crates%2Fwa-core%2Fsrc%2Fwait.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/8c2317dd6ce669e146e3a389bbdb8d004333da06/crates%2Fwa-core%2Fsrc%2Fwait.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Fwa-core%2Fsrc%2Fwait.rs?ref=8c2317dd6ce669e146e3a389bbdb8d004333da06",
+      "patch": "@@ -386,8 +386,9 @@ impl ActivityTracker {\n         let offset = Instant::now()\n             .saturating_duration_since(self.epoch)\n             .as_nanos() as u64;\n+        let encoded = offset.max(1);\n         // Monotonic: never go backwards.\n-        self.last_offset_nanos.fetch_max(offset, Ordering::SeqCst);\n+        self.last_offset_nanos.fetch_max(encoded, Ordering::SeqCst);\n     }\n \n     /// Returns the instant of the last recorded activity, or `None` if\n@@ -398,7 +399,7 @@ impl ActivityTracker {\n         if offset == 0 {\n             None\n         } else {\n-            Some(self.epoch + Duration::from_nanos(offset))\n+            Some(self.epoch + Duration::from_nanos(offset - 1))\n         }\n     }\n \n@@ -1084,6 +1085,14 @@ mod tests {\n         assert!(t.last_activity().is_none());\n     }\n \n+    #[test]\n+    fn tracker_last_activity_decodes_encoded_offset() {\n+        let t = ActivityTracker::new();\n+        t.last_offset_nanos.store(1, Ordering::SeqCst); // encoded zero offset\n+        assert_eq!(t.last_activity(), Some(t.epoch));\n+        assert!(!t.is_idle());\n+    }\n+\n     #[test]\n     fn tracker_records_activity() {\n         let t = ActivityTracker::new();"
+    }
+  ]
+}

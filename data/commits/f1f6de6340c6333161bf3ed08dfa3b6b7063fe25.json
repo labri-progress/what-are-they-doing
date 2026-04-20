@@ -1,0 +1,29 @@
+{
+  "message": "fix(import): Detect installed packages on GitHub Actions Linux\n\nAdd support for pythonLocation environment variable set by\nactions/setup-python. This ensures numpy and other pip-installed\npackages are detected correctly on CI.\n\nAlso fixes if-expression type casting for mixed constant/variable\nbranches.",
+  "files": [
+    {
+      "sha": "4d2afa841b2e0acb6127790abaa18674cb2a5a2c",
+      "filename": "src/codegen/native/expressions.zig",
+      "status": "modified",
+      "additions": 18,
+      "deletions": 6,
+      "changes": 24,
+      "blob_url": "https://github.com/teamchong/metal0/blob/f1f6de6340c6333161bf3ed08dfa3b6b7063fe25/src%2Fcodegen%2Fnative%2Fexpressions.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/f1f6de6340c6333161bf3ed08dfa3b6b7063fe25/src%2Fcodegen%2Fnative%2Fexpressions.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/src%2Fcodegen%2Fnative%2Fexpressions.zig?ref=f1f6de6340c6333161bf3ed08dfa3b6b7063fe25",
+      "patch": "@@ -437,10 +437,18 @@ fn genIfExpr(self: *NativeCodegen, ie: ast.Node.IfExpr) CodegenError!void {\n     // If condition involves runtime values (function calls, runtime vars), branches must be concrete types\n     const is_runtime_condition = isRuntimeCondition(ie.condition.*);\n \n-    // Check if both branches are integer constants - need to cast to i64 for runtime conditions\n+    // Check if branches are integer constants - need to cast to i64 for runtime conditions\n     const body_is_int = ie.body.* == .constant and ie.body.constant.value == .int;\n     const orelse_is_int = ie.orelse_value.* == .constant and ie.orelse_value.constant.value == .int;\n-    const needs_int_cast = is_runtime_condition and body_is_int and orelse_is_int;\n+    // Need int cast when: both branches are int constants, OR one is int constant and other is runtime variable\n+    // This handles patterns like: `10 if base is None else base` where 10 must be cast to match base's type\n+    const orelse_is_var = ie.orelse_value.* == .name;\n+    const body_is_var = ie.body.* == .name;\n+    const needs_int_cast = is_runtime_condition and (\n+        (body_is_int and orelse_is_int) or // Both constants\n+        (body_is_int and orelse_is_var) or // Constant body, variable orelse\n+        (body_is_var and orelse_is_int) // Variable body, constant orelse\n+    );\n \n     // Check if one branch is None - need to wrap other in @as(?T, ...) for type unification\n     // Pattern: `10 if base is None else base` needs both branches to be ?i64\n@@ -517,9 +525,11 @@ fn genIfExpr(self: *NativeCodegen, ie: ast.Node.IfExpr) CodegenError!void {\n         try genExpr(self, ie.body.*);\n         try self.emit(\")\");\n     } else {\n-        if (needs_int_cast) try self.emit(\"@as(i64, \");\n+        // Only cast int constants, not variables (variables already have concrete type)\n+        const cast_body = needs_int_cast and body_is_int;\n+        if (cast_body) try self.emit(\"@as(i64, \");\n         try genExpr(self, ie.body.*);\n-        if (needs_int_cast) try self.emit(\")\");\n+        if (cast_body) try self.emit(\")\");\n     }\n \n     try self.emit(\" else \");\n@@ -536,9 +546,11 @@ fn genIfExpr(self: *NativeCodegen, ie: ast.Node.IfExpr) CodegenError!void {\n         try genExpr(self, ie.orelse_value.*);\n         try self.emit(\")\");\n     } else {\n-        if (needs_int_cast) try self.emit(\"@as(i64, \");\n+        // Only cast int constants, not variables (variables already have concrete type)\n+        const cast_orelse = needs_int_cast and orelse_is_int;\n+        if (cast_orelse) try self.emit(\"@as(i64, \");\n         try genExpr(self, ie.orelse_value.*);\n-        if (needs_int_cast) try self.emit(\")\");\n+        if (cast_orelse) try self.emit(\")\");\n     }\n \n     try self.emit(\")\");"
+    },
+    {
+      "sha": "beadfba101e8c4f4ba27f1ad1278d1da718176b7",
+      "filename": "src/import_resolver/discovery.zig",
+      "status": "modified",
+      "additions": 19,
+      "deletions": 0,
+      "changes": 19,
+      "blob_url": "https://github.com/teamchong/metal0/blob/f1f6de6340c6333161bf3ed08dfa3b6b7063fe25/src%2Fimport_resolver%2Fdiscovery.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/f1f6de6340c6333161bf3ed08dfa3b6b7063fe25/src%2Fimport_resolver%2Fdiscovery.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/src%2Fimport_resolver%2Fdiscovery.zig?ref=f1f6de6340c6333161bf3ed08dfa3b6b7063fe25",
+      "patch": "@@ -36,6 +36,25 @@ pub fn discoverSitePackages(allocator: std.mem.Allocator) ![][]const u8 {\n         paths.append(allocator, local_venv) catch allocator.free(local_venv);\n     }\n \n+    // Check for GitHub Actions Python installation (pythonLocation env var)\n+    // actions/setup-python sets this to /opt/hostedtoolcache/Python/3.X.Y/x64\n+    if (if (comptime builtin.os.tag == .windows) @as(?[]const u8, null) else std.posix.getenv(\"pythonLocation\")) |python_loc| {\n+        var gha_version: u8 = 8;\n+        while (gha_version <= 13) : (gha_version += 1) {\n+            const gha_path = std.fmt.allocPrint(\n+                allocator,\n+                \"{s}/lib/python3.{d}/site-packages\",\n+                .{ python_loc, gha_version },\n+            ) catch continue;\n+            // Only add if directory exists\n+            std.fs.cwd().access(gha_path, .{}) catch {\n+                allocator.free(gha_path);\n+                continue;\n+            };\n+            paths.append(allocator, gha_path) catch allocator.free(gha_path);\n+        }\n+    }\n+\n     switch (builtin.os.tag) {\n         .linux, .freebsd, .openbsd, .netbsd => {\n             // Linux/BSD paths"
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "message": "Improve audit file writing atomicity and simplify list command sorting\n\nAudit command changes:\n- Replace buffered writer with pre-serialized write-all pattern for more\n  atomic-like file operations. The previous approach using BufWriter with\n  separate to_writer and write_all calls could leave partial entries on\n  interruption. Now serializes to a Vec<u8> first, then writes in a single\n  write_all call, reducing the window for partial writes.\n- Remove intermediate BufWriter abstraction that added complexity without\n  meaningful performance benefit for single-line JSONL appends.\n\nList command changes:\n- Remove unused Issue import that became dead code after sorting was\n  delegated to the storage layer in a previous refactor.\n- Delete client-side apply_sort function that duplicated database-level\n  ORDER BY functionality. The storage layer now handles sorting via\n  ListFilters, making this redundant and potentially inconsistent.\n- Add validate_sort_key as an early guard to fail fast with clear error\n  messages for invalid sort fields before executing the database query,\n  rather than silently falling through or erroring after expensive work.\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "6029501f7fc08b977e2ff585c689226cdd3b774d",
+      "filename": "src/cli/commands/audit.rs",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 4,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_rust/blob/1ee4a3bd100efd5d10b5b8be0e5b4bb2ab9ccd9f/src%2Fcli%2Fcommands%2Faudit.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_rust/raw/1ee4a3bd100efd5d10b5b8be0e5b4bb2ab9ccd9f/src%2Fcli%2Fcommands%2Faudit.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_rust/contents/src%2Fcli%2Fcommands%2Faudit.rs?ref=1ee4a3bd100efd5d10b5b8be0e5b4bb2ab9ccd9f",
+      "patch": "@@ -244,15 +244,16 @@ fn append_entry(beads_dir: &Path, entry: &mut AuditEntry) -> Result<String> {\n         entry.created_at = Some(Utc::now());\n     }\n \n+    // Serialize to memory first to ensure atomic-ish write\n+    let mut line = serde_json::to_vec(&entry)?;\n+    line.push(b'\\n');\n+\n     let mut file = fs::OpenOptions::new()\n         .create(true)\n         .append(true)\n         .open(&path)?;\n \n-    let mut writer = io::BufWriter::new(&mut file);\n-    serde_json::to_writer(&mut writer, &entry)?;\n-    writer.write_all(b\"\\n\")?;\n-    writer.flush()?;\n+    file.write_all(&line)?;\n \n     Ok(entry.id.as_ref().expect(\"id set before append\").clone())\n }"
+    },
+    {
+      "sha": "d0725055a7406ea183a8a4acd99f5567da887945",
+      "filename": "src/cli/commands/list.rs",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 19,
+      "changes": 29,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_rust/blob/1ee4a3bd100efd5d10b5b8be0e5b4bb2ab9ccd9f/src%2Fcli%2Fcommands%2Flist.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_rust/raw/1ee4a3bd100efd5d10b5b8be0e5b4bb2ab9ccd9f/src%2Fcli%2Fcommands%2Flist.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_rust/contents/src%2Fcli%2Fcommands%2Flist.rs?ref=1ee4a3bd100efd5d10b5b8be0e5b4bb2ab9ccd9f",
+      "patch": "@@ -8,7 +8,7 @@ use crate::config;\n use crate::error::{BeadsError, Result};\n use crate::format::csv;\n use crate::format::{IssueWithCounts, TextFormatOptions, format_issue_line_with, terminal_width};\n-use crate::model::{Issue, IssueType, Priority, Status};\n+use crate::model::{IssueType, Priority, Status};\n use crate::storage::{ListFilters, SqliteStorage};\n use chrono::Utc;\n use std::collections::HashSet;\n@@ -48,6 +48,9 @@ pub fn execute(args: &ListArgs, json: bool, cli: &config::CliOverrides) -> Resul\n         None\n     };\n \n+    // Validate sort key before query\n+    validate_sort_key(args.sort.as_deref())?;\n+\n     // Query issues\n     let issues = storage.list_issues(&filters)?;\n     let mut issues = if client_filters {\n@@ -56,11 +59,6 @@ pub fn execute(args: &ListArgs, json: bool, cli: &config::CliOverrides) -> Resul\n         issues\n     };\n \n-    // Sort and limit on Issue (before expensive counts)\n-    apply_sort(&mut issues, args.sort.as_deref())?;\n-    if args.reverse {\n-        issues.reverse();\n-    }\n     if let Some(limit) = limit {\n         if limit > 0 && issues.len() > limit {\n             issues.truncate(limit);\n@@ -324,25 +322,18 @@ fn apply_client_filters(\n     Ok(filtered)\n }\n \n-fn apply_sort(issues: &mut [Issue], sort: Option<&str>) -> Result<()> {\n+fn validate_sort_key(sort: Option<&str>) -> Result<()> {\n     let Some(sort_key) = sort else {\n         return Ok(());\n     };\n \n     match sort_key {\n-        \"priority\" => issues.sort_by_key(|issue| issue.priority),\n-        \"created_at\" => issues.sort_by_key(|issue| issue.created_at),\n-        \"updated_at\" => issues.sort_by_key(|issue| issue.updated_at),\n-        \"title\" => issues.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase())),\n-        _ => {\n-            return Err(BeadsError::Validation {\n-                field: \"sort\".to_string(),\n-                reason: format!(\"invalid sort field '{sort_key}'\"),\n-            });\n-        }\n+        \"priority\" | \"created_at\" | \"updated_at\" | \"title\" => Ok(()),\n+        _ => Err(BeadsError::Validation {\n+            field: \"sort\".to_string(),\n+            reason: format!(\"invalid sort field '{sort_key}'\"),\n+        }),\n     }\n-\n-    Ok(())\n }\n \n #[cfg(test)]"
+    }
+  ]
+}

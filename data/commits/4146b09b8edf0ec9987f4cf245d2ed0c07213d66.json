@@ -1,0 +1,53 @@
+{
+  "message": "fix(net): websocket close handshake, fallible mask generation, IPv6 handling, and accept storm backoff\n\nWebSocket close handshake (src/net/websocket/close.rs):\n- Add mark_response_sent() method that transitions CloseReceived \u2192\n  Closed. Previously there was no way to signal that the response close\n  frame was actually written to the wire, leaving the handshake stuck in\n  CloseReceived. The caller can now mark completion after the frame\n  codec confirms the write.\n- Add test verifying the full receive-close \u2192 mark-response-sent \u2192 closed\n  transition.\n- Remove spurious blank lines.\n\nWebSocket mask key generation (src/net/websocket/frame.rs):\n- Change generate_mask_key() from returning [u8; 4] (panicking on RNG\n  failure) to returning io::Result<[u8; 4]>. The previous code used\n  .expect(\"OS RNG unavailable\") which would panic the entire runtime if\n  getrandom failed (e.g., early boot on Linux before /dev/urandom is\n  seeded). Now the error propagates as a normal IO error through the\n  codec's encode path.\n\nWebSocket handshake IPv6 (src/net/websocket/handshake.rs):\n- Handle unbracketed IPv6 addresses (containing multiple colons) by\n  treating the entire host_port as the host with the default port,\n  rather than misinterpreting colons as host:port separators. Bracketed\n  IPv6 [::1]:8080 was already handled correctly.\n\nTCP listener accept storm backoff (src/net/tcp/listener.rs):\n- Unify the backoff delay logic: when note_accept_would_block() returns\n  a storm backoff duration, use it even when the reactor is armed (not\n  just in fallback poll mode). Previously, reactor-armed mode always\n  returned Pending with zero delay, but accept storms can cause rapid\n  spurious wakeups even with reactor notification. Now the delay is\n  max(FALLBACK_ACCEPT_BACKOFF, storm_backoff) for fallback mode, and\n  storm_backoff for reactor mode when it exceeds the base threshold.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "3cb999c8391595774f1fd93c650181870e03fd12",
+      "filename": "src/net/tcp/listener.rs",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 6,
+      "changes": 20,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/4146b09b8edf0ec9987f4cf245d2ed0c07213d66/src%2Fnet%2Ftcp%2Flistener.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/4146b09b8edf0ec9987f4cf245d2ed0c07213d66/src%2Fnet%2Ftcp%2Flistener.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fnet%2Ftcp%2Flistener.rs?ref=4146b09b8edf0ec9987f4cf245d2ed0c07213d66",
+      "patch": "@@ -92,15 +92,23 @@ impl TcpListener {\n                 Poll::Ready(TcpStream::from_std(stream).map(|stream| (stream, addr)))\n             }\n             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {\n-                self.note_accept_would_block();\n+                let storm_backoff = self.note_accept_would_block();\n                 let mode = match self.register_interest(cx) {\n                     Ok(mode) => mode,\n                     Err(err) => return Poll::Ready(Err(err)),\n                 };\n-                if mode == InterestRegistrationMode::FallbackPoll {\n-                    // No reactor-backed readiness available for this task context.\n+\n+                let delay = if mode == InterestRegistrationMode::FallbackPoll {\n+                    FALLBACK_ACCEPT_BACKOFF.max(storm_backoff)\n+                } else if storm_backoff > REARMED_ACCEPT_BACKOFF_BASE {\n+                    storm_backoff\n+                } else {\n+                    Duration::ZERO\n+                };\n+\n+                if delay > Duration::ZERO {\n                     if let Some(timer) = Cx::current().and_then(|c| c.timer_driver()) {\n-                        let deadline = timer.now() + FALLBACK_ACCEPT_BACKOFF;\n+                        let deadline = timer.now() + delay;\n                         let _ = timer.register(deadline, cx.waker().clone());\n                     } else {\n                         // Schedule a delayed wakeup on a background thread to avoid\n@@ -109,13 +117,13 @@ impl TcpListener {\n                         let _ = std::thread::Builder::new()\n                             .name(\"accept-fallback\".into())\n                             .spawn(move || {\n-                                std::thread::sleep(FALLBACK_ACCEPT_BACKOFF);\n+                                std::thread::sleep(delay);\n                                 waker.wake();\n                             });\n                     }\n                 }\n                 // ReactorArmed: the reactor is re-armed and will wake us on\n-                // actual readiness; no sleep needed.\n+                // actual readiness; no sleep needed (unless an accept storm triggered a delay).\n                 Poll::Pending\n             }\n             Err(e) => Poll::Ready(Err(e)),"
+    },
+    {
+      "sha": "c1f1414f4cba804ba9de31d1e193a0bb46282f18",
+      "filename": "src/net/websocket/close.rs",
+      "status": "modified",
+      "additions": 23,
+      "deletions": 2,
+      "changes": 25,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/4146b09b8edf0ec9987f4cf245d2ed0c07213d66/src%2Fnet%2Fwebsocket%2Fclose.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/4146b09b8edf0ec9987f4cf245d2ed0c07213d66/src%2Fnet%2Fwebsocket%2Fclose.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fnet%2Fwebsocket%2Fclose.rs?ref=4146b09b8edf0ec9987f4cf245d2ed0c07213d66",
+      "patch": "@@ -186,8 +186,6 @@ impl Default for CloseReason {\n     }\n }\n \n-\n-\n /// State of the close handshake.\n #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]\n pub enum CloseState {\n@@ -414,6 +412,15 @@ impl CloseHandshake {\n         }\n     }\n \n+    /// Mark that the close response frame has been successfully sent.\n+    ///\n+    /// Transitions `CloseReceived` -> `Closed`. In all other states this is a no-op.\n+    pub fn mark_response_sent(&mut self) {\n+        if self.state == CloseState::CloseReceived {\n+            self.state = CloseState::Closed;\n+        }\n+    }\n+\n     /// Force transition to closed state.\n     ///\n     /// Use this when the connection is terminated without proper handshake\n@@ -674,6 +681,20 @@ mod tests {\n         assert_eq!(handshake.state(), CloseState::Closed);\n     }\n \n+    #[test]\n+    fn handshake_mark_response_sent_closes_after_receiving_peer_close() {\n+        let mut handshake = CloseHandshake::new();\n+\n+        let peer_close = Frame::close(Some(1000), Some(\"bye\"));\n+        let response = handshake.receive_close(&peer_close).unwrap();\n+        assert!(response.is_some());\n+        assert_eq!(handshake.state(), CloseState::CloseReceived);\n+\n+        handshake.mark_response_sent();\n+        assert_eq!(handshake.state(), CloseState::Closed);\n+        assert!(handshake.is_closed());\n+    }\n+\n     #[test]\n     fn handshake_force_close() {\n         let mut handshake = CloseHandshake::new();"
+    },
+    {
+      "sha": "50859ec12a00dd21ac671e79edbad9c7fe4efd1e",
+      "filename": "src/net/websocket/frame.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 6,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/4146b09b8edf0ec9987f4cf245d2ed0c07213d66/src%2Fnet%2Fwebsocket%2Fframe.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/4146b09b8edf0ec9987f4cf245d2ed0c07213d66/src%2Fnet%2Fwebsocket%2Fframe.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fnet%2Fwebsocket%2Fframe.rs?ref=4146b09b8edf0ec9987f4cf245d2ed0c07213d66",
+      "patch": "@@ -731,9 +731,7 @@ impl Encoder<Frame> for FrameCodec {\n \n         // Write mask key and payload\n         if should_mask {\n-            // Generate a mask key (for simplicity, use a simple pattern)\n-            // In production, this should use a cryptographic RNG\n-            let mask_key = generate_mask_key();\n+            let mask_key = generate_mask_key().map_err(WsError::Io)?;\n             dst.put_slice(&mask_key);\n \n             // Apply mask to payload and write\n@@ -762,11 +760,11 @@ pub fn apply_mask(payload: &mut [u8], mask_key: [u8; 4]) {\n ///\n /// RFC 6455 \u00a75.3 requires masking keys to be derived from a strong source of\n /// entropy to prevent cross-protocol attacks via intermediary cache poisoning.\n-fn generate_mask_key() -> [u8; 4] {\n+fn generate_mask_key() -> io::Result<[u8; 4]> {\n     let mut key = [0u8; 4];\n     check_ambient_entropy(\"websocket_mask\");\n-    getrandom::fill(&mut key).expect(\"OS RNG unavailable\");\n-    key\n+    getrandom::fill(&mut key).map_err(io::Error::other)?;\n+    Ok(key)\n }\n \n /// Close codes defined by RFC 6455."
+    },
+    {
+      "sha": "229327bb8db0e71834395a358e913989f9c51a57",
+      "filename": "src/net/websocket/handshake.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 1,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/4146b09b8edf0ec9987f4cf245d2ed0c07213d66/src%2Fnet%2Fwebsocket%2Fhandshake.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/4146b09b8edf0ec9987f4cf245d2ed0c07213d66/src%2Fnet%2Fwebsocket%2Fhandshake.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fnet%2Fwebsocket%2Fhandshake.rs?ref=4146b09b8edf0ec9987f4cf245d2ed0c07213d66",
+      "patch": "@@ -133,8 +133,13 @@ impl WsUrl {\n                 };\n                 (host.to_string(), port)\n             } else {\n-                return Err(HandshakeError::InvalidUrl(\"missing closing bracket for IPv6 address\".into()));\n+                return Err(HandshakeError::InvalidUrl(\n+                    \"missing closing bracket for IPv6 address\".into(),\n+                ));\n             }\n+        } else if host_port.matches(':').count() > 1 {\n+            // Unbracketed IPv6 address - cannot safely have a port (ambiguous)\n+            (host_port.to_string(), default_port)\n         } else if let Some(colon_idx) = host_port.rfind(':') {\n             // host:port\n             let host = &host_port[..colon_idx];"
+    }
+  ]
+}

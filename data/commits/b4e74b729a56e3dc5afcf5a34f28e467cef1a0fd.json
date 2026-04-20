@@ -1,0 +1,41 @@
+{
+  "message": "fix: Handle chained comparisons in list comprehensions\n\nChained comparisons like `0 < x < 3` in list comprehensions were being\ngenerated as-is, which Zig rejects (comparison operators cannot be chained).\n\nNow delegate chained comparisons (cmp.ops.len > 1) to genCompare which\nproperly converts them to `((0 < x) and (x < 3))`.\n\nLong-term fix: Check for multiple comparison operators and route to\nthe proper handler that generates Python-style chained comparison logic.",
+  "files": [
+    {
+      "sha": "38e3d028895fe802fa7fdb60d2f79ae1f71f3c87",
+      "filename": "src/codegen/native/expressions.zig",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/teamchong/metal0/blob/b4e74b729a56e3dc5afcf5a34f28e467cef1a0fd/src%2Fcodegen%2Fnative%2Fexpressions.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/b4e74b729a56e3dc5afcf5a34f28e467cef1a0fd/src%2Fcodegen%2Fnative%2Fexpressions.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/src%2Fcodegen%2Fnative%2Fexpressions.zig?ref=b4e74b729a56e3dc5afcf5a34f28e467cef1a0fd",
+      "patch": "@@ -303,8 +303,8 @@ fn genIfExpr(self: *NativeCodegen, ie: ast.Node.IfExpr) CodegenError!void {\n     if (cond_is_boolop or cond_is_compare) {\n         // Boolean operations and comparisons generate bool directly, use as-is\n         try genExpr(self, ie.condition.*);\n-    } else if (type_traits.isUnknown(cond_type)) {\n-        // Unknown type (PyObject) - use runtime truthiness check\n+    } else if (type_traits.isUnknown(cond_type) or cond_type == .pyvalue) {\n+        // Two-Flow: Unknown/PyValue type - use runtime truthiness check\n         try self.emit(\"runtime.pyTruthy(\");\n         try genExpr(self, ie.condition.*);\n         try self.emit(\")\");"
+    },
+    {
+      "sha": "326ce9810eca8e2f2a82233f36827ffdc4bcdb9a",
+      "filename": "src/codegen/native/expressions/comprehensions.zig",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 11,
+      "changes": 26,
+      "blob_url": "https://github.com/teamchong/metal0/blob/b4e74b729a56e3dc5afcf5a34f28e467cef1a0fd/src%2Fcodegen%2Fnative%2Fexpressions%2Fcomprehensions.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/b4e74b729a56e3dc5afcf5a34f28e467cef1a0fd/src%2Fcodegen%2Fnative%2Fexpressions%2Fcomprehensions.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/src%2Fcodegen%2Fnative%2Fexpressions%2Fcomprehensions.zig?ref=b4e74b729a56e3dc5afcf5a34f28e467cef1a0fd",
+      "patch": "@@ -66,8 +66,8 @@ fn genComprehensionCondition(\n     if (is_already_bool) {\n         // Boolean expression - use directly\n         try genExprWithSubs(self, if_cond, subs);\n-    } else if (type_traits.isUnknown(cond_type)) {\n-        // Unknown type (PyObject) - use runtime truthiness check\n+    } else if (type_traits.isUnknown(cond_type) or cond_type == .pyvalue) {\n+        // Two-Flow: Unknown/PyValue type - use runtime truthiness check\n         try self.emit(\"runtime.pyTruthy(\");\n         try genExprWithSubs(self, if_cond, subs);\n         try self.emit(\")\");\n@@ -141,8 +141,8 @@ fn genComprehensionConditionNoSubs(\n     if (is_already_bool) {\n         // Boolean expression - use directly\n         try genExpr(self, if_cond);\n-    } else if (type_traits.isUnknown(cond_type)) {\n-        // Unknown type (PyObject) - use runtime truthiness check\n+    } else if (type_traits.isUnknown(cond_type) or cond_type == .pyvalue) {\n+        // Two-Flow: Unknown/PyValue type - use runtime truthiness check\n         try self.emit(\"runtime.pyTruthy(\");\n         try genExpr(self, if_cond);\n         try self.emit(\")\");\n@@ -524,8 +524,8 @@ fn genExprWithSubs(\n                 // Integer/float condition - check != 0\n                 try genExprWithSubs(self, ie.condition.*, subs);\n                 try self.emit(\" != 0\");\n-            } else if (type_traits.isUnknown(cond_type)) {\n-                // Unknown type (PyObject) - use runtime truthiness check\n+            } else if (type_traits.isUnknown(cond_type) or cond_type == .pyvalue) {\n+                // Two-Flow: Unknown/PyValue type - use runtime truthiness check\n                 try self.emit(\"runtime.pyTruthy(\");\n                 try genExprWithSubs(self, ie.condition.*, subs);\n                 try self.emit(\")\");\n@@ -540,9 +540,13 @@ fn genExprWithSubs(\n             try self.emit(\")\");\n         },\n         .compare => |cmp| {\n-            // For complex comparisons (in, not in, is, is not), delegate to main genExpr\n-            // which handles container membership, identity checks, etc. properly\n-            const has_complex_op = blk: {\n+            // For complex comparisons (in, not in, is, is not) OR chained comparisons (a < b < c),\n+            // delegate to main genExpr which handles these properly.\n+            // Zig doesn't support chained comparisons, so 0 < x < 3 must become ((0 < x) and (x < 3))\n+            const needs_delegation = blk: {\n+                // Chained comparisons need special handling\n+                if (cmp.ops.len > 1) break :blk true;\n+                // Complex operators need special handling\n                 for (cmp.ops) |op| {\n                     if (op == .In or op == .NotIn or op == .Is or op == .IsNot) {\n                         break :blk true;\n@@ -551,13 +555,13 @@ fn genExprWithSubs(\n                 break :blk false;\n             };\n \n-            if (has_complex_op) {\n+            if (needs_delegation) {\n                 // Apply substitutions first by setting up temp vars, then delegate\n                 // For now, just delegate directly - the loop var will be found\n                 const parent = @import(\"../expressions.zig\");\n                 try parent.genExpr(self, expr);\n             } else {\n-                // Simple comparisons can be handled inline with substitution\n+                // Simple single-operator comparisons can be handled inline with substitution\n                 try self.emit(\"(\");\n                 try genExprWithSubs(self, cmp.left.*, subs);\n                 for (cmp.ops, 0..) |op, idx| {"
+    },
+    {
+      "sha": "a91d3a72fd76c34aa708e3eefc4cef1d6d864014",
+      "filename": "src/codegen/native/expressions/operators/comparison.zig",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 2,
+      "changes": 6,
+      "blob_url": "https://github.com/teamchong/metal0/blob/b4e74b729a56e3dc5afcf5a34f28e467cef1a0fd/src%2Fcodegen%2Fnative%2Fexpressions%2Foperators%2Fcomparison.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/b4e74b729a56e3dc5afcf5a34f28e467cef1a0fd/src%2Fcodegen%2Fnative%2Fexpressions%2Foperators%2Fcomparison.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/src%2Fcodegen%2Fnative%2Fexpressions%2Foperators%2Fcomparison.zig?ref=b4e74b729a56e3dc5afcf5a34f28e467cef1a0fd",
+      "patch": "@@ -1141,8 +1141,10 @@ pub fn genCompare(self: *NativeCodegen, compare: ast.Node.Compare) CodegenError!\n                 try self.emit(\"unreachable // TypeError: ordering comparison not supported for complex numbers\");\n             }\n         }\n-        // Handle unknown type comparisons (anytype parameters)\n-        else if (type_traits.isUnknown(current_left_type) or type_traits.isUnknown(right_type)) {\n+        // Handle unknown type comparisons (anytype parameters) and PyValue (Two-Flow uncertain types)\n+        else if (type_traits.isUnknown(current_left_type) or type_traits.isUnknown(right_type) or\n+            current_left_type == .pyvalue or right_type == .pyvalue)\n+        {\n             // Special case: anytype compared to None\n             // For anytype params with default=None, use comptime type check instead of null comparison\n             const left_is_none = type_traits.isNone(current_left_type) or"
+    }
+  ]
+}

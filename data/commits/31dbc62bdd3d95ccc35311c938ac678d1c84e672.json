@@ -1,0 +1,41 @@
+{
+  "message": "fix(telegram): prevent stuck typing after tool runs",
+  "files": [
+    {
+      "sha": "d4e7ba652deced884798f5bd5805b5f2fa94c0a8",
+      "filename": "src/auto-reply/reply/agent-runner.ts",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 1,
+      "changes": 8,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/31dbc62bdd3d95ccc35311c938ac678d1c84e672/src%2Fauto-reply%2Freply%2Fagent-runner.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/31dbc62bdd3d95ccc35311c938ac678d1c84e672/src%2Fauto-reply%2Freply%2Fagent-runner.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fauto-reply%2Freply%2Fagent-runner.ts?ref=31dbc62bdd3d95ccc35311c938ac678d1c84e672",
+      "patch": "@@ -314,6 +314,9 @@ export async function runReplyAgent(params: {\n             shouldEmitToolResult,\n             onToolResult: opts?.onToolResult\n               ? (payload) => {\n+                  // `subscribeEmbeddedPiSession` may invoke tool callbacks without awaiting them.\n+                  // If a tool callback starts typing after the run finalized, we can end up with\n+                  // a typing loop that never sees a matching markRunComplete(). Track and drain.\n                   const task = (async () => {\n                     let text = payload.text;\n                     if (!isHeartbeat && text?.includes(\"HEARTBEAT_OK\")) {\n@@ -384,13 +387,16 @@ export async function runReplyAgent(params: {\n     }\n \n     const payloadArray = runResult.payloads ?? [];\n-    if (payloadArray.length === 0) return finalizeWithFollowup(undefined);\n     if (pendingBlockTasks.size > 0) {\n       await Promise.allSettled(pendingBlockTasks);\n     }\n     if (pendingToolTasks.size > 0) {\n       await Promise.allSettled(pendingToolTasks);\n     }\n+    // Drain any late tool/block deliveries before deciding there's \"nothing to send\".\n+    // Otherwise, a late typing trigger (e.g. from a tool callback) can outlive the run and\n+    // keep the typing indicator stuck.\n+    if (payloadArray.length === 0) return finalizeWithFollowup(undefined);\n \n     const sanitizedPayloads = isHeartbeat\n       ? payloadArray"
+    },
+    {
+      "sha": "18c3fd3225f6475c6964589fad02275ddf6bd951",
+      "filename": "src/auto-reply/reply/typing.test.ts",
+      "status": "modified",
+      "additions": 24,
+      "deletions": 0,
+      "changes": 24,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/31dbc62bdd3d95ccc35311c938ac678d1c84e672/src%2Fauto-reply%2Freply%2Ftyping.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/31dbc62bdd3d95ccc35311c938ac678d1c84e672/src%2Fauto-reply%2Freply%2Ftyping.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fauto-reply%2Freply%2Ftyping.test.ts?ref=31dbc62bdd3d95ccc35311c938ac678d1c84e672",
+      "patch": "@@ -51,4 +51,28 @@ describe(\"typing controller\", () => {\n     vi.advanceTimersByTime(2_000);\n     expect(onReplyStart).toHaveBeenCalledTimes(3);\n   });\n+\n+  it(\"does not restart typing after it has stopped\", async () => {\n+    vi.useFakeTimers();\n+    const onReplyStart = vi.fn(async () => {});\n+    const typing = createTypingController({\n+      onReplyStart,\n+      typingIntervalSeconds: 1,\n+      typingTtlMs: 30_000,\n+    });\n+\n+    await typing.startTypingLoop();\n+    expect(onReplyStart).toHaveBeenCalledTimes(1);\n+\n+    typing.markRunComplete();\n+    typing.markDispatchIdle();\n+\n+    vi.advanceTimersByTime(5_000);\n+    expect(onReplyStart).toHaveBeenCalledTimes(1);\n+\n+    // Late callbacks should be ignored and must not restart the interval.\n+    await typing.startTypingOnText(\"late tool result\");\n+    vi.advanceTimersByTime(5_000);\n+    expect(onReplyStart).toHaveBeenCalledTimes(1);\n+  });\n });"
+    },
+    {
+      "sha": "7850ec132a9a58c53cbf477de42f45989e08edf2",
+      "filename": "src/auto-reply/reply/typing.ts",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 0,
+      "changes": 13,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/31dbc62bdd3d95ccc35311c938ac678d1c84e672/src%2Fauto-reply%2Freply%2Ftyping.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/31dbc62bdd3d95ccc35311c938ac678d1c84e672/src%2Fauto-reply%2Freply%2Ftyping.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fauto-reply%2Freply%2Ftyping.ts?ref=31dbc62bdd3d95ccc35311c938ac678d1c84e672",
+      "patch": "@@ -26,6 +26,10 @@ export function createTypingController(params: {\n   let active = false;\n   let runComplete = false;\n   let dispatchIdle = false;\n+  // Important: callbacks (tool/block streaming) can fire late (after the run completed),\n+  // especially when upstream event emitters don't await async listeners.\n+  // Once we stop typing, we \"seal\" the controller so late events can't restart typing forever.\n+  let sealed = false;\n   let typingTimer: NodeJS.Timeout | undefined;\n   let typingTtlTimer: NodeJS.Timeout | undefined;\n   const typingIntervalMs = typingIntervalSeconds * 1000;\n@@ -43,6 +47,7 @@ export function createTypingController(params: {\n   };\n \n   const cleanup = () => {\n+    if (sealed) return;\n     if (typingTtlTimer) {\n       clearTimeout(typingTtlTimer);\n       typingTtlTimer = undefined;\n@@ -52,9 +57,11 @@ export function createTypingController(params: {\n       typingTimer = undefined;\n     }\n     resetCycle();\n+    sealed = true;\n   };\n \n   const refreshTypingTtl = () => {\n+    if (sealed) return;\n     if (!typingIntervalMs || typingIntervalMs <= 0) return;\n     if (typingTtlMs <= 0) return;\n     if (typingTtlTimer) {\n@@ -70,10 +77,14 @@ export function createTypingController(params: {\n   };\n \n   const triggerTyping = async () => {\n+    if (sealed) return;\n     await onReplyStart?.();\n   };\n \n   const ensureStart = async () => {\n+    if (sealed) return;\n+    // Late callbacks after a run completed should never restart typing.\n+    if (runComplete) return;\n     if (!active) {\n       active = true;\n     }\n@@ -89,6 +100,7 @@ export function createTypingController(params: {\n   };\n \n   const startTypingLoop = async () => {\n+    if (sealed) return;\n     if (!onReplyStart) return;\n     if (typingIntervalMs <= 0) return;\n     if (typingTimer) return;\n@@ -100,6 +112,7 @@ export function createTypingController(params: {\n   };\n \n   const startTypingOnText = async (text?: string) => {\n+    if (sealed) return;\n     const trimmed = text?.trim();\n     if (!trimmed) return;\n     if (silentToken && trimmed === silentToken) return;"
+    }
+  ]
+}

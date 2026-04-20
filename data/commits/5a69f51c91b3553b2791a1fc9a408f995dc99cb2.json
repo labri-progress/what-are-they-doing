@@ -1,0 +1,29 @@
+{
+  "message": "feat(dashboard): return PostQuitAction to attach tmux session after zoom\n\nThe dashboard's zoom feature previously fired tmux.ZoomPane and\nimmediately quit, discarding its error and never re-attaching the\nclient to the target session. This left the user's terminal detached\nafter zooming into a pane.\n\nChanges:\n- Add PostQuitAction struct to carry post-exit intent (AttachSession)\n  from the TUI model back to the CLI caller.\n- Change dashboard.Run() signature to return (*PostQuitAction, error)\n  so the caller can act on it.\n- In runDashboard(), after Run() returns, call tmux.AttachOrSwitch when\n  the action requests session attachment.\n- Handle tmux.ZoomPane errors explicitly: surface failures in the\n  health message bar instead of silently ignoring them.\n- Add early return (tea.Cmd nil) in the keyboard zoom path when no\n  valid pane is selected, preventing a no-op quit.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "ca4fa8aad84fbf33b6a062e2f984224f21254c77",
+      "filename": "internal/cli/dashboard.go",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 1,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/5a69f51c91b3553b2791a1fc9a408f995dc99cb2/internal%2Fcli%2Fdashboard.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/5a69f51c91b3553b2791a1fc9a408f995dc99cb2/internal%2Fcli%2Fdashboard.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fcli%2Fdashboard.go?ref=5a69f51c91b3553b2791a1fc9a408f995dc99cb2",
+      "patch": "@@ -342,5 +342,12 @@ func runDashboard(w io.Writer, errW io.Writer, session string, debug bool) error\n \t\tcancel()\n \t}\n \n-\treturn dashboard.Run(session, projectDir)\n+\taction, err := dashboard.Run(session, projectDir)\n+\tif err != nil {\n+\t\treturn err\n+\t}\n+\tif action != nil && action.AttachSession != \"\" {\n+\t\treturn tmux.AttachOrSwitch(action.AttachSession)\n+\t}\n+\treturn nil\n }"
+    },
+    {
+      "sha": "33f2d060b6f78abd69fbdcc644923fc0d1e15a42",
+      "filename": "internal/tui/dashboard/dashboard.go",
+      "status": "modified",
+      "additions": 28,
+      "deletions": 6,
+      "changes": 34,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/5a69f51c91b3553b2791a1fc9a408f995dc99cb2/internal%2Ftui%2Fdashboard%2Fdashboard.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/5a69f51c91b3553b2791a1fc9a408f995dc99cb2/internal%2Ftui%2Fdashboard%2Fdashboard.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Ftui%2Fdashboard%2Fdashboard.go?ref=5a69f51c91b3553b2791a1fc9a408f995dc99cb2",
+      "patch": "@@ -595,6 +595,14 @@ type Model struct {\n \tbaseTick      time.Duration // Base tick interval when active (default 100ms)\n \tidleTick      time.Duration // Tick interval when idle (default 500ms)\n \tidleTimeout   time.Duration // Time before entering idle state (default 5s)\n+\n+\t// Post-quit action: tells the caller what to do after the TUI exits.\n+\tpostQuitAction *PostQuitAction\n+}\n+\n+// PostQuitAction describes what the caller should do after the dashboard TUI exits.\n+type PostQuitAction struct {\n+\tAttachSession string // Non-empty: attach/switch to this tmux session.\n }\n \n // PaneStatus tracks the status of a pane including compaction state\n@@ -2309,7 +2317,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {\n \t\treturn m, tea.Batch(cmds...)\n \n \tcase synthtui.ZoomMsg:\n-\t\t_ = tmux.ZoomPane(m.session, msg.PaneIndex)\n+\t\tif err := tmux.ZoomPane(m.session, msg.PaneIndex); err != nil {\n+\t\t\tm.healthMessage = fmt.Sprintf(\"Zoom failed: %v\", err)\n+\t\t\treturn m, nil\n+\t\t}\n+\t\tm.postQuitAction = &PostQuitAction{AttachSession: m.session}\n \t\treturn m, tea.Quit\n \n \tcase EnsembleModesDataMsg:\n@@ -3343,11 +3355,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {\n \n \t\tcase key.Matches(msg, dashKeys.Zoom):\n \t\t\tif (m.focusedPanel == PanelPaneList || m.focusedPanel == PanelDetail) && len(m.panes) > 0 && m.cursor < len(m.panes) {\n-\t\t\t\t// Zoom to selected pane\n \t\t\t\tp := m.panes[m.cursor]\n-\t\t\t\t_ = tmux.ZoomPane(m.session, p.Index)\n+\t\t\t\tif err := tmux.ZoomPane(m.session, p.Index); err != nil {\n+\t\t\t\t\tm.healthMessage = fmt.Sprintf(\"Zoom failed: %v\", err)\n+\t\t\t\t\treturn m, nil\n+\t\t\t\t}\n+\t\t\t\tm.postQuitAction = &PostQuitAction{AttachSession: m.session}\n \t\t\t\treturn m, tea.Quit\n \t\t\t}\n+\t\t\treturn m, nil\n \n \t\t// Number quick-select\n \t\tcase key.Matches(msg, dashKeys.Num1):\n@@ -6686,9 +6702,15 @@ func (m Model) executeReplay(entry history.HistoryEntry) tea.Cmd {\n }\n \n // Run starts the dashboard\n-func Run(session, projectDir string) error {\n+func Run(session, projectDir string) (*PostQuitAction, error) {\n \tmodel := New(session, projectDir)\n \tp := tea.NewProgram(model, tea.WithAltScreen())\n-\t_, err := p.Run()\n-\treturn err\n+\tfinalModel, err := p.Run()\n+\tif err != nil {\n+\t\treturn nil, err\n+\t}\n+\tif m, ok := finalModel.(Model); ok && m.postQuitAction != nil {\n+\t\treturn m.postQuitAction, nil\n+\t}\n+\treturn nil, nil\n }"
+    }
+  ]
+}

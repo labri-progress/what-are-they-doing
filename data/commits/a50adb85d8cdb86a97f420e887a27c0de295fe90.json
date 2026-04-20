@@ -1,0 +1,65 @@
+{
+  "message": "fix(scanner,logger): .tmp_target pattern, shutdown sentinel, auto_vacuum conversion\n\n4 bugs from deep audit:\n- patterns.rs: add tmp-target-prefix pattern so .tmp_target_* dirs are\n  classified as RustTarget (0.90) instead of falling through to generic\n  dot-tmp TempDir (0.60). Remove dead has_git branch in NodeModules.\n- dual.rs: shutdown() now uses blocking send() so the Shutdown sentinel\n  is never silently dropped when the channel is full.\n- sqlite.rs: auto_vacuum=FULL is a no-op on existing databases; now\n  checks current value and runs VACUUM to convert if needed (before\n  setting WAL mode, since VACUUM resets journal_mode).\n- walker.rs: fix stale comment about MAX_ENTRIES_PER_DIR.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "fb9461bf63f6fcaaa05a703f6579edcebc8bc115",
+      "filename": "src/daemon/loop_main.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/blob/a50adb85d8cdb86a97f420e887a27c0de295fe90/src%2Fdaemon%2Floop_main.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/raw/a50adb85d8cdb86a97f420e887a27c0de295fe90/src%2Fdaemon%2Floop_main.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/storage_ballast_helper/contents/src%2Fdaemon%2Floop_main.rs?ref=a50adb85d8cdb86a97f420e887a27c0de295fe90",
+      "patch": "@@ -1562,6 +1562,7 @@ impl MonitoringDaemon {\n \n     // \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 config reload \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n \n+    #[allow(clippy::too_many_lines)]\n     fn handle_config_reload(&mut self, _scan_tx: &Sender<ScanRequest>) {\n         eprintln!(\"[SBH-DAEMON] config reload requested (SIGHUP)\");\n "
+    },
+    {
+      "sha": "760920c467d3e3964c45d80b75677db26123ed8d",
+      "filename": "src/logger/dual.rs",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 6,
+      "changes": 14,
+      "blob_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/blob/a50adb85d8cdb86a97f420e887a27c0de295fe90/src%2Flogger%2Fdual.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/raw/a50adb85d8cdb86a97f420e887a27c0de295fe90/src%2Flogger%2Fdual.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/storage_ballast_helper/contents/src%2Flogger%2Fdual.rs?ref=a50adb85d8cdb86a97f420e887a27c0de295fe90",
+      "patch": "@@ -126,13 +126,15 @@ impl ActivityLoggerHandle {\n         self.dropped_events.load(Ordering::Relaxed)\n     }\n \n-    /// Request graceful shutdown and wait for the logger thread to finish.\n+    /// Request graceful shutdown of the logger thread.\n+    ///\n+    /// Uses a blocking send so the sentinel is never silently dropped when\n+    /// the channel is full.  The caller should `.join()` the thread handle\n+    /// returned by [`spawn_logger`] after calling this.\n     pub fn shutdown(&self) {\n-        if self.tx.try_send(ActivityEvent::Shutdown).is_err() {\n-            // Channel full or disconnected \u2014 brief drain then retry.\n-            std::thread::sleep(std::time::Duration::from_millis(50));\n-            let _ = self.tx.try_send(ActivityEvent::Shutdown);\n-        }\n+        // Blocking send: acceptable during shutdown \u2014 we *must* deliver the\n+        // sentinel even if the channel is temporarily full.\n+        let _ = self.tx.send(ActivityEvent::Shutdown);\n     }\n }\n "
+    },
+    {
+      "sha": "582cb84eb61cc7198ea155866b234cf3d16c2f7f",
+      "filename": "src/logger/sqlite.rs",
+      "status": "modified",
+      "additions": 18,
+      "deletions": 2,
+      "changes": 20,
+      "blob_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/blob/a50adb85d8cdb86a97f420e887a27c0de295fe90/src%2Flogger%2Fsqlite.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/raw/a50adb85d8cdb86a97f420e887a27c0de295fe90/src%2Flogger%2Fsqlite.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/storage_ballast_helper/contents/src%2Flogger%2Fsqlite.rs?ref=a50adb85d8cdb86a97f420e887a27c0de295fe90",
+      "patch": "@@ -338,15 +338,31 @@ pub struct BallastRow {\n // \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 schema & pragmas \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n \n fn apply_pragmas(conn: &Connection) -> Result<()> {\n+    // auto_vacuum can only be changed before the first table is created.\n+    // For existing databases the PRAGMA is silently ignored, so we check\n+    // the current value and run VACUUM to convert if needed.  This must\n+    // happen before setting WAL mode because VACUUM resets journal_mode.\n+    let current_av: i32 = conn.query_row(\"PRAGMA auto_vacuum\", [], |row| row.get(0))?;\n+    if current_av != 1 {\n+        // 1 = FULL.  Setting it and running VACUUM converts the database\n+        // in-place so future page frees actually reclaim space.\n+        if conn\n+            .execute_batch(\"PRAGMA auto_vacuum = FULL; VACUUM;\")\n+            .is_err()\n+        {\n+            eprintln!(\"[SBH-SQLITE] WARNING: failed to enable auto_vacuum (current={current_av})\");\n+        }\n+    }\n+\n     conn.execute_batch(\n         \"PRAGMA journal_mode = WAL;\n          PRAGMA synchronous = NORMAL;\n          PRAGMA cache_size = -8000;\n          PRAGMA mmap_size = 67108864;\n          PRAGMA temp_store = MEMORY;\n-         PRAGMA busy_timeout = 5000;\n-         PRAGMA auto_vacuum = FULL;\",\n+         PRAGMA busy_timeout = 5000;\",\n     )?;\n+\n     // Verify WAL mode is active (I12).\n     let mode: String = conn.query_row(\"PRAGMA journal_mode\", [], |row| row.get(0))?;\n     if !mode.eq_ignore_ascii_case(\"wal\") {"
+    },
+    {
+      "sha": "a115d43020a06a271a16155d36bfdbaaa64e3f4e",
+      "filename": "src/scanner/patterns.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 7,
+      "changes": 14,
+      "blob_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/blob/a50adb85d8cdb86a97f420e887a27c0de295fe90/src%2Fscanner%2Fpatterns.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/raw/a50adb85d8cdb86a97f420e887a27c0de295fe90/src%2Fscanner%2Fpatterns.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/storage_ballast_helper/contents/src%2Fscanner%2Fpatterns.rs?ref=a50adb85d8cdb86a97f420e887a27c0de295fe90",
+      "patch": "@@ -230,13 +230,7 @@ fn structural_score(category: ArtifactCategory, signals: StructuralSignals) -> f\n                 0.40\n             }\n         }\n-        ArtifactCategory::NodeModules => {\n-            if signals.has_git {\n-                0.0\n-            } else {\n-                0.80\n-            }\n-        }\n+        ArtifactCategory::NodeModules => 0.80,\n         ArtifactCategory::PythonCache => 0.75,\n         ArtifactCategory::BuildOutput | ArtifactCategory::CacheDir | ArtifactCategory::TempDir => {\n             if signals.mostly_object_files {\n@@ -295,6 +289,12 @@ fn builtin_patterns() -> Vec<ArtifactPattern> {\n             confidence: 0.88,\n             category: ArtifactCategory::RustTarget,\n         },\n+        ArtifactPattern {\n+            name: \"tmp-target-prefix\",\n+            kind: MatchKind::Prefix(\".tmp_target\"),\n+            confidence: 0.90,\n+            category: ArtifactCategory::RustTarget,\n+        },\n         ArtifactPattern {\n             name: \"tmp-cargo-home\",\n             kind: MatchKind::Prefix(\".tmp_cargo_home_\"),"
+    },
+    {
+      "sha": "1706e74ffaeed68d331511bd7a3b9a24ac8cc15d",
+      "filename": "src/scanner/walker.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/blob/a50adb85d8cdb86a97f420e887a27c0de295fe90/src%2Fscanner%2Fwalker.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/raw/a50adb85d8cdb86a97f420e887a27c0de295fe90/src%2Fscanner%2Fwalker.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/storage_ballast_helper/contents/src%2Fscanner%2Fwalker.rs?ref=a50adb85d8cdb86a97f420e887a27c0de295fe90",
+      "patch": "@@ -317,8 +317,8 @@ fn process_directory(\n             total_count += 1;\n \n             // Per-directory iteration budget: avoid spending seconds iterating\n-            // directories with 8K-60K+ entries. Structural markers appear early;\n-            // 2000 entries is generous enough to capture them reliably.\n+            // directories with tens of thousands of entries. Structural markers\n+            // appear early; MAX_ENTRIES_PER_DIR (65 536) is generous.\n             if total_count >= MAX_ENTRIES_PER_DIR {\n                 break;\n             }"
+    }
+  ]
+}

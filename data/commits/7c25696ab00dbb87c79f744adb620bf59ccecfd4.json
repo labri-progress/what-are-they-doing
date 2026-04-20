@@ -1,0 +1,53 @@
+{
+  "message": "fix(config): enforce default-free persistence in write path",
+  "files": [
+    {
+      "sha": "4761b7b215d02f6833cf7bac264ca5a3b5df5806",
+      "filename": "src/config/config.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/7c25696ab00dbb87c79f744adb620bf59ccecfd4/src%2Fconfig%2Fconfig.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/7c25696ab00dbb87c79f744adb620bf59ccecfd4/src%2Fconfig%2Fconfig.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fconfig%2Fconfig.ts?ref=7c25696ab00dbb87c79f744adb620bf59ccecfd4",
+      "patch": "@@ -13,6 +13,7 @@ export * from \"./types.js\";\n export {\n   validateConfigObject,\n   validateConfigObjectRaw,\n+  validateConfigObjectRawWithPlugins,\n   validateConfigObjectWithPlugins,\n } from \"./validation.js\";\n export { OpenClawSchema } from \"./zod-schema.js\";"
+    },
+    {
+      "sha": "19b1f02e734d3a847b5fc130cd6bbac0c5d6b1ef",
+      "filename": "src/config/io.ts",
+      "status": "modified",
+      "additions": 60,
+      "deletions": 3,
+      "changes": 63,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/7c25696ab00dbb87c79f744adb620bf59ccecfd4/src%2Fconfig%2Fio.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/7c25696ab00dbb87c79f744adb620bf59ccecfd4/src%2Fconfig%2Fio.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fconfig%2Fio.ts?ref=7c25696ab00dbb87c79f744adb620bf59ccecfd4",
+      "patch": "@@ -3,6 +3,7 @@ import crypto from \"node:crypto\";\n import fs from \"node:fs\";\n import os from \"node:os\";\n import path from \"node:path\";\n+import { isDeepStrictEqual } from \"node:util\";\n import type { OpenClawConfig, ConfigFileSnapshot, LegacyConfigIssue } from \"./types.js\";\n import { loadDotEnv } from \"../infra/dotenv.js\";\n import { resolveRequiredHomeDir } from \"../infra/home-dir.js\";\n@@ -28,10 +29,14 @@ import { MissingEnvVarError, resolveConfigEnvVars } from \"./env-substitution.js\"\n import { collectConfigEnvVars } from \"./env-vars.js\";\n import { ConfigIncludeError, resolveConfigIncludes } from \"./includes.js\";\n import { findLegacyConfigIssues } from \"./legacy.js\";\n+import { applyMergePatch } from \"./merge-patch.js\";\n import { normalizeConfigPaths } from \"./normalize-paths.js\";\n import { resolveConfigPath, resolveDefaultConfigCandidates, resolveStateDir } from \"./paths.js\";\n import { applyConfigOverrides } from \"./runtime-overrides.js\";\n-import { validateConfigObjectWithPlugins } from \"./validation.js\";\n+import {\n+  validateConfigObjectRawWithPlugins,\n+  validateConfigObjectWithPlugins,\n+} from \"./validation.js\";\n import { compareOpenClawVersions } from \"./version.js\";\n \n // Re-export for backwards compatibility\n@@ -92,6 +97,49 @@ function coerceConfig(value: unknown): OpenClawConfig {\n   return value as OpenClawConfig;\n }\n \n+function isPlainObject(value: unknown): value is Record<string, unknown> {\n+  return typeof value === \"object\" && value !== null && !Array.isArray(value);\n+}\n+\n+function cloneUnknown<T>(value: T): T {\n+  return structuredClone(value);\n+}\n+\n+function createMergePatch(base: unknown, target: unknown): unknown {\n+  if (!isPlainObject(base) || !isPlainObject(target)) {\n+    return cloneUnknown(target);\n+  }\n+\n+  const patch: Record<string, unknown> = {};\n+  const keys = new Set([...Object.keys(base), ...Object.keys(target)]);\n+  for (const key of keys) {\n+    const hasBase = key in base;\n+    const hasTarget = key in target;\n+    if (!hasTarget) {\n+      patch[key] = null;\n+      continue;\n+    }\n+    const targetValue = target[key];\n+    if (!hasBase) {\n+      patch[key] = cloneUnknown(targetValue);\n+      continue;\n+    }\n+    const baseValue = base[key];\n+    if (isPlainObject(baseValue) && isPlainObject(targetValue)) {\n+      const childPatch = createMergePatch(baseValue, targetValue);\n+      if (isPlainObject(childPatch) && Object.keys(childPatch).length === 0) {\n+        continue;\n+      }\n+      patch[key] = childPatch;\n+      continue;\n+    }\n+    if (!isDeepStrictEqual(baseValue, targetValue)) {\n+      patch[key] = cloneUnknown(targetValue);\n+    }\n+  }\n+  return patch;\n+}\n+\n async function rotateConfigBackups(configPath: string, ioFs: typeof fs.promises): Promise<void> {\n   if (CONFIG_BACKUP_COUNT <= 1) {\n     return;\n@@ -502,7 +550,14 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {\n \n   async function writeConfigFile(cfg: OpenClawConfig) {\n     clearConfigCache();\n-    const validated = validateConfigObjectWithPlugins(cfg);\n+    let persistCandidate: unknown = cfg;\n+    const snapshot = await readConfigFileSnapshot();\n+    if (snapshot.valid && snapshot.exists) {\n+      const patch = createMergePatch(snapshot.config, cfg);\n+      persistCandidate = applyMergePatch(snapshot.resolved, patch);\n+    }\n+\n+    const validated = validateConfigObjectRawWithPlugins(persistCandidate);\n     if (!validated.ok) {\n       const issue = validated.issues[0];\n       const pathLabel = issue?.path ? issue.path : \"<root>\";\n@@ -518,7 +573,9 @@ export function createConfigIO(overrides: ConfigIoDeps = {}) {\n     await deps.fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });\n     // Do NOT apply runtime defaults when writing \u2014 user config should only contain\n     // explicitly set values. Runtime defaults are applied when loading (issue #6070).\n-    const json = JSON.stringify(stampConfigVersion(cfg), null, 2).trimEnd().concat(\"\\n\");\n+    const json = JSON.stringify(stampConfigVersion(validated.config), null, 2)\n+      .trimEnd()\n+      .concat(\"\\n\");\n \n     const tmp = path.join(\n       dir,"
+    },
+    {
+      "sha": "cff5cd245e526ca0f45c154d137e81bb275699f9",
+      "filename": "src/config/io.write-config.test.ts",
+      "status": "added",
+      "additions": 47,
+      "deletions": 0,
+      "changes": 47,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/7c25696ab00dbb87c79f744adb620bf59ccecfd4/src%2Fconfig%2Fio.write-config.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/7c25696ab00dbb87c79f744adb620bf59ccecfd4/src%2Fconfig%2Fio.write-config.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fconfig%2Fio.write-config.test.ts?ref=7c25696ab00dbb87c79f744adb620bf59ccecfd4",
+      "patch": "@@ -0,0 +1,47 @@\n+import fs from \"node:fs/promises\";\n+import path from \"node:path\";\n+import { describe, expect, it } from \"vitest\";\n+import { createConfigIO } from \"./io.js\";\n+import { withTempHome } from \"./test-helpers.js\";\n+\n+describe(\"config io write\", () => {\n+  it(\"persists caller changes onto resolved config without leaking runtime defaults\", async () => {\n+    await withTempHome(async (home) => {\n+      const configPath = path.join(home, \".openclaw\", \"openclaw.json\");\n+      await fs.mkdir(path.dirname(configPath), { recursive: true });\n+      await fs.writeFile(\n+        configPath,\n+        JSON.stringify({ gateway: { port: 18789 } }, null, 2),\n+        \"utf-8\",\n+      );\n+\n+      const io = createConfigIO({\n+        env: {} as NodeJS.ProcessEnv,\n+        homedir: () => home,\n+      });\n+\n+      const snapshot = await io.readConfigFileSnapshot();\n+      expect(snapshot.valid).toBe(true);\n+\n+      const next = structuredClone(snapshot.config);\n+      next.gateway = {\n+        ...next.gateway,\n+        auth: { mode: \"token\" },\n+      };\n+\n+      await io.writeConfigFile(next);\n+\n+      const persisted = JSON.parse(await fs.readFile(configPath, \"utf-8\")) as Record<\n+        string,\n+        unknown\n+      >;\n+      expect(persisted.gateway).toEqual({\n+        port: 18789,\n+        auth: { mode: \"token\" },\n+      });\n+      expect(persisted).not.toHaveProperty(\"agents.defaults\");\n+      expect(persisted).not.toHaveProperty(\"messages.ackReaction\");\n+      expect(persisted).not.toHaveProperty(\"sessions.persistence\");\n+    });\n+  });\n+});"
+    },
+    {
+      "sha": "9f01ad1b24df325e7baf2af3bee35af19258c790",
+      "filename": "src/config/validation.ts",
+      "status": "modified",
+      "additions": 32,
+      "deletions": 1,
+      "changes": 33,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/7c25696ab00dbb87c79f744adb620bf59ccecfd4/src%2Fconfig%2Fvalidation.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/7c25696ab00dbb87c79f744adb620bf59ccecfd4/src%2Fconfig%2Fvalidation.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fconfig%2Fvalidation.ts?ref=7c25696ab00dbb87c79f744adb620bf59ccecfd4",
+      "patch": "@@ -156,7 +156,38 @@ export function validateConfigObjectWithPlugins(raw: unknown):\n       issues: ConfigValidationIssue[];\n       warnings: ConfigValidationIssue[];\n     } {\n-  const base = validateConfigObject(raw);\n+  return validateConfigObjectWithPluginsBase(raw, { applyDefaults: true });\n+}\n+\n+export function validateConfigObjectRawWithPlugins(raw: unknown):\n+  | {\n+      ok: true;\n+      config: OpenClawConfig;\n+      warnings: ConfigValidationIssue[];\n+    }\n+  | {\n+      ok: false;\n+      issues: ConfigValidationIssue[];\n+      warnings: ConfigValidationIssue[];\n+    } {\n+  return validateConfigObjectWithPluginsBase(raw, { applyDefaults: false });\n+}\n+\n+function validateConfigObjectWithPluginsBase(\n+  raw: unknown,\n+  opts: { applyDefaults: boolean },\n+):\n+  | {\n+      ok: true;\n+      config: OpenClawConfig;\n+      warnings: ConfigValidationIssue[];\n+    }\n+  | {\n+      ok: false;\n+      issues: ConfigValidationIssue[];\n+      warnings: ConfigValidationIssue[];\n+    } {\n+  const base = opts.applyDefaults ? validateConfigObject(raw) : validateConfigObjectRaw(raw);\n   if (!base.ok) {\n     return { ok: false, issues: base.issues, warnings: [] };\n   }"
+    }
+  ]
+}

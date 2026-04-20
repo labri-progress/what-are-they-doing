@@ -1,0 +1,77 @@
+{
+  "message": "fix: improve compaction prompts and threshold scaling\n\nCompaction prompts now request structured handoff summaries with\nactionable state (files modified, decisions made, concrete next steps)\ninstead of vague narrative summaries. Modeled after Codex's compaction\nprompt which preserves progress, decisions, and remaining work.\n\nThreshold scaling now clamps to a 0.20 floor so aggressive scales\n(e.g., 0.1) don't collapse all compaction layers into a narrow band\nwhere only observation masking fires repeatedly.\n\nAlso adds --reasoning-effort flag to serfeval for fair comparison\nwith Codex's xhigh reasoning configuration.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "093e8e39b536f6d33044dbc949a6f71e74c21431",
+      "filename": "agent/context_manager.go",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 3,
+      "changes": 12,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/008d95ce16f68b667c32828554391473ab073596/agent%2Fcontext_manager.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/008d95ce16f68b667c32828554391473ab073596/agent%2Fcontext_manager.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/agent%2Fcontext_manager.go?ref=008d95ce16f68b667c32828554391473ab073596",
+      "patch": "@@ -676,9 +676,15 @@ func (cm *ContextManager) summarizeWithLLM(ctx context.Context, history []Turn,\n \t\t}\n \t}\n \n-\tprefix := \"Summarize this coding agent conversation history concisely. \" +\n-\t\t\"Focus on: what task was requested, what actions were taken, what files were modified, \" +\n-\t\t\"what the current state is, and any errors encountered. Be brief but complete.\\n\\n\"\n+\tprefix := \"You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume this task.\\n\\n\" +\n+\t\t\"Include:\\n\" +\n+\t\t\"- The original task/goal\\n\" +\n+\t\t\"- Current progress: what has been accomplished so far (specific files modified, specific changes made)\\n\" +\n+\t\t\"- Key decisions made and why\\n\" +\n+\t\t\"- What remains to be done (clear, actionable next steps)\\n\" +\n+\t\t\"- Any critical data, file paths, variable names, or error messages needed to continue\\n\" +\n+\t\t\"- Important constraints or user preferences discovered\\n\\n\" +\n+\t\t\"Be concise and structured. Focus on helping the next LLM seamlessly continue WITHOUT re-reading files or re-discovering what was already done.\\n\\n\"\n \tprompt := prefix + b.String()\n \n \treq := llm.Request{"
+    },
+    {
+      "sha": "7c1ca1fedea38ad5790614efc122601f27b3631e",
+      "filename": "agent/context_manager_test.go",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 3,
+      "changes": 7,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/008d95ce16f68b667c32828554391473ab073596/agent%2Fcontext_manager_test.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/008d95ce16f68b667c32828554391473ab073596/agent%2Fcontext_manager_test.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/agent%2Fcontext_manager_test.go?ref=008d95ce16f68b667c32828554391473ab073596",
+      "patch": "@@ -601,15 +601,16 @@ func TestSummarizeWithLLM_CallsCheapModel(t *testing.T) {\n \t\t\t\tif req.Model != \"gpt-4.1-nano\" {\n \t\t\t\t\tt.Errorf(\"expected cheap model gpt-4.1-nano, got %q\", req.Model)\n \t\t\t\t}\n-\t\t\t\t// Verify the prompt asks for summarization.\n+\t\t\t\t// Verify the prompt asks for compaction/summarization.\n \t\t\t\tfound := false\n \t\t\t\tfor _, m := range req.Messages {\n-\t\t\t\t\tif strings.Contains(m.Text(), \"Summarize\") || strings.Contains(m.Text(), \"summarize\") {\n+\t\t\t\t\ttext := m.Text()\n+\t\t\t\t\tif strings.Contains(text, \"COMPACTION\") || strings.Contains(text, \"handoff summary\") {\n \t\t\t\t\t\tfound = true\n \t\t\t\t\t}\n \t\t\t\t}\n \t\t\t\tif !found {\n-\t\t\t\t\tt.Error(\"expected summarization prompt\")\n+\t\t\t\t\tt.Error(\"expected compaction/handoff prompt\")\n \t\t\t\t}\n \t\t\t\treturn llm.Response{Message: llm.Assistant(\"Summary: fixed auth bug\")}\n \t\t\t},"
+    },
+    {
+      "sha": "4eb5c7d70a020ea624df8e53ba4185b47bb53ddf",
+      "filename": "agent/context_strategy_test.go",
+      "status": "modified",
+      "additions": 27,
+      "deletions": 15,
+      "changes": 42,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/008d95ce16f68b667c32828554391473ab073596/agent%2Fcontext_strategy_test.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/008d95ce16f68b667c32828554391473ab073596/agent%2Fcontext_strategy_test.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/agent%2Fcontext_strategy_test.go?ref=008d95ce16f68b667c32828554391473ab073596",
+      "patch": "@@ -217,28 +217,40 @@ func TestCompactionThresholdScale(t *testing.T) {\n \tc := llm.NewClient()\n \tc.Register(&fakeAdapter{name: \"openai\"})\n \n+\tcheck := func(name string, got, want float64) {\n+\t\tt.Helper()\n+\t\tif diff := got - want; diff > 0.001 || diff < -0.001 {\n+\t\t\tt.Errorf(\"%s: got %.4f, want %.4f\", name, got, want)\n+\t\t}\n+\t}\n+\n+\t// Scale=0.5 applies normally (all results \u2265 0.20 floor).\n \tsess, err := NewSession(c, NewOpenAIProfile(\"gpt-5.2\"), NewLocalExecutionEnvironment(dir), SessionConfig{\n-\t\tCompactionThresholdScale: 0.1,\n+\t\tCompactionThresholdScale: 0.5,\n \t})\n \tif err != nil {\n \t\tt.Fatalf(\"NewSession: %v\", err)\n \t}\n-\tdefer sess.Close()\n-\n \tcm := sess.contextMgr\n-\n-\t// Verify thresholds are 10% of defaults.\n-\tcheck := func(name string, got, want float64) {\n-\t\tt.Helper()\n-\t\t// Allow small floating-point tolerance.\n-\t\tif diff := got - want; diff > 0.001 || diff < -0.001 {\n-\t\t\tt.Errorf(\"%s: got %.4f, want %.4f\", name, got, want)\n-\t\t}\n+\tcheck(\"ObservationMaskThreshold\", cm.ObservationMaskThreshold, 0.30) // 0.60 * 0.5\n+\tcheck(\"ThinkingClearThreshold\", cm.ThinkingClearThreshold, 0.35)     // 0.70 * 0.5\n+\tcheck(\"CheckpointThreshold\", cm.CheckpointThreshold, 0.40)          // 0.80 * 0.5\n+\tcheck(\"SummarizeThreshold\", cm.SummarizeThreshold, 0.45)            // 0.90 * 0.5\n+\tsess.Close()\n+\n+\t// Scale=0.1 clamps to 0.20 floor.\n+\tsess2, err := NewSession(c, NewOpenAIProfile(\"gpt-5.2\"), NewLocalExecutionEnvironment(dir), SessionConfig{\n+\t\tCompactionThresholdScale: 0.1,\n+\t})\n+\tif err != nil {\n+\t\tt.Fatalf(\"NewSession: %v\", err)\n \t}\n-\tcheck(\"ObservationMaskThreshold\", cm.ObservationMaskThreshold, 0.06)  // 0.60 * 0.1\n-\tcheck(\"ThinkingClearThreshold\", cm.ThinkingClearThreshold, 0.07)      // 0.70 * 0.1\n-\tcheck(\"CheckpointThreshold\", cm.CheckpointThreshold, 0.08)            // 0.80 * 0.1\n-\tcheck(\"SummarizeThreshold\", cm.SummarizeThreshold, 0.09)              // 0.90 * 0.1\n+\tcm2 := sess2.contextMgr\n+\tcheck(\"ObservationMaskThreshold clamped\", cm2.ObservationMaskThreshold, 0.20)\n+\tcheck(\"ThinkingClearThreshold clamped\", cm2.ThinkingClearThreshold, 0.20)\n+\tcheck(\"CheckpointThreshold clamped\", cm2.CheckpointThreshold, 0.20)\n+\tcheck(\"SummarizeThreshold clamped\", cm2.SummarizeThreshold, 0.20)\n+\tsess2.Close()\n }\n \n func TestSession_ContextStrategy_DefaultIsCompact(t *testing.T) {"
+    },
+    {
+      "sha": "01940efc6a958ad38e7a519d3a071617f54c59f2",
+      "filename": "agent/session.go",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 4,
+      "changes": 18,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/008d95ce16f68b667c32828554391473ab073596/agent%2Fsession.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/008d95ce16f68b667c32828554391473ab073596/agent%2Fsession.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/agent%2Fsession.go?ref=008d95ce16f68b667c32828554391473ab073596",
+      "patch": "@@ -1787,12 +1787,22 @@ func (s *Session) resolveFilePath(path string) string {\n \n // applyThresholdScale scales all compaction thresholds on cm by the given\n // factor. A factor of 0 or 1 leaves defaults unchanged.\n+//\n+// Thresholds are clamped to a minimum of 0.20 so that aggressive scaling\n+// (e.g., 0.1) doesn't collapse all layers into a narrow band where only\n+// the weakest layer (observation mask) fires repeatedly.\n func applyThresholdScale(cm *ContextManager, scale float64) {\n \tif scale > 0 && scale != 1.0 {\n-\t\tcm.ObservationMaskThreshold *= scale\n-\t\tcm.ThinkingClearThreshold *= scale\n-\t\tcm.CheckpointThreshold *= scale\n-\t\tcm.SummarizeThreshold *= scale\n+\t\tclamp := func(v float64) float64 {\n+\t\t\tif v < 0.20 {\n+\t\t\t\treturn 0.20\n+\t\t\t}\n+\t\t\treturn v\n+\t\t}\n+\t\tcm.ObservationMaskThreshold = clamp(cm.ObservationMaskThreshold * scale)\n+\t\tcm.ThinkingClearThreshold = clamp(cm.ThinkingClearThreshold * scale)\n+\t\tcm.CheckpointThreshold = clamp(cm.CheckpointThreshold * scale)\n+\t\tcm.SummarizeThreshold = clamp(cm.SummarizeThreshold * scale)\n \t}\n }\n "
+    },
+    {
+      "sha": "3ec99f247b38dab5654792205ccdec9aa1c572fd",
+      "filename": "agent/strategy_recursive_distill.go",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 4,
+      "changes": 14,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/008d95ce16f68b667c32828554391473ab073596/agent%2Fstrategy_recursive_distill.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/008d95ce16f68b667c32828554391473ab073596/agent%2Fstrategy_recursive_distill.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/agent%2Fstrategy_recursive_distill.go?ref=008d95ce16f68b667c32828554391473ab073596",
+      "patch": "@@ -139,10 +139,13 @@ func (s *RecursiveDistillStrategy) microSummarize(ctx context.Context, client *l\n \t\t}\n \t}\n \n-\tprompt := fmt.Sprintf(`Summarize these coding agent actions in 1-2 sentences. Focus on what was accomplished, what files were changed, and any errors.\n+\tprompt := fmt.Sprintf(`Summarize these coding agent actions as a structured status update (2-4 sentences). Include:\n+- What was accomplished (specific files modified, specific changes applied)\n+- What remains to be done (concrete next steps)\n+- Any errors or blockers encountered\n \n %s\n-Summary (1-2 sentences):`, b.String())\n+Status update:`, b.String())\n \n \treq := llm.Request{\n \t\tModel:    s.cm.profile.CheapModel(),\n@@ -165,10 +168,13 @@ func (s *RecursiveDistillStrategy) macroSummarize(ctx context.Context, client *l\n \t\tb.WriteString(fmt.Sprintf(\"%d. %s\\n\", i+1, m))\n \t}\n \n-\tprompt := fmt.Sprintf(`Distill these action summaries into a single 1-2 sentence overview of the agent's progress:\n+\tprompt := fmt.Sprintf(`Consolidate these action summaries into a structured progress report (3-5 sentences). Preserve:\n+- All specific files that were modified and what changes were made\n+- What concrete work remains (do NOT generalize \u2014 list specific files/tasks)\n+- Any errors or blockers\n \n %s\n-Overview (1-2 sentences):`, b.String())\n+Progress report:`, b.String())\n \n \treq := llm.Request{\n \t\tModel:    s.cm.profile.CheapModel(),"
+    },
+    {
+      "sha": "37512d2e1aed5369db194e71dd96edd69df287e1",
+      "filename": "cmd/serfeval/main.go",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 5,
+      "changes": 15,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/008d95ce16f68b667c32828554391473ab073596/cmd%2Fserfeval%2Fmain.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/008d95ce16f68b667c32828554391473ab073596/cmd%2Fserfeval%2Fmain.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/cmd%2Fserfeval%2Fmain.go?ref=008d95ce16f68b667c32828554391473ab073596",
+      "patch": "@@ -34,6 +34,7 @@ func main() {\n \ttestPatch := flag.String(\"test-patch\", \"\", \"path to SWE-bench test patch file for F2P evaluation\")\n \ttestCmd := flag.String(\"test-cmd\", \"\", \"command to run F2P tests (e.g., 'python -m pytest tests/test_foo.py')\")\n \tf2pTests := flag.String(\"f2p-tests\", \"\", \"comma-separated fail-to-pass test names\")\n+\treasoningEffort := flag.String(\"reasoning-effort\", \"\", \"reasoning effort: none|low|medium|high|xhigh\")\n \n \tflag.Usage = func() {\n \t\tfmt.Fprintf(os.Stderr, \"Usage: serfeval --provider <p> --model <m> --task <task> [flags]\\n\\n\")\n@@ -52,6 +53,7 @@ func main() {\n \t\tfmt.Fprintf(os.Stderr, \"  --test-patch <path>  SWE-bench test patch for F2P evaluation\\n\")\n \t\tfmt.Fprintf(os.Stderr, \"  --test-cmd <cmd>     Command to run F2P tests\\n\")\n \t\tfmt.Fprintf(os.Stderr, \"  --f2p-tests <names>  Comma-separated fail-to-pass test names\\n\")\n+\t\tfmt.Fprintf(os.Stderr, \"  --reasoning-effort <level> Reasoning effort: none|low|medium|high|xhigh\\n\")\n \t}\n \tflag.Parse()\n \n@@ -71,8 +73,9 @@ func main() {\n \t\tthresholdScale: *thresholdScale,\n \t\tmaxTurns:       *maxTurns,\n \t\ttestPatch:      *testPatch,\n-\t\ttestCmd:        *testCmd,\n-\t\tf2pTests:       *f2pTests,\n+\t\ttestCmd:         *testCmd,\n+\t\tf2pTests:        *f2pTests,\n+\t\treasoningEffort: *reasoningEffort,\n \t}\n \n \tif err := runEval(cfg); err != nil {\n@@ -91,9 +94,10 @@ type evalConfig struct {\n \tprobesFile     string\n \tthresholdScale float64\n \tmaxTurns       int\n-\ttestPatch      string\n-\ttestCmd        string\n-\tf2pTests       string\n+\ttestPatch       string\n+\ttestCmd         string\n+\tf2pTests        string\n+\treasoningEffort string\n }\n \n func runEval(cfg evalConfig) error {\n@@ -120,6 +124,7 @@ func runEval(cfg evalConfig) error {\n \t\tCompactionThresholdScale: cfg.thresholdScale,\n \t\tStateDir:                 stateDir,\n \t\tMaxTurns:                 cfg.maxTurns,\n+\t\tReasoningEffort:          cfg.reasoningEffort,\n \t}\n \n \tsess, err := agent.NewSession(client, profile, env, sessCfg)"
+    }
+  ]
+}

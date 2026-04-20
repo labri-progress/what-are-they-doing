@@ -1,0 +1,77 @@
+{
+  "message": "macos: control channel diagnostics and tunnel-based testing",
+  "files": [
+    {
+      "sha": "d1d71fc60bf65996df92361ebb11357fdeaf15d7",
+      "filename": "apps/macos/Sources/Clawdis/ControlChannel.swift",
+      "status": "modified",
+      "additions": 41,
+      "deletions": 0,
+      "changes": 41,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/c5b073702c427853ff16edfb472f1d679cc4978d/apps%2Fmacos%2FSources%2FClawdis%2FControlChannel.swift",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/c5b073702c427853ff16edfb472f1d679cc4978d/apps%2Fmacos%2FSources%2FClawdis%2FControlChannel.swift",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/apps%2Fmacos%2FSources%2FClawdis%2FControlChannel.swift?ref=c5b073702c427853ff16edfb472f1d679cc4978d",
+      "patch": "@@ -74,6 +74,13 @@ final class ControlChannel: ObservableObject {\n         case remote(target: String, identity: String)\n     }\n \n+    enum ConnectionState: Equatable {\n+        case disconnected\n+        case connecting\n+        case connected\n+        case degraded(String)\n+    }\n+\n     private let logger = Logger(subsystem: \"com.steipete.clawdis\", category: \"control\")\n     private var connection: NWConnection?\n     private var sshProcess: Process?\n@@ -82,6 +89,10 @@ final class ControlChannel: ObservableObject {\n     private var listenTask: Task<Void, Never>?\n     private var mode: Mode = .local\n     private var localPort: UInt16 = 18789\n+    private var pingTask: Task<Void, Never>?\n+\n+    @Published private(set) var state: ConnectionState = .disconnected\n+    @Published private(set) var lastPingMs: Double?\n \n     func configure(mode: Mode) async throws {\n         if mode == self.mode, self.connection != nil { return }\n@@ -93,6 +104,8 @@ final class ControlChannel: ObservableObject {\n     func disconnect() async {\n         self.listenTask?.cancel()\n         self.listenTask = nil\n+        self.pingTask?.cancel()\n+        self.pingTask = nil\n         if let conn = self.connection {\n             conn.cancel()\n         }\n@@ -103,6 +116,7 @@ final class ControlChannel: ObservableObject {\n             cont.resume(throwing: ControlChannelError.disconnected)\n         }\n         self.pending.removeAll()\n+        self.state = .disconnected\n     }\n \n     func health(timeout: TimeInterval? = nil) async throws -> Data {\n@@ -111,6 +125,13 @@ final class ControlChannel: ObservableObject {\n         return payload\n     }\n \n+    func lastHeartbeat() async throws -> ControlHeartbeatEvent? {\n+        try await self.ensureConnected()\n+        let data = try await self.request(method: \"last-heartbeat\")\n+        if data.isEmpty { return nil }\n+        return try? JSONDecoder().decode(ControlHeartbeatEvent.self, from: data)\n+    }\n+\n     private func request(method: String, params: [String: Any]? = nil) async throws -> Data {\n         try await self.ensureConnected()\n         let id = UUID().uuidString\n@@ -141,6 +162,8 @@ final class ControlChannel: ObservableObject {\n             self.localPort = try self.startSSHTunnel(target: target, identity: identity)\n         }\n \n+        self.state = .connecting\n+\n         let host = NWEndpoint.Host(\"127.0.0.1\")\n         let port = NWEndpoint.Port(rawValue: self.localPort)!\n         let conn = NWConnection(host: host, port: port, using: .tcp)\n@@ -151,9 +174,12 @@ final class ControlChannel: ObservableObject {\n                 switch state {\n                 case .ready:\n                     cont.resume(returning: ())\n+                    Task { @MainActor in self.state = .connected }\n                 case let .failed(err):\n+                    Task { @MainActor in self.state = .degraded(err.localizedDescription) }\n                     cont.resume(throwing: err)\n                 case let .waiting(err):\n+                    Task { @MainActor in self.state = .degraded(err.localizedDescription) }\n                     cont.resume(throwing: err)\n                 default:\n                     break\n@@ -165,6 +191,21 @@ final class ControlChannel: ObservableObject {\n         self.listenTask = Task.detached { [weak self] in\n             await self?.listen()\n         }\n+\n+        self.pingTask = Task.detached { [weak self] in\n+            guard let self else { return }\n+            while !Task.isCancelled {\n+                do {\n+                    try await Task.sleep(nanoseconds: 30 * 1_000_000_000)\n+                    let start = Date()\n+                    _ = try await self.request(method: \"ping\")\n+                    let ms = Date().timeIntervalSince(start) * 1000\n+                    await MainActor.run { self.lastPingMs = ms; self.state = .connected }\n+                } catch {\n+                    await MainActor.run { self.state = .degraded(error.localizedDescription) }\n+                }\n+            }\n+        }\n     }\n \n     private func startSSHTunnel(target: String, identity: String) throws -> UInt16 {"
+    },
+    {
+      "sha": "12ee8d809f7a3216409f9f0bab7a4e81a0c5a5e0",
+      "filename": "apps/macos/Sources/Clawdis/GeneralSettings.swift",
+      "status": "modified",
+      "additions": 42,
+      "deletions": 13,
+      "changes": 55,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/c5b073702c427853ff16edfb472f1d679cc4978d/apps%2Fmacos%2FSources%2FClawdis%2FGeneralSettings.swift",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/c5b073702c427853ff16edfb472f1d679cc4978d/apps%2Fmacos%2FSources%2FClawdis%2FGeneralSettings.swift",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/apps%2Fmacos%2FSources%2FClawdis%2FGeneralSettings.swift?ref=c5b073702c427853ff16edfb472f1d679cc4978d",
+      "patch": "@@ -135,31 +135,60 @@ struct GeneralSettings: View {\n                 .disabled(self.remoteStatus == .checking || self.state.remoteTarget\n                     .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)\n \n-                switch self.remoteStatus {\n-                case .idle:\n-                    EmptyView()\n-                case .checking:\n-                    Text(\"Checking\u2026\").font(.caption).foregroundStyle(.secondary)\n+            switch self.remoteStatus {\n+            case .idle:\n+                EmptyView()\n+            case .checking:\n+                Text(\"Checking\u2026\").font(.caption).foregroundStyle(.secondary)\n                 case .ok:\n                     Label(\"Ready\", systemImage: \"checkmark.circle.fill\")\n                         .font(.caption)\n                         .foregroundStyle(.green)\n                 case let .failed(message):\n-                    Text(message)\n-                        .font(.caption)\n-                        .foregroundStyle(.secondary)\n-                        .lineLimit(2)\n-                }\n+                Text(message)\n+                    .font(.caption)\n+                    .foregroundStyle(.secondary)\n+                    .lineLimit(2)\n             }\n+        }\n \n-            Text(\"Tip: enable Tailscale for stable remote access.\")\n-                .font(.footnote)\n+        // Diagnostics\n+        VStack(alignment: .leading, spacing: 4) {\n+            Text(\"Control channel\")\n+                .font(.caption.weight(.semibold))\n+            Text(self.controlStatusLine)\n+                .font(.caption)\n                 .foregroundStyle(.secondary)\n-                .lineLimit(1)\n+            if let ping = ControlChannel.shared.lastPingMs {\n+                Text(\"Last ping: \\(Int(ping)) ms\")\n+                    .font(.caption)\n+                    .foregroundStyle(.secondary)\n+            }\n+            if let hb = HeartbeatStore.shared.lastEvent {\n+                let ageText = age(from: Date(timeIntervalSince1970: hb.ts / 1000))\n+                Text(\"Last heartbeat: \\(hb.status) \u00b7 \\(ageText)\")\n+                    .font(.caption)\n+                    .foregroundStyle(.secondary)\n+            }\n+        }\n+\n+        Text(\"Tip: enable Tailscale for stable remote access.\")\n+            .font(.footnote)\n+            .foregroundStyle(.secondary)\n+            .lineLimit(1)\n         }\n         .transition(.opacity)\n     }\n \n+    private var controlStatusLine: String {\n+        switch ControlChannel.shared.state {\n+        case .connected: return \"Connected\"\n+        case .connecting: return \"Connecting\u2026\"\n+        case .disconnected: return \"Disconnected\"\n+        case let .degraded(msg): return \"Degraded: \\(msg)\"\n+        }\n+    }\n+\n     private var cliInstaller: some View {\n         VStack(alignment: .leading, spacing: 8) {\n             HStack(spacing: 10) {"
+    },
+    {
+      "sha": "382136e0d53a014ed230573cc9a19e79cc490c65",
+      "filename": "apps/macos/Sources/Clawdis/HeartbeatStore.swift",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 0,
+      "changes": 8,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/c5b073702c427853ff16edfb472f1d679cc4978d/apps%2Fmacos%2FSources%2FClawdis%2FHeartbeatStore.swift",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/c5b073702c427853ff16edfb472f1d679cc4978d/apps%2Fmacos%2FSources%2FClawdis%2FHeartbeatStore.swift",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/apps%2Fmacos%2FSources%2FClawdis%2FHeartbeatStore.swift?ref=c5b073702c427853ff16edfb472f1d679cc4978d",
+      "patch": "@@ -19,6 +19,14 @@ final class HeartbeatStore: ObservableObject {\n                     Task { @MainActor in self?.lastEvent = decoded }\n                 }\n             }\n+\n+        Task {\n+            if self.lastEvent == nil {\n+                if let evt = try? await ControlChannel.shared.lastHeartbeat() {\n+                    self.lastEvent = evt\n+                }\n+            }\n+        }\n     }\n \n     @MainActor"
+    },
+    {
+      "sha": "52f6ce21e7be122c557aac73e18196cd9b74b656",
+      "filename": "apps/macos/Sources/Clawdis/MenuBar.swift",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 1,
+      "changes": 6,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/c5b073702c427853ff16edfb472f1d679cc4978d/apps%2Fmacos%2FSources%2FClawdis%2FMenuBar.swift",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/c5b073702c427853ff16edfb472f1d679cc4978d/apps%2Fmacos%2FSources%2FClawdis%2FMenuBar.swift",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/apps%2Fmacos%2FSources%2FClawdis%2FMenuBar.swift?ref=c5b073702c427853ff16edfb472f1d679cc4978d",
+      "patch": "@@ -58,6 +58,7 @@ private struct MenuContent: View {\n     @ObservedObject private var relayManager = RelayProcessManager.shared\n     @ObservedObject private var healthStore = HealthStore.shared\n     @ObservedObject private var heartbeatStore = HeartbeatStore.shared\n+    @ObservedObject private var controlChannel = ControlChannel.shared\n     @Environment(\\.openSettings) private var openSettings\n     @State private var availableMics: [AudioInputDevice] = []\n     @State private var loadingMics = false\n@@ -176,7 +177,10 @@ private struct MenuContent: View {\n         let label: String\n         let color: Color\n \n-        if let evt = self.heartbeatStore.lastEvent {\n+        if case .degraded = self.controlChannel.state {\n+            label = \"Control channel disconnected\"\n+            color = .red\n+        } else if let evt = self.heartbeatStore.lastEvent {\n             let ageText = age(from: Date(timeIntervalSince1970: evt.ts / 1000))\n             switch evt.status {\n             case \"sent\":"
+    },
+    {
+      "sha": "de57ecdd4c628651ce2370f47112f1a0987fbcb2",
+      "filename": "apps/macos/Sources/Clawdis/VoiceWakeChime.swift",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/c5b073702c427853ff16edfb472f1d679cc4978d/apps%2Fmacos%2FSources%2FClawdis%2FVoiceWakeChime.swift",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/c5b073702c427853ff16edfb472f1d679cc4978d/apps%2Fmacos%2FSources%2FClawdis%2FVoiceWakeChime.swift",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/apps%2Fmacos%2FSources%2FClawdis%2FVoiceWakeChime.swift?ref=c5b073702c427853ff16edfb472f1d679cc4978d",
+      "patch": "@@ -1,7 +1,7 @@\n import AppKit\n import Foundation\n \n-enum VoiceWakeChime: Codable, Equatable {\n+enum VoiceWakeChime: Codable, Equatable, Sendable {\n     case none\n     case system(name: String)\n     case custom(displayName: String, bookmark: Data)"
+    },
+    {
+      "sha": "3153c74a5724f64bf864dff130530a753718d96b",
+      "filename": "apps/macos/Sources/Clawdis/VoiceWakeRuntime.swift",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 2,
+      "changes": 5,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/c5b073702c427853ff16edfb472f1d679cc4978d/apps%2Fmacos%2FSources%2FClawdis%2FVoiceWakeRuntime.swift",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/c5b073702c427853ff16edfb472f1d679cc4978d/apps%2Fmacos%2FSources%2FClawdis%2FVoiceWakeRuntime.swift",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/apps%2Fmacos%2FSources%2FClawdis%2FVoiceWakeRuntime.swift?ref=c5b073702c427853ff16edfb472f1d679cc4978d",
+      "patch": "@@ -119,7 +119,7 @@ actor VoiceWakeRuntime {\n         }\n     }\n \n-    private func stop() {\n+    private func stop(dismissOverlay: Bool = true) {\n         self.captureTask?.cancel()\n         self.captureTask = nil\n         self.isCapturing = false\n@@ -135,6 +135,7 @@ actor VoiceWakeRuntime {\n         self.currentConfig = nil\n         self.logger.debug(\"voicewake runtime stopped\")\n \n+        guard dismissOverlay else { return }\n         Task { @MainActor in\n             VoiceWakeOverlayController.shared.dismiss()\n         }\n@@ -298,7 +299,7 @@ actor VoiceWakeRuntime {\n     private func restartRecognizer() {\n         // Restart the recognizer so we listen for the next trigger with a clean buffer.\n         let current = self.currentConfig\n-        self.stop()\n+        self.stop(dismissOverlay: false)\n         if let current {\n             Task { await self.start(with: current) }\n         }"
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "message": "fix: include custom-registered tools in API request (approve/reject were invisible to model)\n\nallToolDefinitions() only iterated profile and MCP tools. Custom tools registered\ndirectly on the registry (like approve/reject on reviewer sessions) were available\nfor execution but never sent to the model in the tools array. Added a third pass\nthat includes registry-only tools, with parameter normalization for empty schemas.\n\nAdded TestSubmitResult_Depth0_ReviewerToolsInRequest to prevent regression.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "eb203d3fe805348b1c493118b71337f71b21b0f4",
+      "filename": "agent/session.go",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 0,
+      "changes": 22,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/f888a9e25a078a7c054a75ec89215536daed46df/agent%2Fsession.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/f888a9e25a078a7c054a75ec89215536daed46df/agent%2Fsession.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/agent%2Fsession.go?ref=f888a9e25a078a7c054a75ec89215536daed46df",
+      "patch": "@@ -1717,6 +1717,7 @@ func (s *Session) allToolDefinitions(round int) []llm.ToolDefinition {\n \t}\n \n \tvar defs []llm.ToolDefinition\n+\tincluded := make(map[string]bool) // track which tools we've added\n \tfor _, td := range s.profile.ToolDefinitions() {\n \t\tcanonical := td.Name\n \t\tif c, ok := reverseMap[td.Name]; ok {\n@@ -1727,13 +1728,34 @@ func (s *Session) allToolDefinitions(round int) []llm.ToolDefinition {\n \t\t\t\tcontinue\n \t\t\t}\n \t\t\tdefs = append(defs, td)\n+\t\t\tincluded[canonical] = true\n \t\t}\n \t}\n \tfor _, td := range s.mcpTools {\n \t\tif registered[td.Name] {\n \t\t\tdefs = append(defs, td)\n+\t\t\tincluded[td.Name] = true\n \t\t}\n \t}\n+\t// Include any tools registered directly on the registry (e.g. approve/reject\n+\t// on reviewer sessions) that weren't already covered by profile or MCP.\n+\tfor _, td := range s.reg.Definitions() {\n+\t\tif included[td.Name] {\n+\t\t\tcontinue\n+\t\t}\n+\t\tif hideSubmitResult && td.Name == \"submit_result\" {\n+\t\t\tcontinue\n+\t\t}\n+\t\t// Normalize empty parameters to a valid object schema so the LLM\n+\t\t// client doesn't reject the tool definition.\n+\t\tif td.Parameters != nil && td.Parameters[\"type\"] == nil {\n+\t\t\ttd.Parameters = map[string]any{\n+\t\t\t\t\"type\":       \"object\",\n+\t\t\t\t\"properties\": map[string]any{},\n+\t\t\t}\n+\t\t}\n+\t\tdefs = append(defs, td)\n+\t}\n \treturn defs\n }\n "
+    },
+    {
+      "sha": "deb7ba17dee5e93f65546c280e83962a576d7d9f",
+      "filename": "agent/session_submit_result_test.go",
+      "status": "modified",
+      "additions": 54,
+      "deletions": 0,
+      "changes": 54,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/f888a9e25a078a7c054a75ec89215536daed46df/agent%2Fsession_submit_result_test.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/f888a9e25a078a7c054a75ec89215536daed46df/agent%2Fsession_submit_result_test.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/agent%2Fsession_submit_result_test.go?ref=f888a9e25a078a7c054a75ec89215536daed46df",
+      "patch": "@@ -441,6 +441,60 @@ func TestSubmitResult_MinResultRound_ZeroAllowsImmediate(t *testing.T) {\n // Phase 2: Reviewer gate tests\n // ---------------------------------------------------------------------------\n \n+// TestSubmitResult_Depth0_ReviewerToolsInRequest verifies that the approve and\n+// reject tools are actually present in the API request sent to the reviewer\n+// subagent. This guards against a regression where custom-registered tools\n+// were in the registry (for execution) but not in allToolDefinitions() (so the\n+// model never saw them).\n+func TestSubmitResult_Depth0_ReviewerToolsInRequest(t *testing.T) {\n+\tdir := t.TempDir()\n+\tc := llm.NewClient()\n+\n+\tf := &fakeAdapter{\n+\t\tname: \"openai\",\n+\t\tsteps: []func(req llm.Request) llm.Response{\n+\t\t\t// Main agent: call submit_result\n+\t\t\tfunc(req llm.Request) llm.Response {\n+\t\t\t\treturn toolCallResponse(submitResultCall(\"call-1\", \"done\"))\n+\t\t\t},\n+\t\t\t// Reviewer subagent: check that approve/reject are in the tools list\n+\t\t\tfunc(req llm.Request) llm.Response {\n+\t\t\t\ttoolNames := make(map[string]bool)\n+\t\t\t\tfor _, td := range req.Tools {\n+\t\t\t\t\ttoolNames[td.Name] = true\n+\t\t\t\t}\n+\t\t\t\tif !toolNames[\"approve\"] {\n+\t\t\t\t\tt.Errorf(\"reviewer request missing 'approve' tool; tools: %v\", toolNames)\n+\t\t\t\t}\n+\t\t\t\tif !toolNames[\"reject\"] {\n+\t\t\t\t\tt.Errorf(\"reviewer request missing 'reject' tool; tools: %v\", toolNames)\n+\t\t\t\t}\n+\t\t\t\tif toolNames[\"submit_result\"] {\n+\t\t\t\t\tt.Errorf(\"reviewer request should NOT have 'submit_result' tool; tools: %v\", toolNames)\n+\t\t\t\t}\n+\t\t\t\treturn toolCallResponse(approveCall(\"review-1\", \"looks good\"))\n+\t\t\t},\n+\t\t},\n+\t}\n+\tc.Register(f)\n+\n+\tsess, err := NewSession(c, NewOpenAIProfile(\"gpt-5.2\"), NewLocalExecutionEnvironment(dir), SessionConfig{\n+\t\tDepth:              0,\n+\t\tMaxSubagentDepth:   3,\n+\t\tEnableReviewerGate: true,\n+\t})\n+\tif err != nil {\n+\t\tt.Fatalf(\"NewSession: %v\", err)\n+\t}\n+\tctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)\n+\tdefer cancel()\n+\t_, err = sess.ProcessInput(ctx, \"do the task\")\n+\tif err != nil {\n+\t\tt.Fatalf(\"ProcessInput: %v\", err)\n+\t}\n+\tsess.Close()\n+}\n+\n // TestSubmitResult_Depth0_ReviewerPass verifies that at depth 0 (root session),\n // calling submit_result spawns a reviewer subagent. When the reviewer returns\n // PASS, the tool response should indicate accepted:true and the session should"
+    }
+  ]
+}

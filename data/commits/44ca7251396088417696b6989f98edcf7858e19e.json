@@ -1,0 +1,65 @@
+{
+  "message": "fix: Resolve database locking and package loading issues\n\nThis commit addresses two critical bugs identified in the comprehensive review:\n\n1. Database Locking Bug (Rust):\n   - Problem: Multiple VectorDB instances couldn't share the same database file\n   - Root cause: redb::Database uses exclusive file locking\n   - Solution: Implemented global connection pool in storage.rs using\n     Lazy<Mutex<HashMap<PathBuf, Arc<Database>>>>\n   - Multiple VectorDB instances now share Arc<Database> for same path\n   - Location: crates/ruvector-core/src/storage.rs\n\n2. Package Name Mismatch (NPM):\n   - Problem: ruvector-core was using non-existent scoped package names\n   - Fixed platformMap to use correct unscoped names:\n     * @ruvector/core-linux-x64 \u2192 ruvector-core-linux-x64-gnu\n     * @ruvector/core-linux-arm64 \u2192 ruvector-core-linux-arm64-gnu\n     * @ruvector/core-darwin-x64 \u2192 ruvector-core-darwin-x64\n     * @ruvector/core-darwin-arm64 \u2192 ruvector-core-darwin-arm64\n     * @ruvector/core-win32-x64 \u2192 ruvector-core-win32-x64-msvc\n   - Updated error messages to reference correct package names\n   - Location: npm/packages/core/index.js\n\nVersion Updates:\n- ruvector-core: 0.1.1 \u2192 0.1.2\n- ruvector: 0.1.5 \u2192 0.1.6\n\nPublished Packages:\n- ruvector-core@0.1.2 (npm)\n- ruvector@0.1.6 (npm)\n\nBreaking Changes: None\nBackwards Compatible: Yes\n\nTest Coverage:\n- Added test_multiple_instances_same_path() to verify connection pooling\n- Library builds successfully with storage feature enabled\n- CLI commands now work correctly with updated package resolution\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "e0fd0c197c46f05a64f083dd7e450b914fec07f8",
+      "filename": "crates/ruvector-core/src/storage.rs",
+      "status": "modified",
+      "additions": 90,
+      "deletions": 10,
+      "changes": 100,
+      "blob_url": "https://github.com/ruvnet/ruvector/blob/44ca7251396088417696b6989f98edcf7858e19e/crates%2Fruvector-core%2Fsrc%2Fstorage.rs",
+      "raw_url": "https://github.com/ruvnet/ruvector/raw/44ca7251396088417696b6989f98edcf7858e19e/crates%2Fruvector-core%2Fsrc%2Fstorage.rs",
+      "contents_url": "https://api.github.com/repos/ruvnet/ruvector/contents/crates%2Fruvector-core%2Fsrc%2Fstorage.rs?ref=44ca7251396088417696b6989f98edcf7858e19e",
+      "patch": "@@ -14,31 +14,66 @@ use bincode::config;\n #[cfg(feature = \"storage\")]\n use serde_json;\n #[cfg(feature = \"storage\")]\n-use std::path::Path;\n+use std::path::{Path, PathBuf};\n+#[cfg(feature = \"storage\")]\n+use std::sync::Arc;\n+#[cfg(feature = \"storage\")]\n+use std::collections::HashMap;\n+#[cfg(feature = \"storage\")]\n+use parking_lot::Mutex;\n+#[cfg(feature = \"storage\")]\n+use once_cell::sync::Lazy;\n \n #[cfg(feature = \"storage\")]\n \n const VECTORS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new(\"vectors\");\n const METADATA_TABLE: TableDefinition<&str, &str> = TableDefinition::new(\"metadata\");\n \n+// Global database connection pool to allow multiple VectorDB instances\n+// to share the same underlying database file\n+static DB_POOL: Lazy<Mutex<HashMap<PathBuf, Arc<Database>>>> = Lazy::new(|| {\n+    Mutex::new(HashMap::new())\n+});\n+\n /// Storage backend for vector database\n pub struct VectorStorage {\n-    db: Database,\n+    db: Arc<Database>,\n     dimensions: usize,\n }\n \n impl VectorStorage {\n     /// Create or open a vector storage at the given path\n+    ///\n+    /// This method uses a global connection pool to allow multiple VectorDB\n+    /// instances to share the same underlying database file, fixing the\n+    /// \"Database already open. Cannot acquire lock\" error.\n     pub fn new<P: AsRef<Path>>(path: P, dimensions: usize) -> Result<Self> {\n-        let db = Database::create(path)?;\n+        let path_buf = path.as_ref().canonicalize()\n+            .unwrap_or_else(|_| path.as_ref().to_path_buf());\n+\n+        // Check if we already have a Database instance for this path\n+        let db = {\n+            let mut pool = DB_POOL.lock();\n+\n+            if let Some(existing_db) = pool.get(&path_buf) {\n+                // Reuse existing database connection\n+                Arc::clone(existing_db)\n+            } else {\n+                // Create new database and add to pool\n+                let new_db = Arc::new(Database::create(&path_buf)?);\n+\n+                // Initialize tables\n+                let write_txn = new_db.begin_write()?;\n+                {\n+                    let _ = write_txn.open_table(VECTORS_TABLE)?;\n+                    let _ = write_txn.open_table(METADATA_TABLE)?;\n+                }\n+                write_txn.commit()?;\n \n-        // Initialize tables\n-        let write_txn = db.begin_write()?;\n-        {\n-            let _ = write_txn.open_table(VECTORS_TABLE)?;\n-            let _ = write_txn.open_table(METADATA_TABLE)?;\n-        }\n-        write_txn.commit()?;\n+                pool.insert(path_buf, Arc::clone(&new_db));\n+                new_db\n+            }\n+        };\n \n         Ok(Self { db, dimensions })\n     }\n@@ -269,4 +304,49 @@ mod tests {\n \n         Ok(())\n     }\n+\n+    #[test]\n+    fn test_multiple_instances_same_path() -> Result<()> {\n+        // This test verifies the fix for the database locking bug\n+        // Multiple VectorStorage instances should be able to share the same database file\n+        let dir = tempdir().unwrap();\n+        let db_path = dir.path().join(\"shared.db\");\n+\n+        // Create first instance\n+        let storage1 = VectorStorage::new(&db_path, 3)?;\n+\n+        // Insert data with first instance\n+        storage1.insert(&VectorEntry {\n+            id: Some(\"test1\".to_string()),\n+            vector: vec![1.0, 2.0, 3.0],\n+            metadata: None,\n+        })?;\n+\n+        // Create second instance with SAME path - this should NOT fail\n+        let storage2 = VectorStorage::new(&db_path, 3)?;\n+\n+        // Both instances should see the same data\n+        assert_eq!(storage1.len()?, 1);\n+        assert_eq!(storage2.len()?, 1);\n+\n+        // Insert with second instance\n+        storage2.insert(&VectorEntry {\n+            id: Some(\"test2\".to_string()),\n+            vector: vec![4.0, 5.0, 6.0],\n+            metadata: None,\n+        })?;\n+\n+        // Both instances should see both records\n+        assert_eq!(storage1.len()?, 2);\n+        assert_eq!(storage2.len()?, 2);\n+\n+        // Verify data integrity\n+        let retrieved1 = storage1.get(\"test1\")?;\n+        assert!(retrieved1.is_some());\n+\n+        let retrieved2 = storage2.get(\"test2\")?;\n+        assert!(retrieved2.is_some());\n+\n+        Ok(())\n+    }\n }"
+    },
+    {
+      "sha": "d1e8f40dcec828c244dba4a2d867f12261baff53",
+      "filename": "npm/packages/core/index.js",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 6,
+      "changes": 12,
+      "blob_url": "https://github.com/ruvnet/ruvector/blob/44ca7251396088417696b6989f98edcf7858e19e/npm%2Fpackages%2Fcore%2Findex.js",
+      "raw_url": "https://github.com/ruvnet/ruvector/raw/44ca7251396088417696b6989f98edcf7858e19e/npm%2Fpackages%2Fcore%2Findex.js",
+      "contents_url": "https://api.github.com/repos/ruvnet/ruvector/contents/npm%2Fpackages%2Fcore%2Findex.js?ref=44ca7251396088417696b6989f98edcf7858e19e",
+      "patch": "@@ -3,15 +3,15 @@ const { platform, arch } = process;\n // Platform mapping\n const platformMap = {\n   'linux': {\n-    'x64': '@ruvector/core-linux-x64',\n-    'arm64': '@ruvector/core-linux-arm64'\n+    'x64': 'ruvector-core-linux-x64-gnu',\n+    'arm64': 'ruvector-core-linux-arm64-gnu'\n   },\n   'darwin': {\n-    'x64': '@ruvector/core-darwin-x64',\n-    'arm64': '@ruvector/core-darwin-arm64'\n+    'x64': 'ruvector-core-darwin-x64',\n+    'arm64': 'ruvector-core-darwin-arm64'\n   },\n   'win32': {\n-    'x64': '@ruvector/core-win32-x64'\n+    'x64': 'ruvector-core-win32-x64-msvc'\n   }\n };\n \n@@ -35,7 +35,7 @@ function loadNativeModule() {\n       throw new Error(\n         `Native module not found for ${platform}-${arch}\\n` +\n         `Please install: npm install ${platformPackage}\\n` +\n-        `Or reinstall @ruvector/core to get optional dependencies`\n+        `Or reinstall ruvector-core to get optional dependencies`\n       );\n     }\n     throw error;"
+    },
+    {
+      "sha": "03e30966e600d79eef348535bc017738254998b3",
+      "filename": "npm/packages/core/package.json",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/ruvnet/ruvector/blob/44ca7251396088417696b6989f98edcf7858e19e/npm%2Fpackages%2Fcore%2Fpackage.json",
+      "raw_url": "https://github.com/ruvnet/ruvector/raw/44ca7251396088417696b6989f98edcf7858e19e/npm%2Fpackages%2Fcore%2Fpackage.json",
+      "contents_url": "https://api.github.com/repos/ruvnet/ruvector/contents/npm%2Fpackages%2Fcore%2Fpackage.json?ref=44ca7251396088417696b6989f98edcf7858e19e",
+      "patch": "@@ -1,6 +1,6 @@\n {\n   \"name\": \"ruvector-core\",\n-  \"version\": \"0.1.1\",\n+  \"version\": \"0.1.2\",\n   \"description\": \"High-performance vector database with HNSW indexing - 50k+ inserts/sec, built in Rust for AI/ML similarity search and semantic search applications\",\n   \"main\": \"index.js\",\n   \"types\": \"index.d.ts\","
+    },
+    {
+      "sha": "cb4227d7ab3495be0944302a40835737e81cc5dc",
+      "filename": "npm/packages/ruvector/package.json",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/ruvnet/ruvector/blob/44ca7251396088417696b6989f98edcf7858e19e/npm%2Fpackages%2Fruvector%2Fpackage.json",
+      "raw_url": "https://github.com/ruvnet/ruvector/raw/44ca7251396088417696b6989f98edcf7858e19e/npm%2Fpackages%2Fruvector%2Fpackage.json",
+      "contents_url": "https://api.github.com/repos/ruvnet/ruvector/contents/npm%2Fpackages%2Fruvector%2Fpackage.json?ref=44ca7251396088417696b6989f98edcf7858e19e",
+      "patch": "@@ -1,6 +1,6 @@\n {\n   \"name\": \"ruvector\",\n-  \"version\": \"0.1.4\",\n+  \"version\": \"0.1.6\",\n   \"description\": \"High-performance vector database for Node.js with automatic native/WASM fallback\",\n   \"main\": \"dist/index.js\",\n   \"types\": \"dist/index.d.ts\",\n@@ -43,7 +43,7 @@\n     \"directory\": \"npm/packages/ruvector\"\n   },\n   \"dependencies\": {\n-    \"ruvector-core\": \"^0.1.1\",\n+    \"ruvector-core\": \"^0.1.2\",\n     \"commander\": \"^11.1.0\",\n     \"chalk\": \"^4.1.2\",\n     \"ora\": \"^5.4.1\""
+    },
+    {
+      "sha": "8bdb6348a0ea0274cfbf46c8feac6f14b814e80c",
+      "filename": "npm/packages/ruvector/src/index.ts",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/ruvnet/ruvector/blob/44ca7251396088417696b6989f98edcf7858e19e/npm%2Fpackages%2Fruvector%2Fsrc%2Findex.ts",
+      "raw_url": "https://github.com/ruvnet/ruvector/raw/44ca7251396088417696b6989f98edcf7858e19e/npm%2Fpackages%2Fruvector%2Fsrc%2Findex.ts",
+      "contents_url": "https://api.github.com/repos/ruvnet/ruvector/contents/npm%2Fpackages%2Fruvector%2Fsrc%2Findex.ts?ref=44ca7251396088417696b6989f98edcf7858e19e",
+      "patch": "@@ -13,7 +13,7 @@ let implementationType: 'native' | 'wasm' = 'wasm';\n \n try {\n   // Try to load native module first\n-  implementation = require('@ruvector/core');\n+  implementation = require('ruvector-core');\n   implementationType = 'native';\n \n   // Verify it's actually working\n@@ -28,7 +28,7 @@ try {\n   }\n \n   try {\n-    implementation = require('@ruvector/wasm');\n+    implementation = require('ruvector-wasm');\n     implementationType = 'wasm';\n   } catch (wasmError: any) {\n     throw new Error("
+    }
+  ]
+}

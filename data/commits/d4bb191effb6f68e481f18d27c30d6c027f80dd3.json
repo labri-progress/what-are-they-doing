@@ -1,0 +1,53 @@
+{
+  "message": "feat(codegen): Improve C extension module handling for numpy tests\n\n- Add CExtFromImport struct to track from-imports from C extension modules\n- Detect submodules of C extension packages (e.g., numpy.testing when numpy is installed)\n- Generate var declarations for C ext from-imports with main() initialization\n- Mark imports inside function bodies as potentially erroring (for !void return types)\n- Add c_extension_from_imports tracking field to NativeCodegen\n\nThese changes improve support for running numpy tests with metal0, though\nfull numpy.testing support requires additional Python import semantics.",
+  "files": [
+    {
+      "sha": "1e57f196b3e1f03c6aeca4219217bb56cd736af8",
+      "filename": "src/analysis/traits/function_traits/call_graph.zig",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/teamchong/metal0/blob/d4bb191effb6f68e481f18d27c30d6c027f80dd3/src%2Fanalysis%2Ftraits%2Ffunction_traits%2Fcall_graph.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/d4bb191effb6f68e481f18d27c30d6c027f80dd3/src%2Fanalysis%2Ftraits%2Ffunction_traits%2Fcall_graph.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/src%2Fanalysis%2Ftraits%2Ffunction_traits%2Fcall_graph.zig?ref=d4bb191effb6f68e481f18d27c30d6c027f80dd3",
+      "patch": "@@ -572,6 +572,12 @@ fn analyzeStmtForTraits(stmt: ast.Node, ctx: *AnalyzerContext) !void {\n             }\n             ctx.op_count += 1;\n         },\n+        // Imports inside function bodies will be codegen'd as try runtime.eval(...)\n+        // for external modules not in the registry. Be conservative and mark as can_error.\n+        .import_stmt, .import_from => {\n+            ctx.can_error = true;\n+            ctx.op_count += 1;\n+        },\n         else => {\n             ctx.op_count += 1;\n         },"
+    },
+    {
+      "sha": "93708fca7220bea9bf3eba74d4f523057827a731",
+      "filename": "src/codegen/native/main/core.zig",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 0,
+      "changes": 11,
+      "blob_url": "https://github.com/teamchong/metal0/blob/d4bb191effb6f68e481f18d27c30d6c027f80dd3/src%2Fcodegen%2Fnative%2Fmain%2Fcore.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/d4bb191effb6f68e481f18d27c30d6c027f80dd3/src%2Fcodegen%2Fnative%2Fmain%2Fcore.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/src%2Fcodegen%2Fnative%2Fmain%2Fcore.zig?ref=d4bb191effb6f68e481f18d27c30d6c027f80dd3",
+      "patch": "@@ -330,6 +330,12 @@ pub const FinallyContext = struct {\n     is_defer_based: bool, // True if using defer approach (skip inline duplication)\n };\n \n+/// From-import from C extension module (e.g., from numpy.testing import assert_)\n+pub const CExtFromImport = struct {\n+    module: []const u8, // Module name (e.g., \"numpy.testing\")\n+    attr: []const u8, // Attribute name (e.g., \"assert_\")\n+};\n+\n pub const NativeCodegen = struct {\n     allocator: std.mem.Allocator,\n     arena: *std.heap.ArenaAllocator, // Arena for internal string allocations (deinit frees all at once)\n@@ -886,6 +892,10 @@ pub const NativeCodegen = struct {\n     // These are loaded at runtime via PyImport_ImportModule\n     c_extension_modules: FnvStringMap,\n \n+    // Track from-imports from C extension modules (need runtime initialization)\n+    // Maps symbol name -> {module, attr} (e.g., \"assert_\" -> {\"numpy.testing\", \"assert_\"})\n+    c_extension_from_imports: hashmap_helper.StringHashMap(CExtFromImport),\n+\n     // Track local variable types within current function/method scope\n     // Maps variable name -> NativeType (e.g., \"result\" -> .string)\n     // Cleared when entering a new function scope, used to avoid type shadowing issues\n@@ -1163,6 +1173,7 @@ pub const NativeCodegen = struct {\n             .skipped_functions = FnvVoidMap.init(aa),\n             .codegen_only_modules = FnvVoidMap.init(aa),\n             .c_extension_modules = FnvStringMap.init(aa),\n+            .c_extension_from_imports = hashmap_helper.StringHashMap(CExtFromImport).init(aa),\n             .local_var_types = hashmap_helper.StringHashMap(NativeType).init(aa),\n             .local_from_imports = FnvStringMap.init(aa),\n             .loop_capture_vars = FnvVoidMap.init(aa),"
+    },
+    {
+      "sha": "ead10a32f7705ae69c6777d064b936875f789f5e",
+      "filename": "src/codegen/native/main/from_imports.zig",
+      "status": "modified",
+      "additions": 25,
+      "deletions": 0,
+      "changes": 25,
+      "blob_url": "https://github.com/teamchong/metal0/blob/d4bb191effb6f68e481f18d27c30d6c027f80dd3/src%2Fcodegen%2Fnative%2Fmain%2Ffrom_imports.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/d4bb191effb6f68e481f18d27c30d6c027f80dd3/src%2Fcodegen%2Fnative%2Fmain%2Ffrom_imports.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/src%2Fcodegen%2Fnative%2Fmain%2Ffrom_imports.zig?ref=d4bb191effb6f68e481f18d27c30d6c027f80dd3",
+      "patch": "@@ -626,6 +626,31 @@ pub fn generateFromImports(self: *NativeCodegen) !void {\n                 continue;\n             }\n \n+            // Check if this is a C extension module (or submodule of one)\n+            // e.g., from numpy.testing import assert_ -> c_interop.getAttr(numpy.testing, \"assert_\")\n+            // These must be vars initialized in main() since they require runtime module loading\n+            if (self.isCExtensionModule(from_imp.module)) {\n+                for (from_imp.names, 0..) |name, i| {\n+                    if (std.mem.eql(u8, name, \"*\")) continue;\n+                    const symbol_name = if (i < from_imp.asnames.len and from_imp.asnames[i] != null)\n+                        from_imp.asnames[i].?\n+                    else\n+                        name;\n+                    if (generated_symbols.contains(symbol_name)) continue;\n+                    // Generate: var symbol_name: ?*c_interop.PyObject = null;\n+                    // The actual initialization happens in main() after the module is loaded\n+                    try self.emit(\"var \");\n+                    try self.emitIdent(symbol_name);\n+                    try self.emit(\": ?*c_interop.PyObject = null;\\n\");\n+                    try generated_symbols.put(symbol_name, {});\n+                    // Track for local variable shadowing prevention\n+                    try self.module_level_from_imports.put(symbol_name, {});\n+                    // Track for main() initialization\n+                    try self.c_extension_from_imports.put(symbol_name, .{ .module = from_imp.module, .attr = name });\n+                }\n+                continue;\n+            }\n+\n             // Module not in registry - generate null placeholders for optional imports\n             // This handles try/except ImportError patterns like: from numpy import ndarray as numpy_array\n             for (from_imp.names, 0..) |name, i| {"
+    },
+    {
+      "sha": "8120083318bc7b0c0283bfe6ea7b62137a2b720f",
+      "filename": "src/codegen/native/main/generator.zig",
+      "status": "modified",
+      "additions": 17,
+      "deletions": 0,
+      "changes": 17,
+      "blob_url": "https://github.com/teamchong/metal0/blob/d4bb191effb6f68e481f18d27c30d6c027f80dd3/src%2Fcodegen%2Fnative%2Fmain%2Fgenerator.zig",
+      "raw_url": "https://github.com/teamchong/metal0/raw/d4bb191effb6f68e481f18d27c30d6c027f80dd3/src%2Fcodegen%2Fnative%2Fmain%2Fgenerator.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/metal0/contents/src%2Fcodegen%2Fnative%2Fmain%2Fgenerator.zig?ref=d4bb191effb6f68e481f18d27c30d6c027f80dd3",
+      "patch": "@@ -1672,6 +1672,23 @@ pub fn generate(self: *NativeCodegen, module: ast.Node.Module) ![]const u8 {\n                 try self.emitFmt(\" = c_interop.importModule(\\\"{s}\\\") orelse @panic(\\\"Failed to import C extension module: {s}\\\");\\n\", .{ module_name, module_name });\n             }\n         }\n+\n+        // Initialize from-imports from C extension modules\n+        // e.g., assert_ = c_interop.getAttr(@\"numpy.testing\".?, \"assert_\") orelse @panic(...);\n+        if (self.c_extension_from_imports.count() > 0) {\n+            try self.emit(\"\\n\");\n+            try self.emitIndent();\n+            try self.emit(\"// Initialize from-imports from C extension modules\\n\");\n+\n+            for (self.c_extension_from_imports.keys()) |symbol_name| {\n+                const info = self.c_extension_from_imports.get(symbol_name).?;\n+                try self.emitIndent();\n+                try self.emitIdent(symbol_name);\n+                try self.emit(\" = c_interop.getAttr(\");\n+                try self.emitIdent(info.module);\n+                try self.emitFmt(\".?, \\\"{s}\\\") orelse @panic(\\\"Failed to get attribute '{s}' from C extension module '{s}'\\\");\\n\", .{ info.attr, info.attr, info.module });\n+            }\n+        }\n     }\n \n     // PHASE 7: Generate statements (skip class/function defs and imports - already handled)"
+    }
+  ]
+}

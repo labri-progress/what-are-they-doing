@@ -1,0 +1,41 @@
+{
+  "message": "Storage/UI: add read-only database access for TUI detail view\n\nIntroduce a read-only database connection mode for the TUI to fetch\nconversation details more efficiently without risking write conflicts\nwith the background indexer.\n\n**src/storage/sqlite.rs**\n- Add open_readonly() method that opens SQLite with:\n  - SQLITE_OPEN_READ_ONLY flag (prevents accidental writes)\n  - SQLITE_OPEN_NO_MUTEX flag (no need for write mutex overhead)\n- Apply common pragmas for performance consistency\n\n**src/ui/data.rs**\n- Change load_conversation() signature to accept &SqliteStorage reference\n  instead of &Path\n- Removes redundant connection opening on each detail view load\n- Caller now controls connection lifecycle and can reuse it\n\n**src/ui/tui.rs**\n- Open a single read-only DB connection at TUI startup (db_reader)\n- Gracefully handle case where DB doesn't exist yet (first run)\n- Pass db_reader reference to load_conversation() for detail fetching\n- Eliminates repeated open/close cycles when browsing results\n\nBenefits:\n- Reduced syscall overhead when rapidly scrolling through results\n- No risk of read-only TUI interfering with background indexer writes\n- Cleaner separation of concerns: TUI reads, indexer writes\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "4288ca01b96c7a85d6dc099422d294a463f684a9",
+      "filename": "src/storage/sqlite.rs",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 0,
+      "changes": 20,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/7e9118b2d275578c888370ed1884f197b0d4c314/src%2Fstorage%2Fsqlite.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/7e9118b2d275578c888370ed1884f197b0d4c314/src%2Fstorage%2Fsqlite.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/src%2Fstorage%2Fsqlite.rs?ref=7e9118b2d275578c888370ed1884f197b0d4c314",
+      "patch": "@@ -169,6 +169,18 @@ impl SqliteStorage {\n         Ok(Self { conn })\n     }\n \n+    pub fn open_readonly(path: &Path) -> Result<Self> {\n+        let conn = Connection::open_with_flags(\n+            path,\n+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,\n+        )\n+        .with_context(|| format!(\"opening sqlite db readonly at {}\", path.display()))?;\n+\n+        apply_common_pragmas(&conn)?;\n+\n+        Ok(Self { conn })\n+    }\n+\n     pub fn raw(&self) -> &Connection {\n         &self.conn\n     }\n@@ -433,6 +445,14 @@ fn apply_pragmas(conn: &mut Connection) -> Result<()> {\n         r#\"\n         PRAGMA journal_mode = WAL;\n         PRAGMA synchronous = NORMAL;\n+        \"#,\n+    )?;\n+    apply_common_pragmas(conn)\n+}\n+\n+fn apply_common_pragmas(conn: &Connection) -> Result<()> {\n+    conn.execute_batch(\n+        r#\"\n         PRAGMA temp_store = MEMORY;\n         PRAGMA cache_size = -65536; -- 64MB\n         PRAGMA mmap_size = 268435456; -- 256MB"
+    },
+    {
+      "sha": "8dc5b81f8ffdbd6f599996e73582d86b8d659987",
+      "filename": "src/ui/data.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 2,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/7e9118b2d275578c888370ed1884f197b0d4c314/src%2Fui%2Fdata.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/7e9118b2d275578c888370ed1884f197b0d4c314/src%2Fui%2Fdata.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/src%2Fui%2Fdata.rs?ref=7e9118b2d275578c888370ed1884f197b0d4c314",
+      "patch": "@@ -20,10 +20,9 @@ pub struct ConversationView {\n }\n \n pub fn load_conversation(\n-    db_path: &std::path::Path,\n+    storage: &SqliteStorage,\n     source_path: &str,\n ) -> Result<Option<ConversationView>> {\n-    let storage = SqliteStorage::open(db_path)?;\n     let mut stmt = storage.raw().prepare(\n         \"SELECT c.id, a.slug, w.id, w.path, w.display_name, c.external_id, c.title, c.source_path, c.started_at, c.ended_at, c.approx_tokens, c.metadata_json\n          FROM conversations c"
+    },
+    {
+      "sha": "f9c85cc7a9e9e3ef9669e30456282711cb8a52d0",
+      "filename": "src/ui/tui.rs",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 1,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/7e9118b2d275578c888370ed1884f197b0d4c314/src%2Fui%2Ftui.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/7e9118b2d275578c888370ed1884f197b0d4c314/src%2Fui%2Ftui.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/src%2Fui%2Ftui.rs?ref=7e9118b2d275578c888370ed1884f197b0d4c314",
+      "patch": "@@ -1504,6 +1504,10 @@ pub fn run_tui(\n     let state_path = state_path_for(&data_dir);\n     let persisted = load_state(&state_path);\n     let search_client = SearchClient::open(&index_path, Some(&db_path))?;\n+    // Open a read-only connection for the UI to fetch details efficiently.\n+    // If DB doesn't exist yet (first run), this will be None, which is fine as we can't view details anyway.\n+    let db_reader = crate::storage::sqlite::SqliteStorage::open_readonly(&db_path).ok();\n+\n     let index_ready = search_client.is_some();\n     let mut status = if index_ready {\n         format!(\n@@ -1926,7 +1930,11 @@ pub fn run_tui(\n                     {\n                         cached_detail.as_ref().map(|(_, d)| d.clone())\n                     } else {\n-                        let loaded = load_conversation(&db_path, &hit.source_path).ok().flatten();\n+                        let loaded = if let Some(storage) = &db_reader {\n+                            load_conversation(storage, &hit.source_path).ok().flatten()\n+                        } else {\n+                            None\n+                        };\n                         if let Some(d) = &loaded {\n                             cached_detail = Some((hit.source_path.clone(), d.clone()));\n                             // Reset scroll when loading new conversation"
+    }
+  ]
+}

@@ -1,0 +1,113 @@
+{
+  "message": "Refactor to OperatorPlugin and add nested tests",
+  "files": [
+    {
+      "sha": "e8144d103e23ab067a3a2fda656ac20dc9bdb34e",
+      "filename": "libtenzir/builtins/operators/set_select.cpp",
+      "status": "modified",
+      "additions": 67,
+      "deletions": 145,
+      "changes": 212,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/ec6edd4e17d28c64c92628da8adc25a75533f962/libtenzir%2Fbuiltins%2Foperators%2Fset_select.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/ec6edd4e17d28c64c92628da8adc25a75533f962/libtenzir%2Fbuiltins%2Foperators%2Fset_select.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Fbuiltins%2Foperators%2Fset_select.cpp?ref=ec6edd4e17d28c64c92628da8adc25a75533f962",
+      "patch": "@@ -6,15 +6,12 @@\n // SPDX-FileCopyrightText: (c) 2024 The Tenzir Contributors\n // SPDX-License-Identifier: BSD-3-Clause\n \n-#include <tenzir/compile_ctx.hpp>\n #include <tenzir/detail/narrow.hpp>\n-#include <tenzir/ir.hpp>\n+#include <tenzir/operator_plugin.hpp>\n #include <tenzir/plugin.hpp>\n #include <tenzir/rebatch.hpp>\n-#include <tenzir/substitute_ctx.hpp>\n #include <tenzir/tql2/eval.hpp>\n #include <tenzir/tql2/plugin.hpp>\n-#include <tenzir/tql2/registry.hpp>\n #include <tenzir/tql2/set.hpp>\n \n #include <ranges>\n@@ -23,24 +20,52 @@ namespace tenzir::plugins::set_select {\n \n namespace {\n \n-/// Create a `where` IR operator with the given expression.\n-auto make_where_ir(ast::expression filter) -> Box<ir::Operator> {\n-  auto const* where = plugins::find<operator_compiler_plugin>(\"tql2.where\");\n-  TENZIR_ASSERT(where);\n-  auto args = std::vector<ast::expression>{};\n-  args.push_back(std::move(filter));\n-  // TODO: This should reuse the existing compile context.\n-  auto dh = null_diagnostic_handler{};\n-  auto reg = global_registry();\n-  auto ctx = compile_ctx::make_root(base_ctx{dh, *reg});\n-  return where->compile(ast::invocation{ast::entity{{}}, std::move(args)}, ctx)\n-    .unwrap();\n+struct SelectArgs {\n+  std::vector<ast::expression> fields;\n+};\n+\n+auto make_select_assignments(std::vector<ast::expression> args,\n+                             diagnostic_handler* dh)\n+  -> std::optional<std::vector<ast::assignment>> {\n+  auto assignments = std::vector<ast::assignment>{};\n+  assignments.reserve(1 + args.size());\n+  assignments.emplace_back(ast::field_path::try_from(ast::this_{}).value(),\n+                           location::unknown,\n+                           ast::record{location::unknown, {}, location::unknown});\n+  for (auto& arg : args) {\n+    if (auto* assignment = std::get_if<ast::assignment>(&*arg.kind)) {\n+      auto* selector = std::get_if<ast::field_path>(&assignment->left);\n+      if (not selector) {\n+        if (dh) {\n+          diagnostic::error(\"expected selector\")\n+            .primary(assignment->left)\n+            .emit(*dh);\n+        }\n+        return std::nullopt;\n+      }\n+      assignments.push_back(std::move(*assignment));\n+      continue;\n+    }\n+    auto selector = ast::field_path::try_from(std::move(arg));\n+    if (not selector) {\n+      if (dh) {\n+        diagnostic::error(\"expected selector\").primary(arg).emit(*dh);\n+      }\n+      return std::nullopt;\n+    }\n+    auto rhs = selector->inner();\n+    assignments.emplace_back(std::move(*selector), location::unknown,\n+                             std::move(rhs));\n+  }\n+  return assignments;\n }\n \n class SelectSet final : public Operator<table_slice, table_slice> {\n public:\n-  SelectSet(std::vector<ast::assignment> assignments, event_order order)\n-    : assignments_{std::move(assignments)}, order_{order} {\n+  explicit SelectSet(SelectArgs args) {\n+    auto assignments = make_select_assignments(std::move(args.fields), nullptr);\n+    TENZIR_ASSERT(assignments);\n+    assignments_ = std::move(*assignments);\n     for (auto& assignment : assignments_) {\n       auto [pruned_assignment, moved_fields]\n         = resolve_move_keyword(std::move(assignment));\n@@ -89,83 +114,16 @@ class SelectSet final : public Operator<table_slice, table_slice> {\n       }\n       std::ranges::move(state, std::back_inserter(results));\n     }\n-    // This can reshuffle output schemas when strict ordering is not required.\n-    if (order_ != event_order::ordered) {\n-      std::ranges::stable_sort(results, std::ranges::less{},\n-                               &table_slice::schema);\n-    }\n     for (auto& result : rebatch(std::move(results))) {\n       co_await push(std::move(result));\n     }\n   }\n \n private:\n   std::vector<ast::assignment> assignments_;\n-  event_order order_ = event_order::ordered;\n   std::vector<ast::field_path> moved_fields_;\n };\n \n-class select_ir final : public ir::Operator {\n-public:\n-  select_ir() = default;\n-\n-  explicit select_ir(std::vector<ast::assignment> assignments)\n-    : assignments_{std::move(assignments)} {\n-  }\n-\n-  auto name() const -> std::string override {\n-    return \"select_ir\";\n-  }\n-\n-  auto substitute(substitute_ctx ctx, bool instantiate)\n-    -> failure_or<void> override {\n-    (void)instantiate;\n-    for (auto& x : assignments_) {\n-      TRY(x.right.substitute(ctx));\n-    }\n-    return {};\n-  }\n-\n-  auto optimize(ir::optimize_filter filter,\n-                event_order order) && -> ir::optimize_result override {\n-    // Remember the order for potential rebatches.\n-    order_ = order;\n-    auto ops = std::vector<Box<ir::Operator>>{};\n-    if (not filter.empty()) {\n-      // TODO: Propagate all filters.\n-      TENZIR_ASSERT(filter.size() == 1);\n-      ops.reserve(2);\n-      auto where = make_where_ir(filter[0]);\n-      ops.push_back(std::move(where));\n-    }\n-    ops.emplace_back(select_ir{std::move(*this)});\n-    auto replacement = ir::pipeline{std::vector<ir::let>{}, std::move(ops)};\n-    return {{}, order_, std::move(replacement)};\n-  }\n-\n-  auto spawn(element_type_tag input) && -> AnyOperator override {\n-    TENZIR_ASSERT(input.is<table_slice>());\n-    return SelectSet{std::move(assignments_), order_};\n-  }\n-\n-  auto infer_type(element_type_tag input, diagnostic_handler& dh) const\n-    -> failure_or<std::optional<element_type_tag>> override {\n-    if (input.is_not<table_slice>()) {\n-      diagnostic::error(\"select operator expected events\").emit(dh);\n-      return failure::promise();\n-    }\n-    return input;\n-  }\n-\n-  friend auto inspect(auto& f, select_ir& x) -> bool {\n-    return f.object(x).fields(f.field(\"assignments\", x.assignments_));\n-  }\n-\n-private:\n-  std::vector<ast::assignment> assignments_;\n-  event_order order_ = event_order::ordered;\n-};\n-\n class set final : public operator_plugin2<set_operator> {\n public:\n   auto make(invocation inv, session ctx) const\n@@ -190,85 +148,49 @@ class set final : public operator_plugin2<set_operator> {\n   }\n };\n \n-class select final : public virtual operator_factory_plugin,\n-                     public virtual operator_compiler_plugin {\n+class select final : public virtual operator_plugin2<set_operator>,\n+                     public virtual OperatorPlugin {\n public:\n   auto name() const -> std::string override {\n     return \"tql2.select\";\n   }\n \n   auto make(invocation inv, session ctx) const\n     -> failure_or<operator_ptr> override {\n-    auto assignments = std::vector<ast::assignment>{};\n-    assignments.reserve(1 + inv.args.size());\n-    assignments.emplace_back(\n-      ast::field_path::try_from(ast::this_{}).value(), location::unknown,\n-      ast::record{location::unknown, {}, location::unknown});\n-    for (auto& arg : inv.args) {\n-      if (auto assignment = std::get_if<ast::assignment>(&*arg.kind)) {\n-        auto selector = std::get_if<ast::field_path>(&assignment->left);\n-        if (not selector) {\n-          diagnostic::error(\"expected selector\")\n-            .primary(assignment->left)\n-            .emit(ctx);\n-          continue;\n-        }\n-        assignments.push_back(std::move(*assignment));\n-      } else {\n-        auto selector = ast::field_path::try_from(arg);\n-        if (not selector) {\n-          diagnostic::error(\"expected selector\").primary(arg).emit(ctx);\n-          continue;\n-        }\n-        // TODO: This is a hack.\n-        assignments.emplace_back(std::move(*selector), location::unknown,\n-                                 std::move(arg));\n-      }\n+    auto assignments = make_select_assignments(std::move(inv.args), &ctx.dh());\n+    if (not assignments) {\n+      return failure::promise();\n     }\n-    return std::make_unique<set_operator>(std::move(assignments));\n+    return std::make_unique<set_operator>(std::move(*assignments));\n   }\n \n-  auto compile(ast::invocation inv, compile_ctx ctx) const\n-    -> failure_or<Box<ir::Operator>> override {\n-    auto assignments = std::vector<ast::assignment>{};\n-    assignments.reserve(1 + inv.args.size());\n-    // Start with `this = {}` to clear the record.\n-    assignments.emplace_back(\n-      ast::field_path::try_from(ast::this_{}).value(), location::unknown,\n-      ast::record{location::unknown, {}, location::unknown});\n-    for (auto& arg : inv.args) {\n-      if (auto* assignment = std::get_if<ast::assignment>(&*arg.kind)) {\n-        auto* selector = std::get_if<ast::field_path>(&assignment->left);\n-        if (not selector) {\n-          diagnostic::error(\"expected selector\")\n-            .primary(assignment->left)\n-            .emit(ctx);\n-          continue;\n-        }\n-        TRY(assignment->right.bind(ctx));\n-        assignments.push_back(std::move(*assignment));\n-      } else {\n-        auto selector = ast::field_path::try_from(arg);\n-        if (not selector) {\n-          diagnostic::error(\"expected selector\").primary(arg).emit(ctx);\n+  auto describe() const -> Description override {\n+    auto d = Describer<SelectArgs, SelectSet>{};\n+    auto fields\n+      = d.optional_variadic(\"field\", &SelectArgs::fields, \"selector\");\n+    d.validate([fields](ValidateCtx& ctx) -> Empty {\n+      auto args = ctx.get_all(fields);\n+      auto fields = std::vector<ast::expression>{};\n+      fields.reserve(args.size());\n+      for (auto& arg : args) {\n+        if (not arg) {\n           continue;\n         }\n-        TRY(arg.bind(ctx));\n-        // TODO: This is a hack.\n-        assignments.emplace_back(std::move(*selector), location::unknown,\n-                                 std::move(arg));\n+        fields.push_back(std::move(*arg));\n       }\n-    }\n-    return select_ir{std::move(assignments)};\n+      auto ignored = make_select_assignments(\n+        std::move(fields), &static_cast<diagnostic_handler&>(ctx));\n+      (void)ignored;\n+      return {};\n+    });\n+    d.assignments_are_positional();\n+    return d.order_invariant();\n   }\n };\n \n-using select_ir_plugin = inspection_plugin<ir::Operator, select_ir>;\n-\n } // namespace\n \n } // namespace tenzir::plugins::set_select\n \n TENZIR_REGISTER_PLUGIN(tenzir::plugins::set_select::set)\n TENZIR_REGISTER_PLUGIN(tenzir::plugins::set_select::select)\n-TENZIR_REGISTER_PLUGIN(tenzir::plugins::set_select::select_ir_plugin)"
+    },
+    {
+      "sha": "58fd4d3f8fc6237bf798f1d9381136e9a1f44cbd",
+      "filename": "libtenzir/include/tenzir/operator_plugin.hpp",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/ec6edd4e17d28c64c92628da8adc25a75533f962/libtenzir%2Finclude%2Ftenzir%2Foperator_plugin.hpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/ec6edd4e17d28c64c92628da8adc25a75533f962/libtenzir%2Finclude%2Ftenzir%2Foperator_plugin.hpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Finclude%2Ftenzir%2Foperator_plugin.hpp?ref=ec6edd4e17d28c64c92628da8adc25a75533f962",
+      "patch": "@@ -134,6 +134,8 @@ struct Description {\n   std::optional<Validator> validator;\n   std::optional<Setter<ir::optimize_filter>> set_filter;\n   std::optional<Setter<location>> set_operator_location;\n+  // If true, assignments are treated as positional arguments, not named args.\n+  bool assignments_are_positional = false;\n };\n \n class OperatorPlugin : public virtual operator_compiler_plugin {\n@@ -793,6 +795,10 @@ class Describer {\n     desc_.validator = std::move(validator);\n   }\n \n+  auto assignments_are_positional() -> void {\n+    desc_.assignments_are_positional = true;\n+  }\n+\n   // TODO\n   template <class F>\n   auto optimize(F&& f) -> Description;"
+    },
+    {
+      "sha": "d54842e9897b0195e69420e21b5d455408ee6434",
+      "filename": "libtenzir/src/operator_plugin.cpp",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/ec6edd4e17d28c64c92628da8adc25a75533f962/libtenzir%2Fsrc%2Foperator_plugin.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/ec6edd4e17d28c64c92628da8adc25a75533f962/libtenzir%2Fsrc%2Foperator_plugin.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Fsrc%2Foperator_plugin.cpp?ref=ec6edd4e17d28c64c92628da8adc25a75533f962",
+      "patch": "@@ -206,7 +206,8 @@ class GenericIr final : public ir::Operator {\n       = desc->first_optional.value_or(desc->positional.size());\n     auto max_positional = desc->positional.size();\n     for (auto& arg : args) {\n-      if (auto* assignment = try_as<ast::assignment>(arg)) {\n+      if (auto* assignment = try_as<ast::assignment>(arg);\n+          assignment and not desc->assignments_are_positional) {\n         // Named argument.\n         auto* sel = try_as<ast::field_path>(assignment->left);\n         if (not sel or sel->has_this() or sel->path().size() != 1"
+    },
+    {
+      "sha": "14cad5a3ff4d5698447c4207c16423fd56d597b7",
+      "filename": "test/tests/operators/select/nested_create.tql",
+      "status": "added",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/ec6edd4e17d28c64c92628da8adc25a75533f962/test%2Ftests%2Foperators%2Fselect%2Fnested_create.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/ec6edd4e17d28c64c92628da8adc25a75533f962/test%2Ftests%2Foperators%2Fselect%2Fnested_create.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fselect%2Fnested_create.tql?ref=ec6edd4e17d28c64c92628da8adc25a75533f962",
+      "patch": "@@ -0,0 +1,2 @@\n+from {x: 1}\n+select a.b.c = x"
+    },
+    {
+      "sha": "5c1196344b016980997c8abeda30de6fd50b6632",
+      "filename": "test/tests/operators/select/nested_create.txt",
+      "status": "added",
+      "additions": 7,
+      "deletions": 0,
+      "changes": 7,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/ec6edd4e17d28c64c92628da8adc25a75533f962/test%2Ftests%2Foperators%2Fselect%2Fnested_create.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/ec6edd4e17d28c64c92628da8adc25a75533f962/test%2Ftests%2Foperators%2Fselect%2Fnested_create.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fselect%2Fnested_create.txt?ref=ec6edd4e17d28c64c92628da8adc25a75533f962",
+      "patch": "@@ -0,0 +1,7 @@\n+{\n+  a: {\n+    b: {\n+      c: 1,\n+    },\n+  },\n+}"
+    },
+    {
+      "sha": "160692d4818f6cef66f69eb89d413d71ed07a665",
+      "filename": "test/tests/operators/select/nested_missing_selector.tql",
+      "status": "added",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/ec6edd4e17d28c64c92628da8adc25a75533f962/test%2Ftests%2Foperators%2Fselect%2Fnested_missing_selector.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/ec6edd4e17d28c64c92628da8adc25a75533f962/test%2Ftests%2Foperators%2Fselect%2Fnested_missing_selector.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fselect%2Fnested_missing_selector.tql?ref=ec6edd4e17d28c64c92628da8adc25a75533f962",
+      "patch": "@@ -0,0 +1,2 @@\n+from {x: 1}\n+select a?.b?.c?"
+    },
+    {
+      "sha": "88fa384080bdbca68c3c9b20c975cb2e2a123d75",
+      "filename": "test/tests/operators/select/nested_missing_selector.txt",
+      "status": "added",
+      "additions": 7,
+      "deletions": 0,
+      "changes": 7,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/ec6edd4e17d28c64c92628da8adc25a75533f962/test%2Ftests%2Foperators%2Fselect%2Fnested_missing_selector.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/ec6edd4e17d28c64c92628da8adc25a75533f962/test%2Ftests%2Foperators%2Fselect%2Fnested_missing_selector.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fselect%2Fnested_missing_selector.txt?ref=ec6edd4e17d28c64c92628da8adc25a75533f962",
+      "patch": "@@ -0,0 +1,7 @@\n+{\n+  a: {\n+    b: {\n+      c: null,\n+    },\n+  },\n+}"
+    },
+    {
+      "sha": "5e668a5992484acc67a39e16e758244b95e659b7",
+      "filename": "test/tests/operators/select/nested_missing_source.tql",
+      "status": "added",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/ec6edd4e17d28c64c92628da8adc25a75533f962/test%2Ftests%2Foperators%2Fselect%2Fnested_missing_source.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/ec6edd4e17d28c64c92628da8adc25a75533f962/test%2Ftests%2Foperators%2Fselect%2Fnested_missing_source.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fselect%2Fnested_missing_source.tql?ref=ec6edd4e17d28c64c92628da8adc25a75533f962",
+      "patch": "@@ -0,0 +1,2 @@\n+from {x: 1}\n+select a.b.c = y?"
+    },
+    {
+      "sha": "88fa384080bdbca68c3c9b20c975cb2e2a123d75",
+      "filename": "test/tests/operators/select/nested_missing_source.txt",
+      "status": "added",
+      "additions": 7,
+      "deletions": 0,
+      "changes": 7,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/ec6edd4e17d28c64c92628da8adc25a75533f962/test%2Ftests%2Foperators%2Fselect%2Fnested_missing_source.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/ec6edd4e17d28c64c92628da8adc25a75533f962/test%2Ftests%2Foperators%2Fselect%2Fnested_missing_source.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fselect%2Fnested_missing_source.txt?ref=ec6edd4e17d28c64c92628da8adc25a75533f962",
+      "patch": "@@ -0,0 +1,7 @@\n+{\n+  a: {\n+    b: {\n+      c: null,\n+    },\n+  },\n+}"
+    }
+  ]
+}

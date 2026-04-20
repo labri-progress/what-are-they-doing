@@ -1,0 +1,29 @@
+{
+  "message": "fix(llm): apply default adapter timeouts",
+  "files": [
+    {
+      "sha": "a97a4f51332cafd5e70ad6e0158ef866e3de7739",
+      "filename": "llm/client.go",
+      "status": "modified",
+      "additions": 12,
+      "deletions": 0,
+      "changes": 12,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/6e782901caa78e16733a769109ab9a130d80d99b/llm%2Fclient.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/6e782901caa78e16733a769109ab9a130d80d99b/llm%2Fclient.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/llm%2Fclient.go?ref=6e782901caa78e16733a769109ab9a130d80d99b",
+      "patch": "@@ -53,6 +53,12 @@ func (c *Client) Complete(ctx context.Context, req Request) (Response, error) {\n \tif err := req.Validate(); err != nil {\n \t\treturn Response{}, err\n \t}\n+\t// Default to a bounded network profile. Adapters use request context deadlines and\n+\t// connect timeouts, so leaving this nil can hang indefinitely on stalled networks.\n+\tif req.AdapterTimeout == nil {\n+\t\tat := DefaultAdapterTimeout()\n+\t\treq.AdapterTimeout = &at\n+\t}\n \tprov := req.Provider\n \tif prov == \"\" {\n \t\tprov = c.defaultProvider\n@@ -78,6 +84,12 @@ func (c *Client) Stream(ctx context.Context, req Request) (Stream, error) {\n \tif err := req.Validate(); err != nil {\n \t\treturn nil, err\n \t}\n+\t// Default to a bounded network profile. For streaming requests this primarily\n+\t// enforces connect + stream read timeouts.\n+\tif req.AdapterTimeout == nil {\n+\t\tat := DefaultAdapterTimeout()\n+\t\treq.AdapterTimeout = &at\n+\t}\n \tprov := req.Provider\n \tif prov == \"\" {\n \t\tprov = c.defaultProvider"
+    },
+    {
+      "sha": "8d8553492e364431a8cdbda8fb9fbceb696116ad",
+      "filename": "llm/client_test.go",
+      "status": "modified",
+      "additions": 75,
+      "deletions": 0,
+      "changes": 75,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/6e782901caa78e16733a769109ab9a130d80d99b/llm%2Fclient_test.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/6e782901caa78e16733a769109ab9a130d80d99b/llm%2Fclient_test.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/llm%2Fclient_test.go?ref=6e782901caa78e16733a769109ab9a130d80d99b",
+      "patch": "@@ -24,6 +24,36 @@ func (a *fakeAdapter) Stream(ctx context.Context, req Request) (Stream, error) {\n \treturn nil, errors.New(\"stream not implemented in fakeAdapter\")\n }\n \n+type recordReqAdapter struct {\n+\tname    string\n+\tlastReq Request\n+\tmu      sync.Mutex\n+}\n+\n+func (a *recordReqAdapter) Name() string { return a.name }\n+func (a *recordReqAdapter) Complete(ctx context.Context, req Request) (Response, error) {\n+\t_ = ctx\n+\ta.mu.Lock()\n+\ta.lastReq = req\n+\ta.mu.Unlock()\n+\treturn Response{Provider: a.name, Model: req.Model, Message: Assistant(\"ok\")}, nil\n+}\n+func (a *recordReqAdapter) Stream(ctx context.Context, req Request) (Stream, error) {\n+\ta.mu.Lock()\n+\ta.lastReq = req\n+\ta.mu.Unlock()\n+\n+\tsctx, cancel := context.WithCancel(ctx)\n+\t_ = sctx\n+\ts := NewChanStream(cancel)\n+\tgo func() {\n+\t\tdefer s.CloseSend()\n+\t\ts.Send(StreamEvent{Type: StreamEventStreamStart})\n+\t\ts.Send(StreamEvent{Type: StreamEventFinish, Response: &Response{Provider: a.name, Model: req.Model, Message: Assistant(\"ok\")}})\n+\t}()\n+\treturn s, nil\n+}\n+\n type stepAdapter struct {\n \tname  string\n \ti     int\n@@ -61,6 +91,51 @@ func TestClient_DefaultProviderRouting(t *testing.T) {\n \t}\n }\n \n+func TestClient_DefaultAdapterTimeout_AppliedWhenNil(t *testing.T) {\n+\tc := NewClient()\n+\ta := &recordReqAdapter{name: \"openai\"}\n+\tc.Register(a)\n+\n+\tctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)\n+\tdefer cancel()\n+\tif _, err := c.Complete(ctx, Request{Model: \"m\", Messages: []Message{User(\"hi\")}}); err != nil {\n+\t\tt.Fatalf(\"Complete: %v\", err)\n+\t}\n+\n+\ta.mu.Lock()\n+\tgot := a.lastReq.AdapterTimeout\n+\ta.mu.Unlock()\n+\n+\tif got == nil {\n+\t\tt.Fatal(\"expected AdapterTimeout to be set by default\")\n+\t}\n+\twant := DefaultAdapterTimeout()\n+\tif got.Connect != want.Connect || got.Request != want.Request || got.StreamRead != want.StreamRead {\n+\t\tt.Fatalf(\"AdapterTimeout: got=%+v want=%+v\", *got, want)\n+\t}\n+}\n+\n+func TestClient_DefaultAdapterTimeout_DoesNotOverrideExplicit(t *testing.T) {\n+\tc := NewClient()\n+\ta := &recordReqAdapter{name: \"openai\"}\n+\tc.Register(a)\n+\n+\texplicit := &AdapterTimeout{Connect: 123 * time.Millisecond}\n+\tctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)\n+\tdefer cancel()\n+\tif _, err := c.Complete(ctx, Request{Model: \"m\", Messages: []Message{User(\"hi\")}, AdapterTimeout: explicit}); err != nil {\n+\t\tt.Fatalf(\"Complete: %v\", err)\n+\t}\n+\n+\ta.mu.Lock()\n+\tgot := a.lastReq.AdapterTimeout\n+\ta.mu.Unlock()\n+\n+\tif got != explicit {\n+\t\tt.Fatalf(\"expected explicit AdapterTimeout pointer to be preserved\")\n+\t}\n+}\n+\n func TestClient_ProviderAlias_GeminiRoutesToGoogle(t *testing.T) {\n \tc := NewClient()\n \tc.Register(&fakeAdapter{name: \"google\"})"
+    }
+  ]
+}

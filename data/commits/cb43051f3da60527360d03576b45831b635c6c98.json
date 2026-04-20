@@ -1,0 +1,65 @@
+{
+  "message": "fix(wal): detect and truncate corrupted WAL trailers on index load\n\nPrevent future append failures by detecting and truncating WAL files with\ntrailing garbage from prior crashes. Propagate index field through scored\nresults in searcher and lexical modules. Add reproduction test for WAL\ntruncation scenarios.\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "3f211fa1630ddf292ff22145b46f14a517a5ba45",
+      "filename": "crates/frankensearch-fusion/src/searcher.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensearch/blob/cb43051f3da60527360d03576b45831b635c6c98/crates%2Ffrankensearch-fusion%2Fsrc%2Fsearcher.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensearch/raw/cb43051f3da60527360d03576b45831b635c6c98/crates%2Ffrankensearch-fusion%2Fsrc%2Fsearcher.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensearch/contents/crates%2Ffrankensearch-fusion%2Fsrc%2Fsearcher.rs?ref=cb43051f3da60527360d03576b45831b635c6c98",
+      "patch": "@@ -1806,6 +1806,7 @@ fn fused_hits_to_scored_results(\n                 doc_id: fh.doc_id.clone(),\n                 score,\n                 source,\n+                index: fh.semantic_index,\n                 fast_score: fh.semantic_score,\n                 quality_score: None,\n                 lexical_score: fh.lexical_score,\n@@ -1867,6 +1868,7 @@ fn vector_hits_to_scored_results(\n                 doc_id: h.doc_id.clone(),\n                 score: h.score,\n                 source: ScoreSource::SemanticFast,\n+                index: Some(h.index),\n                 fast_score: Some(h.score),\n                 quality_score: None,\n                 lexical_score: None,"
+    },
+    {
+      "sha": "e219cb836c00faaea3d3fe382f2365ac9421662c",
+      "filename": "crates/frankensearch-index/src/lib.rs",
+      "status": "modified",
+      "additions": 21,
+      "deletions": 1,
+      "changes": 22,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensearch/blob/cb43051f3da60527360d03576b45831b635c6c98/crates%2Ffrankensearch-index%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensearch/raw/cb43051f3da60527360d03576b45831b635c6c98/crates%2Ffrankensearch-index%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensearch/contents/crates%2Ffrankensearch-index%2Fsrc%2Flib.rs?ref=cb43051f3da60527360d03576b45831b635c6c98",
+      "patch": "@@ -52,6 +52,7 @@ pub mod two_tier;\n pub mod wal;\n pub mod warmup;\n mod repro_soft_delete_rollback;\n+mod repro_wal_truncation;\n \n use std::fs::{self, File, OpenOptions};\n use std::io::{BufWriter, Write};\n@@ -243,9 +244,28 @@ impl VectorIndex {\n \n         // Load WAL entries if a sidecar file exists.\n         let wal_path = wal::wal_path_for(path);\n-        let (mut wal_entries, wal_compaction_gen) =\n+        let (mut wal_entries, wal_compaction_gen, valid_len) =\n             wal::read_wal(&wal_path, metadata.dimension, metadata.quantization)?;\n \n+        // If the WAL file has trailing garbage (e.g. from a crash during append),\n+        // truncate it to the valid length so future appends are contiguous.\n+        if wal_path.exists() {\n+            let actual_len = std::fs::metadata(&wal_path)\n+                .map_err(SearchError::Io)?\n+                .len();\n+            if actual_len > valid_len {\n+                tracing::warn!(\n+                    path = %wal_path.display(),\n+                    actual_len,\n+                    valid_len,\n+                    \"truncating corrupted WAL trailer\"\n+                );\n+                let file = OpenOptions::new().write(true).open(&wal_path).map_err(SearchError::Io)?;\n+                file.set_len(valid_len).map_err(SearchError::Io)?;\n+                file.sync_all().map_err(SearchError::Io)?;\n+            }\n+        }\n+\n         // Stale WAL detection:\n         //\n         // A valid WAL must have a generation of `next_generation(main_gen)`."
+    },
+    {
+      "sha": "96cba3e93eec39dc27b367f6ca630725c34c7028",
+      "filename": "crates/frankensearch-index/src/repro_wal_truncation.rs",
+      "status": "added",
+      "additions": 101,
+      "deletions": 0,
+      "changes": 101,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensearch/blob/cb43051f3da60527360d03576b45831b635c6c98/crates%2Ffrankensearch-index%2Fsrc%2Frepro_wal_truncation.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensearch/raw/cb43051f3da60527360d03576b45831b635c6c98/crates%2Ffrankensearch-index%2Fsrc%2Frepro_wal_truncation.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensearch/contents/crates%2Ffrankensearch-index%2Fsrc%2Frepro_wal_truncation.rs?ref=cb43051f3da60527360d03576b45831b635c6c98",
+      "patch": "@@ -0,0 +1,101 @@\n+#[cfg(test)]\n+mod tests {\n+    use crate::wal::{append_wal_batch, read_wal, wal_path_for, WalEntry};\n+    use crate::Quantization;\n+    use std::fs;\n+    use std::path::PathBuf;\n+    use std::time::{SystemTime, UNIX_EPOCH};\n+\n+    fn temp_wal_path(name: &str) -> PathBuf {\n+        let now = SystemTime::now()\n+            .duration_since(UNIX_EPOCH)\n+            .unwrap_or_default()\n+            .as_nanos();\n+        std::env::temp_dir().join(format!(\n+            \"frankensearch-wal-repro-{name}-{}-{now}.fsvi.wal\",\n+            std::process::id()\n+        ))\n+    }\n+\n+    fn make_entry(doc_id: &str, base: f32, dim: usize) -> WalEntry {\n+        WalEntry {\n+            doc_id: doc_id.to_owned(),\n+            doc_id_hash: crate::fnv1a_hash(doc_id.as_bytes()),\n+            embedding: vec![base; dim],\n+        }\n+    }\n+\n+    #[test]\n+    fn wal_append_after_corruption_orphans_new_data() {\n+        let path = temp_wal_path(\"append-after-corruption\");\n+        let dim = 4;\n+\n+        // 1. Write Batch A (valid)\n+        append_wal_batch(\n+            &path,\n+            &[make_entry(\"doc-a\", 1.0, dim)],\n+            dim,\n+            Quantization::F16,\n+            0,\n+            true,\n+        )\n+        .unwrap();\n+\n+        // 2. Simulate a partial write (Batch B crashed halfway)\n+        let valid_len = fs::metadata(&path).unwrap().len();\n+        \n+        // Append a valid batch...\n+        append_wal_batch(\n+            &path,\n+            &[make_entry(\"doc-b\", 2.0, dim)],\n+            dim,\n+            Quantization::F16,\n+            0,\n+            true,\n+        )\n+        .unwrap();\n+        \n+        // ...then truncate it to be corrupt/partial\n+        let full_len = fs::metadata(&path).unwrap().len();\n+        let corrupted_len = valid_len + (full_len - valid_len) / 2;\n+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();\n+        file.set_len(corrupted_len).unwrap();\n+        drop(file);\n+\n+        // Verify read_wal stops at Batch A and reports valid length\n+        let (loaded, _, reported_len) = read_wal(&path, dim, Quantization::F16).unwrap();\n+        assert_eq!(loaded.len(), 1);\n+        assert_eq!(loaded[0].doc_id, \"doc-a\");\n+        assert_eq!(reported_len, valid_len);\n+\n+        // 3. Open the index to trigger auto-truncation\n+        // We can't easily use VectorIndex::open here without a full FSVI file.\n+        // Instead, we can simulate what VectorIndex::open does:\n+        if fs::metadata(&path).unwrap().len() > reported_len {\n+            let file = fs::OpenOptions::new().write(true).open(&path).unwrap();\n+            file.set_len(reported_len).unwrap();\n+        }\n+\n+        // 4. Write Batch C (valid)\n+        // This should now append immediately after Batch A, overwriting the garbage.\n+        append_wal_batch(\n+            &path,\n+            &[make_entry(\"doc-c\", 3.0, dim)],\n+            dim,\n+            Quantization::F16,\n+            0,\n+            true,\n+        )\n+        .unwrap();\n+\n+        // 5. Read WAL again\n+        // Expected behavior (FIXED): Batch A and Batch C are visible.\n+        let (loaded_final, _, _) = read_wal(&path, dim, Quantization::F16).unwrap();\n+        \n+        assert_eq!(loaded_final.len(), 2, \"Batch C should be visible after auto-truncation\");\n+        assert_eq!(loaded_final[0].doc_id, \"doc-a\");\n+        assert_eq!(loaded_final[1].doc_id, \"doc-c\");\n+\n+        fs::remove_file(&path).ok();\n+    }\n+}"
+    },
+    {
+      "sha": "28689e350637bd1cebe8252b7243b2b9a681c4c5",
+      "filename": "crates/frankensearch-index/src/wal.rs",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 5,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensearch/blob/cb43051f3da60527360d03576b45831b635c6c98/crates%2Ffrankensearch-index%2Fsrc%2Fwal.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensearch/raw/cb43051f3da60527360d03576b45831b635c6c98/crates%2Ffrankensearch-index%2Fsrc%2Fwal.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensearch/contents/crates%2Ffrankensearch-index%2Fsrc%2Fwal.rs?ref=cb43051f3da60527360d03576b45831b635c6c98",
+      "patch": "@@ -131,14 +131,14 @@ pub(crate) fn read_wal(\n     path: &Path,\n     expected_dimension: usize,\n     quantization: Quantization,\n-) -> SearchResult<(Vec<WalEntry>, u8)> {\n+) -> SearchResult<(Vec<WalEntry>, u8, u64)> {\n     if !path.exists() {\n-        return Ok((Vec::new(), 0));\n+        return Ok((Vec::new(), 0, 0));\n     }\n     let data = std::fs::read(path)?;\n     if data.len() < WAL_HEADER_SIZE {\n         warn!(path = %path.display(), len = data.len(), \"WAL file too small, ignoring\");\n-        return Ok((Vec::new(), 0));\n+        return Ok((Vec::new(), 0, 0));\n     }\n     parse_wal_bytes(&data, expected_dimension, quantization, path)\n }\n@@ -148,7 +148,7 @@ fn parse_wal_bytes(\n     expected_dimension: usize,\n     quantization: Quantization,\n     path: &Path,\n-) -> SearchResult<(Vec<WalEntry>, u8)> {\n+) -> SearchResult<(Vec<WalEntry>, u8, u64)> {\n     // Header validation.\n     if data[..4] != WAL_MAGIC {\n         return Err(wal_corrupted(path, \"bad magic bytes\"));\n@@ -203,7 +203,7 @@ fn parse_wal_bytes(\n     }\n \n     debug!(path = %path.display(), entries = entries.len(), \"loaded WAL entries\");\n-    Ok((entries, compaction_gen))\n+    Ok((entries, compaction_gen, cursor as u64))\n }\n \n fn parse_batch("
+    },
+    {
+      "sha": "765adec80730629a70b267fdd635bb657e315a5d",
+      "filename": "crates/frankensearch-lexical/src/lib.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensearch/blob/cb43051f3da60527360d03576b45831b635c6c98/crates%2Ffrankensearch-lexical%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensearch/raw/cb43051f3da60527360d03576b45831b635c6c98/crates%2Ffrankensearch-lexical%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensearch/contents/crates%2Ffrankensearch-lexical%2Fsrc%2Flib.rs?ref=cb43051f3da60527360d03576b45831b635c6c98",
+      "patch": "@@ -603,6 +603,7 @@ impl LexicalSearch for TantivyIndex {\n                     doc_id,\n                     score: bm25_score,\n                     source: ScoreSource::Lexical,\n+                    index: None,\n                     fast_score: None,\n                     quality_score: None,\n                     lexical_score: Some(bm25_score),"
+    }
+  ]
+}

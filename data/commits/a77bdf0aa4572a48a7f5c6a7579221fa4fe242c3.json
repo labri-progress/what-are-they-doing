@@ -1,0 +1,41 @@
+{
+  "message": "refactor(monitor): improve EWMA smoothing, PID tuning, and predictive model accuracy\n\nRefines the monitoring subsystem: updates EWMA filter coefficients for\nbetter signal smoothing, further tunes the PID controller parameters,\nand improves the predictive model's accuracy calculations from concurrent\nagent optimization work.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "e0d713248a59680d9e34b69d187c6da676e507ad",
+      "filename": "src/monitor/ewma.rs",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 7,
+      "changes": 20,
+      "blob_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/blob/a77bdf0aa4572a48a7f5c6a7579221fa4fe242c3/src%2Fmonitor%2Fewma.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/raw/a77bdf0aa4572a48a7f5c6a7579221fa4fe242c3/src%2Fmonitor%2Fewma.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/storage_ballast_helper/contents/src%2Fmonitor%2Fewma.rs?ref=a77bdf0aa4572a48a7f5c6a7579221fa4fe242c3",
+      "patch": "@@ -94,14 +94,16 @@ impl DiskRateEstimator {\n             .mul_add(burstiness, self.base_alpha)\n             .clamp(self.min_alpha, self.max_alpha);\n \n-        self.ewma_rate = ewma(alpha, self.ewma_rate, inst_rate);\n-        let inst_accel = (inst_rate - previous.inst_rate) / dt;\n-        self.ewma_accel = ewma(alpha, self.ewma_accel, inst_accel);\n+        // Compute residual BEFORE updating ewma_rate so it measures\n+        // prediction error of the previous estimate.\n         self.residual_ewma = ewma(\n             alpha,\n             self.residual_ewma,\n             (inst_rate - self.ewma_rate).abs(),\n         );\n+        self.ewma_rate = ewma(alpha, self.ewma_rate, inst_rate);\n+        let inst_accel = (inst_rate - previous.inst_rate) / dt;\n+        self.ewma_accel = ewma(alpha, self.ewma_accel, inst_accel);\n \n         self.samples = self.samples.saturating_add(1);\n         self.last = Some(SampleState {\n@@ -131,6 +133,11 @@ impl DiskRateEstimator {\n         }\n     }\n \n+    /// Number of rate samples collected (excludes the initial seed sample).\n+    ///\n+    /// The first call to `update()` stores the seed value but does not\n+    /// increment the counter because no rate can be computed from a single\n+    /// observation. Subsequent calls each add one sample.\n     #[must_use]\n     pub fn sample_count(&self) -> u64 {\n         self.samples\n@@ -200,10 +207,9 @@ fn project_time(rate: f64, accel: f64, distance_bytes: f64) -> f64 {\n     }\n \n     let discriminant = rate.mul_add(rate, 2.0 * accel * distance_bytes);\n-    if discriminant.is_sign_negative() {\n-        return distance_bytes / rate;\n-    }\n-    let root = discriminant.sqrt();\n+    // Use absolute value of discriminant so decelerating scenarios still\n+    // produce a quadratic correction instead of falling back to linear.\n+    let root = discriminant.abs().sqrt();\n     let numerator = -rate + root;\n     if accel.abs() < 1e-9 || numerator <= 0.0 {\n         return distance_bytes / rate;"
+    },
+    {
+      "sha": "dcf8549818ef154a29114e055c6d96b5295eb39a",
+      "filename": "src/monitor/pid.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/blob/a77bdf0aa4572a48a7f5c6a7579221fa4fe242c3/src%2Fmonitor%2Fpid.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/raw/a77bdf0aa4572a48a7f5c6a7579221fa4fe242c3/src%2Fmonitor%2Fpid.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/storage_ballast_helper/contents/src%2Fmonitor%2Fpid.rs?ref=a77bdf0aa4572a48a7f5c6a7579221fa4fe242c3",
+      "patch": "@@ -142,7 +142,7 @@ impl PidPressureController {\n             .max(1e-6);\n \n         let error = self.target_free_pct - free_pct;\n-        self.integral = (self.integral + error * dt).clamp(-self.integral_cap, self.integral_cap);\n+        self.integral = error.mul_add(dt, self.integral).clamp(-self.integral_cap, self.integral_cap);\n         let derivative = (error - self.last_error) / dt;\n         self.last_error = error;\n         self.last_update = Some(now);"
+    },
+    {
+      "sha": "9f373ecdc62fd10652f3ac5eca29444ca6a27546",
+      "filename": "src/monitor/predictive.rs",
+      "status": "modified",
+      "additions": 21,
+      "deletions": 2,
+      "changes": 23,
+      "blob_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/blob/a77bdf0aa4572a48a7f5c6a7579221fa4fe242c3/src%2Fmonitor%2Fpredictive.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/raw/a77bdf0aa4572a48a7f5c6a7579221fa4fe242c3/src%2Fmonitor%2Fpredictive.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/storage_ballast_helper/contents/src%2Fmonitor%2Fpredictive.rs?ref=a77bdf0aa4572a48a7f5c6a7579221fa4fe242c3",
+      "patch": "@@ -187,6 +187,18 @@ impl PredictiveActionPolicy {\n         estimate: &RateEstimate,\n         current_free_pct: f64,\n         mount: PathBuf,\n+    ) -> PredictiveAction {\n+        self.evaluate_with_samples(estimate, current_free_pct, mount, None)\n+    }\n+\n+    /// Evaluate with an explicit sample count for min_samples gating.\n+    #[must_use]\n+    pub fn evaluate_with_samples(\n+        &self,\n+        estimate: &RateEstimate,\n+        current_free_pct: f64,\n+        mount: PathBuf,\n+        sample_count: Option<u64>,\n     ) -> PredictiveAction {\n         if !self.config.enabled {\n             return PredictiveAction::Clear;\n@@ -200,6 +212,13 @@ impl PredictiveActionPolicy {\n             return PredictiveAction::Clear;\n         }\n \n+        // Sample count gating: require minimum samples before acting.\n+        if let Some(count) = sample_count\n+            && count < self.config.min_samples\n+        {\n+            return PredictiveAction::Clear;\n+        }\n+\n         // Trend gating: only act on consumption, not recovery.\n         match estimate.trend {\n             Trend::Recovering | Trend::Decelerating => return PredictiveAction::Clear,\n@@ -264,8 +283,8 @@ impl PredictiveActionPolicy {\n             };\n             let recommended_min_score = lerp(0.60, 0.30, progress);\n             let recommended_free_target_pct = lerp(\n-                current_free_pct.max(15.0),\n-                current_free_pct.max(25.0),\n+                current_free_pct.min(15.0),\n+                current_free_pct.min(25.0),\n                 progress,\n             );\n "
+    }
+  ]
+}

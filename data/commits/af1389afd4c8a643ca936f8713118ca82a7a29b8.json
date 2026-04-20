@@ -1,0 +1,101 @@
+{
+  "message": "fix(api): add rate limiting to public-facing mutation endpoints\n\nThe appeals, DMCA, export, and roadmap POST/GET endpoints were\nunprotected against abuse. A single IP could submit unlimited appeals,\nDMCA requests, or feature requests, or hammer the export ZIP builder.\n\nEach endpoint now uses createRateLimiter with per-IP sliding windows:\n- Appeals: 5/hour (matches real-world appeal frequency)\n- DMCA: 10/hour (allows batch filings while preventing spam)\n- Export: 30/minute (ZIP generation is CPU-intensive)\n- Roadmap: 5/hour (feature requests should be deliberate)\n\nTests mock the rate-limit module to keep them fast and deterministic.\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "b4a6646279ebfd30a187ef427c0c90f0ee155b9b",
+      "filename": "apps/web/src/app/api/appeals/route.test.ts",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 1,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/jeffreysprompts.com/blob/af1389afd4c8a643ca936f8713118ca82a7a29b8/apps%2Fweb%2Fsrc%2Fapp%2Fapi%2Fappeals%2Froute.test.ts",
+      "raw_url": "https://github.com/Dicklesworthstone/jeffreysprompts.com/raw/af1389afd4c8a643ca936f8713118ca82a7a29b8/apps%2Fweb%2Fsrc%2Fapp%2Fapi%2Fappeals%2Froute.test.ts",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/jeffreysprompts.com/contents/apps%2Fweb%2Fsrc%2Fapp%2Fapi%2Fappeals%2Froute.test.ts?ref=af1389afd4c8a643ca936f8713118ca82a7a29b8",
+      "patch": "@@ -1,10 +1,17 @@\n /**\n  * Tests for /api/appeals (POST, GET)\n  */\n-import { describe, it, expect, beforeEach } from \"vitest\";\n+import { describe, it, expect, beforeEach, vi } from \"vitest\";\n import { NextRequest } from \"next/server\";\n import { POST, GET } from \"./route\";\n \n+vi.mock(\"@/lib/rate-limit\", () => ({\n+  createRateLimiter: () => ({\n+    check: vi.fn().mockResolvedValue({ allowed: true, remaining: 10, retryAfterSeconds: 0 }),\n+  }),\n+  getTrustedClientIp: vi.fn().mockReturnValue(\"127.0.0.1\"),\n+}));\n+\n function clearStores() {\n   const g = globalThis as unknown as Record<string, unknown>;\n   delete g[\"__jfp_appeal_store__\"];"
+    },
+    {
+      "sha": "91767b6dd802e73e2561f4c6f435a7bb5578777d",
+      "filename": "apps/web/src/app/api/appeals/route.ts",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 6,
+      "changes": 28,
+      "blob_url": "https://github.com/Dicklesworthstone/jeffreysprompts.com/blob/af1389afd4c8a643ca936f8713118ca82a7a29b8/apps%2Fweb%2Fsrc%2Fapp%2Fapi%2Fappeals%2Froute.ts",
+      "raw_url": "https://github.com/Dicklesworthstone/jeffreysprompts.com/raw/af1389afd4c8a643ca936f8713118ca82a7a29b8/apps%2Fweb%2Fsrc%2Fapp%2Fapi%2Fappeals%2Froute.ts",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/jeffreysprompts.com/contents/apps%2Fweb%2Fsrc%2Fapp%2Fapi%2Fappeals%2Froute.ts?ref=af1389afd4c8a643ca936f8713118ca82a7a29b8",
+      "patch": "@@ -9,6 +9,13 @@ import {\n import { getModerationAction } from \"@/lib/moderation/action-store\";\n import { checkContentForSpam } from \"@/lib/moderation/spam-check\";\n import { getUserIdFromRequest } from \"@/lib/user-id\";\n+import { createRateLimiter, getTrustedClientIp } from \"@/lib/rate-limit\";\n+\n+const appealRateLimiter = createRateLimiter({\n+  name: \"appeals\",\n+  windowMs: 60 * 60 * 1000, // 1 hour\n+  maxRequests: 5,\n+});\n \n /** Constant-time token comparison to prevent timing attacks */\n function safeTokenEqual(a: string, b: string): boolean {\n@@ -37,6 +44,15 @@ const MIN_EXPLANATION_LENGTH = 50;\n  * - explanation: string - Why the user is appealing (50-2000 chars)\n  */\n export async function POST(request: NextRequest) {\n+  const clientIp = getTrustedClientIp(request);\n+  const rateLimit = await appealRateLimiter.check(clientIp);\n+  if (!rateLimit.allowed) {\n+    return NextResponse.json(\n+      { error: \"Too many requests\", message: \"You have exceeded the maximum number of appeals.\" },\n+      { status: 429, headers: { \"Retry-After\": String(rateLimit.retryAfterSeconds) } }\n+    );\n+  }\n+\n   let payload: {\n     actionId?: string;\n     userId?: string;\n@@ -52,12 +68,12 @@ export async function POST(request: NextRequest) {\n     return NextResponse.json({ error: \"Invalid JSON body.\" }, { status: 400 });\n   }\n \n-  const actionId = payload.actionId?.trim() ?? \"\";\n-  const userId = payload.userId?.trim() ?? \"\";\n-  const userEmail = payload.userEmail?.trim().toLowerCase() ?? \"\";\n-  const userName = payload.userName?.trim() ?? \"\";\n-  const explanation = payload.explanation?.trim() ?? \"\";\n-  const honeypot = payload.company?.trim();\n+  const actionId = typeof payload.actionId === \"string\" ? payload.actionId.trim() : \"\";\n+  const userId = typeof payload.userId === \"string\" ? payload.userId.trim() : \"\";\n+  const userEmail = typeof payload.userEmail === \"string\" ? payload.userEmail.trim().toLowerCase() : \"\";\n+  const userName = typeof payload.userName === \"string\" ? payload.userName.trim() : \"\";\n+  const explanation = typeof payload.explanation === \"string\" ? payload.explanation.trim() : \"\";\n+  const honeypot = typeof payload.company === \"string\" ? payload.company.trim() : undefined;\n \n   // Honeypot check\n   if (honeypot) {"
+    },
+    {
+      "sha": "af5a455d91d254cf06d37ab5e76b674b350539ab",
+      "filename": "apps/web/src/app/api/dmca/route.test.ts",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 1,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/jeffreysprompts.com/blob/af1389afd4c8a643ca936f8713118ca82a7a29b8/apps%2Fweb%2Fsrc%2Fapp%2Fapi%2Fdmca%2Froute.test.ts",
+      "raw_url": "https://github.com/Dicklesworthstone/jeffreysprompts.com/raw/af1389afd4c8a643ca936f8713118ca82a7a29b8/apps%2Fweb%2Fsrc%2Fapp%2Fapi%2Fdmca%2Froute.test.ts",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/jeffreysprompts.com/contents/apps%2Fweb%2Fsrc%2Fapp%2Fapi%2Fdmca%2Froute.test.ts?ref=af1389afd4c8a643ca936f8713118ca82a7a29b8",
+      "patch": "@@ -7,6 +7,13 @@ import { POST, GET, PUT } from \"./route\";\n \n const TOKEN = \"test-admin-token\";\n \n+vi.mock(\"@/lib/rate-limit\", () => ({\n+  createRateLimiter: () => ({\n+    check: vi.fn().mockResolvedValue({ allowed: true, remaining: 10, retryAfterSeconds: 0 }),\n+  }),\n+  getTrustedClientIp: vi.fn().mockReturnValue(\"127.0.0.1\"),\n+}));\n+\n function clearStore() {\n   const g = globalThis as unknown as Record<string, unknown>;\n   delete g[\"__jfp_dmca_store__\"];\n@@ -15,7 +22,7 @@ function clearStore() {\n function authedRequest(url: string, init?: RequestInit): NextRequest {\n   const headers = new Headers(init?.headers);\n   headers.set(\"authorization\", `Bearer ${TOKEN}`);\n-  return new NextRequest(url, { ...init, headers, signal: (init as any)?.signal || undefined } as any);\n+  return new NextRequest(url, { ...init, headers, signal: (init as unknown as Record<string, unknown>)?.signal || undefined } as unknown as Record<string, unknown>);\n }\n \n const validDmcaPayload = {"
+    },
+    {
+      "sha": "9f8a95ce010f46c8dbe83ac2f6b822acaecbad46",
+      "filename": "apps/web/src/app/api/dmca/route.ts",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 0,
+      "changes": 16,
+      "blob_url": "https://github.com/Dicklesworthstone/jeffreysprompts.com/blob/af1389afd4c8a643ca936f8713118ca82a7a29b8/apps%2Fweb%2Fsrc%2Fapp%2Fapi%2Fdmca%2Froute.ts",
+      "raw_url": "https://github.com/Dicklesworthstone/jeffreysprompts.com/raw/af1389afd4c8a643ca936f8713118ca82a7a29b8/apps%2Fweb%2Fsrc%2Fapp%2Fapi%2Fdmca%2Froute.ts",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/jeffreysprompts.com/contents/apps%2Fweb%2Fsrc%2Fapp%2Fapi%2Fdmca%2Froute.ts?ref=af1389afd4c8a643ca936f8713118ca82a7a29b8",
+      "patch": "@@ -1,6 +1,7 @@\n import { NextResponse } from \"next/server\";\n import type { NextRequest } from \"next/server\";\n import { checkAdminPermission } from \"@/lib/admin/permissions\";\n+import { createRateLimiter, getTrustedClientIp } from \"@/lib/rate-limit\";\n import type { DmcaStatus } from \"@/lib/legal/dmca\";\n import {\n   createDmcaRequest,\n@@ -12,6 +13,12 @@ import {\n   updateDmcaRequestStatus,\n } from \"@/lib/legal/dmca\";\n \n+const dmcaRateLimiter = createRateLimiter({\n+  name: \"dmca\",\n+  windowMs: 60 * 60 * 1000, // 1 hour\n+  maxRequests: 10,\n+});\n+\n const MAX_TEXT_LENGTH = 2000;\n const MAX_NAME_LENGTH = 140;\n const MAX_ADDRESS_LENGTH = 300;\n@@ -49,6 +56,15 @@ function normalizeDate(value?: string | null) {\n }\n \n export async function POST(request: NextRequest) {\n+  const clientIp = getTrustedClientIp(request);\n+  const rateLimit = await dmcaRateLimiter.check(clientIp);\n+  if (!rateLimit.allowed) {\n+    return NextResponse.json(\n+      { error: \"Too many requests\", message: \"You have exceeded the maximum number of DMCA requests.\" },\n+      { status: 429, headers: { \"Retry-After\": String(rateLimit.retryAfterSeconds) } }\n+    );\n+  }\n+\n   let payload: Record<string, unknown>;\n \n   try {"
+    },
+    {
+      "sha": "8ee8aa6acb71edb01f1cbe2ac76c7f4c99210806",
+      "filename": "apps/web/src/app/api/export/route.test.ts",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 0,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/jeffreysprompts.com/blob/af1389afd4c8a643ca936f8713118ca82a7a29b8/apps%2Fweb%2Fsrc%2Fapp%2Fapi%2Fexport%2Froute.test.ts",
+      "raw_url": "https://github.com/Dicklesworthstone/jeffreysprompts.com/raw/af1389afd4c8a643ca936f8713118ca82a7a29b8/apps%2Fweb%2Fsrc%2Fapp%2Fapi%2Fexport%2Froute.test.ts",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/jeffreysprompts.com/contents/apps%2Fweb%2Fsrc%2Fapp%2Fapi%2Fexport%2Froute.test.ts?ref=af1389afd4c8a643ca936f8713118ca82a7a29b8",
+      "patch": "@@ -9,6 +9,13 @@ import JSZip from \"jszip\";\n import { GET } from \"./route\";\n import * as promptRegistry from \"@jeffreysprompts/core/prompts/registry\";\n \n+vi.mock(\"@/lib/rate-limit\", () => ({\n+  createRateLimiter: () => ({\n+    check: vi.fn().mockResolvedValue({ allowed: true, remaining: 10, retryAfterSeconds: 0 }),\n+  }),\n+  getTrustedClientIp: vi.fn().mockReturnValue(\"127.0.0.1\"),\n+}));\n+\n function makeRequest(url: string): NextRequest {\n   return new NextRequest(url);\n }"
+    },
+    {
+      "sha": "c0c0460298244b676d6b69668c9fe4cbe01c116a",
+      "filename": "apps/web/src/app/api/export/route.ts",
+      "status": "modified",
+      "additions": 19,
+      "deletions": 0,
+      "changes": 19,
+      "blob_url": "https://github.com/Dicklesworthstone/jeffreysprompts.com/blob/af1389afd4c8a643ca936f8713118ca82a7a29b8/apps%2Fweb%2Fsrc%2Fapp%2Fapi%2Fexport%2Froute.ts",
+      "raw_url": "https://github.com/Dicklesworthstone/jeffreysprompts.com/raw/af1389afd4c8a643ca936f8713118ca82a7a29b8/apps%2Fweb%2Fsrc%2Fapp%2Fapi%2Fexport%2Froute.ts",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/jeffreysprompts.com/contents/apps%2Fweb%2Fsrc%2Fapp%2Fapi%2Fexport%2Froute.ts?ref=af1389afd4c8a643ca936f8713118ca82a7a29b8",
+      "patch": "@@ -5,12 +5,19 @@ import { getPrompt } from \"@jeffreysprompts/core/prompts/registry\";\n import { generatePromptMarkdown } from \"@jeffreysprompts/core/export/markdown\";\n import { generateSkillMd } from \"@jeffreysprompts/core/export/skills\";\n import type { Prompt } from \"@jeffreysprompts/core/prompts/types\";\n+import { createRateLimiter, getTrustedClientIp } from \"@/lib/rate-limit\";\n \n // Ensure this runs in a Node.js runtime (JSZip + core export helpers rely on Node APIs).\n export const runtime = \"nodejs\";\n \n const MAX_IDS = 200;\n \n+const exportRateLimiter = createRateLimiter({\n+  name: \"export\",\n+  windowMs: 60 * 1000, // 1 minute\n+  maxRequests: 30, // Limit exports per IP to 30/min\n+});\n+\n function parseIds(raw: string | null): string[] {\n   if (!raw) return [];\n   return raw\n@@ -36,6 +43,18 @@ function safeDownloadName(name: string): string {\n }\n \n export async function GET(request: NextRequest) {\n+  const clientIp = getTrustedClientIp(request);\n+  const rateLimit = await exportRateLimiter.check(clientIp);\n+  if (!rateLimit.allowed) {\n+    return NextResponse.json(\n+      { error: \"Too many requests\", message: \"Please try again later.\" },\n+      {\n+        status: 429,\n+        headers: { \"Retry-After\": String(rateLimit.retryAfterSeconds) },\n+      }\n+    );\n+  }\n+\n   const { searchParams } = new URL(request.url);\n \n   const format = searchParams.get(\"format\");"
+    },
+    {
+      "sha": "28918f3990594bf1b6cebf9d7a2353d9433240b5",
+      "filename": "apps/web/src/app/api/roadmap/route.test.ts",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 0,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/jeffreysprompts.com/blob/af1389afd4c8a643ca936f8713118ca82a7a29b8/apps%2Fweb%2Fsrc%2Fapp%2Fapi%2Froadmap%2Froute.test.ts",
+      "raw_url": "https://github.com/Dicklesworthstone/jeffreysprompts.com/raw/af1389afd4c8a643ca936f8713118ca82a7a29b8/apps%2Fweb%2Fsrc%2Fapp%2Fapi%2Froadmap%2Froute.test.ts",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/jeffreysprompts.com/contents/apps%2Fweb%2Fsrc%2Fapp%2Fapi%2Froadmap%2Froute.test.ts?ref=af1389afd4c8a643ca936f8713118ca82a7a29b8",
+      "patch": "@@ -26,6 +26,13 @@ vi.mock(\"@/lib/user-id\", () => ({\n   }),\n }));\n \n+vi.mock(\"@/lib/rate-limit\", () => ({\n+  createRateLimiter: () => ({\n+    check: vi.fn().mockResolvedValue({ allowed: true, remaining: 10, retryAfterSeconds: 0 }),\n+  }),\n+  getTrustedClientIp: vi.fn().mockReturnValue(\"127.0.0.1\"),\n+}));\n+\n const sampleFeatures = [\n   {\n     id: \"feat-001\","
+    },
+    {
+      "sha": "fa39f71e74241b09be57ab2674154788de2d940b",
+      "filename": "apps/web/src/app/api/roadmap/route.ts",
+      "status": "modified",
+      "additions": 19,
+      "deletions": 0,
+      "changes": 19,
+      "blob_url": "https://github.com/Dicklesworthstone/jeffreysprompts.com/blob/af1389afd4c8a643ca936f8713118ca82a7a29b8/apps%2Fweb%2Fsrc%2Fapp%2Fapi%2Froadmap%2Froute.ts",
+      "raw_url": "https://github.com/Dicklesworthstone/jeffreysprompts.com/raw/af1389afd4c8a643ca936f8713118ca82a7a29b8/apps%2Fweb%2Fsrc%2Fapp%2Fapi%2Froadmap%2Froute.ts",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/jeffreysprompts.com/contents/apps%2Fweb%2Fsrc%2Fapp%2Fapi%2Froadmap%2Froute.ts?ref=af1389afd4c8a643ca936f8713118ca82a7a29b8",
+      "patch": "@@ -7,6 +7,13 @@ import {\n   type FeatureStatus,\n } from \"@/lib/roadmap/roadmap-store\";\n import { getOrCreateUserId } from \"@/lib/user-id\";\n+import { createRateLimiter, getTrustedClientIp } from \"@/lib/rate-limit\";\n+\n+const roadmapRateLimiter = createRateLimiter({\n+  name: \"roadmap\",\n+  windowMs: 60 * 60 * 1000, // 1 hour\n+  maxRequests: 5, // Limit feature requests to 5 per hour per IP\n+});\n \n /**\n  * GET /api/roadmap\n@@ -93,6 +100,18 @@ export async function GET(request: NextRequest) {\n  * Uses the signed anonymous user cookie to track the submitter.\n  */\n export async function POST(request: NextRequest) {\n+  const clientIp = getTrustedClientIp(request);\n+  const rateLimit = await roadmapRateLimiter.check(clientIp);\n+  if (!rateLimit.allowed) {\n+    return NextResponse.json(\n+      { error: \"Too many requests\", message: \"You can only submit 5 feature requests per hour.\" },\n+      {\n+        status: 429,\n+        headers: { \"Retry-After\": String(rateLimit.retryAfterSeconds) },\n+      }\n+    );\n+  }\n+\n   try {\n     const body = await request.json();\n "
+    }
+  ]
+}

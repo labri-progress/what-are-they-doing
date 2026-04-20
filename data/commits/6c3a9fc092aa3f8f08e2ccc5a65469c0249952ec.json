@@ -1,0 +1,41 @@
+{
+  "message": "fix: handle extension relay session reuse",
+  "files": [
+    {
+      "sha": "45839520d75671e63a810637626aee33753265eb",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6c3a9fc092aa3f8f08e2ccc5a65469c0249952ec/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6c3a9fc092aa3f8f08e2ccc5a65469c0249952ec/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=6c3a9fc092aa3f8f08e2ccc5a65469c0249952ec",
+      "patch": "@@ -48,6 +48,7 @@ Docs: https://docs.clawd.bot\n - Agents: treat plugin-only tool allowlists as opt-ins; keep core tools enabled. (#1467)\n - Exec approvals: persist allowlist entry ids to keep macOS allowlist rows stable. (#1521) Thanks @ngutman.\n - MS Teams (plugin): remove `.default` suffix from Graph scopes to avoid double-appending. (#1507) Thanks @Evizero.\n+- Browser: keep extension relay tabs controllable when the extension reuses a session id after switching tabs. (#1160)\n \n ## 2026.1.22\n "
+    },
+    {
+      "sha": "e1cd67eed1795d09e2ab68009d02ee4881cddadb",
+      "filename": "src/browser/extension-relay.test.ts",
+      "status": "modified",
+      "additions": 67,
+      "deletions": 0,
+      "changes": 67,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6c3a9fc092aa3f8f08e2ccc5a65469c0249952ec/src%2Fbrowser%2Fextension-relay.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6c3a9fc092aa3f8f08e2ccc5a65469c0249952ec/src%2Fbrowser%2Fextension-relay.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fbrowser%2Fextension-relay.test.ts?ref=6c3a9fc092aa3f8f08e2ccc5a65469c0249952ec",
+      "patch": "@@ -247,4 +247,71 @@ describe(\"chrome extension relay server\", () => {\n     cdp.close();\n     ext.close();\n   }, 15_000);\n+\n+  it(\"rebroadcasts attach when a session id is reused for a new target\", async () => {\n+    const port = await getFreePort();\n+    cdpUrl = `http://127.0.0.1:${port}`;\n+    await ensureChromeExtensionRelayServer({ cdpUrl });\n+\n+    const ext = new WebSocket(`ws://127.0.0.1:${port}/extension`);\n+    await waitForOpen(ext);\n+\n+    const cdp = new WebSocket(`ws://127.0.0.1:${port}/cdp`);\n+    await waitForOpen(cdp);\n+    const q = createMessageQueue(cdp);\n+\n+    ext.send(\n+      JSON.stringify({\n+        method: \"forwardCDPEvent\",\n+        params: {\n+          method: \"Target.attachedToTarget\",\n+          params: {\n+            sessionId: \"shared-session\",\n+            targetInfo: {\n+              targetId: \"t1\",\n+              type: \"page\",\n+              title: \"First\",\n+              url: \"https://example.com\",\n+            },\n+            waitingForDebugger: false,\n+          },\n+        },\n+      }),\n+    );\n+\n+    const first = JSON.parse(await q.next()) as { method?: string; params?: unknown };\n+    expect(first.method).toBe(\"Target.attachedToTarget\");\n+    expect(JSON.stringify(first.params ?? {})).toContain(\"t1\");\n+\n+    ext.send(\n+      JSON.stringify({\n+        method: \"forwardCDPEvent\",\n+        params: {\n+          method: \"Target.attachedToTarget\",\n+          params: {\n+            sessionId: \"shared-session\",\n+            targetInfo: {\n+              targetId: \"t2\",\n+              type: \"page\",\n+              title: \"Second\",\n+              url: \"https://example.org\",\n+            },\n+            waitingForDebugger: false,\n+          },\n+        },\n+      }),\n+    );\n+\n+    const received: Array<{ method?: string; params?: unknown }> = [];\n+    received.push(JSON.parse(await q.next()) as never);\n+    received.push(JSON.parse(await q.next()) as never);\n+\n+    const detached = received.find((m) => m.method === \"Target.detachedFromTarget\");\n+    const attached = received.find((m) => m.method === \"Target.attachedToTarget\");\n+    expect(JSON.stringify(detached?.params ?? {})).toContain(\"t1\");\n+    expect(JSON.stringify(attached?.params ?? {})).toContain(\"t2\");\n+\n+    cdp.close();\n+    ext.close();\n+  });\n });"
+    },
+    {
+      "sha": "f93ff0abe01fca476f895547093d42470410e136",
+      "filename": "src/browser/extension-relay.ts",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 3,
+      "changes": 16,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6c3a9fc092aa3f8f08e2ccc5a65469c0249952ec/src%2Fbrowser%2Fextension-relay.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6c3a9fc092aa3f8f08e2ccc5a65469c0249952ec/src%2Fbrowser%2Fextension-relay.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fbrowser%2Fextension-relay.ts?ref=6c3a9fc092aa3f8f08e2ccc5a65469c0249952ec",
+      "patch": "@@ -477,13 +477,23 @@ export async function ensureChromeExtensionRelayServer(opts: {\n           const targetType = attached?.targetInfo?.type ?? \"page\";\n           if (targetType !== \"page\") return;\n           if (attached?.sessionId && attached?.targetInfo?.targetId) {\n-            const already = connectedTargets.has(attached.sessionId);\n+            const prev = connectedTargets.get(attached.sessionId);\n+            const nextTargetId = attached.targetInfo.targetId;\n+            const prevTargetId = prev?.targetId;\n+            const changedTarget = Boolean(prev && prevTargetId && prevTargetId !== nextTargetId);\n             connectedTargets.set(attached.sessionId, {\n               sessionId: attached.sessionId,\n-              targetId: attached.targetInfo.targetId,\n+              targetId: nextTargetId,\n               targetInfo: attached.targetInfo,\n             });\n-            if (!already) {\n+            if (changedTarget && prevTargetId) {\n+              broadcastToCdpClients({\n+                method: \"Target.detachedFromTarget\",\n+                params: { sessionId: attached.sessionId, targetId: prevTargetId },\n+                sessionId: attached.sessionId,\n+              });\n+            }\n+            if (!prev || changedTarget) {\n               broadcastToCdpClients({ method, params, sessionId });\n             }\n             return;"
+    }
+  ]
+}

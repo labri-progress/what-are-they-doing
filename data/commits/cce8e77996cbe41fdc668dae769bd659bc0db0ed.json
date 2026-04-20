@@ -1,0 +1,17 @@
+{
+  "message": "Reduce from_kafka timeout poll churn",
+  "files": [
+    {
+      "sha": "7a5d79684eb3e9e49240ddaa31dc6bcd3e3b1691",
+      "filename": "plugins/kafka/builtins/from_kafka.cpp",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 7,
+      "changes": 27,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/cce8e77996cbe41fdc668dae769bd659bc0db0ed/plugins%2Fkafka%2Fbuiltins%2Ffrom_kafka.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/cce8e77996cbe41fdc668dae769bd659bc0db0ed/plugins%2Fkafka%2Fbuiltins%2Ffrom_kafka.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/plugins%2Fkafka%2Fbuiltins%2Ffrom_kafka.cpp?ref=cce8e77996cbe41fdc668dae769bd659bc0db0ed",
+      "patch": "@@ -101,8 +101,8 @@ constexpr auto default_batch_timeout = 100ms;\n /// Default upper bound for one Kafka notification wait in the source poll loop.\n constexpr auto default_fetch_wait_timeout = 1ms;\n \n-/// Maximum adaptive wait used after repeated empty fetch timeouts.\n-constexpr auto fetch_wait_backoff_cap = 16ms;\n+/// Maximum adaptive wait floor for source poll timeout backoff.\n+constexpr auto fetch_wait_backoff_floor = 16ms;\n \n /// Number of consecutive idle timeouts before doubling fetch wait.\n constexpr auto fetch_wait_backoff_after = 8uz;\n@@ -879,9 +879,13 @@ class FromKafkaOperator final : public Operator<void, table_slice> {\n     auto state = FetchPollState{};\n     state.base_poll_wait = std::max(args_._fetch_wait_timeout, min_wait);\n     state.poll_wait = state.base_poll_wait;\n+    // Allow backoff to grow up to the batch flush horizon, so partial batches\n+    // do not spin in short timeout polls while waiting for additional records.\n     auto poll_wait_cap\n       = std::max(state.base_poll_wait,\n-                 std::chrono::duration_cast<duration>(fetch_wait_backoff_cap));\n+                 std::max(args_._batch_timeout,\n+                          std::chrono::duration_cast<duration>(\n+                            fetch_wait_backoff_floor)));\n     while (pending_messages.size() < max_messages\n            and not is_pipeline_stopping()) {\n       auto wait = std::chrono::duration_cast<std::chrono::milliseconds>(\n@@ -915,13 +919,22 @@ class FromKafkaOperator final : public Operator<void, table_slice> {\n       if (batch.messages.empty()) {\n         if (batch.timed_out) {\n           add_perf_counter(perf_.fetch_timeouts);\n-          if (not pending_messages.empty()) {\n-            break;\n-          }\n           ++state.consecutive_empty_timeouts;\n-          if (state.consecutive_empty_timeouts >= fetch_wait_backoff_after) {\n+          // Once we already have some data in the current source window, back\n+          // off on every timeout and keep waiting until the flush deadline.\n+          auto should_backoff = not pending_messages.empty()\n+                                or state.consecutive_empty_timeouts\n+                                     >= fetch_wait_backoff_after;\n+          if (should_backoff) {\n             state.poll_wait = std::min(poll_wait_cap, state.poll_wait * 2);\n           }\n+          if (not pending_messages.empty()) {\n+            TENZIR_ASSERT(state.batch_deadline);\n+            if (std::chrono::steady_clock::now() < *state.batch_deadline) {\n+              continue;\n+            }\n+            break;\n+          }\n           continue;\n         }\n         break;"
+    }
+  ]
+}

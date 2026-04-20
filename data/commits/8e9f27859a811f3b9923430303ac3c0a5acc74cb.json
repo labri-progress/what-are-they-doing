@@ -1,0 +1,101 @@
+{
+  "message": "chore: merge origin/main into feature/audio-messages",
+  "files": [
+    {
+      "sha": "4ce55a5cf86b1c5f1dd523a15ac43895a886b5e9",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 1,
+      "changes": 4,
+      "blob_url": "https://github.com/steipete/imsg/blob/8e9f27859a811f3b9923430303ac3c0a5acc74cb/CHANGELOG.md",
+      "raw_url": "https://github.com/steipete/imsg/raw/8e9f27859a811f3b9923430303ac3c0a5acc74cb/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/steipete/imsg/contents/CHANGELOG.md?ref=8e9f27859a811f3b9923430303ac3c0a5acc74cb",
+      "patch": "@@ -1,10 +1,12 @@\n # Changelog\n \n-## Unreleased (0.3.1)\n+## Unreleased (0.3.2)\n+- fix: prefer chat guid for chat_id sends to avoid 1:1 AppleScript errors (thanks @mshuffett)\n - chore: replace pnpm scripts with make targets\n - build: add universal binary build helper\n - ci: switch to make-based lint/test/build\n - docs: update build/test/release instructions\n+- fix: stage message attachments in Messages attachments directory (thanks @antons)\n - feat: surface audio message transcriptions (thanks @antons)\n \n ## 0.3.0 - 2026-01-02"
+    },
+    {
+      "sha": "cf84bc679900a52cd172871fc5d5cfc4437ee0f3",
+      "filename": "Sources/IMsgCore/MessageSender.swift",
+      "status": "modified",
+      "additions": 80,
+      "deletions": 3,
+      "changes": 83,
+      "blob_url": "https://github.com/steipete/imsg/blob/8e9f27859a811f3b9923430303ac3c0a5acc74cb/Sources%2FIMsgCore%2FMessageSender.swift",
+      "raw_url": "https://github.com/steipete/imsg/raw/8e9f27859a811f3b9923430303ac3c0a5acc74cb/Sources%2FIMsgCore%2FMessageSender.swift",
+      "contents_url": "https://api.github.com/repos/steipete/imsg/contents/Sources%2FIMsgCore%2FMessageSender.swift?ref=8e9f27859a811f3b9923430303ac3c0a5acc74cb",
+      "patch": "@@ -38,32 +38,79 @@ public struct MessageSendOptions: Sendable {\n public struct MessageSender {\n   private let normalizer: PhoneNumberNormalizer\n   private let runner: (String, [String]) throws -> Void\n+  private let attachmentsSubdirectoryProvider: () -> URL\n \n   public init() {\n     self.normalizer = PhoneNumberNormalizer()\n     self.runner = MessageSender.runAppleScript\n+    self.attachmentsSubdirectoryProvider = MessageSender.defaultAttachmentsSubdirectory\n   }\n \n   init(runner: @escaping (String, [String]) throws -> Void) {\n     self.normalizer = PhoneNumberNormalizer()\n     self.runner = runner\n+    self.attachmentsSubdirectoryProvider = MessageSender.defaultAttachmentsSubdirectory\n+  }\n+\n+  init(\n+    runner: @escaping (String, [String]) throws -> Void,\n+    attachmentsSubdirectoryProvider: @escaping () -> URL\n+  ) {\n+    self.normalizer = PhoneNumberNormalizer()\n+    self.runner = runner\n+    self.attachmentsSubdirectoryProvider = attachmentsSubdirectoryProvider\n   }\n \n   public func send(_ options: MessageSendOptions) throws {\n     var resolved = options\n-    let chatTarget = resolved.chatIdentifier.isEmpty ? resolved.chatGUID : resolved.chatIdentifier\n+    let chatTarget = resolveChatTarget(&resolved)\n     let useChat = !chatTarget.isEmpty\n     if useChat == false {\n       if resolved.region.isEmpty { resolved.region = \"US\" }\n       resolved.recipient = normalizer.normalize(resolved.recipient, region: resolved.region)\n       if resolved.service == .auto { resolved.service = .imessage }\n-    } else if chatTarget.isEmpty {\n-      throw IMsgError.invalidChatTarget(\"Missing chat identifier or guid\")\n+    }\n+\n+    if resolved.attachmentPath.isEmpty == false {\n+      resolved.attachmentPath = try stageAttachment(at: resolved.attachmentPath)\n     }\n \n     try sendViaAppleScript(resolved, chatTarget: chatTarget, useChat: useChat)\n   }\n \n+  private func stageAttachment(at path: String) throws -> String {\n+    let expandedPath = (path as NSString).expandingTildeInPath\n+    let sourceURL = URL(fileURLWithPath: expandedPath)\n+    let fileManager = FileManager.default\n+    guard fileManager.fileExists(atPath: sourceURL.path) else {\n+      throw IMsgError.appleScriptFailure(\"Attachment not found at \\(sourceURL.path)\")\n+    }\n+\n+    let subdirectory = attachmentsSubdirectoryProvider()\n+    try fileManager.createDirectory(at: subdirectory, withIntermediateDirectories: true)\n+    let attachmentDir = subdirectory.appendingPathComponent(\n+      UUID().uuidString,\n+      isDirectory: true\n+    )\n+    try fileManager.createDirectory(at: attachmentDir, withIntermediateDirectories: true)\n+    let destination = attachmentDir.appendingPathComponent(\n+      sourceURL.lastPathComponent,\n+      isDirectory: false\n+    )\n+    try fileManager.copyItem(at: sourceURL, to: destination)\n+    return destination.path\n+  }\n+\n+  private static func defaultAttachmentsSubdirectory() -> URL {\n+    let fileManager = FileManager.default\n+    let home = fileManager.homeDirectoryForCurrentUser\n+    let messagesRoot = home.appendingPathComponent(\n+      \"Library/Messages/Attachments\",\n+      isDirectory: true\n+    )\n+    return messagesRoot.appendingPathComponent(\"imsg\", isDirectory: true)\n+  }\n+\n   private func sendViaAppleScript(\n     _ resolved: MessageSendOptions,\n     chatTarget: String,\n@@ -124,6 +171,36 @@ public struct MessageSender {\n       \"\"\"\n   }\n \n+  private func resolveChatTarget(_ options: inout MessageSendOptions) -> String {\n+    let guid = options.chatGUID.trimmingCharacters(in: .whitespacesAndNewlines)\n+    if !guid.isEmpty {\n+      return guid\n+    }\n+    let identifier = options.chatIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)\n+    if identifier.isEmpty {\n+      return \"\"\n+    }\n+    if looksLikeHandle(identifier) {\n+      if options.recipient.isEmpty {\n+        options.recipient = identifier\n+      }\n+      return \"\"\n+    }\n+    return identifier\n+  }\n+\n+  private func looksLikeHandle(_ value: String) -> Bool {\n+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)\n+    if trimmed.isEmpty { return false }\n+    let lower = trimmed.lowercased()\n+    if lower.hasPrefix(\"imessage:\") || lower.hasPrefix(\"sms:\") || lower.hasPrefix(\"auto:\") {\n+      return true\n+    }\n+    if trimmed.contains(\"@\") { return true }\n+    let allowed = CharacterSet(charactersIn: \"+0123456789 ()-\")\n+    return trimmed.rangeOfCharacter(from: allowed.inverted) == nil\n+  }\n+\n   private static func runAppleScript(source: String, arguments: [String]) throws {\n     guard let script = NSAppleScript(source: source) else {\n       throw IMsgError.appleScriptFailure(\"Unable to compile AppleScript\")"
+    },
+    {
+      "sha": "428f1957e81dddf42ab5fdd1aed122d685cd66b3",
+      "filename": "Sources/imsg/Resources/Info.plist",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/steipete/imsg/blob/8e9f27859a811f3b9923430303ac3c0a5acc74cb/Sources%2Fimsg%2FResources%2FInfo.plist",
+      "raw_url": "https://github.com/steipete/imsg/raw/8e9f27859a811f3b9923430303ac3c0a5acc74cb/Sources%2Fimsg%2FResources%2FInfo.plist",
+      "contents_url": "https://api.github.com/repos/steipete/imsg/contents/Sources%2Fimsg%2FResources%2FInfo.plist?ref=8e9f27859a811f3b9923430303ac3c0a5acc74cb",
+      "patch": "@@ -11,9 +11,9 @@\n   <key>CFBundlePackageType</key>\n   <string>APPL</string>\n   <key>CFBundleShortVersionString</key>\n-  <string>0.3.1</string>\n+  <string>0.3.2</string>\n   <key>CFBundleVersion</key>\n-  <string>0.3.1</string>\n+  <string>0.3.2</string>\n   <key>NSAppleEventsUsageDescription</key>\n   <string>Send messages via Messages.app.</string>\n </dict>"
+    },
+    {
+      "sha": "907618720d914321626ad4d699c276212970aaf6",
+      "filename": "Sources/imsg/Version.swift",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/steipete/imsg/blob/8e9f27859a811f3b9923430303ac3c0a5acc74cb/Sources%2Fimsg%2FVersion.swift",
+      "raw_url": "https://github.com/steipete/imsg/raw/8e9f27859a811f3b9923430303ac3c0a5acc74cb/Sources%2Fimsg%2FVersion.swift",
+      "contents_url": "https://api.github.com/repos/steipete/imsg/contents/Sources%2Fimsg%2FVersion.swift?ref=8e9f27859a811f3b9923430303ac3c0a5acc74cb",
+      "patch": "@@ -1,4 +1,4 @@\n // Generated by scripts/generate-version.sh. Do not edit.\n enum IMsgVersion {\n-  static let current = \"0.3.1\"\n+  static let current = \"0.3.2\"\n }"
+    },
+    {
+      "sha": "ab270d97b9567c2e3a4e33ac04cda3d43664ff35",
+      "filename": "Tests/IMsgCoreTests/UtilityTests.swift",
+      "status": "modified",
+      "additions": 147,
+      "deletions": 5,
+      "changes": 152,
+      "blob_url": "https://github.com/steipete/imsg/blob/8e9f27859a811f3b9923430303ac3c0a5acc74cb/Tests%2FIMsgCoreTests%2FUtilityTests.swift",
+      "raw_url": "https://github.com/steipete/imsg/raw/8e9f27859a811f3b9923430303ac3c0a5acc74cb/Tests%2FIMsgCoreTests%2FUtilityTests.swift",
+      "contents_url": "https://api.github.com/repos/steipete/imsg/contents/Tests%2FIMsgCoreTests%2FUtilityTests.swift?ref=8e9f27859a811f3b9923430303ac3c0a5acc74cb",
+      "patch": "@@ -140,26 +140,168 @@ func messageSenderBuildsArguments() throws {\n \n @Test\n func messageSenderUsesChatIdentifier() throws {\n+  let fileManager = FileManager.default\n+  let tempDir = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)\n+  try fileManager.createDirectory(at: tempDir, withIntermediateDirectories: true)\n+  defer { try? fileManager.removeItem(at: tempDir) }\n+  let attachment = tempDir.appendingPathComponent(\"file.dat\")\n+  try Data(\"hello\".utf8).write(to: attachment)\n+  let attachmentsSubdirectory = tempDir.appendingPathComponent(\"staged\")\n+  try fileManager.createDirectory(at: attachmentsSubdirectory, withIntermediateDirectories: true)\n+\n   var captured: [String] = []\n-  let sender = MessageSender(runner: { _, args in\n-    captured = args\n-  })\n+  let sender = MessageSender(\n+    runner: { _, args in captured = args },\n+    attachmentsSubdirectoryProvider: { attachmentsSubdirectory }\n+  )\n   try sender.send(\n     MessageSendOptions(\n       recipient: \"\",\n       text: \"hi\",\n-      attachmentPath: \"/tmp/file.dat\",\n+      attachmentPath: attachment.path,\n       service: .sms,\n       region: \"US\",\n       chatIdentifier: \"iMessage;+;chat123\",\n       chatGUID: \"ignored-guid\"\n     )\n   )\n-  #expect(captured[5] == \"iMessage;+;chat123\")\n+  #expect(captured[5] == \"ignored-guid\")\n   #expect(captured[6] == \"1\")\n   #expect(captured[4] == \"1\")\n }\n \n+@Test\n+func messageSenderStagesAttachmentsBeforeSend() throws {\n+  let fileManager = FileManager.default\n+  let attachmentsSubdirectory = fileManager.temporaryDirectory.appendingPathComponent(\n+    UUID().uuidString\n+  )\n+  try fileManager.createDirectory(at: attachmentsSubdirectory, withIntermediateDirectories: true)\n+  defer { try? fileManager.removeItem(at: attachmentsSubdirectory) }\n+  let sourceDir = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)\n+  try fileManager.createDirectory(at: sourceDir, withIntermediateDirectories: true)\n+  defer { try? fileManager.removeItem(at: sourceDir) }\n+  let sourceFile = sourceDir.appendingPathComponent(\"sample.txt\")\n+  let payload = Data(\"hi\".utf8)\n+  try payload.write(to: sourceFile)\n+\n+  var captured: [String] = []\n+  let sender = MessageSender(\n+    runner: { _, args in captured = args },\n+    attachmentsSubdirectoryProvider: { attachmentsSubdirectory }\n+  )\n+\n+  try sender.send(\n+    MessageSendOptions(\n+      recipient: \"+16502530000\",\n+      text: \"\",\n+      attachmentPath: sourceFile.path,\n+      service: .imessage,\n+      region: \"US\"\n+    )\n+  )\n+\n+  let stagedPath = captured[3]\n+  #expect(stagedPath != sourceFile.path)\n+  #expect(stagedPath.hasPrefix(attachmentsSubdirectory.path))\n+  #expect(fileManager.fileExists(atPath: stagedPath))\n+  let stagedData = try Data(contentsOf: URL(fileURLWithPath: stagedPath))\n+  #expect(stagedData == payload)\n+}\n+\n+@Test\n+func messageSenderThrowsWhenAttachmentsSubdirectoryIsReadOnly() throws {\n+  let fileManager = FileManager.default\n+  let readOnlyRoot = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)\n+  try fileManager.createDirectory(at: readOnlyRoot, withIntermediateDirectories: true)\n+  try fileManager.setAttributes([.posixPermissions: 0o555], ofItemAtPath: readOnlyRoot.path)\n+  defer {\n+    try? fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: readOnlyRoot.path)\n+    try? fileManager.removeItem(at: readOnlyRoot)\n+  }\n+  let sourceFile = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString)\n+  let payload = Data(\"payload\".utf8)\n+  try payload.write(to: sourceFile)\n+  defer { try? fileManager.removeItem(at: sourceFile) }\n+\n+  let sender = MessageSender(\n+    runner: { _, _ in },\n+    attachmentsSubdirectoryProvider: { readOnlyRoot }\n+  )\n+\n+  do {\n+    try sender.send(\n+      MessageSendOptions(\n+        recipient: \"+16502530000\",\n+        text: \"\",\n+        attachmentPath: sourceFile.path,\n+        service: .imessage,\n+        region: \"US\"\n+      )\n+    )\n+    #expect(Bool(false))\n+  } catch {\n+    #expect(Bool(true))\n+  }\n+}\n+\n+@Test\n+func messageSenderThrowsWhenAttachmentMissing() {\n+  let fileManager = FileManager.default\n+  let attachmentsSubdirectory = fileManager.temporaryDirectory.appendingPathComponent(\n+    UUID().uuidString\n+  )\n+  try? fileManager.createDirectory(at: attachmentsSubdirectory, withIntermediateDirectories: true)\n+  defer { try? fileManager.removeItem(at: attachmentsSubdirectory) }\n+  let missingFile = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString).path\n+  var runnerCalled = false\n+  let sender = MessageSender(\n+    runner: { _, _ in runnerCalled = true },\n+    attachmentsSubdirectoryProvider: { attachmentsSubdirectory }\n+  )\n+\n+  do {\n+    try sender.send(\n+      MessageSendOptions(\n+        recipient: \"+16502530000\",\n+        text: \"\",\n+        attachmentPath: missingFile,\n+        service: .imessage,\n+        region: \"US\"\n+      )\n+    )\n+    #expect(Bool(false))\n+  } catch let error as IMsgError {\n+    #expect(error.errorDescription?.contains(\"Attachment not found\") == true)\n+  } catch {\n+    #expect(Bool(false))\n+  }\n+\n+  #expect(runnerCalled == false)\n+}\n+\n+@Test\n+func messageSenderTreatsHandleIdentifierAsRecipient() throws {\n+  var captured: [String] = []\n+  let sender = MessageSender(runner: { _, args in\n+    captured = args\n+  })\n+  try sender.send(\n+    MessageSendOptions(\n+      recipient: \"\",\n+      text: \"hi\",\n+      attachmentPath: \"\",\n+      service: .auto,\n+      region: \"US\",\n+      chatIdentifier: \"+16502530000\",\n+      chatGUID: \"\"\n+    )\n+  )\n+  #expect(captured[0] == \"+16502530000\")\n+  #expect(captured[5].isEmpty)\n+  #expect(captured[6] == \"0\")\n+}\n+\n @Test\n func errorDescriptionsIncludeDetails() {\n   let error = IMsgError.invalidService(\"weird\")"
+    },
+    {
+      "sha": "9f5a7a3781be25f875b43d5f56ceca1928b224e9",
+      "filename": "Tests/imsgTests/CommandTests.swift",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/steipete/imsg/blob/8e9f27859a811f3b9923430303ac3c0a5acc74cb/Tests%2FimsgTests%2FCommandTests.swift",
+      "raw_url": "https://github.com/steipete/imsg/raw/8e9f27859a811f3b9923430303ac3c0a5acc74cb/Tests%2FimsgTests%2FCommandTests.swift",
+      "contents_url": "https://api.github.com/repos/steipete/imsg/contents/Tests%2FimsgTests%2FCommandTests.swift?ref=8e9f27859a811f3b9923430303ac3c0a5acc74cb",
+      "patch": "@@ -192,6 +192,7 @@ func sendCommandResolvesChatID() async throws {\n     })\n   #expect(captured?.chatIdentifier == \"+123\")\n   #expect(captured?.chatGUID == \"iMessage;+;chat123\")\n+  #expect(captured?.recipient.isEmpty == true)\n }\n \n @Test"
+    },
+    {
+      "sha": "505c91b4fa7dc6f76f85c743f7169f3fa9ba6513",
+      "filename": "Tests/imsgTests/RPCServerTests.swift",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/steipete/imsg/blob/8e9f27859a811f3b9923430303ac3c0a5acc74cb/Tests%2FimsgTests%2FRPCServerTests.swift",
+      "raw_url": "https://github.com/steipete/imsg/raw/8e9f27859a811f3b9923430303ac3c0a5acc74cb/Tests%2FimsgTests%2FRPCServerTests.swift",
+      "contents_url": "https://api.github.com/repos/steipete/imsg/contents/Tests%2FimsgTests%2FRPCServerTests.swift?ref=8e9f27859a811f3b9923430303ac3c0a5acc74cb",
+      "patch": "@@ -171,6 +171,7 @@ func rpcSendResolvesChatID() async throws {\n \n   #expect(captured?.chatIdentifier == \"iMessage;+;chat123\")\n   #expect(captured?.chatGUID == \"iMessage;+;chat123\")\n+  #expect(captured?.recipient.isEmpty == true)\n   #expect(output.responses.first?[\"result\"] as? [String: Any] != nil)\n }\n "
+    },
+    {
+      "sha": "994804f8bd32149f3e11fc3fb8994d038183ae97",
+      "filename": "version.env",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/steipete/imsg/blob/8e9f27859a811f3b9923430303ac3c0a5acc74cb/version.env",
+      "raw_url": "https://github.com/steipete/imsg/raw/8e9f27859a811f3b9923430303ac3c0a5acc74cb/version.env",
+      "contents_url": "https://api.github.com/repos/steipete/imsg/contents/version.env?ref=8e9f27859a811f3b9923430303ac3c0a5acc74cb",
+      "patch": "@@ -1 +1 @@\n-MARKETING_VERSION=0.3.1\n+MARKETING_VERSION=0.3.2"
+    }
+  ]
+}

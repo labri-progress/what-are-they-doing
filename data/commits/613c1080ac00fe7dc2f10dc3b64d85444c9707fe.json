@@ -1,0 +1,41 @@
+{
+  "message": "fix: improve triage cache isolation, grep highlighting, and load reading\n\nThree independent fixes to improve reliability:\n\n1. internal/bv/triage.go - Directory-aware triage cache\n   - Added triageCacheDir to track which directory the cache is for\n   - Cache now validates both TTL AND directory match before returning\n   - Fixes bug where switching projects could return stale triage data\n   - InvalidateTriageCache now also clears the cached directory\n\n2. internal/cli/grep.go - Case-sensitivity aware highlighting\n   - Added CaseInsensitive field to GrepResult struct for JSON output\n   - highlightMatch() now respects the actual search case-sensitivity\n   - Previously always used (?i) flag regardless of search options\n   - Highlighting now matches what was actually found in search\n\n3. internal/robot/health.go - Direct file read for load average\n   - Replaced exec.Command(\"cat\", \"/proc/loadavg\") with os.ReadFile()\n   - Eliminates process spawn overhead for a simple file read\n   - More idiomatic Go for reading procfs\n   - Slightly faster health checks\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "b17cb67f997a27c32f75c33904014d3e5a2e061b",
+      "filename": "internal/bv/triage.go",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 2,
+      "changes": 8,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/613c1080ac00fe7dc2f10dc3b64d85444c9707fe/internal%2Fbv%2Ftriage.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/613c1080ac00fe7dc2f10dc3b64d85444c9707fe/internal%2Fbv%2Ftriage.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fbv%2Ftriage.go?ref=613c1080ac00fe7dc2f10dc3b64d85444c9707fe",
+      "patch": "@@ -14,6 +14,7 @@ const TriageCacheTTL = 30 * time.Second\n \n var (\n \ttriageCache     *TriageResponse\n+\ttriageCacheDir  string\n \ttriageCacheTime time.Time\n \ttriageCacheTTL  = TriageCacheTTL\n \ttriageCacheMu   sync.Mutex\n@@ -25,8 +26,8 @@ func GetTriage(dir string) (*TriageResponse, error) {\n \ttriageCacheMu.Lock()\n \tdefer triageCacheMu.Unlock()\n \n-\t// Return cached result if still valid\n-\tif triageCache != nil && time.Since(triageCacheTime) < triageCacheTTL {\n+\t// Return cached result if still valid and for the same directory\n+\tif triageCache != nil && triageCacheDir == dir && time.Since(triageCacheTime) < triageCacheTTL {\n \t\treturn triageCache, nil\n \t}\n \n@@ -42,6 +43,7 @@ func GetTriage(dir string) (*TriageResponse, error) {\n \n \t// Update cache\n \ttriageCache = &resp\n+\ttriageCacheDir = dir\n \ttriageCacheTime = time.Now()\n \n \treturn &resp, nil\n@@ -62,6 +64,7 @@ func GetTriageNoCache(dir string) (*TriageResponse, error) {\n \t// Also update cache with fresh data\n \ttriageCacheMu.Lock()\n \ttriageCache = &resp\n+\ttriageCacheDir = dir\n \ttriageCacheTime = time.Now()\n \ttriageCacheMu.Unlock()\n \n@@ -73,6 +76,7 @@ func GetTriageNoCache(dir string) (*TriageResponse, error) {\n func InvalidateTriageCache() {\n \ttriageCacheMu.Lock()\n \ttriageCache = nil\n+\ttriageCacheDir = \"\"\n \ttriageCacheTTL = TriageCacheTTL // Reset to default\n \ttriageCacheMu.Unlock()\n }"
+    },
+    {
+      "sha": "cc532308de6c334e21e743edbac85c687e9d1ca6",
+      "filename": "internal/cli/grep.go",
+      "status": "modified",
+      "additions": 27,
+      "deletions": 17,
+      "changes": 44,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/613c1080ac00fe7dc2f10dc3b64d85444c9707fe/internal%2Fcli%2Fgrep.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/613c1080ac00fe7dc2f10dc3b64d85444c9707fe/internal%2Fcli%2Fgrep.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fcli%2Fgrep.go?ref=613c1080ac00fe7dc2f10dc3b64d85444c9707fe",
+      "patch": "@@ -31,12 +31,13 @@ type GrepMatch struct {\n \n // GrepResult contains all matches from a grep operation\n type GrepResult struct {\n-\tPattern    string      `json:\"pattern\"`\n-\tSession    string      `json:\"session\"`\n-\tMatches    []GrepMatch `json:\"matches\"`\n-\tTotalLines int         `json:\"total_lines_searched\"`\n-\tMatchCount int         `json:\"match_count\"`\n-\tPaneCount  int         `json:\"panes_searched\"`\n+\tPattern         string      `json:\"pattern\"`\n+\tSession         string      `json:\"session\"`\n+\tMatches         []GrepMatch `json:\"matches\"`\n+\tTotalLines      int         `json:\"total_lines_searched\"`\n+\tMatchCount      int         `json:\"match_count\"`\n+\tPaneCount       int         `json:\"panes_searched\"`\n+\tCaseInsensitive bool        `json:\"case_insensitive,omitempty\"`\n }\n \n // Text outputs the grep result as human-readable text\n@@ -80,7 +81,7 @@ func (r *GrepResult) Text(w io.Writer) error {\n \t\t// Print matching line with highlighting\n \t\tfmt.Fprintf(w, \"%s%s/%s:%d:%s %s\\n\",\n \t\t\tcolorize(t.Blue), m.Session, m.Pane, m.Line, colorize(t.Text),\n-\t\t\thighlightMatch(m.Content, r.Pattern, t))\n+\t\t\thighlightMatch(m.Content, r.Pattern, r.CaseInsensitive, t))\n \n \t\t// Print context after (if any)\n \t\tif len(m.Context) > 0 {\n@@ -333,12 +334,13 @@ func runGrep(pattern, session string, opts GrepOptions) error {\n \n \t// Build result\n \tresult := &GrepResult{\n-\t\tPattern:    pattern,\n-\t\tSession:    session,\n-\t\tMatches:    allMatches,\n-\t\tTotalLines: totalLines,\n-\t\tMatchCount: len(allMatches),\n-\t\tPaneCount:  panesSearched,\n+\t\tPattern:         pattern,\n+\t\tSession:         session,\n+\t\tMatches:         allMatches,\n+\t\tTotalLines:      totalLines,\n+\t\tMatchCount:      len(allMatches),\n+\t\tPaneCount:       panesSearched,\n+\t\tCaseInsensitive: opts.CaseInsensitive,\n \t}\n \tif opts.AllSessions {\n \t\tresult.Session = \"<all>\"\n@@ -387,12 +389,20 @@ func outputMatchingPanes(panes map[string]bool) error {\n }\n \n // highlightMatch highlights the matched portion in the line\n-func highlightMatch(line, pattern string, t theme.Theme) string {\n-\t// Try raw pattern first (matches what the search actually uses)\n-\tre, err := regexp.Compile(\"(?i)(\" + pattern + \")\")\n+func highlightMatch(line, pattern string, caseInsensitive bool, t theme.Theme) string {\n+\t// Build pattern with optional case-insensitivity to match actual search behavior\n+\trePattern := \"(\" + pattern + \")\"\n+\tif caseInsensitive {\n+\t\trePattern = \"(?i)\" + rePattern\n+\t}\n+\tre, err := regexp.Compile(rePattern)\n \tif err != nil {\n \t\t// If pattern fails to compile as regex, use escaped literal\n-\t\tre, err = regexp.Compile(\"(?i)(\" + regexp.QuoteMeta(pattern) + \")\")\n+\t\trePattern = \"(\" + regexp.QuoteMeta(pattern) + \")\"\n+\t\tif caseInsensitive {\n+\t\t\trePattern = \"(?i)\" + rePattern\n+\t\t}\n+\t\tre, err = regexp.Compile(rePattern)\n \t\tif err != nil {\n \t\t\treturn line // Can't highlight, return as-is\n \t\t}"
+    },
+    {
+      "sha": "191ed252fd8b6a455ac17387c93011f3ca5c490a",
+      "filename": "internal/robot/health.go",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/613c1080ac00fe7dc2f10dc3b64d85444c9707fe/internal%2Frobot%2Fhealth.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/613c1080ac00fe7dc2f10dc3b64d85444c9707fe/internal%2Frobot%2Fhealth.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Frobot%2Fhealth.go?ref=613c1080ac00fe7dc2f10dc3b64d85444c9707fe",
+      "patch": "@@ -5,6 +5,7 @@ package robot\n import (\n \t\"context\"\n \t\"fmt\"\n+\t\"os\"\n \t\"os/exec\"\n \t\"runtime\"\n \t\"strconv\"\n@@ -226,8 +227,7 @@ func getLoadAverage() float64 {\n \t\t\treturn load\n \t\t}\n \t\t// Linux: read from /proc/loadavg\n-\t\tcmd := exec.Command(\"cat\", \"/proc/loadavg\")\n-\t\tout, err := cmd.Output()\n+\t\tout, err := os.ReadFile(\"/proc/loadavg\")\n \t\tif err != nil {\n \t\t\treturn -1\n \t\t}"
+    }
+  ]
+}

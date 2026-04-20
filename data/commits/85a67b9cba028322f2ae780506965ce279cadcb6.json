@@ -1,0 +1,53 @@
+{
+  "message": "feat(decision): integrate CVaR risk-sensitive control into decision outcome\n\nAdd risk_sensitive field to DecisionOutcome and expose\napply_risk_sensitive_control function to allow callers to apply\nCVaR-based tail-risk adjustment after initial expected-loss decision.\n\nThis enables robot mode and other high-stakes scenarios to use\nconservative decisions that minimize catastrophic outcomes.\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "7ea5d72a91851700f5942d3da92962f4672a849a",
+      "filename": "crates/pt-core/src/action/executor.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/process_triage/blob/85a67b9cba028322f2ae780506965ce279cadcb6/crates%2Fpt-core%2Fsrc%2Faction%2Fexecutor.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/process_triage/raw/85a67b9cba028322f2ae780506965ce279cadcb6/crates%2Fpt-core%2Fsrc%2Faction%2Fexecutor.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/process_triage/contents/crates%2Fpt-core%2Fsrc%2Faction%2Fexecutor.rs?ref=85a67b9cba028322f2ae780506965ce279cadcb6",
+      "patch": "@@ -327,6 +327,7 @@ mod tests {\n                 disabled_actions: vec![],\n                 used_recovery_preference: false,\n             },\n+            risk_sensitive: None,\n         };\n         let bundle = DecisionBundle {\n             session_id: SessionId(\"pt-20260115-120000-abcd\".to_string()),"
+    },
+    {
+      "sha": "16bc8e74abbbce1a14b0237a0b2ecb42529c21b0",
+      "filename": "crates/pt-core/src/decision/expected_loss.rs",
+      "status": "modified",
+      "additions": 94,
+      "deletions": 0,
+      "changes": 94,
+      "blob_url": "https://github.com/Dicklesworthstone/process_triage/blob/85a67b9cba028322f2ae780506965ce279cadcb6/crates%2Fpt-core%2Fsrc%2Fdecision%2Fexpected_loss.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/process_triage/raw/85a67b9cba028322f2ae780506965ce279cadcb6/crates%2Fpt-core%2Fsrc%2Fdecision%2Fexpected_loss.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/process_triage/contents/crates%2Fpt-core%2Fsrc%2Fdecision%2Fexpected_loss.rs?ref=85a67b9cba028322f2ae780506965ce279cadcb6",
+      "patch": "@@ -3,6 +3,7 @@\n use crate::config::policy::{LossMatrix, LossRow, Policy};\n use crate::config::priors::Priors;\n use crate::decision::causal_interventions::{expected_recovery_by_action, RecoveryExpectation};\n+use crate::decision::cvar::{decide_with_cvar, CvarTrigger, RiskSensitiveOutcome};\n use crate::inference::ClassScores;\n use serde::{Deserialize, Serialize};\n use thiserror::Error;\n@@ -221,6 +222,9 @@ pub struct DecisionOutcome {\n     pub posterior_odds_abandoned_vs_useful: Option<f64>,\n     pub recovery_expectations: Option<Vec<RecoveryExpectation>>,\n     pub rationale: DecisionRationale,\n+    /// Risk-sensitive (CVaR) decision information, if applied.\n+    #[serde(skip_serializing_if = \"Option::is_none\")]\n+    pub risk_sensitive: Option<RiskSensitiveOutcome>,\n }\n \n /// Errors raised during decisioning.\n@@ -284,6 +288,7 @@ pub fn decide_action(\n             disabled_actions: disabled,\n             used_recovery_preference: false,\n         },\n+        risk_sensitive: None,\n     })\n }\n \n@@ -358,9 +363,98 @@ pub fn decide_action_with_recovery(\n             disabled_actions: disabled,\n             used_recovery_preference,\n         },\n+        risk_sensitive: None,\n     })\n }\n \n+/// Apply risk-sensitive (CVaR) adjustment to a decision outcome.\n+///\n+/// This function takes an existing decision and applies CVaR-based\n+/// risk-sensitive control when trigger conditions are met.\n+///\n+/// # Arguments\n+/// * `outcome` - The base decision outcome (from decide_action or decide_action_with_recovery)\n+/// * `posterior` - Class probabilities\n+/// * `policy` - Policy containing loss matrix\n+/// * `trigger` - Conditions that determine whether CVaR should be applied\n+/// * `alpha` - CVaR confidence level (e.g., 0.95 for worst 5% tail)\n+///\n+/// # Returns\n+/// The decision outcome with risk_sensitive field populated if CVaR was applied.\n+pub fn apply_risk_sensitive_control(\n+    mut outcome: DecisionOutcome,\n+    posterior: &ClassScores,\n+    policy: &Policy,\n+    trigger: &CvarTrigger,\n+    alpha: f64,\n+) -> DecisionOutcome {\n+    if !trigger.should_apply() {\n+        outcome.risk_sensitive = Some(RiskSensitiveOutcome {\n+            applied: false,\n+            reason: \"no_trigger\".to_string(),\n+            original_action: outcome.optimal_action,\n+            risk_adjusted_action: outcome.optimal_action,\n+            cvar_losses: vec![],\n+            alpha,\n+            action_changed: false,\n+        });\n+        return outcome;\n+    }\n+\n+    // Get feasible actions from the expected loss results\n+    let feasible_actions: Vec<Action> = outcome\n+        .expected_loss\n+        .iter()\n+        .map(|e| e.action)\n+        .collect();\n+\n+    if feasible_actions.is_empty() {\n+        outcome.risk_sensitive = Some(RiskSensitiveOutcome {\n+            applied: false,\n+            reason: \"no_feasible_actions\".to_string(),\n+            original_action: outcome.optimal_action,\n+            risk_adjusted_action: outcome.optimal_action,\n+            cvar_losses: vec![],\n+            alpha,\n+            action_changed: false,\n+        });\n+        return outcome;\n+    }\n+\n+    // Compute CVaR for all feasible actions\n+    match decide_with_cvar(\n+        posterior,\n+        policy,\n+        &feasible_actions,\n+        alpha,\n+        outcome.optimal_action,\n+        &trigger.reason(),\n+    ) {\n+        Ok(risk_outcome) => {\n+            // Update optimal action if CVaR recommends a different one\n+            if risk_outcome.action_changed {\n+                outcome.optimal_action = risk_outcome.risk_adjusted_action;\n+                outcome.rationale.chosen_action = risk_outcome.risk_adjusted_action;\n+            }\n+            outcome.risk_sensitive = Some(risk_outcome);\n+        }\n+        Err(_) => {\n+            // CVaR computation failed, keep original decision\n+            outcome.risk_sensitive = Some(RiskSensitiveOutcome {\n+                applied: false,\n+                reason: \"cvar_computation_failed\".to_string(),\n+                original_action: outcome.optimal_action,\n+                risk_adjusted_action: outcome.optimal_action,\n+                cvar_losses: vec![],\n+                alpha,\n+                action_changed: false,\n+            });\n+        }\n+    }\n+\n+    outcome\n+}\n+\n fn validate_posterior(posterior: &ClassScores) -> Result<(), DecisionError> {\n     let values = [\n         posterior.useful,"
+    },
+    {
+      "sha": "b4a899e2ba35876f5a16a73ec5c27d76f81009b1",
+      "filename": "crates/pt-core/src/decision/mod.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 2,
+      "changes": 5,
+      "blob_url": "https://github.com/Dicklesworthstone/process_triage/blob/85a67b9cba028322f2ae780506965ce279cadcb6/crates%2Fpt-core%2Fsrc%2Fdecision%2Fmod.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/process_triage/raw/85a67b9cba028322f2ae780506965ce279cadcb6/crates%2Fpt-core%2Fsrc%2Fdecision%2Fmod.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/process_triage/contents/crates%2Fpt-core%2Fsrc%2Fdecision%2Fmod.rs?ref=85a67b9cba028322f2ae780506965ce279cadcb6",
+      "patch": "@@ -29,8 +29,9 @@ pub use enforcer::{\n     ProcessCandidate, ViolationKind,\n };\n pub use expected_loss::{\n-    decide_action, decide_action_with_recovery, Action, ActionFeasibility, DecisionError,\n-    DecisionOutcome, DecisionRationale, DisabledAction, ExpectedLoss, SprtBoundary,\n+    apply_risk_sensitive_control, decide_action, decide_action_with_recovery, Action,\n+    ActionFeasibility, DecisionError, DecisionOutcome, DecisionRationale, DisabledAction,\n+    ExpectedLoss, SprtBoundary,\n };\n pub use fdr_selection::{\n     by_correction_factor, select_fdr, CandidateSelection, FdrCandidate, FdrError, FdrMethod,"
+    },
+    {
+      "sha": "3dc01c7da3dabd7ff9bd20634fe9613723435211",
+      "filename": "crates/pt-core/src/plan/mod.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/process_triage/blob/85a67b9cba028322f2ae780506965ce279cadcb6/crates%2Fpt-core%2Fsrc%2Fplan%2Fmod.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/process_triage/raw/85a67b9cba028322f2ae780506965ce279cadcb6/crates%2Fpt-core%2Fsrc%2Fplan%2Fmod.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/process_triage/contents/crates%2Fpt-core%2Fsrc%2Fplan%2Fmod.rs?ref=85a67b9cba028322f2ae780506965ce279cadcb6",
+      "patch": "@@ -658,6 +658,7 @@ mod tests {\n                 disabled_actions: vec![],\n                 used_recovery_preference: false,\n             },\n+            risk_sensitive: None,\n         }\n     }\n "
+    }
+  ]
+}

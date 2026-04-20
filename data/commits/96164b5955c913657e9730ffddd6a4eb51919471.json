@@ -1,0 +1,53 @@
+{
+  "message": "fix: improve socket error handling",
+  "files": [
+    {
+      "sha": "17c9080de88b75e7abc6b04d539dcd1fc849fce9",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/96164b5955c913657e9730ffddd6a4eb51919471/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/96164b5955c913657e9730ffddd6a4eb51919471/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=96164b5955c913657e9730ffddd6a4eb51919471",
+      "patch": "@@ -24,6 +24,7 @@\n - Telegram: stop typing after tool results. Thanks @AbhisekBasu1 for PR #322.\n - Messages: stop defaulting ack reactions to \ud83d\udc40 when identity emoji is missing.\n - Auto-reply: require slash for control commands to avoid false triggers in normal text.\n+- Auto-reply: flag error payloads and improve Bun socket error messaging. Thanks @emanuelst for PR #331.\n - Commands: unify native + text chat commands behind `commands.*` config (Discord/Slack/Telegram). Thanks @thewilloftheshadow for PR #275.\n - Auto-reply: treat steer during compaction as a follow-up, queued until compaction completes.\n - Auth: lock auth profile refreshes to avoid multi-instance OAuth logouts; keep credentials on refresh failure."
+    },
+    {
+      "sha": "017a51ca911cec39a746ce6f39f3f763049c888d",
+      "filename": "src/auto-reply/reply/agent-runner.heartbeat-typing.test.ts",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 0,
+      "changes": 22,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/96164b5955c913657e9730ffddd6a4eb51919471/src%2Fauto-reply%2Freply%2Fagent-runner.heartbeat-typing.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/96164b5955c913657e9730ffddd6a4eb51919471/src%2Fauto-reply%2Freply%2Fagent-runner.heartbeat-typing.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fauto-reply%2Freply%2Fagent-runner.heartbeat-typing.test.ts?ref=96164b5955c913657e9730ffddd6a4eb51919471",
+      "patch": "@@ -209,4 +209,26 @@ describe(\"runReplyAgent typing (heartbeat)\", () => {\n     expect(payloads[0]?.text).toContain(\"count 1\");\n     expect(sessionStore.main.compactionCount).toBe(1);\n   });\n+\n+  it(\"rewrites Bun socket errors into friendly text\", async () => {\n+    runEmbeddedPiAgentMock.mockImplementationOnce(async () => ({\n+      payloads: [\n+        {\n+          text: \"TypeError: The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()\",\n+          isError: true,\n+        },\n+      ],\n+      meta: {},\n+    }));\n+\n+    const { run } = createMinimalRun();\n+    const res = await run();\n+    const payloads = Array.isArray(res) ? res : res ? [res] : [];\n+    expect(payloads.length).toBe(1);\n+    expect(payloads[0]?.text).toContain(\"LLM connection failed\");\n+    expect(payloads[0]?.text).toContain(\n+      \"socket connection was closed unexpectedly\",\n+    );\n+    expect(payloads[0]?.text).toContain(\"```\");\n+  });\n });"
+    },
+    {
+      "sha": "79b85e57a86380cab2b518c15699dc95f86e4802",
+      "filename": "src/auto-reply/reply/agent-runner.ts",
+      "status": "modified",
+      "additions": 17,
+      "deletions": 13,
+      "changes": 30,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/96164b5955c913657e9730ffddd6a4eb51919471/src%2Fauto-reply%2Freply%2Fagent-runner.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/96164b5955c913657e9730ffddd6a4eb51919471/src%2Fauto-reply%2Freply%2Fagent-runner.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fauto-reply%2Freply%2Fagent-runner.ts?ref=96164b5955c913657e9730ffddd6a4eb51919471",
+      "patch": "@@ -31,6 +31,21 @@ import { extractReplyToTag } from \"./reply-tags.js\";\n import { incrementCompactionCount } from \"./session-updates.js\";\n import type { TypingController } from \"./typing.js\";\n \n+const BUN_FETCH_SOCKET_ERROR_RE = /socket connection was closed unexpectedly/i;\n+\n+const isBunFetchSocketError = (message?: string) =>\n+  Boolean(message && BUN_FETCH_SOCKET_ERROR_RE.test(message));\n+\n+const formatBunFetchSocketError = (message: string) => {\n+  const trimmed = message.trim();\n+  return [\n+    \"\u26a0\ufe0f LLM connection failed. This could be due to server issues, network problems, or context length exceeded (e.g., with local LLMs like LM Studio). Original error:\",\n+    \"```\",\n+    trimmed || \"Unknown error\",\n+    \"```\",\n+  ].join(\"\\n\");\n+};\n+\n export async function runReplyAgent(params: {\n   commandBody: string;\n   followupRun: FollowupRun;\n@@ -403,19 +418,8 @@ export async function runReplyAgent(params: {\n       : payloadArray.flatMap((payload) => {\n           let text = payload.text;\n \n-          if (payload.isError) {\n-            // Handle Bun fetch socket connection error that may indicate a context length issue\n-            // Error source: https://github.com/oven-sh/bun/blob/main/src/bun.js/webcore/fetch/FetchTasklet.zig\n-            const isBunFetchSocketError =\n-              text ===\n-              \"The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()\";\n-\n-            if (isBunFetchSocketError) {\n-              text = `\u26a0\ufe0f LLM connection failed. This could be due to server issues, network problems, or context length exceeded (e.g., with local LLMs like LM Studio). Original error:\n-              \\`\\`\\`\n-              ${text || \"Unknown error\"}\n-              \\`\\`\\``;\n-            }\n+          if (payload.isError && text && isBunFetchSocketError(text)) {\n+            text = formatBunFetchSocketError(text);\n           }\n \n           if (!text || !text.includes(\"HEARTBEAT_OK\"))"
+    },
+    {
+      "sha": "b76a0a5a11bca744c8738ba6169837c36cef97da",
+      "filename": "src/auto-reply/types.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/96164b5955c913657e9730ffddd6a4eb51919471/src%2Fauto-reply%2Ftypes.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/96164b5955c913657e9730ffddd6a4eb51919471/src%2Fauto-reply%2Ftypes.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fauto-reply%2Ftypes.ts?ref=96164b5955c913657e9730ffddd6a4eb51919471",
+      "patch": "@@ -14,4 +14,5 @@ export type ReplyPayload = {\n   mediaUrl?: string;\n   mediaUrls?: string[];\n   replyToId?: string;\n+  isError?: boolean;\n };"
+    }
+  ]
+}

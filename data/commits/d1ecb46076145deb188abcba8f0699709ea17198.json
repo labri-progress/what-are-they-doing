@@ -1,0 +1,41 @@
+{
+  "message": "fix: harden exec allowlist parsing",
+  "files": [
+    {
+      "sha": "4fd847b7f3437ecafa141742e253127fe99a3289",
+      "filename": "docs/tools/exec-approvals.md",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/d1ecb46076145deb188abcba8f0699709ea17198/docs%2Ftools%2Fexec-approvals.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/d1ecb46076145deb188abcba8f0699709ea17198/docs%2Ftools%2Fexec-approvals.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/docs%2Ftools%2Fexec-approvals.md?ref=d1ecb46076145deb188abcba8f0699709ea17198",
+      "patch": "@@ -128,6 +128,8 @@ Shell chaining and redirections are not auto-allowed in allowlist mode.\n \n Shell chaining (`&&`, `||`, `;`) is allowed when every top-level segment satisfies the allowlist\n (including safe bins or skill auto-allow). Redirections remain unsupported in allowlist mode.\n+Command substitution (`$()` / backticks) is rejected during allowlist parsing, including inside\n+double quotes; use single quotes if you need literal `$()` text.\n \n Default safe bins: `jq`, `grep`, `cut`, `sort`, `uniq`, `head`, `tail`, `tr`, `wc`.\n "
+    },
+    {
+      "sha": "635ba97113ede7d6d906b0f655f247ca790cd5ac",
+      "filename": "src/infra/exec-approvals.test.ts",
+      "status": "modified",
+      "additions": 42,
+      "deletions": 0,
+      "changes": 42,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/d1ecb46076145deb188abcba8f0699709ea17198/src%2Finfra%2Fexec-approvals.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/d1ecb46076145deb188abcba8f0699709ea17198/src%2Finfra%2Fexec-approvals.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Fexec-approvals.test.ts?ref=d1ecb46076145deb188abcba8f0699709ea17198",
+      "patch": "@@ -131,6 +131,36 @@ describe(\"exec approvals shell parsing\", () => {\n     expect(res.ok).toBe(true);\n     expect(res.segments[0]?.argv).toEqual([\"/bin/echo\", \"ok\"]);\n   });\n+\n+  it(\"rejects command substitution inside double quotes\", () => {\n+    const res = analyzeShellCommand({ command: 'echo \"output: $(whoami)\"' });\n+    expect(res.ok).toBe(false);\n+    expect(res.reason).toBe(\"unsupported shell token: $()\");\n+  });\n+\n+  it(\"rejects backticks inside double quotes\", () => {\n+    const res = analyzeShellCommand({ command: 'echo \"output: `id`\"' });\n+    expect(res.ok).toBe(false);\n+    expect(res.reason).toBe(\"unsupported shell token: `\");\n+  });\n+\n+  it(\"rejects command substitution outside quotes\", () => {\n+    const res = analyzeShellCommand({ command: \"echo $(whoami)\" });\n+    expect(res.ok).toBe(false);\n+    expect(res.reason).toBe(\"unsupported shell token: $()\");\n+  });\n+\n+  it(\"allows escaped command substitution inside double quotes\", () => {\n+    const res = analyzeShellCommand({ command: 'echo \"output: \\\\$(whoami)\"' });\n+    expect(res.ok).toBe(true);\n+    expect(res.segments[0]?.argv[0]).toBe(\"echo\");\n+  });\n+\n+  it(\"allows command substitution syntax inside single quotes\", () => {\n+    const res = analyzeShellCommand({ command: \"echo 'output: $(whoami)'\" });\n+    expect(res.ok).toBe(true);\n+    expect(res.segments[0]?.argv[0]).toBe(\"echo\");\n+  });\n });\n \n describe(\"exec approvals shell allowlist (chained commands)\", () => {\n@@ -185,6 +215,18 @@ describe(\"exec approvals shell allowlist (chained commands)\", () => {\n     expect(result.analysisOk).toBe(true);\n     expect(result.allowlistSatisfied).toBe(true);\n   });\n+\n+  it(\"respects escaped quotes when splitting chains\", () => {\n+    const allowlist: ExecAllowlistEntry[] = [{ pattern: \"/usr/bin/echo\" }];\n+    const result = evaluateShellAllowlist({\n+      command: '/usr/bin/echo \"foo\\\\\" && bar\"',\n+      allowlist,\n+      safeBins: new Set(),\n+      cwd: \"/tmp\",\n+    });\n+    expect(result.analysisOk).toBe(true);\n+    expect(result.allowlistSatisfied).toBe(true);\n+  });\n });\n \n describe(\"exec approvals safe bins\", () => {"
+    },
+    {
+      "sha": "a510bd72abac204d4a052dd80f3c76c405beed87",
+      "filename": "src/infra/exec-approvals.ts",
+      "status": "modified",
+      "additions": 33,
+      "deletions": 0,
+      "changes": 33,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/d1ecb46076145deb188abcba8f0699709ea17198/src%2Finfra%2Fexec-approvals.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/d1ecb46076145deb188abcba8f0699709ea17198/src%2Finfra%2Fexec-approvals.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Fexec-approvals.ts?ref=d1ecb46076145deb188abcba8f0699709ea17198",
+      "patch": "@@ -585,6 +585,11 @@ export type ExecCommandAnalysis = {\n };\n \n const DISALLOWED_PIPELINE_TOKENS = new Set([\">\", \"<\", \"`\", \"\\n\", \"\\r\", \"(\", \")\"]);\n+const DOUBLE_QUOTE_ESCAPES = new Set([\"\\\\\", '\"', \"$\", \"`\", \"\\n\", \"\\r\"]);\n+\n+function isDoubleQuoteEscape(next: string | undefined): next is string {\n+  return Boolean(next && DOUBLE_QUOTE_ESCAPES.has(next));\n+}\n \n type IteratorAction = \"split\" | \"skip\" | \"include\" | { reject: string };\n \n@@ -637,6 +642,21 @@ function iterateQuoteAware(\n       continue;\n     }\n     if (inDouble) {\n+      if (ch === \"\\\\\" && isDoubleQuoteEscape(next)) {\n+        buf += ch;\n+        buf += next;\n+        i += 1;\n+        continue;\n+      }\n+      if (ch === \"$\" && next === \"(\") {\n+        return { ok: false, reason: \"unsupported shell token: $()\" };\n+      }\n+      if (ch === \"`\") {\n+        return { ok: false, reason: \"unsupported shell token: `\" };\n+      }\n+      if (ch === \"\\n\" || ch === \"\\r\") {\n+        return { ok: false, reason: \"unsupported shell token: newline\" };\n+      }\n       if (ch === '\"') {\n         inDouble = false;\n       }\n@@ -749,6 +769,12 @@ function tokenizeShellSegment(segment: string): string[] | null {\n       continue;\n     }\n     if (inDouble) {\n+      const next = segment[i + 1];\n+      if (ch === \"\\\\\" && isDoubleQuoteEscape(next)) {\n+        buf += next;\n+        i += 1;\n+        continue;\n+      }\n       if (ch === '\"') {\n         inDouble = false;\n       } else {\n@@ -1067,6 +1093,7 @@ function splitCommandChain(command: string): string[] | null {\n \n   for (let i = 0; i < command.length; i += 1) {\n     const ch = command[i];\n+    const next = command[i + 1];\n     if (escaped) {\n       buf += ch;\n       escaped = false;\n@@ -1085,6 +1112,12 @@ function splitCommandChain(command: string): string[] | null {\n       continue;\n     }\n     if (inDouble) {\n+      if (ch === \"\\\\\" && isDoubleQuoteEscape(next)) {\n+        buf += ch;\n+        buf += next;\n+        i += 1;\n+        continue;\n+      }\n       if (ch === '\"') {\n         inDouble = false;\n       }"
+    }
+  ]
+}

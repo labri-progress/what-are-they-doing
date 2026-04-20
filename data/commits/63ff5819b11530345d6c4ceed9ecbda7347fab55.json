@@ -1,0 +1,29 @@
+{
+  "message": "fix: retry telegram poll conflicts",
+  "files": [
+    {
+      "sha": "25eac0a217367791ab5705c040de0fb360786c41",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/63ff5819b11530345d6c4ceed9ecbda7347fab55/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/63ff5819b11530345d6c4ceed9ecbda7347fab55/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=63ff5819b11530345d6c4ceed9ecbda7347fab55",
+      "patch": "@@ -6,6 +6,7 @@\n - Hooks: allow per-hook model overrides for webhook/Gmail runs (e.g. GPT 5 Mini).\n - Control UI: logs tab opens at the newest entries (bottom).\n - Control UI: add Docs link, remove chat composer divider, and add New session button.\n+- Telegram: retry long-polling conflicts with backoff to avoid fatal exits.\n \n ## 2026.1.8\n "
+    },
+    {
+      "sha": "9d2bc83fd6450ff81e126205d8dc5887d3a86179",
+      "filename": "src/telegram/monitor.ts",
+      "status": "modified",
+      "additions": 68,
+      "deletions": 12,
+      "changes": 80,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/63ff5819b11530345d6c4ceed9ecbda7347fab55/src%2Ftelegram%2Fmonitor.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/63ff5819b11530345d6c4ceed9ecbda7347fab55/src%2Ftelegram%2Fmonitor.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Ftelegram%2Fmonitor.ts?ref=63ff5819b11530345d6c4ceed9ecbda7347fab55",
+      "patch": "@@ -1,6 +1,8 @@\n import { type RunOptions, run } from \"@grammyjs/runner\";\n import type { ClawdbotConfig } from \"../config/config.js\";\n import { loadConfig } from \"../config/config.js\";\n+import { computeBackoff, sleepWithAbort } from \"../infra/backoff.js\";\n+import { formatDurationMs } from \"../infra/format-duration.js\";\n import type { RuntimeEnv } from \"../runtime.js\";\n import { resolveTelegramAccount } from \"./accounts.js\";\n import { createTelegramBot } from \"./bot.js\";\n@@ -37,6 +39,35 @@ export function createTelegramRunnerOptions(\n   };\n }\n \n+const TELEGRAM_POLL_RESTART_POLICY = {\n+  initialMs: 2000,\n+  maxMs: 30_000,\n+  factor: 1.8,\n+  jitter: 0.25,\n+};\n+\n+const isGetUpdatesConflict = (err: unknown) => {\n+  if (!err || typeof err !== \"object\") return false;\n+  const typed = err as {\n+    error_code?: number;\n+    errorCode?: number;\n+    description?: string;\n+    method?: string;\n+    message?: string;\n+  };\n+  const errorCode = typed.error_code ?? typed.errorCode;\n+  if (errorCode !== 409) return false;\n+  const haystack = [\n+    typed.method,\n+    typed.description,\n+    typed.message,\n+  ]\n+    .filter((value): value is string => typeof value === \"string\")\n+    .join(\" \")\n+    .toLowerCase();\n+  return haystack.includes(\"getupdates\");\n+};\n+\n export async function monitorTelegramProvider(opts: MonitorTelegramOpts = {}) {\n   const cfg = opts.config ?? loadConfig();\n   const account = resolveTelegramAccount({\n@@ -79,19 +110,44 @@ export async function monitorTelegramProvider(opts: MonitorTelegramOpts = {}) {\n   }\n \n   // Use grammyjs/runner for concurrent update processing\n-  const runner = run(bot, createTelegramRunnerOptions(cfg));\n+  const log = opts.runtime?.log ?? console.log;\n+  let restartAttempts = 0;\n \n-  const stopOnAbort = () => {\n-    if (opts.abortSignal?.aborted) {\n-      void runner.stop();\n+  while (!opts.abortSignal?.aborted) {\n+    const runner = run(bot, createTelegramRunnerOptions(cfg));\n+    const stopOnAbort = () => {\n+      if (opts.abortSignal?.aborted) {\n+        void runner.stop();\n+      }\n+    };\n+    opts.abortSignal?.addEventListener(\"abort\", stopOnAbort, { once: true });\n+    try {\n+      // runner.task() returns a promise that resolves when the runner stops\n+      await runner.task();\n+      return;\n+    } catch (err) {\n+      if (opts.abortSignal?.aborted) {\n+        throw err;\n+      }\n+      if (!isGetUpdatesConflict(err)) {\n+        throw err;\n+      }\n+      restartAttempts += 1;\n+      const delayMs = computeBackoff(\n+        TELEGRAM_POLL_RESTART_POLICY,\n+        restartAttempts,\n+      );\n+      log(\n+        `Telegram getUpdates conflict; retrying in ${formatDurationMs(delayMs)}.`,\n+      );\n+      try {\n+        await sleepWithAbort(delayMs, opts.abortSignal);\n+      } catch (sleepErr) {\n+        if (opts.abortSignal?.aborted) return;\n+        throw sleepErr;\n+      }\n+    } finally {\n+      opts.abortSignal?.removeEventListener(\"abort\", stopOnAbort);\n     }\n-  };\n-  opts.abortSignal?.addEventListener(\"abort\", stopOnAbort, { once: true });\n-\n-  try {\n-    // runner.task() returns a promise that resolves when the runner stops\n-    await runner.task();\n-  } finally {\n-    opts.abortSignal?.removeEventListener(\"abort\", stopOnAbort);\n   }\n }"
+    }
+  ]
+}

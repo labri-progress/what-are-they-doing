@@ -1,0 +1,161 @@
+{
+  "message": "fix(runtime): enforce call timeouts and keep-alive overrides",
+  "files": [
+    {
+      "sha": "ea55da8914ac3868e95c3a72924c4c9672f735be",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 1,
+      "changes": 7,
+      "blob_url": "https://github.com/steipete/mcporter/blob/676cc15cbb7538c367a1ef83a24e197a54120c81/CHANGELOG.md",
+      "raw_url": "https://github.com/steipete/mcporter/raw/676cc15cbb7538c367a1ef83a24e197a54120c81/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/steipete/mcporter/contents/CHANGELOG.md?ref=676cc15cbb7538c367a1ef83a24e197a54120c81",
+      "patch": "@@ -3,7 +3,12 @@\n ## [Unreleased]\n \n ### CLI & runtime\n-- _Nothing yet._\n+- Propagate the CLI\u2019s per-call timeout (defaults to 60s or `--timeout`) into the keep-alive daemon layer, so chrome-devtools and other persistent STDIO servers respect the same deadline as ephemeral transports and no longer outlive aborted calls.\n+- `Runtime.callTool` now forwards `timeoutMs` through the daemon bridge, ensuring TanStack MCP clients and mcporter CLI invocations share a single source of truth for long-running tool cancellation.\n+- Ad-hoc STDIO servers launched via `mcporter call \"npx \u2026\"` (or `--stdio`) now inherit the same keep-alive heuristics as config-defined entries, so commands like `chrome-devtools-mcp` are proxied through the daemon instead of spawning a fresh browser for every call once you\u2019ve already got one running.\n+\n+### Tests\n+- Added `tests/daemon-client-timeout.test.ts` plus updated keep-alive + CLI call suites to cover timeout propagation, preventing regressions in future daemon or CLI refactors.\n \n ## [0.5.3] - 2025-11-10\n "
+    },
+    {
+      "sha": "ba1da80579974123aef251aaf458fb90ef2f322e",
+      "filename": "src/cli/adhoc-server.ts",
+      "status": "modified",
+      "additions": 26,
+      "deletions": 2,
+      "changes": 28,
+      "blob_url": "https://github.com/steipete/mcporter/blob/676cc15cbb7538c367a1ef83a24e197a54120c81/src%2Fcli%2Fadhoc-server.ts",
+      "raw_url": "https://github.com/steipete/mcporter/raw/676cc15cbb7538c367a1ef83a24e197a54120c81/src%2Fcli%2Fadhoc-server.ts",
+      "contents_url": "https://api.github.com/repos/steipete/mcporter/contents/src%2Fcli%2Fadhoc-server.ts?ref=676cc15cbb7538c367a1ef83a24e197a54120c81",
+      "patch": "@@ -3,6 +3,7 @@ import path from 'node:path';\n import type { CommandSpec, ServerDefinition } from '../config.js';\n import { __configInternals } from '../config.js';\n import { expandHome } from '../env.js';\n+import { canonicalKeepAliveName, resolveLifecycle } from '../lifecycle.js';\n \n export interface EphemeralServerSpec {\n   name?: string;\n@@ -40,23 +41,27 @@ export function resolveEphemeralServer(spec: EphemeralServerSpec): EphemeralServ\n     if (url.protocol === 'http:' && !spec.allowInsecureHttp) {\n       throw new Error('HTTP endpoints require --allow-http to confirm insecure usage.');\n     }\n-    const name = slugify(spec.name ?? inferNameFromUrl(url));\n     const command: CommandSpec = {\n       kind: 'http',\n       url,\n       headers: __configInternals.ensureHttpAcceptHeader(undefined),\n     };\n+    const canonical = spec.name ? undefined : canonicalKeepAliveName(command);\n+    const name = slugify(spec.name ?? canonical ?? inferNameFromUrl(url));\n+    const lifecycle = resolveLifecycle(name, undefined, command);\n     const definition: ServerDefinition = {\n       name,\n       description: spec.description,\n       command,\n       env: spec.env && Object.keys(spec.env).length > 0 ? spec.env : undefined,\n       source: TEMP_SOURCE,\n+      lifecycle,\n     };\n     const persistedEntry: Record<string, unknown> = {\n       baseUrl: url.href,\n       ...(spec.description ? { description: spec.description } : {}),\n       ...(spec.env && Object.keys(spec.env).length > 0 ? { env: spec.env } : {}),\n+      ...(lifecycle ? { lifecycle: serializeLifecycle(lifecycle) } : {}),\n     };\n     return { definition, name, persistedEntry };\n   }\n@@ -68,26 +73,30 @@ export function resolveEphemeralServer(spec: EphemeralServerSpec): EphemeralServ\n   }\n   const [commandBinary, ...commandRest] = parts as [string, ...string[]];\n   const commandArgs = commandRest.concat(spec.stdioArgs ?? []);\n-  const name = slugify(spec.name ?? inferNameFromCommand(parts));\n   const cwd = spec.cwd ? path.resolve(spec.cwd) : process.cwd();\n   const command: CommandSpec = {\n     kind: 'stdio',\n     command: commandBinary,\n     args: commandArgs,\n     cwd,\n   };\n+  const canonical = spec.name ? undefined : canonicalKeepAliveName(command);\n+  const name = slugify(spec.name ?? canonical ?? inferNameFromCommand(parts));\n+  const lifecycle = resolveLifecycle(name, undefined, command);\n   const definition: ServerDefinition = {\n     name,\n     description: spec.description,\n     command,\n     env: spec.env && Object.keys(spec.env).length > 0 ? spec.env : undefined,\n     source: TEMP_SOURCE,\n+    lifecycle,\n   };\n   const persistedEntry: Record<string, unknown> = {\n     command: commandBinary,\n     ...(commandArgs.length > 0 ? { args: commandArgs } : {}),\n     ...(spec.description ? { description: spec.description } : {}),\n     ...(spec.env && Object.keys(spec.env).length > 0 ? { env: spec.env } : {}),\n+    ...(lifecycle ? { lifecycle: serializeLifecycle(lifecycle) } : {}),\n   };\n   if (spec.cwd) {\n     persistedEntry.cwd = spec.cwd;\n@@ -194,3 +203,18 @@ export function splitCommandLine(input: string): string[] {\n   }\n   return result;\n }\n+\n+function serializeLifecycle(\n+  lifecycle: ReturnType<typeof resolveLifecycle>\n+): string | { mode: 'keep-alive'; idleTimeoutMs?: number } | undefined {\n+  if (!lifecycle) {\n+    return undefined;\n+  }\n+  if (lifecycle.mode === 'keep-alive' && lifecycle.idleTimeoutMs === undefined) {\n+    return 'keep-alive';\n+  }\n+  if (lifecycle.mode === 'keep-alive') {\n+    return { mode: 'keep-alive', idleTimeoutMs: lifecycle.idleTimeoutMs };\n+  }\n+  return 'ephemeral';\n+}"
+    },
+    {
+      "sha": "0c12d0fb7603f6a4296b2effa300f82d50f5a36d",
+      "filename": "src/cli/call-command.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/steipete/mcporter/blob/676cc15cbb7538c367a1ef83a24e197a54120c81/src%2Fcli%2Fcall-command.ts",
+      "raw_url": "https://github.com/steipete/mcporter/raw/676cc15cbb7538c367a1ef83a24e197a54120c81/src%2Fcli%2Fcall-command.ts",
+      "contents_url": "https://api.github.com/repos/steipete/mcporter/contents/src%2Fcli%2Fcall-command.ts?ref=676cc15cbb7538c367a1ef83a24e197a54120c81",
+      "patch": "@@ -223,7 +223,7 @@ async function attemptCall(\n   allowCorrection: boolean\n ): Promise<{ result: unknown; resolvedTool: string }> {\n   try {\n-    const result = await withTimeout(runtime.callTool(server, tool, { args }), timeoutMs);\n+    const result = await withTimeout(runtime.callTool(server, tool, { args, timeoutMs }), timeoutMs);\n     return { result, resolvedTool: tool };\n   } catch (error) {\n     if (error instanceof Error && error.message === 'Timeout') {"
+    },
+    {
+      "sha": "0b8d33bcb841d7f64594c0a5ff90aca251682fd5",
+      "filename": "src/daemon/client.ts",
+      "status": "modified",
+      "additions": 24,
+      "deletions": 6,
+      "changes": 30,
+      "blob_url": "https://github.com/steipete/mcporter/blob/676cc15cbb7538c367a1ef83a24e197a54120c81/src%2Fdaemon%2Fclient.ts",
+      "raw_url": "https://github.com/steipete/mcporter/raw/676cc15cbb7538c367a1ef83a24e197a54120c81/src%2Fdaemon%2Fclient.ts",
+      "contents_url": "https://api.github.com/repos/steipete/mcporter/contents/src%2Fdaemon%2Fclient.ts?ref=676cc15cbb7538c367a1ef83a24e197a54120c81",
+      "patch": "@@ -19,6 +19,8 @@ export interface DaemonClientOptions {\n   readonly rootDir?: string;\n }\n \n+const DEFAULT_DAEMON_TIMEOUT_MS = 30_000;\n+\n export interface DaemonPaths {\n   readonly key: string;\n   readonly socketPath: string;\n@@ -46,7 +48,7 @@ export class DaemonClient {\n   }\n \n   async callTool(params: CallToolParams): Promise<unknown> {\n-    return this.invoke('callTool', params);\n+    return this.invoke('callTool', params, params.timeoutMs);\n   }\n \n   async listTools(params: ListToolsParams): Promise<unknown> {\n@@ -83,14 +85,14 @@ export class DaemonClient {\n     }\n   }\n \n-  private async invoke<T = unknown>(method: DaemonRequestMethod, params: unknown): Promise<T> {\n+  private async invoke<T = unknown>(method: DaemonRequestMethod, params: unknown, timeoutMs?: number): Promise<T> {\n     await this.ensureDaemon();\n     try {\n-      return (await this.sendRequest<T>(method, params)) as T;\n+      return (await this.sendRequest<T>(method, params, timeoutMs)) as T;\n     } catch (error) {\n       if (isTransportError(error)) {\n         await this.restartDaemon();\n-        return (await this.sendRequest<T>(method, params)) as T;\n+        return (await this.sendRequest<T>(method, params, timeoutMs)) as T;\n       }\n       throw error;\n     }\n@@ -153,13 +155,14 @@ export class DaemonClient {\n     }\n   }\n \n-  private async sendRequest<T>(method: DaemonRequestMethod, params: unknown): Promise<T> {\n+  private async sendRequest<T>(method: DaemonRequestMethod, params: unknown, timeoutOverrideMs?: number): Promise<T> {\n     const request: DaemonRequest = {\n       id: randomUUID(),\n       method,\n       params,\n     };\n     const payload = JSON.stringify(request);\n+    const timeoutMs = resolveDaemonTimeout(timeoutOverrideMs);\n     const response = await new Promise<string>((resolve, reject) => {\n       const socket = net.createConnection(this.socketPath);\n       let settled = false;\n@@ -177,7 +180,7 @@ export class DaemonClient {\n         settled = true;\n         resolve(value);\n       };\n-      socket.setTimeout(30_000, () => {\n+      socket.setTimeout(timeoutMs, () => {\n         socket.destroy(Object.assign(new Error('Daemon request timed out.'), { code: 'ETIMEDOUT' }));\n       });\n       let buffer = '';\n@@ -233,6 +236,21 @@ function isTransportError(error: unknown): boolean {\n   return code === 'ECONNREFUSED' || code === 'ENOENT' || code === 'ETIMEDOUT' || code === 'ECONNRESET';\n }\n \n+function resolveDaemonTimeout(override?: number): number {\n+  if (typeof override === 'number' && Number.isFinite(override) && override > 0) {\n+    return override;\n+  }\n+  const raw = process.env.MCPORTER_DAEMON_TIMEOUT_MS;\n+  if (!raw) {\n+    return DEFAULT_DAEMON_TIMEOUT_MS;\n+  }\n+  const parsed = Number.parseInt(raw, 10);\n+  if (!Number.isFinite(parsed) || parsed <= 0) {\n+    return DEFAULT_DAEMON_TIMEOUT_MS;\n+  }\n+  return parsed;\n+}\n+\n function delay(ms: number): Promise<void> {\n   return new Promise((resolve) => {\n     setTimeout(resolve, ms);"
+    },
+    {
+      "sha": "5fcf22d35e6ac51d16b11c1f6443739bb0877f7d",
+      "filename": "src/daemon/host.ts",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 1,
+      "changes": 5,
+      "blob_url": "https://github.com/steipete/mcporter/blob/676cc15cbb7538c367a1ef83a24e197a54120c81/src%2Fdaemon%2Fhost.ts",
+      "raw_url": "https://github.com/steipete/mcporter/raw/676cc15cbb7538c367a1ef83a24e197a54120c81/src%2Fdaemon%2Fhost.ts",
+      "contents_url": "https://api.github.com/repos/steipete/mcporter/contents/src%2Fdaemon%2Fhost.ts?ref=676cc15cbb7538c367a1ef83a24e197a54120c81",
+      "patch": "@@ -233,7 +233,10 @@ async function processRequest(\n           logEvent(logContext, `callTool start server=${params.server} tool=${params.tool}`);\n         }\n         try {\n-          const result = await runtime.callTool(params.server, params.tool, { args: params.args ?? {} });\n+          const result = await runtime.callTool(params.server, params.tool, {\n+            args: params.args ?? {},\n+            timeoutMs: params.timeoutMs,\n+          });\n           markActivity(params.server, activity);\n           if (loggable) {\n             logEvent(logContext, `callTool success server=${params.server} tool=${params.tool}`);"
+    },
+    {
+      "sha": "e70badfbd6e80498983249c96b738f88f5ebe8a5",
+      "filename": "src/daemon/protocol.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/steipete/mcporter/blob/676cc15cbb7538c367a1ef83a24e197a54120c81/src%2Fdaemon%2Fprotocol.ts",
+      "raw_url": "https://github.com/steipete/mcporter/raw/676cc15cbb7538c367a1ef83a24e197a54120c81/src%2Fdaemon%2Fprotocol.ts",
+      "contents_url": "https://api.github.com/repos/steipete/mcporter/contents/src%2Fdaemon%2Fprotocol.ts?ref=676cc15cbb7538c367a1ef83a24e197a54120c81",
+      "patch": "@@ -20,6 +20,7 @@ export interface CallToolParams {\n   readonly server: string;\n   readonly tool: string;\n   readonly args?: Record<string, unknown>;\n+  readonly timeoutMs?: number;\n }\n \n export interface ListToolsParams {"
+    },
+    {
+      "sha": "797d087c1fe9a184c78210af1c0bb408801791a1",
+      "filename": "src/daemon/runtime-wrapper.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/steipete/mcporter/blob/676cc15cbb7538c367a1ef83a24e197a54120c81/src%2Fdaemon%2Fruntime-wrapper.ts",
+      "raw_url": "https://github.com/steipete/mcporter/raw/676cc15cbb7538c367a1ef83a24e197a54120c81/src%2Fdaemon%2Fruntime-wrapper.ts",
+      "contents_url": "https://api.github.com/repos/steipete/mcporter/contents/src%2Fdaemon%2Fruntime-wrapper.ts?ref=676cc15cbb7538c367a1ef83a24e197a54120c81",
+      "patch": "@@ -61,6 +61,7 @@ class KeepAliveRuntime implements Runtime {\n         server,\n         tool: toolName,\n         args: options?.args,\n+        timeoutMs: options?.timeoutMs,\n       });\n     }\n     return this.base.callTool(server, toolName, options);"
+    },
+    {
+      "sha": "8c1bba8df3538f6ba4c7bbfd8b10a38e665823b6",
+      "filename": "src/lifecycle.ts",
+      "status": "modified",
+      "additions": 25,
+      "deletions": 9,
+      "changes": 34,
+      "blob_url": "https://github.com/steipete/mcporter/blob/676cc15cbb7538c367a1ef83a24e197a54120c81/src%2Flifecycle.ts",
+      "raw_url": "https://github.com/steipete/mcporter/raw/676cc15cbb7538c367a1ef83a24e197a54120c81/src%2Flifecycle.ts",
+      "contents_url": "https://api.github.com/repos/steipete/mcporter/contents/src%2Flifecycle.ts?ref=676cc15cbb7538c367a1ef83a24e197a54120c81",
+      "patch": "@@ -11,13 +11,14 @@ interface OverrideSet {\n }\n \n interface CommandSignature {\n+  readonly label: string;\n   readonly fragments: string[];\n }\n \n const KEEP_ALIVE_COMMANDS: CommandSignature[] = [\n-  { fragments: ['chrome-devtools-mcp'] },\n-  { fragments: ['@mobilenext/mobile-mcp', 'mobile-mcp'] },\n-  { fragments: ['@playwright/mcp', 'playwright/mcp'] },\n+  { label: 'chrome-devtools', fragments: ['chrome-devtools-mcp'] },\n+  { label: 'mobile-mcp', fragments: ['@mobilenext/mobile-mcp', 'mobile-mcp'] },\n+  { label: 'playwright', fragments: ['@playwright/mcp', 'playwright/mcp'] },\n ];\n \n export function resolveLifecycle(\n@@ -26,8 +27,13 @@ export function resolveLifecycle(\n   command: CommandSpec\n ): ServerLifecycle | undefined {\n   const normalizedName = name.toLowerCase();\n-  const forcedDisable = excludeOverride.all || excludeOverride.names.has(normalizedName);\n-  const forcedEnable = includeOverride.all || includeOverride.names.has(normalizedName);\n+  const canonicalName = canonicalKeepAliveName(command);\n+  const candidateNames = new Set<string>([normalizedName]);\n+  if (canonicalName) {\n+    candidateNames.add(canonicalName);\n+  }\n+  const forcedDisable = excludeOverride.all || matchesOverride(excludeOverride.names, candidateNames);\n+  const forcedEnable = includeOverride.all || matchesOverride(includeOverride.names, candidateNames);\n \n   if (forcedEnable) {\n     return { mode: 'keep-alive' };\n@@ -40,20 +46,21 @@ export function resolveLifecycle(\n   if (lifecycle) {\n     return lifecycle;\n   }\n-  if (DEFAULT_KEEP_ALIVE.has(normalizedName) || matchesKeepAliveSignature(command)) {\n+  if (Array.from(candidateNames).some((candidate) => DEFAULT_KEEP_ALIVE.has(candidate))) {\n     return { mode: 'keep-alive' };\n   }\n   return undefined;\n }\n \n-function matchesKeepAliveSignature(command: CommandSpec): boolean {\n+export function canonicalKeepAliveName(command: CommandSpec): string | undefined {\n   if (command.kind !== 'stdio') {\n-    return false;\n+    return undefined;\n   }\n   const tokens = [command.command, ...command.args].map((token) => token.toLowerCase());\n-  return KEEP_ALIVE_COMMANDS.some((signature) =>\n+  const match = KEEP_ALIVE_COMMANDS.find((signature) =>\n     signature.fragments.some((fragment) => tokens.some((token) => token.includes(fragment)))\n   );\n+  return match?.label;\n }\n \n function parseList(value: string | undefined): OverrideSet {\n@@ -70,6 +77,15 @@ function parseList(value: string | undefined): OverrideSet {\n   return { all: false, names: new Set(names) };\n }\n \n+function matchesOverride(names: Set<string>, candidates: Set<string>): boolean {\n+  for (const candidate of candidates) {\n+    if (names.has(candidate)) {\n+      return true;\n+    }\n+  }\n+  return false;\n+}\n+\n function coerceLifecycle(raw: RawLifecycle): ServerLifecycle | undefined {\n   if (typeof raw === 'string') {\n     if (raw === 'keep-alive') {"
+    },
+    {
+      "sha": "81d9c97ca1c235d33f201617208984f00b120a56",
+      "filename": "src/runtime.ts",
+      "status": "modified",
+      "additions": 39,
+      "deletions": 1,
+      "changes": 40,
+      "blob_url": "https://github.com/steipete/mcporter/blob/676cc15cbb7538c367a1ef83a24e197a54120c81/src%2Fruntime.ts",
+      "raw_url": "https://github.com/steipete/mcporter/raw/676cc15cbb7538c367a1ef83a24e197a54120c81/src%2Fruntime.ts",
+      "contents_url": "https://api.github.com/repos/steipete/mcporter/contents/src%2Fruntime.ts?ref=676cc15cbb7538c367a1ef83a24e197a54120c81",
+      "patch": "@@ -48,6 +48,7 @@ export type RuntimeLogger = Logger;\n \n export interface CallOptions {\n   readonly args?: CallToolRequest['params']['arguments'];\n+  readonly timeoutMs?: number;\n }\n \n export interface ListToolsOptions {\n@@ -193,7 +194,14 @@ class McpRuntime implements Runtime {\n       name: toolName,\n       arguments: options.args ?? {},\n     };\n-    return client.callTool(params);\n+    const resultPromise = client.callTool(params);\n+    const timeoutMs = normalizeTimeout(options.timeoutMs);\n+    if (!timeoutMs) {\n+      return resultPromise;\n+    }\n+    return raceWithTimeout(resultPromise, timeoutMs, () => {\n+      void this.close(server).catch(() => {});\n+    });\n   }\n \n   // listResources delegates to the MCP resources/list method with passthrough params.\n@@ -495,6 +503,36 @@ function waitForAuthorizationCodeWithTimeout(\n   });\n }\n \n+function normalizeTimeout(raw?: number): number | undefined {\n+  if (raw == null) {\n+    return undefined;\n+  }\n+  if (!Number.isFinite(raw)) {\n+    return undefined;\n+  }\n+  const coerced = Math.trunc(raw);\n+  return coerced > 0 ? coerced : undefined;\n+}\n+\n+function raceWithTimeout<T>(promise: Promise<T>, timeoutMs: number, onTimeout?: () => void): Promise<T> {\n+  return new Promise<T>((resolve, reject) => {\n+    const timer = setTimeout(() => {\n+      onTimeout?.();\n+      reject(new Error('Timeout'));\n+    }, timeoutMs);\n+    promise.then(\n+      (value) => {\n+        clearTimeout(timer);\n+        resolve(value);\n+      },\n+      (error) => {\n+        clearTimeout(timer);\n+        reject(error);\n+      }\n+    );\n+  });\n+}\n+\n // createConsoleLogger produces the default runtime logger honoring MCPORTER_LOG_LEVEL.\n function createConsoleLogger(level: LogLevel = resolveLogLevelFromEnv()): RuntimeLogger {\n   return createPrefixedConsoleLogger('mcporter', level);"
+    },
+    {
+      "sha": "29120753f907272b4638c8aef2fe18702e5c94a2",
+      "filename": "tests/adhoc-server.test.ts",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 0,
+      "changes": 9,
+      "blob_url": "https://github.com/steipete/mcporter/blob/676cc15cbb7538c367a1ef83a24e197a54120c81/tests%2Fadhoc-server.test.ts",
+      "raw_url": "https://github.com/steipete/mcporter/raw/676cc15cbb7538c367a1ef83a24e197a54120c81/tests%2Fadhoc-server.test.ts",
+      "contents_url": "https://api.github.com/repos/steipete/mcporter/contents/tests%2Fadhoc-server.test.ts?ref=676cc15cbb7538c367a1ef83a24e197a54120c81",
+      "patch": "@@ -9,4 +9,13 @@ describe('resolveEphemeralServer', () => {\n     expect(headers?.accept?.toLowerCase()).toContain('application/json');\n     expect(headers?.accept?.toLowerCase()).toContain('text/event-stream');\n   });\n+\n+  it('auto-enables keep-alive for STDIO commands that match known signatures', () => {\n+    const { definition, persistedEntry } = resolveEphemeralServer({\n+      stdioCommand: 'npx -y chrome-devtools-mcp@latest',\n+    });\n+    expect(definition.name).toBe('chrome-devtools');\n+    expect(definition.lifecycle?.mode).toBe('keep-alive');\n+    expect(persistedEntry.lifecycle).toBe('keep-alive');\n+  });\n });"
+    },
+    {
+      "sha": "a8cec4dfeea57b3a3e973aece95d9f2a6a350386",
+      "filename": "tests/cli-call-execution.test.ts",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 6,
+      "changes": 16,
+      "blob_url": "https://github.com/steipete/mcporter/blob/676cc15cbb7538c367a1ef83a24e197a54120c81/tests%2Fcli-call-execution.test.ts",
+      "raw_url": "https://github.com/steipete/mcporter/raw/676cc15cbb7538c367a1ef83a24e197a54120c81/tests%2Fcli-call-execution.test.ts",
+      "contents_url": "https://api.github.com/repos/steipete/mcporter/contents/tests%2Fcli-call-execution.test.ts?ref=676cc15cbb7538c367a1ef83a24e197a54120c81",
+      "patch": "@@ -37,7 +37,7 @@ describe('CLI call execution behavior', () => {\n     );\n     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});\n     await handleCall(runtime, ['linear', 'limit=5']);\n-    expect(callTool).toHaveBeenCalledWith('linear', toolName, { args: { limit: 5 } });\n+    expect(callTool).toHaveBeenCalledWith('linear', toolName, expect.objectContaining({ args: { limit: 5 } }));\n     logSpy.mockRestore();\n   });\n \n@@ -84,9 +84,13 @@ describe('CLI call execution behavior', () => {\n     });\n     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});\n     await handleCall(runtime, [command, 'domain=answeroverflow.com']);\n-    expect(callTool).toHaveBeenCalledWith(adhocName, 'getDomainAvailability', {\n-      args: { domain: 'answeroverflow.com' },\n-    });\n+    expect(callTool).toHaveBeenCalledWith(\n+      adhocName,\n+      'getDomainAvailability',\n+      expect.objectContaining({\n+        args: { domain: 'answeroverflow.com' },\n+      })\n+    );\n     logSpy.mockRestore();\n   });\n \n@@ -132,8 +136,8 @@ describe('CLI call execution behavior', () => {\n     const notes = logSpy.mock.calls.map((call) => call.join(' '));\n     expect(notes.some((line) => line.includes('Auto-corrected tool call to linear.list_issues'))).toBe(true);\n     expect(callTool).toHaveBeenCalledTimes(2);\n-    expect(callTool).toHaveBeenNthCalledWith(1, 'linear', 'listIssues', { args: {} });\n-    expect(callTool).toHaveBeenNthCalledWith(2, 'linear', 'list_issues', { args: {} });\n+    expect(callTool).toHaveBeenNthCalledWith(1, 'linear', 'listIssues', expect.objectContaining({ args: {} }));\n+    expect(callTool).toHaveBeenNthCalledWith(2, 'linear', 'list_issues', expect.objectContaining({ args: {} }));\n     expect(listTools).toHaveBeenCalledWith('linear', { autoAuthorize: true, includeSchema: false });\n \n     logSpy.mockRestore();"
+    },
+    {
+      "sha": "3119661ba734e4aa04661b198a832ffb8fb6ad44",
+      "filename": "tests/daemon-client-timeout.test.ts",
+      "status": "added",
+      "additions": 114,
+      "deletions": 0,
+      "changes": 114,
+      "blob_url": "https://github.com/steipete/mcporter/blob/676cc15cbb7538c367a1ef83a24e197a54120c81/tests%2Fdaemon-client-timeout.test.ts",
+      "raw_url": "https://github.com/steipete/mcporter/raw/676cc15cbb7538c367a1ef83a24e197a54120c81/tests%2Fdaemon-client-timeout.test.ts",
+      "contents_url": "https://api.github.com/repos/steipete/mcporter/contents/tests%2Fdaemon-client-timeout.test.ts?ref=676cc15cbb7538c367a1ef83a24e197a54120c81",
+      "patch": "@@ -0,0 +1,114 @@\n+import { EventEmitter } from 'node:events';\n+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';\n+\n+const timeoutRecords: Array<{ method: string; timeout: number }> = [];\n+\n+class MockSocket extends EventEmitter {\n+  currentTimeout = 0;\n+\n+  setTimeout(ms: number): this {\n+    this.currentTimeout = ms;\n+    return this;\n+  }\n+\n+  write(data: string, cb?: (err?: Error | null) => void): boolean {\n+    const payload = JSON.parse(data.toString());\n+    timeoutRecords.push({ method: payload.method, timeout: this.currentTimeout });\n+    const response = buildResponse(payload.method, payload.id);\n+    setTimeout(() => {\n+      this.emit('data', JSON.stringify(response));\n+      this.emit('end');\n+    }, responseDelayMs);\n+    cb?.();\n+    return true;\n+  }\n+\n+  end(cb?: () => void): this {\n+    cb?.();\n+    return this;\n+  }\n+\n+  destroy(): this {\n+    return this;\n+  }\n+}\n+\n+let responseDelayMs = 5;\n+const createConnection = vi.fn(() => {\n+  const socket = new MockSocket();\n+  setTimeout(() => socket.emit('connect'), 0);\n+  return socket;\n+});\n+\n+let previousDaemonTimeout: string | undefined;\n+\n+vi.mock('node:net', () => ({\n+  createConnection,\n+  default: { createConnection },\n+}));\n+\n+vi.mock('../src/daemon/launch.js', () => ({\n+  launchDaemonDetached: vi.fn(),\n+}));\n+\n+const { DaemonClient } = await import('../src/daemon/client.js');\n+\n+function buildResponse(method: string, id: string) {\n+  if (method === 'status') {\n+    return {\n+      id,\n+      ok: true,\n+      result: {\n+        pid: 123,\n+        startedAt: Date.now(),\n+        configPath: 'test',\n+        socketPath: '/tmp/socket',\n+        servers: [],\n+      },\n+    };\n+  }\n+  return {\n+    id,\n+    ok: true,\n+    result: { ok: true },\n+  };\n+}\n+\n+describe('DaemonClient timeouts', () => {\n+  beforeEach(() => {\n+    timeoutRecords.length = 0;\n+    responseDelayMs = 5;\n+    previousDaemonTimeout = process.env.MCPORTER_DAEMON_TIMEOUT_MS;\n+    delete process.env.MCPORTER_DAEMON_TIMEOUT_MS;\n+  });\n+\n+  afterEach(() => {\n+    if (previousDaemonTimeout === undefined) {\n+      delete process.env.MCPORTER_DAEMON_TIMEOUT_MS;\n+    } else {\n+      process.env.MCPORTER_DAEMON_TIMEOUT_MS = previousDaemonTimeout;\n+    }\n+  });\n+\n+  it('defaults to 30s per request', async () => {\n+    const client = new DaemonClient({ configPath: 'mcporter.config.json' });\n+    await client.callTool({ server: 'foo', tool: 'bar' });\n+    const callRecord = timeoutRecords.find((entry) => entry.method === 'callTool');\n+    expect(callRecord?.timeout).toBe(30_000);\n+  });\n+\n+  it('honors MCPORTER_DAEMON_TIMEOUT_MS override', async () => {\n+    process.env.MCPORTER_DAEMON_TIMEOUT_MS = '4500';\n+    const client = new DaemonClient({ configPath: 'mcporter.config.json' });\n+    await client.callTool({ server: 'foo', tool: 'bar' });\n+    const callRecord = timeoutRecords.find((entry) => entry.method === 'callTool');\n+    expect(callRecord?.timeout).toBe(4_500);\n+  });\n+\n+  it('honors per-call timeout overrides', async () => {\n+    const client = new DaemonClient({ configPath: 'mcporter.config.json' });\n+    await client.callTool({ server: 'foo', tool: 'bar', timeoutMs: 12_345 });\n+    const callRecord = timeoutRecords.find((entry) => entry.method === 'callTool');\n+    expect(callRecord?.timeout).toBe(12_345);\n+  });\n+});"
+    },
+    {
+      "sha": "dcdff1722d2402711a2e80a5dff905ed54a4edaa",
+      "filename": "tests/keep-alive-runtime.test.ts",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 2,
+      "changes": 9,
+      "blob_url": "https://github.com/steipete/mcporter/blob/676cc15cbb7538c367a1ef83a24e197a54120c81/tests%2Fkeep-alive-runtime.test.ts",
+      "raw_url": "https://github.com/steipete/mcporter/raw/676cc15cbb7538c367a1ef83a24e197a54120c81/tests%2Fkeep-alive-runtime.test.ts",
+      "contents_url": "https://api.github.com/repos/steipete/mcporter/contents/tests%2Fkeep-alive-runtime.test.ts?ref=676cc15cbb7538c367a1ef83a24e197a54120c81",
+      "patch": "@@ -85,8 +85,13 @@ describe('createKeepAliveRuntime', () => {\n       keepAliveServers: new Set(['alpha']),\n     });\n \n-    await keepAliveRuntime.callTool('alpha', 'ping', { args: { value: 1 } });\n-    expect(daemon.callTool).toHaveBeenCalledWith({ server: 'alpha', tool: 'ping', args: { value: 1 } });\n+    await keepAliveRuntime.callTool('alpha', 'ping', { args: { value: 1 }, timeoutMs: 4_200 });\n+    expect(daemon.callTool).toHaveBeenCalledWith({\n+      server: 'alpha',\n+      tool: 'ping',\n+      args: { value: 1 },\n+      timeoutMs: 4_200,\n+    });\n \n     await keepAliveRuntime.listTools('alpha', { includeSchema: true });\n     expect(daemon.listTools).toHaveBeenCalledWith({ server: 'alpha', includeSchema: true, autoAuthorize: undefined });"
+    }
+  ]
+}

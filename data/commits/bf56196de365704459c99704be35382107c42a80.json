@@ -1,0 +1,41 @@
+{
+  "message": "fix: tighten feishu dedupe boundary (#23377) (thanks @SidQin-cyber)",
+  "files": [
+    {
+      "sha": "daa694d466436807daf5bfd874643d25c65bae3f",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/bf56196de365704459c99704be35382107c42a80/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/bf56196de365704459c99704be35382107c42a80/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=bf56196de365704459c99704be35382107c42a80",
+      "patch": "@@ -20,7 +20,7 @@ Docs: https://docs.openclaw.ai\n \n - Gateway/Restart: fix restart-loop edge cases by keeping `openclaw.mjs -> dist/entry.js` bootstrap detection explicit, reacquiring the gateway lock for in-process restart fallback paths, and tightening restart-loop regression coverage. (#23416) Thanks @jeffwnli.\n - Signal/Monitor: treat user-initiated abort shutdowns as clean exits when auto-started `signal-cli` is terminated, while still surfacing unexpected daemon exits as startup/runtime failures. (#23379) Thanks @frankekn.\n-- Channels/Dedupe: centralize plugin dedupe primitives in plugin SDK (memory + persistent), move Feishu inbound dedupe to a namespace-scoped persistent store, and reuse shared dedupe cache logic for Zalo webhook replay + Tlon processed-message tracking to reduce duplicate handling during reconnect/replay paths.\n+- Channels/Dedupe: centralize plugin dedupe primitives in plugin SDK (memory + persistent), move Feishu inbound dedupe to a namespace-scoped persistent store, and reuse shared dedupe cache logic for Zalo webhook replay + Tlon processed-message tracking to reduce duplicate handling during reconnect/replay paths. (#23377) Thanks @SidQin-cyber.\n - ACP/Gateway: wait for gateway hello before opening ACP requests, and fail fast on pre-hello connect failures to avoid startup hangs and early `gateway not connected` request races. (#23390) Thanks @janckerchen.\n - Security/Audit: add `openclaw security audit` detection for open group policies that expose runtime/filesystem tools without sandbox/workspace guards (`security.exposure.open_groups_with_runtime_or_fs`).\n - Security/Exec env: block request-scoped `HOME` and `ZDOTDIR` overrides in host exec env sanitizers (Node + macOS), preventing shell startup-file execution before allowlist-evaluated command bodies. This ships in the next npm release. Thanks @tdjackey for reporting."
+    },
+    {
+      "sha": "86ca3a6353c3302134fc58f9d110f5d4e9192052",
+      "filename": "extensions/feishu/src/dedup-store.ts",
+      "status": "removed",
+      "additions": 0,
+      "deletions": 104,
+      "changes": 104,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/9e5e555ba3762819f630a066ba813a239ad6cfd0/extensions%2Ffeishu%2Fsrc%2Fdedup-store.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/9e5e555ba3762819f630a066ba813a239ad6cfd0/extensions%2Ffeishu%2Fsrc%2Fdedup-store.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Ffeishu%2Fsrc%2Fdedup-store.ts?ref=9e5e555ba3762819f630a066ba813a239ad6cfd0",
+      "patch": "@@ -1,104 +0,0 @@\n-import fs from \"node:fs\";\n-import os from \"node:os\";\n-import path from \"node:path\";\n-\n-const DEFAULT_DEDUP_DIR = path.join(os.homedir(), \".openclaw\", \"feishu\", \"dedup\");\n-const MAX_ENTRIES_PER_FILE = 10_000;\n-const CLEANUP_PROBABILITY = 0.02;\n-const CACHE_STALE_MS = 30_000;\n-\n-type DedupData = Record<string, number>;\n-\n-/**\n- * Filesystem-backed dedup store.  Each \"namespace\" (typically a Feishu account\n- * ID) maps to a single JSON file containing `{ messageId: timestampMs }` pairs.\n- *\n- * Writes use atomic rename to avoid partial-read corruption.  Probabilistic\n- * cleanup keeps the file size bounded without adding latency to every call.\n- */\n-export class DedupStore {\n-  private readonly dir: string;\n-  private cache = new Map<string, DedupData>();\n-  private cacheLoadedAt = new Map<string, number>();\n-\n-  constructor(dir?: string) {\n-    this.dir = dir ?? DEFAULT_DEDUP_DIR;\n-  }\n-\n-  private filePath(namespace: string): string {\n-    const safe = namespace.replace(/[^a-zA-Z0-9_-]/g, \"_\");\n-    return path.join(this.dir, `${safe}.json`);\n-  }\n-\n-  async load(namespace: string): Promise<DedupData> {\n-    const loadedAt = this.cacheLoadedAt.get(namespace);\n-    if (loadedAt != null && Date.now() - loadedAt > CACHE_STALE_MS) {\n-      this.cache.delete(namespace);\n-      this.cacheLoadedAt.delete(namespace);\n-    }\n-\n-    const cached = this.cache.get(namespace);\n-    if (cached) return cached;\n-\n-    try {\n-      const raw = await fs.promises.readFile(this.filePath(namespace), \"utf-8\");\n-      const data: DedupData = JSON.parse(raw);\n-      this.cache.set(namespace, data);\n-      this.cacheLoadedAt.set(namespace, Date.now());\n-      return data;\n-    } catch {\n-      const data: DedupData = {};\n-      this.cache.set(namespace, data);\n-      this.cacheLoadedAt.set(namespace, Date.now());\n-      return data;\n-    }\n-  }\n-\n-  async has(namespace: string, messageId: string, ttlMs: number): Promise<boolean> {\n-    const data = await this.load(namespace);\n-    const ts = data[messageId];\n-    if (ts == null) return false;\n-    if (Date.now() - ts > ttlMs) {\n-      // Expired \u2014 treat as absent.  Skip the delete here to avoid silent\n-      // cache/disk divergence; actual cleanup happens probabilistically\n-      // inside record().\n-      return false;\n-    }\n-    return true;\n-  }\n-\n-  async record(namespace: string, messageId: string, ttlMs: number): Promise<void> {\n-    const data = await this.load(namespace);\n-    data[messageId] = Date.now();\n-\n-    if (Math.random() < CLEANUP_PROBABILITY) {\n-      this.evict(data, ttlMs);\n-    }\n-\n-    await this.flush(namespace, data);\n-  }\n-\n-  private evict(data: DedupData, ttlMs: number): void {\n-    const now = Date.now();\n-    for (const key of Object.keys(data)) {\n-      if (now - data[key] > ttlMs) delete data[key];\n-    }\n-\n-    const keys = Object.keys(data);\n-    if (keys.length > MAX_ENTRIES_PER_FILE) {\n-      keys\n-        .sort((a, b) => data[a] - data[b])\n-        .slice(0, keys.length - MAX_ENTRIES_PER_FILE)\n-        .forEach((k) => delete data[k]);\n-    }\n-  }\n-\n-  private async flush(namespace: string, data: DedupData): Promise<void> {\n-    await fs.promises.mkdir(this.dir, { recursive: true });\n-    const fp = this.filePath(namespace);\n-    const tmp = `${fp}.tmp.${process.pid}`;\n-    await fs.promises.writeFile(tmp, JSON.stringify(data), \"utf-8\");\n-    await fs.promises.rename(tmp, fp);\n-    this.cacheLoadedAt.set(namespace, Date.now());\n-  }\n-}"
+    },
+    {
+      "sha": "6468e30f23d5027be8155b9a4fca2cb944a6ac15",
+      "filename": "extensions/feishu/src/dedup.ts",
+      "status": "modified",
+      "additions": 0,
+      "deletions": 3,
+      "changes": 3,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/bf56196de365704459c99704be35382107c42a80/extensions%2Ffeishu%2Fsrc%2Fdedup.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/bf56196de365704459c99704be35382107c42a80/extensions%2Ffeishu%2Fsrc%2Fdedup.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Ffeishu%2Fsrc%2Fdedup.ts?ref=bf56196de365704459c99704be35382107c42a80",
+      "patch": "@@ -14,9 +14,6 @@ function resolveStateDirFromEnv(env: NodeJS.ProcessEnv = process.env): string {\n   if (stateOverride) {\n     return stateOverride;\n   }\n-  if (env.VITEST || env.NODE_ENV === \"test\") {\n-    return path.join(os.tmpdir(), \"openclaw-vitest-\" + process.pid);\n-  }\n   return path.join(os.homedir(), \".openclaw\");\n }\n "
+    }
+  ]
+}

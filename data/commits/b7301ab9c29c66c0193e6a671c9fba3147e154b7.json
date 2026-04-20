@@ -1,0 +1,65 @@
+{
+  "message": "fix: harden windows support",
+  "files": [
+    {
+      "sha": "5cd30026cb77b5ffb86f8d34c20a051b2d6b553c",
+      "filename": ".github/workflows/ci.yml",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 0,
+      "changes": 22,
+      "blob_url": "https://github.com/steipete/mcporter/blob/b7301ab9c29c66c0193e6a671c9fba3147e154b7/.github%2Fworkflows%2Fci.yml",
+      "raw_url": "https://github.com/steipete/mcporter/raw/b7301ab9c29c66c0193e6a671c9fba3147e154b7/.github%2Fworkflows%2Fci.yml",
+      "contents_url": "https://api.github.com/repos/steipete/mcporter/contents/.github%2Fworkflows%2Fci.yml?ref=b7301ab9c29c66c0193e6a671c9fba3147e154b7",
+      "patch": "@@ -29,3 +29,25 @@ jobs:\n         env:\n           FIRECRAWL_API_KEY: test\n           LINEAR_API_KEY: test\n+  windows:\n+    runs-on: windows-latest\n+    steps:\n+      - uses: actions/checkout@v4\n+      - uses: pnpm/action-setup@v3\n+        with:\n+          version: 10.20.0\n+          run_install: false\n+      - uses: actions/setup-node@v4\n+        with:\n+          node-version: 22\n+      - uses: oven-sh/setup-bun@v2\n+        with:\n+          bun-version: 1.3.1\n+      - run: pnpm install --no-frozen-lockfile\n+      - run: pnpm --version\n+      - run: pnpm check\n+      - run: pnpm build\n+      - run: pnpm test\n+        env:\n+          FIRECRAWL_API_KEY: test\n+          LINEAR_API_KEY: test"
+    },
+    {
+      "sha": "bc9a58b1d5a838f83e094d0762b7269721d537dc",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/steipete/mcporter/blob/b7301ab9c29c66c0193e6a671c9fba3147e154b7/CHANGELOG.md",
+      "raw_url": "https://github.com/steipete/mcporter/raw/b7301ab9c29c66c0193e6a671c9fba3147e154b7/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/steipete/mcporter/contents/CHANGELOG.md?ref=b7301ab9c29c66c0193e6a671c9fba3147e154b7",
+      "patch": "@@ -5,6 +5,11 @@\n ### CLI & runtime\n - Added a per-login daemon that auto-starts when keep-alive MCP servers (e.g., Chrome DevTools, Mobile MCP, Playwright) are invoked. The daemon keeps STDIO transports alive across agents, exposes `mcporter daemon <start|status|stop>`, and supports idle shutdown plus manual restarts.\n - Keep-alive detection now honors the `lifecycle` config flag/env overrides and also inspects STDIO command signatures, so renaming `chrome-devtools` (or other stateful servers) no longer disables the daemon accidentally.\n+- Windows imports now probe workspace `.cursor/mcp.json`, `%USERPROFILE%\\\\.cursor\\\\mcp.json`, `%APPDATA%\\\\Cursor\\\\User\\\\mcp.json`, `.vscode/mcp.json`, and the current Windsurf/Codeium directories so editor-managed MCP servers show up without manual copies on Windows machines.\n+- Implemented Windows process-tree enumeration/termination (via `powershell.exe Get-CimInstance Win32_Process`) so closing stdio transports tears down the full process tree on Windows just like macOS/Linux, preventing orphaned child servers.\n+\n+### CI\n+- Added a `windows-latest` job to the GitHub Actions workflow to run the same install/lint/build/test sequence as Linux, catching platform regressions before release.\n \n \n ## [0.4.5] - 2025-11-10"
+    },
+    {
+      "sha": "9aa31502b22165a96bd023ebf193da850548b42e",
+      "filename": "src/runtime-process-utils.ts",
+      "status": "modified",
+      "additions": 57,
+      "deletions": 15,
+      "changes": 72,
+      "blob_url": "https://github.com/steipete/mcporter/blob/b7301ab9c29c66c0193e6a671c9fba3147e154b7/src%2Fruntime-process-utils.ts",
+      "raw_url": "https://github.com/steipete/mcporter/raw/b7301ab9c29c66c0193e6a671c9fba3147e154b7/src%2Fruntime-process-utils.ts",
+      "contents_url": "https://api.github.com/repos/steipete/mcporter/contents/src%2Fruntime-process-utils.ts?ref=b7301ab9c29c66c0193e6a671c9fba3147e154b7",
+      "patch": "@@ -196,8 +196,7 @@ async function listDescendantPids(rootPid: number): Promise<number[]> {\n     return [];\n   }\n   if (process.platform === 'win32') {\n-    // TODO: implement Windows process tree enumeration if/when needed.\n-    return [];\n+    return listDescendantPidsWindows(rootPid);\n   }\n \n   try {\n@@ -219,23 +218,42 @@ async function listDescendantPids(rootPid: number): Promise<number[]> {\n       children.set(ppid, bucket);\n     }\n \n-    const result: number[] = [];\n-    const queue = [...(children.get(rootPid) ?? [])];\n-    const seen = new Set<number>(queue);\n-    while (queue.length > 0) {\n-      const current = queue.shift();\n-      if (current === undefined) {\n+    return collectDescendantsFromChildren(rootPid, children);\n+  } catch {\n+    return [];\n+  }\n+}\n+\n+async function listDescendantPidsWindows(rootPid: number): Promise<number[]> {\n+  try {\n+    const powershellScript =\n+      'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress';\n+    const { stdout } = await execFileAsync('powershell.exe', ['-NoProfile', '-Command', powershellScript]);\n+    const trimmed = stdout.trim();\n+    if (!trimmed) {\n+      return [];\n+    }\n+    const parsed = JSON.parse(trimmed) as\n+      | { ProcessId?: number; ParentProcessId?: number }\n+      | Array<{ ProcessId?: number; ParentProcessId?: number }>;\n+    const entries = Array.isArray(parsed) ? parsed : [parsed];\n+    const children = new Map<number, number[]>();\n+    for (const entry of entries) {\n+      const pidCandidate = entry?.ProcessId;\n+      const ppidCandidate = entry?.ParentProcessId;\n+      if (typeof pidCandidate !== 'number' || typeof ppidCandidate !== 'number') {\n         continue;\n       }\n-      result.push(current);\n-      for (const child of children.get(current) ?? []) {\n-        if (!seen.has(child)) {\n-          seen.add(child);\n-          queue.push(child);\n-        }\n+      const pid = Number.isFinite(pidCandidate) ? pidCandidate : undefined;\n+      const ppid = Number.isFinite(ppidCandidate) ? ppidCandidate : undefined;\n+      if (pid === undefined || ppid === undefined) {\n+        continue;\n       }\n+      const bucket = children.get(ppid) ?? [];\n+      bucket.push(pid);\n+      children.set(ppid, bucket);\n     }\n-    return result;\n+    return collectDescendantsFromChildren(rootPid, children);\n   } catch {\n     return [];\n   }\n@@ -258,6 +276,30 @@ async function collectProcessTreePids(rootPid: number): Promise<number[]> {\n   return [...descendants, rootPid];\n }\n \n+function collectDescendantsFromChildren(rootPid: number, children: Map<number, number[]>): number[] {\n+  const result: number[] = [];\n+  const queue = [...(children.get(rootPid) ?? [])];\n+  const seen = new Set<number>(queue);\n+  while (queue.length > 0) {\n+    const current = queue.shift();\n+    if (current === undefined) {\n+      continue;\n+    }\n+    result.push(current);\n+    for (const child of children.get(current) ?? []) {\n+      if (!seen.has(child)) {\n+        seen.add(child);\n+        queue.push(child);\n+      }\n+    }\n+  }\n+  return result;\n+}\n+\n+export const __testHooks = {\n+  listDescendantPids,\n+};\n+\n async function waitForTreeExit(pids: number[], durationMs: number): Promise<boolean> {\n   const deadline = Date.now() + durationMs;\n   while (true) {"
+    },
+    {
+      "sha": "75859f3c21a7e3127c58d5b9b9da92a4a08abdde",
+      "filename": "tests/config-import-paths.test.ts",
+      "status": "added",
+      "additions": 52,
+      "deletions": 0,
+      "changes": 52,
+      "blob_url": "https://github.com/steipete/mcporter/blob/b7301ab9c29c66c0193e6a671c9fba3147e154b7/tests%2Fconfig-import-paths.test.ts",
+      "raw_url": "https://github.com/steipete/mcporter/raw/b7301ab9c29c66c0193e6a671c9fba3147e154b7/tests%2Fconfig-import-paths.test.ts",
+      "contents_url": "https://api.github.com/repos/steipete/mcporter/contents/tests%2Fconfig-import-paths.test.ts?ref=b7301ab9c29c66c0193e6a671c9fba3147e154b7",
+      "patch": "@@ -0,0 +1,52 @@\n+import os from 'node:os';\n+import path from 'node:path';\n+import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';\n+import { pathsForImport } from '../src/config-imports.js';\n+\n+describe('pathsForImport on Windows', () => {\n+  let platformSpy: ReturnType<typeof vi.spyOn>;\n+  let homeSpy: ReturnType<typeof vi.spyOn>;\n+  const homeDir = path.join(os.tmpdir(), 'mcporter-win-home');\n+  const appData = path.join(homeDir, 'AppData', 'Roaming');\n+\n+  beforeEach(() => {\n+    platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');\n+    homeSpy = vi.spyOn(os, 'homedir').mockReturnValue(homeDir);\n+    process.env.HOME = homeDir;\n+    process.env.USERPROFILE = homeDir;\n+    process.env.APPDATA = appData;\n+    process.env.XDG_CONFIG_HOME = '';\n+  });\n+\n+  afterEach(() => {\n+    platformSpy.mockRestore();\n+    homeSpy.mockRestore();\n+    delete process.env.HOME;\n+    delete process.env.USERPROFILE;\n+    delete process.env.APPDATA;\n+    delete process.env.XDG_CONFIG_HOME;\n+  });\n+\n+  it('includes Windows Cursor directories and workspace override', () => {\n+    const rootDir = 'C:/repo';\n+    const paths = pathsForImport('cursor', rootDir);\n+    expect(paths).toContain(path.resolve(rootDir, '.cursor', 'mcp.json'));\n+    expect(paths).toContain(path.join(homeDir, '.cursor', 'mcp.json'));\n+    expect(paths).toContain(path.join(appData, 'Cursor', 'User', 'mcp.json'));\n+  });\n+\n+  it('includes Windows windsuf configs across Codeium directories', () => {\n+    const rootDir = 'C:/repo';\n+    const paths = pathsForImport('windsurf', rootDir);\n+    expect(paths).toContain(path.join(appData, 'Codeium', 'windsurf', 'mcp_config.json'));\n+    expect(paths).toContain(path.join(homeDir, '.codeium', 'windsurf', 'mcp_config.json'));\n+  });\n+\n+  it('prefers workspace .vscode/mcp.json before user-level VS Code configs', () => {\n+    const rootDir = 'C:/repo';\n+    const paths = pathsForImport('vscode', rootDir);\n+    expect(paths[0]).toBe(path.resolve(rootDir, '.vscode', 'mcp.json'));\n+    expect(paths).toContain(path.join(appData, 'Code', 'User', 'mcp.json'));\n+    expect(paths).toContain(path.join(appData, 'Code - Insiders', 'User', 'mcp.json'));\n+  });\n+});"
+    },
+    {
+      "sha": "021c52c25a2bbe5a6fb12eec848931ebfc0c20dc",
+      "filename": "tests/runtime-process-utils.test.ts",
+      "status": "added",
+      "additions": 55,
+      "deletions": 0,
+      "changes": 55,
+      "blob_url": "https://github.com/steipete/mcporter/blob/b7301ab9c29c66c0193e6a671c9fba3147e154b7/tests%2Fruntime-process-utils.test.ts",
+      "raw_url": "https://github.com/steipete/mcporter/raw/b7301ab9c29c66c0193e6a671c9fba3147e154b7/tests%2Fruntime-process-utils.test.ts",
+      "contents_url": "https://api.github.com/repos/steipete/mcporter/contents/tests%2Fruntime-process-utils.test.ts?ref=b7301ab9c29c66c0193e6a671c9fba3147e154b7",
+      "patch": "@@ -0,0 +1,55 @@\n+import type { ChildProcess } from 'node:child_process';\n+import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';\n+\n+const execFileMock = vi.fn();\n+\n+vi.mock('node:child_process', async () => {\n+  const actual = await vi.importActual<typeof import('node:child_process')>('node:child_process');\n+  return {\n+    ...actual,\n+    execFile: execFileMock,\n+  };\n+});\n+\n+describe('runtime-process-utils Windows process tree', () => {\n+  let platformSpy: ReturnType<typeof vi.spyOn>;\n+\n+  beforeEach(() => {\n+    vi.resetModules();\n+    execFileMock.mockReset();\n+    platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');\n+  });\n+\n+  afterEach(() => {\n+    platformSpy.mockRestore();\n+  });\n+\n+  it('parses PowerShell output to enumerate descendants', async () => {\n+    const { __testHooks } = await import('../src/runtime-process-utils.js');\n+    const rootPid = process.pid;\n+    const powershellOutput = JSON.stringify([\n+      { ProcessId: rootPid + 1, ParentProcessId: rootPid },\n+      { ProcessId: rootPid + 2, ParentProcessId: rootPid + 1 },\n+      { ProcessId: rootPid + 3, ParentProcessId: 42 },\n+    ]);\n+\n+    execFileMock.mockImplementation((command, args, options, callback) => {\n+      const cb = typeof options === 'function' ? options : callback;\n+      if (command === 'powershell.exe') {\n+        cb?.(null, powershellOutput, '');\n+      } else {\n+        cb?.(new Error('unexpected command'));\n+      }\n+      return { pid: 1 } as ChildProcess;\n+    });\n+\n+    const descendants = await __testHooks.listDescendantPids(rootPid);\n+    expect(descendants).toEqual([rootPid + 1, rootPid + 2]);\n+    expect(execFileMock).toHaveBeenCalledWith(\n+      'powershell.exe',\n+      expect.arrayContaining(['-NoProfile', '-Command', expect.stringContaining('Get-CimInstance')]),\n+      expect.any(Object),\n+      expect.any(Function)\n+    );\n+  });\n+});"
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "message": "fix(storage): check git commit state for 2PC recovery, not filesystem\n\nThe TxManager recovery logic for pending transactions previously used\nskill_exists() to check if a skill was present, but this only checks\nthe filesystem. If the git commit failed after writing files but before\ncompleting the transaction, recovery would incorrectly assume success.\n\nAdded skill_committed() method to GitArchive that checks if a skill\nactually exists in the HEAD commit tree, ensuring accurate recovery\ndecisions.\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "d137d45cde2f7a3355abe0212d2ece4b4e6d840f",
+      "filename": "src/storage/git.rs",
+      "status": "modified",
+      "additions": 52,
+      "deletions": 0,
+      "changes": 52,
+      "blob_url": "https://github.com/Dicklesworthstone/meta_skill/blob/85d4ba88dd8c43e8376e3370771a908beb01b97b/src%2Fstorage%2Fgit.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/meta_skill/raw/85d4ba88dd8c43e8376e3370771a908beb01b97b/src%2Fstorage%2Fgit.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/meta_skill/contents/src%2Fstorage%2Fgit.rs?ref=85d4ba88dd8c43e8376e3370771a908beb01b97b",
+      "patch": "@@ -87,6 +87,32 @@ impl GitArchive {\n             .unwrap_or(false)\n     }\n \n+    /// Check if a skill exists in the current HEAD commit.\n+    /// This is used for 2PC recovery to verify if a commit actually happened.\n+    pub fn skill_committed(&self, skill_id: &str) -> Result<bool> {\n+        // Safe because skill_exists/skill_path checks for traversal, but we construct path manually here\n+        // to match repo root relative path.\n+        if skill_id.trim().is_empty() || skill_id == \".\" || skill_id == \"..\" || skill_id.contains('/') || skill_id.contains('\\\\') {\n+             return Ok(false);\n+        }\n+        \n+        let path = Path::new(\"skills/by-id\").join(skill_id).join(\"skill.spec.json\");\n+        let head = match self.repo.head() {\n+            Ok(h) => h,\n+            Err(_) => return Ok(false), // No head = no commits\n+        };\n+        \n+        let target = head.target().ok_or_else(|| MsError::Git(git2::Error::from_str(\"HEAD is not a commit\")))?;\n+        let commit = self.repo.find_commit(target)?;\n+        let tree = commit.tree().map_err(MsError::Git)?;\n+        \n+        match tree.get_path(&path) {\n+            Ok(_) => Ok(true),\n+            Err(e) if e.code() == ErrorCode::NotFound => Ok(false),\n+            Err(e) => Err(MsError::Git(e)),\n+        }\n+    }\n+\n     pub fn list_skill_ids(&self) -> Result<Vec<String>> {\n         let base = self.root.join(\"skills/by-id\");\n         if !base.exists() {\n@@ -590,4 +616,30 @@ mod tests {\n         let path = archive.skill_path(\".\");\n         assert!(path.is_none(), \"Should reject '.' as skill ID\");\n     }\n+\n+    #[test]\n+    fn test_skill_committed() {\n+        let dir = tempdir().unwrap();\n+        let archive = GitArchive::open(dir.path()).unwrap();\n+\n+        let spec = sample_spec(\"comm-skill\");\n+        \n+        // Not committed yet\n+        assert!(!archive.skill_committed(\"comm-skill\").unwrap());\n+\n+        // Write and commit\n+        archive.write_skill(&spec).unwrap();\n+        \n+        // Now committed\n+        assert!(archive.skill_committed(\"comm-skill\").unwrap());\n+\n+        // Create a file manually (uncommitted)\n+        let uncomm_dir = dir.path().join(\"skills/by-id/uncomm-skill\");\n+        fs::create_dir_all(&uncomm_dir).unwrap();\n+        fs::write(uncomm_dir.join(\"skill.spec.json\"), \"{}\").unwrap();\n+\n+        // Should exist on disk but not committed\n+        assert!(archive.skill_exists(\"uncomm-skill\"));\n+        assert!(!archive.skill_committed(\"uncomm-skill\").unwrap());\n+    }\n }"
+    },
+    {
+      "sha": "2b5243171508dd5810638284efb249cb7d01a2a1",
+      "filename": "src/storage/tx.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 6,
+      "changes": 12,
+      "blob_url": "https://github.com/Dicklesworthstone/meta_skill/blob/85d4ba88dd8c43e8376e3370771a908beb01b97b/src%2Fstorage%2Ftx.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/meta_skill/raw/85d4ba88dd8c43e8376e3370771a908beb01b97b/src%2Fstorage%2Ftx.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/meta_skill/contents/src%2Fstorage%2Ftx.rs?ref=85d4ba88dd8c43e8376e3370771a908beb01b97b",
+      "patch": "@@ -712,16 +712,16 @@ impl TxManager {\n             }\n             TxPhase::Pending => {\n                 // SQLite written but phase still pending - need to check Git state.\n-                // If Git already has the skill (from a partial git_commit where\n-                // write_skill succeeded but update_tx_phase failed), complete the tx.\n-                // Otherwise, Git doesn't have it and we can safely roll back.\n-                if self.git.skill_exists(&tx.entity_id) {\n-                    info!(\"Completing pending tx with existing Git data: {}\", tx.id);\n+                // We must check if the COMMIT actually happened.\n+                // Checking self.git.skill_exists() only checks the filesystem, which\n+                // might have files even if commit failed.\n+                if self.git.skill_committed(&tx.entity_id)? {\n+                    info!(\"Completing pending tx with committed Git data: {}\", tx.id);\n                     let tx = self.db_mark_committed(tx)?;\n                     self.cleanup_tx(&tx)?;\n                     report.completed += 1;\n                 } else {\n-                    info!(\"Rolling back pending tx: {}\", tx.id);\n+                    info!(\"Rolling back pending tx (not committed): {}\", tx.id);\n                     self.rollback_tx(tx)?;\n                     report.rolled_back += 1;\n                 }"
+    }
+  ]
+}

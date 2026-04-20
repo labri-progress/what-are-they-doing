@@ -1,0 +1,54 @@
+{
+  "message": "fix: cross-platform hook execution overhaul (v1.2.0)\n\nThree root causes were breaking the Stop hook across platforms:\n\n1. Escaped quotes in hooks.json (\"\\\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\\\"\")\n   produced malformed shell syntax on macOS/Linux. Removed quotes entirely.\n\n2. run-hook.cmd Unix side called the script directly, requiring execute-bit.\n   Now uses `exec bash` so no chmod needed. Also updated Windows side to try\n   multiple bash locations (Program Files x86, PATH) rather than one hardcoded\n   path, fixing MSYS2/Cygwin users.\n\n3. Script had .sh extension. Claude Code on Windows auto-prepends `bash` to\n   any hook command containing .sh, defeating the polyglot dispatch entirely.\n   Renamed to claude-judge-continuation (no extension).\n\nAlso adds from issue reports:\n- 30s timeout on claude --print subprocess (configurable via\n  DOUBLE_SHOT_LATTE_TIMEOUT); times out to approve rather than hang\n- Trap handler to clean up any orphaned child processes on exit\n- Transcript context capped at 4 JSONL lines / 32KB before sending to\n  judge model (large parallel-agent outputs were sending megabytes)\n\nFixes #6, #8, #13, #14. Closes #9, #10 (changes incorporated here).",
+  "files": [
+    {
+      "sha": "0c3d49709aba981e87abf7c92ffdd289c02dbbc5",
+      "filename": ".claude-plugin/plugin.json",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/obra/double-shot-latte/blob/465f212d8edb3218b209aa3e4e196c6a45d5af4e/.claude-plugin%2Fplugin.json",
+      "raw_url": "https://github.com/obra/double-shot-latte/raw/465f212d8edb3218b209aa3e4e196c6a45d5af4e/.claude-plugin%2Fplugin.json",
+      "contents_url": "https://api.github.com/repos/obra/double-shot-latte/contents/.claude-plugin%2Fplugin.json?ref=465f212d8edb3218b209aa3e4e196c6a45d5af4e",
+      "patch": "@@ -1,6 +1,6 @@\n {\n   \"name\": \"double-shot-latte\",\n-  \"version\": \"1.1.5\",\n+  \"version\": \"1.2.0\",\n   \"description\": \"Automatically evaluates whether Claude should continue working instead of stopping prematurely using Claude-judged decision making\",\n   \"author\": {\n     \"name\": \"Jesse\","
+    },
+    {
+      "sha": "7889996c0adb0450ecea599f6225fdb39f088d2e",
+      "filename": "hooks/claude-judge-continuation",
+      "status": "renamed",
+      "additions": 32,
+      "deletions": 8,
+      "changes": 40,
+      "blob_url": "https://github.com/obra/double-shot-latte/blob/465f212d8edb3218b209aa3e4e196c6a45d5af4e/hooks%2Fclaude-judge-continuation",
+      "raw_url": "https://github.com/obra/double-shot-latte/raw/465f212d8edb3218b209aa3e4e196c6a45d5af4e/hooks%2Fclaude-judge-continuation",
+      "contents_url": "https://api.github.com/repos/obra/double-shot-latte/contents/hooks%2Fclaude-judge-continuation?ref=465f212d8edb3218b209aa3e4e196c6a45d5af4e",
+      "patch": "@@ -5,6 +5,15 @@\n # Uses another Claude instance to judge whether continuation is appropriate\n # DEFAULT STANCE: Continue unless there's a CLEAR reason to stop\n \n+# Clean up any background jobs on exit to avoid orphaned claude processes\n+cleanup() {\n+    pids=$(jobs -p 2>/dev/null)\n+    if [ -n \"$pids\" ]; then\n+        kill $pids 2>/dev/null\n+    fi\n+}\n+trap cleanup EXIT TERM INT HUP\n+\n # Check if we're in a recursive call (judge Claude instance)\n if [ \"$CLAUDE_HOOK_JUDGE_MODE\" = \"true\" ]; then\n     echo '{\"decision\": \"approve\", \"reason\": \"Running in judge mode, allowing stop\"}'\n@@ -55,9 +64,11 @@ if [ -z \"$TRANSCRIPT_PATH\" ] || [ ! -f \"$TRANSCRIPT_PATH\" ]; then\n     exit 0\n fi\n \n-# Extract the last few exchanges from the transcript (Claude's response + context)\n-# We want the most recent assistant message and some preceding context\n-RECENT_CONTEXT=$(tail -n 10 \"$TRANSCRIPT_PATH\" | jq -s '.')\n+# Extract the last few exchanges from the transcript.\n+# JSONL files have one JSON object per line; lines from parallel agents can be\n+# megabytes each. Take the last 4 lines then cap total size so the judge model\n+# gets classification-level context, not a firehose.\n+RECENT_CONTEXT=$(tail -n 4 \"$TRANSCRIPT_PATH\" | jq -s '.' 2>/dev/null | head -c 32000)\n \n # Create a JSON schema for the response\n JSON_SCHEMA='{\"type\":\"object\",\"properties\":{\"should_continue\":{\"type\":\"boolean\"},\"reasoning\":{\"type\":\"string\"}},\"required\":[\"should_continue\",\"reasoning\"]}'\n@@ -104,12 +115,25 @@ Default to STOP when uncertain.\"\n # Set environment variable to prevent recursion, use JSON schema, disable tools\n # Run claude in the dedicated working directory\n # Model can be configured via DOUBLE_SHOT_LATTE_MODEL env var (default: haiku)\n+# Timeout can be configured via DOUBLE_SHOT_LATTE_TIMEOUT env var (default: 30s)\n JUDGE_MODEL=\"${DOUBLE_SHOT_LATTE_MODEL:-haiku}\"\n-CLAUDE_RESPONSE=$(echo \"$EVALUATION_PROMPT\" | (cd \"$CLAUDE_WORK_DIR\" && CLAUDE_HOOK_JUDGE_MODE=true claude --print --model \"$JUDGE_MODEL\" --output-format json --json-schema \"$JSON_SCHEMA\" --system-prompt \"$SYSTEM_PROMPT\" --disallowedTools '*') 2>/dev/null)\n-\n-# Check if claude command succeeded\n-if [ $? -ne 0 ]; then\n-    echo '{\"decision\": \"approve\", \"reason\": \"Claude evaluation command failed, allowing default stop behavior\"}'\n+JUDGE_TIMEOUT=\"${DOUBLE_SHOT_LATTE_TIMEOUT:-30}\"\n+CLAUDE_RESPONSE=$(cd \"$CLAUDE_WORK_DIR\" && echo \"$EVALUATION_PROMPT\" | \\\n+    CLAUDE_HOOK_JUDGE_MODE=true timeout \"$JUDGE_TIMEOUT\" claude --print \\\n+    --model \"$JUDGE_MODEL\" \\\n+    --output-format json \\\n+    --json-schema \"$JSON_SCHEMA\" \\\n+    --system-prompt \"$SYSTEM_PROMPT\" \\\n+    --disallowedTools '*' 2>/dev/null)\n+CLAUDE_EXIT_CODE=$?\n+\n+# Check if claude command succeeded (exit 124 = timeout)\n+if [ $CLAUDE_EXIT_CODE -ne 0 ]; then\n+    if [ $CLAUDE_EXIT_CODE -eq 124 ]; then\n+        echo '{\"decision\": \"approve\", \"reason\": \"Claude evaluation timed out, allowing default stop behavior\"}'\n+    else\n+        echo '{\"decision\": \"approve\", \"reason\": \"Claude evaluation command failed, allowing default stop behavior\"}'\n+    fi\n     exit 0\n fi\n ",
+      "previous_filename": "hooks/claude-judge-continuation.sh"
+    },
+    {
+      "sha": "0e77cb183cf496e308b2d16d9ef13661b181f2d0",
+      "filename": "hooks/hooks.json",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/obra/double-shot-latte/blob/465f212d8edb3218b209aa3e4e196c6a45d5af4e/hooks%2Fhooks.json",
+      "raw_url": "https://github.com/obra/double-shot-latte/raw/465f212d8edb3218b209aa3e4e196c6a45d5af4e/hooks%2Fhooks.json",
+      "contents_url": "https://api.github.com/repos/obra/double-shot-latte/contents/hooks%2Fhooks.json?ref=465f212d8edb3218b209aa3e4e196c6a45d5af4e",
+      "patch": "@@ -5,7 +5,7 @@\n         \"hooks\": [\n           {\n             \"type\": \"command\",\n-            \"command\": \"\\\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\\\" claude-judge-continuation.sh\"\n+            \"command\": \"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd claude-judge-continuation\"\n           }\n         ]\n       }"
+    },
+    {
+      "sha": "3c8e5a9253f868a573401b0ffcc4820aaa5b3e4e",
+      "filename": "hooks/run-hook.cmd",
+      "status": "modified",
+      "additions": 37,
+      "deletions": 7,
+      "changes": 44,
+      "blob_url": "https://github.com/obra/double-shot-latte/blob/465f212d8edb3218b209aa3e4e196c6a45d5af4e/hooks%2Frun-hook.cmd",
+      "raw_url": "https://github.com/obra/double-shot-latte/raw/465f212d8edb3218b209aa3e4e196c6a45d5af4e/hooks%2Frun-hook.cmd",
+      "contents_url": "https://api.github.com/repos/obra/double-shot-latte/contents/hooks%2Frun-hook.cmd?ref=465f212d8edb3218b209aa3e4e196c6a45d5af4e",
+      "patch": "@@ -1,15 +1,45 @@\n : << 'CMDBLOCK'\n @echo off\n-REM Polyglot wrapper: runs .sh scripts cross-platform\n+REM Cross-platform polyglot wrapper for hook scripts.\n+REM On Windows: cmd.exe runs the batch portion, which finds and calls bash.\n+REM On Unix: the shell interprets this as a script (: is a no-op in bash).\n+REM\n+REM Hook scripts use extensionless filenames (e.g. \"claude-judge-continuation\" not\n+REM \"claude-judge-continuation.sh\") so Claude Code's Windows auto-detection -- which\n+REM prepends \"bash\" to any command containing .sh -- doesn't interfere.\n+REM\n REM Usage: run-hook.cmd <script-name> [args...]\n-REM The script should be in the same directory as this wrapper\n \n-\"C:\\Program Files\\Git\\bin\\bash.exe\" -l \"%~dp0%~1\"\n-exit /b\n+if \"%~1\"==\"\" (\n+    echo run-hook.cmd: missing script name >&2\n+    exit /b 1\n+)\n+\n+set \"HOOK_DIR=%~dp0\"\n+\n+REM Try Git for Windows bash in standard locations\n+if exist \"C:\\Program Files\\Git\\bin\\bash.exe\" (\n+    \"C:\\Program Files\\Git\\bin\\bash.exe\" \"%HOOK_DIR%%~1\" %2 %3 %4 %5 %6 %7 %8 %9\n+    exit /b %ERRORLEVEL%\n+)\n+if exist \"C:\\Program Files (x86)\\Git\\bin\\bash.exe\" (\n+    \"C:\\Program Files (x86)\\Git\\bin\\bash.exe\" \"%HOOK_DIR%%~1\" %2 %3 %4 %5 %6 %7 %8 %9\n+    exit /b %ERRORLEVEL%\n+)\n+\n+REM Try bash on PATH (e.g. user-installed Git Bash, MSYS2, Cygwin)\n+where bash >nul 2>nul\n+if %ERRORLEVEL% equ 0 (\n+    bash \"%HOOK_DIR%%~1\" %2 %3 %4 %5 %6 %7 %8 %9\n+    exit /b %ERRORLEVEL%\n+)\n+\n+REM No bash found - exit silently rather than error\n+exit /b 0\n CMDBLOCK\n \n-# Unix shell runs from here\n-SCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\n+# Unix: run the named script via explicit bash (no execute-bit required)\n+SCRIPT_DIR=\"$(cd \"$(dirname \"${BASH_SOURCE[0]:-$0}\")\" && pwd)\"\n SCRIPT_NAME=\"$1\"\n shift\n-\"${SCRIPT_DIR}/${SCRIPT_NAME}\" \"$@\"\n+exec bash \"${SCRIPT_DIR}/${SCRIPT_NAME}\" \"$@\""
+    }
+  ]
+}

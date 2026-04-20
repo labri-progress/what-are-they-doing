@@ -1,0 +1,41 @@
+{
+  "message": "fix(ci): improve benchmark reliability and error reporting\n\n- Install coreutils on macOS CI for reliable gtimeout command\n- Prefer gtimeout over Perl fallback for timeout handling\n- Write daemon errors to client socket for visible debugging\n- Handle missing _start function gracefully",
+  "files": [
+    {
+      "sha": "b7b9f4ce9bed7e15b1f9292ccd1170f4726408f4",
+      "filename": ".github/actions/setup-edgebox/action.yml",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/teamchong/edgebox/blob/93cd2f8f0d773e2229682f9f86cc076c1797ae80/.github%2Factions%2Fsetup-edgebox%2Faction.yml",
+      "raw_url": "https://github.com/teamchong/edgebox/raw/93cd2f8f0d773e2229682f9f86cc076c1797ae80/.github%2Factions%2Fsetup-edgebox%2Faction.yml",
+      "contents_url": "https://api.github.com/repos/teamchong/edgebox/contents/.github%2Factions%2Fsetup-edgebox%2Faction.yml?ref=93cd2f8f0d773e2229682f9f86cc076c1797ae80",
+      "patch": "@@ -50,7 +50,8 @@ runs:\n       shell: bash\n       run: |\n         if [[ \"$OSTYPE\" == \"darwin\"* ]]; then\n-          brew install hyperfine\n+          # Install hyperfine and coreutils (for gtimeout)\n+          brew install hyperfine coreutils\n         else\n           wget -q https://github.com/sharkdp/hyperfine/releases/download/v1.20.0/hyperfine-musl_1.20.0_amd64.deb\n           sudo dpkg -i hyperfine-musl_1.20.0_amd64.deb"
+    },
+    {
+      "sha": "655e042f3852e27be6502f220fec4d9a6e815c3b",
+      "filename": "bench/run_hyperfine.sh",
+      "status": "modified",
+      "additions": 18,
+      "deletions": 8,
+      "changes": 26,
+      "blob_url": "https://github.com/teamchong/edgebox/blob/93cd2f8f0d773e2229682f9f86cc076c1797ae80/bench%2Frun_hyperfine.sh",
+      "raw_url": "https://github.com/teamchong/edgebox/raw/93cd2f8f0d773e2229682f9f86cc076c1797ae80/bench%2Frun_hyperfine.sh",
+      "contents_url": "https://api.github.com/repos/teamchong/edgebox/contents/bench%2Frun_hyperfine.sh?ref=93cd2f8f0d773e2229682f9f86cc076c1797ae80",
+      "patch": "@@ -14,15 +14,25 @@ set -uo pipefail\n SCRIPT_DIR=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd)\"\n ROOT_DIR=\"$(dirname \"$SCRIPT_DIR\")\"\n \n-# Detect timeout command (GNU timeout on Linux, gtimeout on macOS with coreutils)\n-if command -v timeout >/dev/null 2>&1; then\n-    TIMEOUT_CMD=\"timeout\"\n-elif command -v gtimeout >/dev/null 2>&1; then\n-    TIMEOUT_CMD=\"gtimeout\"\n+# Detect timeout command (prefer gtimeout on macOS, timeout on Linux)\n+if [[ \"$OSTYPE\" == \"darwin\"* ]]; then\n+    # macOS: prefer gtimeout from coreutils\n+    if command -v gtimeout >/dev/null 2>&1; then\n+        TIMEOUT_CMD=\"gtimeout\"\n+    elif command -v timeout >/dev/null 2>&1; then\n+        TIMEOUT_CMD=\"timeout\"\n+    else\n+        TIMEOUT_CMD=\"\"\n+        echo \"WARNING: Neither 'gtimeout' nor 'timeout' found. Using Perl-based timeout fallback.\"\n+    fi\n else\n-    # Fallback: use Perl-based timeout (works on all Unix systems)\n-    TIMEOUT_CMD=\"\"\n-    echo \"WARNING: Neither 'timeout' nor 'gtimeout' found. Using Perl-based timeout fallback.\"\n+    # Linux: use standard timeout\n+    if command -v timeout >/dev/null 2>&1; then\n+        TIMEOUT_CMD=\"timeout\"\n+    else\n+        TIMEOUT_CMD=\"\"\n+        echo \"WARNING: 'timeout' not found. Using Perl-based timeout fallback.\"\n+    fi\n fi\n \n # Parse arguments"
+    },
+    {
+      "sha": "5834aaf9ff7df65ffc6b50284871d0e8b8995d70",
+      "filename": "src/edgebox_wamr.zig",
+      "status": "modified",
+      "additions": 31,
+      "deletions": 18,
+      "changes": 49,
+      "blob_url": "https://github.com/teamchong/edgebox/blob/93cd2f8f0d773e2229682f9f86cc076c1797ae80/src%2Fedgebox_wamr.zig",
+      "raw_url": "https://github.com/teamchong/edgebox/raw/93cd2f8f0d773e2229682f9f86cc076c1797ae80/src%2Fedgebox_wamr.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/edgebox/contents/src%2Fedgebox_wamr.zig?ref=93cd2f8f0d773e2229682f9f86cc076c1797ae80",
+      "patch": "@@ -1359,6 +1359,10 @@ fn runDaemonServer() !void {\n         const client = std.posix.accept(server, null, null, 0) catch continue;\n         const should_exit = handleClientRequest(client) catch |err| blk: {\n             std.debug.print(\"[daemon] Request error: {}\\n\", .{err});\n+            // Write error to client so benchmark can see it\n+            var err_buf: [256]u8 = undefined;\n+            const err_msg = std.fmt.bufPrint(&err_buf, \"[daemon error] {}\\n\", .{err}) catch \"[daemon error] unknown\\n\";\n+            _ = std.posix.write(client, err_msg) catch {};\n             break :blk false;\n         };\n         std.posix.close(client);\n@@ -1667,29 +1671,38 @@ fn runModuleInstance(cached: *CachedModule, wasm_path: []const u8, client: std.p\n \n     // Call _start\n     const start_func = c.wasm_runtime_lookup_function(instance, \"_start\");\n-    if (start_func != null) {\n-        const success = c.wasm_runtime_call_wasm(exec_env, start_func, 0, null);\n+    if (start_func == null) {\n+        const msg = \"[daemon error] _start function not found\\n\";\n+        _ = std.posix.write(client, msg) catch {};\n+        return;\n+    }\n \n+    const success = c.wasm_runtime_call_wasm(exec_env, start_func, 0, null);\n+\n+    // Check for errors\n+    if (!success) {\n         // Check for gas exhaustion\n-        if (!success) {\n-            if (g_config) |config| {\n-                if (config.gas_metering) {\n-                    if (getGasLeft(instance)) |gas_left| {\n-                        if (gas_left < 0) {\n-                            std.debug.print(\"Error: Gas exhausted (limit: {}, consumed: {})\\n\", .{\n-                                config.gas_limit,\n-                                if (config.gas_limit > 0) config.gas_limit - gas_left else -gas_left,\n-                            });\n-                            return;\n-                        }\n+        if (g_config) |config| {\n+            if (config.gas_metering) {\n+                if (getGasLeft(instance)) |gas_left| {\n+                    if (gas_left < 0) {\n+                        var gas_msg: [256]u8 = undefined;\n+                        const gas_str = std.fmt.bufPrint(&gas_msg, \"[daemon error] Gas exhausted (limit: {}, consumed: {})\\n\", .{\n+                            config.gas_limit,\n+                            if (config.gas_limit > 0) config.gas_limit - gas_left else -gas_left,\n+                        }) catch \"[daemon error] gas exhausted\\n\";\n+                        _ = std.posix.write(client, gas_str) catch {};\n+                        return;\n                     }\n                 }\n             }\n-            // If not gas exhaustion, print the actual error\n-            const exception = c.wasm_runtime_get_exception(instance);\n-            if (exception != null) {\n-                std.debug.print(\"Error: {s}\\n\", .{exception});\n-            }\n+        }\n+        // If not gas exhaustion, print the actual error\n+        const exception = c.wasm_runtime_get_exception(instance);\n+        if (exception != null) {\n+            var err_msg: [512]u8 = undefined;\n+            const err_str = std.fmt.bufPrint(&err_msg, \"[daemon error] {s}\\n\", .{exception}) catch \"[daemon error] unknown exception\\n\";\n+            _ = std.posix.write(client, err_str) catch {};\n         }\n     }\n }"
+    }
+  ]
+}

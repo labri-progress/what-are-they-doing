@@ -1,0 +1,41 @@
+{
+  "message": "perf(audit,trauma): optimize batch operations\n\nAudit improvements:\n- Move rulesList string generation outside the session processing loop\n- Previously regenerated identical string for every session in batch\n- Now computed once since active bullets don't change during scan\n\nTrauma batch saving:\n- Add new saveTraumas() function for efficient multi-entry persistence\n- Groups entries by target file path to minimize lock acquisitions\n- Single appendFile call per file instead of per-entry\n- Uses withLock for each batch to maintain atomicity\n\nTrauma import command:\n- Refactor to collect entries first, then batch save\n- Previously called saveTrauma() in a loop (N file operations)\n- Now single saveTraumas() call (1 file operation per unique path)\n- Significant speedup for large imports\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "38e5a8e58290095debff41a0f08e89200d70baaa",
+      "filename": "src/audit.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 5,
+      "changes": 8,
+      "blob_url": "https://github.com/Jyotilohar18/cass_memory_system/blob/fe98a72553d47ee04e831ad36944a5d5572e0f37/src%2Faudit.ts",
+      "raw_url": "https://github.com/Jyotilohar18/cass_memory_system/raw/fe98a72553d47ee04e831ad36944a5d5572e0f37/src%2Faudit.ts",
+      "contents_url": "https://api.github.com/repos/Jyotilohar18/cass_memory_system/contents/src%2Faudit.ts?ref=fe98a72553d47ee04e831ad36944a5d5572e0f37",
+      "patch": "@@ -31,6 +31,9 @@ export async function scanSessionsForViolations(\n     warn(`Audit running with ${activeBullets.length} rules. This may exceed context limits or degrade performance.`);\n   }\n \n+  // Pre-generate rules list string once (optimization)\n+  const rulesList = activeBullets.map(b => `- [${b.id}] ${b.content}`).join(\"\\n\");\n+\n   // Simple concurrency batching\n   for (let i = 0; i < sessions.length; i += CONCURRENCY) {\n     const chunk = sessions.slice(i, i + CONCURRENCY);\n@@ -43,11 +46,6 @@ export async function scanSessionsForViolations(\n           : await cassExport(sessionPath, \"text\", config.cassPath, config);\n         if (!content) return;\n \n-        // Truncate rules list if necessary (rough estimate: 100 chars per rule)\n-        // If we have > 200 rules, this string is > 20kb. \n-        // For now, simple join is okay as most playbooks are small.\n-        const rulesList = activeBullets.map(b => `- [${b.id}] ${b.content}`).join(\"\\n\");\n-        \n         // Truncate session content to ensure rules fit\n         // Reserve 10k chars for rules + overhead if possible\n         const maxContentChars = Math.max(5000, 30000 - rulesList.length);"
+    },
+    {
+      "sha": "668b026cc810f32f4c7be18cca4a0c36579b38e3",
+      "filename": "src/commands/trauma.ts",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 1,
+      "changes": 9,
+      "blob_url": "https://github.com/Jyotilohar18/cass_memory_system/blob/fe98a72553d47ee04e831ad36944a5d5572e0f37/src%2Fcommands%2Ftrauma.ts",
+      "raw_url": "https://github.com/Jyotilohar18/cass_memory_system/raw/fe98a72553d47ee04e831ad36944a5d5572e0f37/src%2Fcommands%2Ftrauma.ts",
+      "contents_url": "https://api.github.com/repos/Jyotilohar18/cass_memory_system/contents/src%2Fcommands%2Ftrauma.ts?ref=fe98a72553d47ee04e831ad36944a5d5572e0f37",
+      "patch": "@@ -6,6 +6,7 @@ import {\n import { \n   loadTraumas, \n   saveTrauma,\n+  saveTraumas,\n   setTraumaStatusById,\n   removeTraumaById\n } from \"../trauma.js\";\n@@ -371,6 +372,8 @@ async function importTraumas(\n   const warnings: string[] = [];\n   let imported = 0;\n \n+  const entriesToSave: TraumaEntry[] = [];\n+\n   for (let i = 0; i < lines.length; i++) {\n     const raw = lines[i] ?? \"\";\n     const trimmed = raw.trim();\n@@ -421,10 +424,14 @@ async function importTraumas(\n       created_at: now(),\n     };\n \n-    await saveTrauma(entry);\n+    entriesToSave.push(entry);\n     imported += 1;\n   }\n \n+  if (entriesToSave.length > 0) {\n+    await saveTraumas(entriesToSave);\n+  }\n+\n   if (flags.json) {\n     printJsonResult(\n       \"trauma import\","
+    },
+    {
+      "sha": "c27c466e2e221e8e42838c69d0350de91eb5a176",
+      "filename": "src/trauma.ts",
+      "status": "modified",
+      "additions": 44,
+      "deletions": 0,
+      "changes": 44,
+      "blob_url": "https://github.com/Jyotilohar18/cass_memory_system/blob/fe98a72553d47ee04e831ad36944a5d5572e0f37/src%2Ftrauma.ts",
+      "raw_url": "https://github.com/Jyotilohar18/cass_memory_system/raw/fe98a72553d47ee04e831ad36944a5d5572e0f37/src%2Ftrauma.ts",
+      "contents_url": "https://api.github.com/repos/Jyotilohar18/cass_memory_system/contents/src%2Ftrauma.ts?ref=fe98a72553d47ee04e831ad36944a5d5572e0f37",
+      "patch": "@@ -389,6 +389,50 @@ export async function saveTrauma(entry: TraumaEntry): Promise<void> {\n   });\n }\n \n+/**\n+ * Save multiple trauma entries in batch.\n+ * Optimizes file locking by grouping writes per file.\n+ */\n+export async function saveTraumas(entries: TraumaEntry[]): Promise<void> {\n+  // Group entries by target path\n+  const batches = new Map<string, string[]>();\n+\n+  for (const entry of entries) {\n+    let targetPath: string;\n+\n+    if (entry.scope === \"global\") {\n+      const globalDir = resolveGlobalDir();\n+      targetPath = path.join(globalDir, GLOBAL_TRAUMA_FILE);\n+    } else {\n+      // Project scope\n+      if (!entry.projectPath) {\n+        const repoDir = await resolveRepoDir();\n+        if (!repoDir) {\n+          throw new Error(\"Cannot save project-scoped trauma: not in a git repository\");\n+        }\n+        targetPath = path.join(repoDir, REPO_TRAUMA_FILE);\n+      } else {\n+        targetPath = path.join(entry.projectPath, \".cass\", REPO_TRAUMA_FILE);\n+      }\n+    }\n+\n+    if (!batches.has(targetPath)) {\n+      batches.set(targetPath, []);\n+    }\n+    batches.get(targetPath)!.push(JSON.stringify(entry));\n+  }\n+\n+  // Write each batch under a single lock\n+  for (const [targetPath, lines] of batches.entries()) {\n+    await ensureDir(path.dirname(targetPath));\n+    const content = lines.join(\"\\n\") + \"\\n\";\n+    \n+    await withLock(targetPath, async () => {\n+      await fs.appendFile(expandPath(targetPath), content, \"utf-8\");\n+    });\n+  }\n+}\n+\n /**\n  * Check a command against all active traumas.\n  * Returns the matching entry if found, null otherwise."
+    }
+  ]
+}

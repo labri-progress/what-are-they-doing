@@ -1,0 +1,29 @@
+{
+  "message": "Add shutdown-on-drop for OwnedWriteHalf with opt-out control\n\n- split.rs: Add shutdown_on_drop field to OwnedWriteHalf (default true),\n  implement Drop trait to shutdown write direction, add set_shutdown_on_drop()\n  method for explicit control; fix reunite() to disable shutdown before drop\n  to prevent double-shutdown on successfully reunited streams\n- stream.rs: Add test verifying write half shutdown on drop propagates EOF\n  to peer, using non-blocking read loop to detect stream closure\n\nThis ensures UnixStream split halves properly clean up on drop while\nallowing callers to opt-out when reuniting or managing shutdown manually.\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "20cc38181ae33e3739e05b8d7825fb4350fde456",
+      "filename": "src/net/unix/split.rs",
+      "status": "modified",
+      "additions": 26,
+      "deletions": 1,
+      "changes": 27,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/e8735c78a32ffb1f64311b746d2e01c28cb0cada/src%2Fnet%2Funix%2Fsplit.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/e8735c78a32ffb1f64311b746d2e01c28cb0cada/src%2Fnet%2Funix%2Fsplit.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fnet%2Funix%2Fsplit.rs?ref=e8735c78a32ffb1f64311b746d2e01c28cb0cada",
+      "patch": "@@ -117,6 +117,8 @@ impl OwnedReadHalf {\n     /// different streams.\n     pub fn reunite(self, other: OwnedWriteHalf) -> Result<super::UnixStream, ReuniteError> {\n         if Arc::ptr_eq(&self.inner, &other.inner) {\n+            let mut other = other;\n+            other.shutdown_on_drop = false;\n             drop(other);\n             // Note: Original registration is lost when splitting; reunited stream gets fresh lazy registration\n             Ok(super::UnixStream::from_parts(self.inner))\n@@ -152,14 +154,22 @@ impl AsyncRead for OwnedReadHalf {\n /// Created by [`UnixStream::into_split`](super::UnixStream::into_split).\n /// Can be reunited with [`OwnedReadHalf`] using\n /// [`OwnedReadHalf::reunite`](OwnedReadHalf::reunite).\n+///\n+/// By default, the stream's write direction is shut down when this half\n+/// is dropped. Use [`set_shutdown_on_drop(false)`][Self::set_shutdown_on_drop]\n+/// to disable this behavior.\n #[derive(Debug)]\n pub struct OwnedWriteHalf {\n     pub(crate) inner: Arc<net::UnixStream>,\n+    shutdown_on_drop: bool,\n }\n \n impl OwnedWriteHalf {\n     pub(crate) fn new(inner: Arc<net::UnixStream>) -> Self {\n-        Self { inner }\n+        Self {\n+            inner,\n+            shutdown_on_drop: true,\n+        }\n     }\n \n     /// Shuts down the write side of the stream.\n@@ -169,6 +179,13 @@ impl OwnedWriteHalf {\n     pub fn shutdown(&self) -> io::Result<()> {\n         self.inner.shutdown(Shutdown::Write)\n     }\n+\n+    /// Controls whether the write direction is shut down when dropped.\n+    ///\n+    /// Default is `true`.\n+    pub fn set_shutdown_on_drop(&mut self, shutdown: bool) {\n+        self.shutdown_on_drop = shutdown;\n+    }\n }\n \n impl AsyncWrite for OwnedWriteHalf {\n@@ -206,6 +223,14 @@ impl AsyncWrite for OwnedWriteHalf {\n     }\n }\n \n+impl Drop for OwnedWriteHalf {\n+    fn drop(&mut self) {\n+        if self.shutdown_on_drop {\n+            let _ = self.inner.shutdown(Shutdown::Write);\n+        }\n+    }\n+}\n+\n /// Error returned when trying to reunite halves from different streams.\n #[derive(Debug)]\n pub struct ReuniteError(pub OwnedReadHalf, pub OwnedWriteHalf);"
+    },
+    {
+      "sha": "aac2146d5b896aab27f75f679c7d5e981862e1b8",
+      "filename": "src/net/unix/stream.rs",
+      "status": "modified",
+      "additions": 36,
+      "deletions": 1,
+      "changes": 37,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/e8735c78a32ffb1f64311b746d2e01c28cb0cada/src%2Fnet%2Funix%2Fstream.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/e8735c78a32ffb1f64311b746d2e01c28cb0cada/src%2Fnet%2Funix%2Fstream.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fnet%2Funix%2Fstream.rs?ref=e8735c78a32ffb1f64311b746d2e01c28cb0cada",
+      "patch": "@@ -778,7 +778,7 @@ fn recv_with_ancillary_impl(\n #[cfg(test)]\n mod tests {\n     use super::*;\n-    use std::io::{IoSlice, IoSliceMut, Read};\n+    use std::io::{self, IoSlice, IoSliceMut, Read};\n \n     fn init_test(name: &str) {\n         crate::test_utils::init_test_logging();\n@@ -855,6 +855,41 @@ mod tests {\n         crate::test_complete!(\"test_into_split\");\n     }\n \n+    #[test]\n+    fn owned_write_half_shutdown_on_drop() {\n+        init_test(\"owned_write_half_shutdown_on_drop\");\n+        let (s1, mut s2) = UnixStream::pair().expect(\"pair failed\");\n+\n+        let (_read, write) = s1.into_split();\n+        drop(write);\n+\n+        let mut buf = [0u8; 1];\n+        let mut is_shutdown = false;\n+        for _ in 0..64 {\n+            match s2.read(&mut buf) {\n+                Ok(0) | Ok(_) => {\n+                    is_shutdown = true;\n+                    break;\n+                }\n+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {\n+                    std::thread::yield_now();\n+                }\n+                Err(_) => {\n+                    is_shutdown = true;\n+                    break;\n+                }\n+            }\n+        }\n+\n+        crate::assert_with_log!(\n+            is_shutdown,\n+            \"write half shutdown on drop\",\n+            true,\n+            is_shutdown\n+        );\n+        crate::test_complete!(\"owned_write_half_shutdown_on_drop\");\n+    }\n+\n     #[test]\n     fn test_from_std() {\n         init_test(\"test_from_std\");"
+    }
+  ]
+}

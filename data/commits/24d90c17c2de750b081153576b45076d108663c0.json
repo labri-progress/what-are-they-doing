@@ -1,0 +1,38 @@
+[
+  {
+    "sha": "31e3574659af9b90a5779b294f6919b17b9149a6",
+    "filename": "CHANGELOG.md",
+    "status": "modified",
+    "additions": 1,
+    "deletions": 0,
+    "changes": 1,
+    "blob_url": "https://github.com/Trompetilla/ClawAbierto/blob/24d90c17c2de750b081153576b45076d108663c0/CHANGELOG.md",
+    "raw_url": "https://github.com/Trompetilla/ClawAbierto/raw/24d90c17c2de750b081153576b45076d108663c0/CHANGELOG.md",
+    "contents_url": "https://api.github.com/repos/Trompetilla/ClawAbierto/contents/CHANGELOG.md?ref=24d90c17c2de750b081153576b45076d108663c0",
+    "patch": "@@ -13,6 +13,7 @@\n - Simplified send/agent/relay/heartbeat to web-only delivery; removed Twilio mocks/tests and dead code.\n - Tau RPC timeout is now inactivity-based (5m without events) and error messages show seconds only.\n - Directive triggers (`/think`, `/verbose`, `/stop` et al.) now reply immediately using normalized bodies (timestamps/group prefixes stripped) without waiting for the agent.\n+- Batched history blocks no longer trip directive parsing; `/think` in prior messages won't emit stray acknowledgements.\n \n ## 1.4.1 \u2014 2025-12-04\n "
+  },
+  {
+    "sha": "7baeb9dd0c6c1c9afd1139fdc4f04d414d9351e6",
+    "filename": "src/auto-reply/reply.triggers.test.ts",
+    "status": "modified",
+    "additions": 40,
+    "deletions": 1,
+    "changes": 41,
+    "blob_url": "https://github.com/Trompetilla/ClawAbierto/blob/24d90c17c2de750b081153576b45076d108663c0/src%2Fauto-reply%2Freply.triggers.test.ts",
+    "raw_url": "https://github.com/Trompetilla/ClawAbierto/raw/24d90c17c2de750b081153576b45076d108663c0/src%2Fauto-reply%2Freply.triggers.test.ts",
+    "contents_url": "https://api.github.com/repos/Trompetilla/ClawAbierto/contents/src%2Fauto-reply%2Freply.triggers.test.ts?ref=24d90c17c2de750b081153576b45076d108663c0",
+    "patch": "@@ -1,5 +1,6 @@\n-import { describe, expect, it, vi } from \"vitest\";\n+import { afterEach, describe, expect, it, vi } from \"vitest\";\n \n+import * as tauRpc from \"../process/tau-rpc.js\";\n import { getReplyFromConfig } from \"./reply.js\";\n \n const baseCfg = {\n@@ -12,6 +13,10 @@ const baseCfg = {\n   },\n };\n \n+afterEach(() => {\n+  vi.restoreAllMocks();\n+});\n+\n describe(\"trigger handling\", () => {\n   it(\"aborts even with timestamp prefix\", async () => {\n     const runner = vi.fn();\n@@ -46,4 +51,38 @@ describe(\"trigger handling\", () => {\n     expect(text?.startsWith(\"\u2699\ufe0f Restarting\" ?? \"\")).toBe(true);\n     expect(runner).not.toHaveBeenCalled();\n   });\n+\n+  it(\"ignores think directives that only appear in the context wrapper\", async () => {\n+    const rpcMock = vi.spyOn(tauRpc, \"runPiRpc\").mockResolvedValue({\n+      stdout:\n+        '{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}',\n+      stderr: \"\",\n+      code: 0,\n+      signal: null,\n+      killed: false,\n+    });\n+\n+    const res = await getReplyFromConfig(\n+      {\n+        Body: [\n+          \"[Chat messages since your last reply - for context]\",\n+          \"Peter: /thinking high [2025-12-05T21:45:00.000Z]\",\n+          \"\",\n+          \"[Current message - respond to this]\",\n+          \"Give me the status\",\n+        ].join(\"\\n\"),\n+        From: \"+1002\",\n+        To: \"+2000\",\n+      },\n+      {},\n+      baseCfg,\n+    );\n+\n+    const text = Array.isArray(res) ? res[0]?.text : res?.text;\n+    expect(text).toBe(\"ok\");\n+    expect(rpcMock).toHaveBeenCalledOnce();\n+    const prompt = rpcMock.mock.calls[0]?.[0]?.prompt ?? \"\";\n+    expect(prompt).toContain(\"Give me the status\");\n+    expect(prompt).not.toContain(\"/thinking high\");\n+  });\n });"
+  },
+  {
+    "sha": "ccd1837481fb100603831805ddb92752a76767fc",
+    "filename": "src/auto-reply/reply.ts",
+    "status": "modified",
+    "additions": 24,
+    "deletions": 11,
+    "changes": 35,
+    "blob_url": "https://github.com/Trompetilla/ClawAbierto/blob/24d90c17c2de750b081153576b45076d108663c0/src%2Fauto-reply%2Freply.ts",
+    "raw_url": "https://github.com/Trompetilla/ClawAbierto/raw/24d90c17c2de750b081153576b45076d108663c0/src%2Fauto-reply%2Freply.ts",
+    "contents_url": "https://api.github.com/repos/Trompetilla/ClawAbierto/contents/src%2Fauto-reply%2Freply.ts?ref=24d90c17c2de750b081153576b45076d108663c0",
+    "patch": "@@ -298,20 +298,33 @@ export async function getReplyFromConfig(\n     IsNewSession: isNewSession ? \"true\" : \"false\",\n   };\n \n+  const directiveSource = stripStructuralPrefixes(\n+    sessionCtx.BodyStripped ?? sessionCtx.Body ?? \"\",\n+  );\n   const {\n-    cleaned: thinkCleaned,\n+    cleaned: thinkCleanedDirective,\n     thinkLevel: inlineThink,\n     rawLevel: rawThinkLevel,\n     hasDirective: hasThinkDirective,\n-  } = extractThinkDirective(sessionCtx.BodyStripped ?? sessionCtx.Body ?? \"\");\n+  } = extractThinkDirective(directiveSource);\n   const {\n-    cleaned: verboseCleaned,\n+    cleaned: verboseCleanedDirective,\n     verboseLevel: inlineVerbose,\n     rawLevel: rawVerboseLevel,\n     hasDirective: hasVerboseDirective,\n-  } = extractVerboseDirective(thinkCleaned);\n-  sessionCtx.Body = verboseCleaned;\n-  sessionCtx.BodyStripped = verboseCleaned;\n+  } = extractVerboseDirective(thinkCleanedDirective);\n+\n+  // Keep the full body (including context wrapper) for the agent, but strip\n+  // directives from it separately so history remains intact.\n+  const { cleaned: thinkCleanedFull } = extractThinkDirective(\n+    sessionCtx.Body ?? \"\",\n+  );\n+  const { cleaned: verboseCleanedFull } = extractVerboseDirective(\n+    thinkCleanedFull,\n+  );\n+\n+  sessionCtx.Body = verboseCleanedFull;\n+  sessionCtx.BodyStripped = verboseCleanedFull;\n \n   const isGroup =\n     typeof ctx.From === \"string\" &&\n@@ -331,16 +344,16 @@ export async function getReplyFromConfig(\n     hasThinkDirective &&\n     hasVerboseDirective &&\n     (() => {\n-      const stripped = stripStructuralPrefixes(verboseCleaned ?? \"\");\n+      const stripped = stripStructuralPrefixes(verboseCleanedDirective ?? \"\");\n       const noMentions = isGroup ? stripMentions(stripped, ctx, cfg) : stripped;\n       return noMentions.length === 0;\n     })();\n \n   const directiveOnly = (() => {\n     if (!hasThinkDirective) return false;\n-    if (!thinkCleaned) return true;\n+    if (!thinkCleanedDirective) return true;\n     // Check after stripping both think and verbose so combined directives count.\n-    const stripped = stripStructuralPrefixes(verboseCleaned);\n+    const stripped = stripStructuralPrefixes(verboseCleanedDirective);\n     const noMentions = isGroup ? stripMentions(stripped, ctx, cfg) : stripped;\n     return noMentions.length === 0;\n   })();\n@@ -406,8 +419,8 @@ export async function getReplyFromConfig(\n \n   const verboseDirectiveOnly = (() => {\n     if (!hasVerboseDirective) return false;\n-    if (!verboseCleaned) return true;\n-    const stripped = stripStructuralPrefixes(verboseCleaned);\n+    if (!verboseCleanedDirective) return true;\n+    const stripped = stripStructuralPrefixes(verboseCleanedDirective);\n     const noMentions = isGroup ? stripMentions(stripped, ctx, cfg) : stripped;\n     return noMentions.length === 0;\n   })();"
+  }
+]

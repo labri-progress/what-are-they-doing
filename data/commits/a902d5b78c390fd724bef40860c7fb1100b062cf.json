@@ -1,0 +1,53 @@
+{
+  "message": "Expose per-process IO/FDs in sysmon; add ionice guidance",
+  "files": [
+    {
+      "sha": "e7ca8d9e7f4769af4985b2bb4c03d0c45764bca1",
+      "filename": "README.md",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/system_resource_protection_script/blob/a902d5b78c390fd724bef40860c7fb1100b062cf/README.md",
+      "raw_url": "https://github.com/Dicklesworthstone/system_resource_protection_script/raw/a902d5b78c390fd724bef40860c7fb1100b062cf/README.md",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/system_resource_protection_script/contents/README.md?ref=a902d5b78c390fd724bef40860c7fb1100b062cf",
+      "patch": "@@ -23,6 +23,7 @@ SRPS is a single script + helpers that assemble a tuned stack for developer/work\n - **Systemd manager limits** (especially for WSL2) to prevent FD/process explosions.\n - **Helper tools & aliases** for monitoring, throttling, diagnostics.\n - **Modern TUI monitor (`sysmon`)** written in Go (Bubble Tea) with live gauges, tables, per-core sparklines, filters, JSON/NDJSON export. Legacy bash TUI kept as fallback.\n+- **IO awareness:** per-process IO throughput (read/write kB/s) and open FD counts surfaced in the TUI/JSON so you can spot runaway file handles or disk hogs and `ionice` them manually.\n \n **Safety-first philosophy:** SRPS never ships an automated process killer. Helpers are log/renice-only; the only termination tool is `kill-cursor`, and you must run it manually. If you choose to run an OOM daemon (e.g., earlyoom), use ultra-conservative thresholds (example below) so action happens only when the machine is effectively out of resources.\n \n@@ -147,6 +148,8 @@ Non-TTY: auto emits JSON one-shot. `--json` / `--json-stream` also available.\n - Aliases (when systemd-run available): `limited`, `limited-mem`, `cargo-limited`, `make-limited`, `node-limited`\n - Bash completion at `/etc/bash_completion.d/srps`\n \n+IO tip: when you spot a disk hog or FD explosion in `sysmon`, manually drop it to idle IO priority with `sudo ionice -c3 -p <pid>` (log/renice-only helpers ensure no automatic killing).\n+\n ---\n \n ## \ud83d\udd27 Troubleshooting"
+    },
+    {
+      "sha": "fff2f101fccea807ab7d00b36d40d0121ea72a21",
+      "filename": "internal/model/sample.go",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 5,
+      "changes": 13,
+      "blob_url": "https://github.com/Dicklesworthstone/system_resource_protection_script/blob/a902d5b78c390fd724bef40860c7fb1100b062cf/internal%2Fmodel%2Fsample.go",
+      "raw_url": "https://github.com/Dicklesworthstone/system_resource_protection_script/raw/a902d5b78c390fd724bef40860c7fb1100b062cf/internal%2Fmodel%2Fsample.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/system_resource_protection_script/contents/internal%2Fmodel%2Fsample.go?ref=a902d5b78c390fd724bef40860c7fb1100b062cf",
+      "patch": "@@ -45,11 +45,14 @@ type Battery struct {\n \n // Process is a lightweight top entry.\n type Process struct {\n-\tPID     int\n-\tNice    int\n-\tCPU     float64\n-\tMemory  float64\n-\tCommand string\n+\tPID      int\n+\tNice     int\n+\tCPU      float64\n+\tMemory   float64\n+\tCommand  string\n+\tFDCount  int\n+\tReadKBs  float64\n+\tWriteKBs float64\n }\n \n // Cgroup summarizes CPU usage by unit/name."
+    },
+    {
+      "sha": "53f2f644539c5be64d65494d15fd65038abce384",
+      "filename": "internal/sampler/sampler.go",
+      "status": "modified",
+      "additions": 38,
+      "deletions": 10,
+      "changes": 48,
+      "blob_url": "https://github.com/Dicklesworthstone/system_resource_protection_script/blob/a902d5b78c390fd724bef40860c7fb1100b062cf/internal%2Fsampler%2Fsampler.go",
+      "raw_url": "https://github.com/Dicklesworthstone/system_resource_protection_script/raw/a902d5b78c390fd724bef40860c7fb1100b062cf/internal%2Fsampler%2Fsampler.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/system_resource_protection_script/contents/internal%2Fsampler%2Fsampler.go?ref=a902d5b78c390fd724bef40860c7fb1100b062cf",
+      "patch": "@@ -26,11 +26,12 @@ import (\n type Sampler struct {\n \tInterval time.Duration\n \n-\tprevTotal float64\n-\tprevIdle  float64\n-\tprevCore  []cpu.TimesStat\n-\tprevDisk  map[string]disk.IOCountersStat\n-\tprevNet   []net.IOCountersStat\n+\tprevTotal  float64\n+\tprevIdle   float64\n+\tprevCore   []cpu.TimesStat\n+\tprevDisk   map[string]disk.IOCountersStat\n+\tprevNet    []net.IOCountersStat\n+\tprevProcIO map[int]procIO\n \n \t// Cgroup cache\n \tcgroupCache map[int]string\n@@ -45,10 +46,16 @@ func New(interval time.Duration) *Sampler {\n \treturn &Sampler{\n \t\tInterval:    interval,\n \t\tprevDisk:    make(map[string]disk.IOCountersStat),\n+\t\tprevProcIO:  make(map[int]procIO),\n \t\tcgroupCache: make(map[int]string),\n \t}\n }\n \n+type procIO struct {\n+\tread  uint64\n+\twrite uint64\n+}\n+\n // Stream returns a channel that will receive snapshots until ctx is done.\n func (s *Sampler) Stream(ctx context.Context) <-chan model.Sample {\n \tch := make(chan model.Sample)\n@@ -200,6 +207,8 @@ func (s *Sampler) topProcs() (top []model.Process, throttled []model.Process, cg\n \tprocs, _ := process.Processes()\n \ttype cgAgg struct{ cpu float64 }\n \tcgMap := make(map[string]*cgAgg)\n+\tnewProcIO := make(map[int]procIO)\n+\tdt := s.Interval.Seconds()\n \n \tfor _, p := range procs {\n \t\t// Skip kernel threads without name\n@@ -214,12 +223,29 @@ func (s *Sampler) topProcs() (top []model.Process, throttled []model.Process, cg\n \t\tif cmd == \"\" {\n \t\t\tcmd = name\n \t\t}\n+\t\tfdCount, _ := p.NumFDs()\n+\n+\t\tvar rRate, wRate float64\n+\t\tif ioCounters, err := p.IOCounters(); err == nil && ioCounters != nil {\n+\t\t\tprev := s.prevProcIO[int(p.Pid)]\n+\t\t\tif prev.read > 0 && ioCounters.ReadBytes >= prev.read && dt > 0 {\n+\t\t\t\trRate = float64(ioCounters.ReadBytes-prev.read) / 1024.0 / dt\n+\t\t\t}\n+\t\t\tif prev.write > 0 && ioCounters.WriteBytes >= prev.write && dt > 0 {\n+\t\t\t\twRate = float64(ioCounters.WriteBytes-prev.write) / 1024.0 / dt\n+\t\t\t}\n+\t\t\tnewProcIO[int(p.Pid)] = procIO{read: ioCounters.ReadBytes, write: ioCounters.WriteBytes}\n+\t\t}\n+\n \t\tentry := model.Process{\n-\t\t\tPID:     int(p.Pid),\n-\t\t\tNice:    int(nice),\n-\t\t\tCPU:     cpuPct,\n-\t\t\tMemory:  float64(memPct),\n-\t\t\tCommand: truncate(cmd, 60),\n+\t\t\tPID:      int(p.Pid),\n+\t\t\tNice:     int(nice),\n+\t\t\tCPU:      cpuPct,\n+\t\t\tMemory:   float64(memPct),\n+\t\t\tCommand:  truncate(cmd, 60),\n+\t\t\tFDCount:  int(fdCount),\n+\t\t\tReadKBs:  rRate,\n+\t\t\tWriteKBs: wRate,\n \t\t}\n \t\ttop = append(top, entry)\n \t\tif nice > 0 {\n@@ -251,6 +277,8 @@ func (s *Sampler) topProcs() (top []model.Process, throttled []model.Process, cg\n \tif len(cgs) > 16 {\n \t\tcgs = cgs[:16]\n \t}\n+\n+\ts.prevProcIO = newProcIO\n \treturn\n }\n "
+    },
+    {
+      "sha": "bb32e3151ab9f04b4b52345553ac55fddd168805",
+      "filename": "internal/ui/ui.go",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/system_resource_protection_script/blob/a902d5b78c390fd724bef40860c7fb1100b062cf/internal%2Fui%2Fui.go",
+      "raw_url": "https://github.com/Dicklesworthstone/system_resource_protection_script/raw/a902d5b78c390fd724bef40860c7fb1100b062cf/internal%2Fui%2Fui.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/system_resource_protection_script/contents/internal%2Fui%2Fui.go?ref=a902d5b78c390fd724bef40860c7fb1100b062cf",
+      "patch": "@@ -577,7 +577,7 @@ func renderProcessTable(procs []model.Process, height int, highlightColor string\n \tvar b strings.Builder\n \n \t// Header\n-\tfmt.Fprintf(&b, \"% -18s %6s %4s %5s %5s\\n\", \"COMMAND\", \"PID\", \"NI\", \"CPU%\", \"MEM%\")\n+\tfmt.Fprintf(&b, \"%-18s %6s %4s %6s %6s %6s %6s %5s\\n\", \"COMMAND\", \"PID\", \"NI\", \"CPU%\", \"MEM%\", \"Rk/s\", \"Wk/s\", \"FDs\")\n \n \tcount := 0\n \tfor _, p := range procs {\n@@ -586,7 +586,7 @@ func renderProcessTable(procs []model.Process, height int, highlightColor string\n \t\t} // -1 for header\n \n \t\tcmd := truncate(p.Command, 18)\n-\t\tline := fmt.Sprintf(\"% -18s %6d %4d %5.1f %5.1f\", cmd, p.PID, p.Nice, p.CPU, p.Memory)\n+\t\tline := fmt.Sprintf(\"%-18s %6d %4d %6.1f %6.1f %6.1f %6.1f %5d\", cmd, p.PID, p.Nice, p.CPU, p.Memory, p.ReadKBs, p.WriteKBs, p.FDCount)\n \n \t\tstyle := rowStyle\n \t\tif p.Nice > 0 {"
+    }
+  ]
+}

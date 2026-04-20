@@ -1,0 +1,77 @@
+{
+  "message": "refactor(tmp): harden temp boundary guardrails",
+  "files": [
+    {
+      "sha": "fea3cda8357cc2aaafeda1b5a775ea06b1b589fb",
+      "filename": "SECURITY.md",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/def993dbd843ff28f2b3bad5cc24603874ba9f1e/SECURITY.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/def993dbd843ff28f2b3bad5cc24603874ba9f1e/SECURITY.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/SECURITY.md?ref=def993dbd843ff28f2b3bad5cc24603874ba9f1e",
+      "patch": "@@ -171,6 +171,10 @@ Security boundary notes:\n - Sandbox media validation allows absolute temp paths only under the OpenClaw-managed temp root.\n - Arbitrary host tmp paths are not treated as trusted media roots.\n - Plugin/extension code should use OpenClaw temp helpers (`resolvePreferredOpenClawTmpDir`, `buildRandomTempFilePath`, `withTempDownloadPath`) rather than raw `os.tmpdir()` defaults when handling media files.\n+- Enforcement reference points:\n+  - temp root resolver: `src/infra/tmp-openclaw-dir.ts`\n+  - SDK temp helpers: `src/plugin-sdk/temp-path.ts`\n+  - messaging/channel tmp guardrail: `scripts/check-no-random-messaging-tmp.mjs`\n \n ## Operational Guidance\n "
+    },
+    {
+      "sha": "af7b56a371fb39704ef85e8b57d1923e43fa3da9",
+      "filename": "scripts/check-no-random-messaging-tmp.mjs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 3,
+      "changes": 7,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/def993dbd843ff28f2b3bad5cc24603874ba9f1e/scripts%2Fcheck-no-random-messaging-tmp.mjs",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/def993dbd843ff28f2b3bad5cc24603874ba9f1e/scripts%2Fcheck-no-random-messaging-tmp.mjs",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/scripts%2Fcheck-no-random-messaging-tmp.mjs?ref=def993dbd843ff28f2b3bad5cc24603874ba9f1e",
+      "patch": "@@ -47,7 +47,8 @@ async function collectTypeScriptFiles(dir) {\n   return out;\n }\n \n-function collectNodeOsImports(sourceFile) {\n+function collectOsTmpdirImports(sourceFile) {\n+  const osModuleSpecifiers = new Set([\"node:os\", \"os\"]);\n   const osNamespaceOrDefault = new Set();\n   const namedTmpdir = new Set();\n   for (const statement of sourceFile.statements) {\n@@ -57,7 +58,7 @@ function collectNodeOsImports(sourceFile) {\n     if (!statement.importClause || !ts.isStringLiteral(statement.moduleSpecifier)) {\n       continue;\n     }\n-    if (statement.moduleSpecifier.text !== \"node:os\") {\n+    if (!osModuleSpecifiers.has(statement.moduleSpecifier.text)) {\n       continue;\n     }\n     const clause = statement.importClause;\n@@ -101,7 +102,7 @@ function unwrapExpression(expression) {\n \n export function findMessagingTmpdirCallLines(content, fileName = \"source.ts\") {\n   const sourceFile = ts.createSourceFile(fileName, content, ts.ScriptTarget.Latest, true);\n-  const { osNamespaceOrDefault, namedTmpdir } = collectNodeOsImports(sourceFile);\n+  const { osNamespaceOrDefault, namedTmpdir } = collectOsTmpdirImports(sourceFile);\n   const lines = [];\n \n   const visit = (node) => {"
+    },
+    {
+      "sha": "1e8250b3210fd602bdd168909f849a1eeec99f28",
+      "filename": "src/infra/tmp-openclaw-dir.ts",
+      "status": "modified",
+      "additions": 34,
+      "deletions": 21,
+      "changes": 55,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/def993dbd843ff28f2b3bad5cc24603874ba9f1e/src%2Finfra%2Ftmp-openclaw-dir.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/def993dbd843ff28f2b3bad5cc24603874ba9f1e/src%2Finfra%2Ftmp-openclaw-dir.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Ftmp-openclaw-dir.ts?ref=def993dbd843ff28f2b3bad5cc24603874ba9f1e",
+      "patch": "@@ -66,35 +66,48 @@ export function resolvePreferredOpenClawTmpDir(\n     return path.join(base, suffix);\n   };\n \n-  try {\n-    const preferred = lstatSync(POSIX_OPENCLAW_TMP_DIR);\n-    if (!preferred.isDirectory() || preferred.isSymbolicLink()) {\n-      return fallback();\n-    }\n-    accessSync(POSIX_OPENCLAW_TMP_DIR, fs.constants.W_OK | fs.constants.X_OK);\n-    if (!isSecureDirForUser(preferred)) {\n-      return fallback();\n+  const isTrustedPreferredDir = (st: {\n+    isDirectory(): boolean;\n+    isSymbolicLink(): boolean;\n+    mode?: number;\n+    uid?: number;\n+  }): boolean => {\n+    return st.isDirectory() && !st.isSymbolicLink() && isSecureDirForUser(st);\n+  };\n+\n+  const resolvePreferredState = (\n+    requireWritableAccess: boolean,\n+  ): \"available\" | \"missing\" | \"invalid\" => {\n+    try {\n+      const preferred = lstatSync(POSIX_OPENCLAW_TMP_DIR);\n+      if (!isTrustedPreferredDir(preferred)) {\n+        return \"invalid\";\n+      }\n+      if (requireWritableAccess) {\n+        accessSync(POSIX_OPENCLAW_TMP_DIR, fs.constants.W_OK | fs.constants.X_OK);\n+      }\n+      return \"available\";\n+    } catch (err) {\n+      if (isNodeErrorWithCode(err, \"ENOENT\")) {\n+        return \"missing\";\n+      }\n+      return \"invalid\";\n     }\n+  };\n+\n+  const existingPreferredState = resolvePreferredState(true);\n+  if (existingPreferredState === \"available\") {\n     return POSIX_OPENCLAW_TMP_DIR;\n-  } catch (err) {\n-    if (!isNodeErrorWithCode(err, \"ENOENT\")) {\n-      return fallback();\n-    }\n+  }\n+  if (existingPreferredState === \"invalid\") {\n+    return fallback();\n   }\n \n   try {\n     accessSync(\"/tmp\", fs.constants.W_OK | fs.constants.X_OK);\n     // Create with a safe default; subsequent callers expect it exists.\n     mkdirSync(POSIX_OPENCLAW_TMP_DIR, { recursive: true, mode: 0o700 });\n-    try {\n-      const preferred = lstatSync(POSIX_OPENCLAW_TMP_DIR);\n-      if (!preferred.isDirectory() || preferred.isSymbolicLink()) {\n-        return fallback();\n-      }\n-      if (!isSecureDirForUser(preferred)) {\n-        return fallback();\n-      }\n-    } catch {\n+    if (resolvePreferredState(true) !== \"available\") {\n       return fallback();\n     }\n     return POSIX_OPENCLAW_TMP_DIR;"
+    },
+    {
+      "sha": "51476200ca16ed917c66745437ae103b9b8ff067",
+      "filename": "src/media/local-roots.ts",
+      "status": "modified",
+      "additions": 18,
+      "deletions": 2,
+      "changes": 20,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/def993dbd843ff28f2b3bad5cc24603874ba9f1e/src%2Fmedia%2Flocal-roots.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/def993dbd843ff28f2b3bad5cc24603874ba9f1e/src%2Fmedia%2Flocal-roots.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fmedia%2Flocal-roots.ts?ref=def993dbd843ff28f2b3bad5cc24603874ba9f1e",
+      "patch": "@@ -4,9 +4,25 @@ import type { OpenClawConfig } from \"../config/config.js\";\n import { resolveStateDir } from \"../config/paths.js\";\n import { resolvePreferredOpenClawTmpDir } from \"../infra/tmp-openclaw-dir.js\";\n \n-function buildMediaLocalRoots(stateDir: string): string[] {\n+type BuildMediaLocalRootsOptions = {\n+  preferredTmpDir?: string;\n+};\n+\n+let cachedPreferredTmpDir: string | undefined;\n+\n+function resolveCachedPreferredTmpDir(): string {\n+  if (!cachedPreferredTmpDir) {\n+    cachedPreferredTmpDir = resolvePreferredOpenClawTmpDir();\n+  }\n+  return cachedPreferredTmpDir;\n+}\n+\n+function buildMediaLocalRoots(\n+  stateDir: string,\n+  options: BuildMediaLocalRootsOptions = {},\n+): string[] {\n   const resolvedStateDir = path.resolve(stateDir);\n-  const preferredTmpDir = resolvePreferredOpenClawTmpDir();\n+  const preferredTmpDir = options.preferredTmpDir ?? resolveCachedPreferredTmpDir();\n   return [\n     preferredTmpDir,\n     path.join(resolvedStateDir, \"media\"),"
+    },
+    {
+      "sha": "c418fe9f664d284e498f37130e391179c640bfe6",
+      "filename": "src/plugin-sdk/temp-path.ts",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 1,
+      "changes": 17,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/def993dbd843ff28f2b3bad5cc24603874ba9f1e/src%2Fplugin-sdk%2Ftemp-path.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/def993dbd843ff28f2b3bad5cc24603874ba9f1e/src%2Fplugin-sdk%2Ftemp-path.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fplugin-sdk%2Ftemp-path.ts?ref=def993dbd843ff28f2b3bad5cc24603874ba9f1e",
+      "patch": "@@ -31,6 +31,15 @@ function resolveTempRoot(tmpDir?: string): string {\n   return tmpDir ?? resolvePreferredOpenClawTmpDir();\n }\n \n+function isNodeErrorWithCode(err: unknown, code: string): boolean {\n+  return (\n+    typeof err === \"object\" &&\n+    err !== null &&\n+    \"code\" in err &&\n+    (err as { code?: string }).code === code\n+  );\n+}\n+\n export function buildRandomTempFilePath(params: {\n   prefix: string;\n   extension?: string;\n@@ -64,6 +73,12 @@ export async function withTempDownloadPath<T>(\n   try {\n     return await fn(tmpPath);\n   } finally {\n-    await rm(dir, { recursive: true, force: true }).catch(() => {});\n+    try {\n+      await rm(dir, { recursive: true, force: true });\n+    } catch (err) {\n+      if (!isNodeErrorWithCode(err, \"ENOENT\")) {\n+        console.warn(`temp-path cleanup failed for ${dir}: ${String(err)}`);\n+      }\n+    }\n   }\n }"
+    },
+    {
+      "sha": "276a19962af33e3ae13edc302f62ce9d46211c8c",
+      "filename": "test/scripts/check-no-random-messaging-tmp.test.ts",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 0,
+      "changes": 8,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/def993dbd843ff28f2b3bad5cc24603874ba9f1e/test%2Fscripts%2Fcheck-no-random-messaging-tmp.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/def993dbd843ff28f2b3bad5cc24603874ba9f1e/test%2Fscripts%2Fcheck-no-random-messaging-tmp.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/test%2Fscripts%2Fcheck-no-random-messaging-tmp.test.ts?ref=def993dbd843ff28f2b3bad5cc24603874ba9f1e",
+      "patch": "@@ -18,6 +18,14 @@ describe(\"check-no-random-messaging-tmp\", () => {\n     expect(findMessagingTmpdirCallLines(source)).toEqual([3]);\n   });\n \n+  it(\"finds tmpdir calls imported from os\", () => {\n+    const source = `\n+      import os from \"os\";\n+      const dir = os.tmpdir();\n+    `;\n+    expect(findMessagingTmpdirCallLines(source)).toEqual([3]);\n+  });\n+\n   it(\"ignores mentions in comments and strings\", () => {\n     const source = `\n       // os.tmpdir()"
+    }
+  ]
+}

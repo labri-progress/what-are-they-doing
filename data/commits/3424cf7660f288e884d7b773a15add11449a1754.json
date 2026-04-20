@@ -1,0 +1,53 @@
+{
+  "message": "fix(timer): promote coalescing window entries from all wheel levels and overflow\n\nTimer coalescing was missing entries hashed into non-current wheel slots\nor sitting in the overflow heap whose deadlines fell within the\ncoalescing window boundary. These entries would fire late on the next\ntick visiting their slot instead of being batched with the current group.\n\n- Add promote_coalescing_window_entries() that scans all wheel levels\n  and the overflow heap for entries with deadline <= boundary, moving\n  them into the ready vec before the coalescing check runs\n- Optimize semaphore waiter removal from O(N) retain scan to O(1)\n  pop_front since the granted waiter is proven to be at the deque front\n- Minor: remove redundant clone in mpsc_fifo_repro test, fix arena\n  whitespace\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "ff33dab979f17690cc56fb9d8f369500d23f78be",
+      "filename": "src/sync/semaphore.rs",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 2,
+      "changes": 22,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/3424cf7660f288e884d7b773a15add11449a1754/src%2Fsync%2Fsemaphore.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/3424cf7660f288e884d7b773a15add11449a1754/src%2Fsync%2Fsemaphore.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fsync%2Fsemaphore.rs?ref=3424cf7660f288e884d7b773a15add11449a1754",
+      "patch": "@@ -286,7 +286,14 @@ impl<'a> Future for AcquireFuture<'a, '_> {\n \n         if is_next_in_line && state.permits >= self.count {\n             state.permits -= self.count;\n-            state.waiters.retain(|waiter| waiter.id != waiter_id);\n+\n+            // Optimization: Since we verified we are next in line, we are either\n+            // at the front of the queue or the queue is empty. We can just pop\n+            // the front instead of scanning the whole deque with retain (O(N)).\n+            if !state.waiters.is_empty() {\n+                state.waiters.pop_front();\n+            }\n+\n             // Wake next waiter if there are still permits available.\n             // Without this, add_permits(N) where N satisfies multiple waiters\n             // would only wake the first, leaving others sleeping indefinitely.\n@@ -295,6 +302,9 @@ impl<'a> Future for AcquireFuture<'a, '_> {\n                     next.waker.wake_by_ref();\n                 }\n             }\n+            drop(state);\n+            // Clear waiter_id after releasing state guard to avoid borrow conflicts.\n+            self.waiter_id = None;\n             return Poll::Ready(Ok(SemaphorePermit {\n                 semaphore: self.semaphore,\n                 count: self.count,\n@@ -487,7 +497,12 @@ impl Future for OwnedAcquireFuture {\n \n         if is_next_in_line && state.permits >= self.count {\n             state.permits -= self.count;\n-            state.waiters.retain(|waiter| waiter.id != waiter_id);\n+\n+            // Optimization: O(1) removal instead of O(N) retain\n+            if !state.waiters.is_empty() {\n+                state.waiters.pop_front();\n+            }\n+\n             // Wake next waiter if there are still permits available.\n             // Without this, add_permits(N) where N satisfies multiple waiters\n             // would only wake the first, leaving others sleeping indefinitely.\n@@ -496,6 +511,9 @@ impl Future for OwnedAcquireFuture {\n                     next.waker.wake_by_ref();\n                 }\n             }\n+            drop(state);\n+            // Prevent redundant Drop cleanup after releasing state guard.\n+            self.waiter_id = None;\n             return Poll::Ready(Ok(OwnedSemaphorePermit {\n                 semaphore: self.semaphore.clone(),\n                 count: self.count,"
+    },
+    {
+      "sha": "9b101039a608f7fc2899422983fe4b6861e2e90e",
+      "filename": "src/time/wheel.rs",
+      "status": "modified",
+      "additions": 35,
+      "deletions": 0,
+      "changes": 35,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/3424cf7660f288e884d7b773a15add11449a1754/src%2Ftime%2Fwheel.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/3424cf7660f288e884d7b773a15add11449a1754/src%2Ftime%2Fwheel.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Ftime%2Fwheel.rs?ref=3424cf7660f288e884d7b773a15add11449a1754",
+      "patch": "@@ -719,6 +719,37 @@ impl TimerWheel {\n         }\n     }\n \n+    fn promote_coalescing_window_entries(&mut self, boundary: Time, ready: &mut Vec<TimerEntry>) {\n+        for level in &mut self.levels {\n+            for slot_idx in 0..SLOTS_PER_LEVEL {\n+                let slot_empty = {\n+                    let slot = &mut level.slots[slot_idx];\n+                    let mut i = 0;\n+                    while i < slot.len() {\n+                        if slot[i].deadline <= boundary {\n+                            ready.push(slot.swap_remove(i));\n+                        } else {\n+                            i += 1;\n+                        }\n+                    }\n+                    slot.is_empty()\n+                };\n+                if slot_empty {\n+                    level.clear_occupied(slot_idx);\n+                }\n+            }\n+        }\n+\n+        while self\n+            .overflow\n+            .peek()\n+            .is_some_and(|entry| entry.deadline <= boundary)\n+        {\n+            let entry = self.overflow.pop().expect(\"peeked entry missing\");\n+            ready.push(entry.entry);\n+        }\n+    }\n+\n     fn drain_ready(&mut self, now: Time) -> Vec<Waker> {\n         let mut wakers = Vec::new();\n \n@@ -744,6 +775,10 @@ impl TimerWheel {\n         } else {\n             None\n         };\n+        if let Some(boundary) = coalesced_time {\n+            self.promote_coalescing_window_entries(boundary, &mut ready);\n+        }\n+\n         let coalescing_enabled = coalesced_time.is_some_and(|boundary| {\n             let min_group_size = self.coalescing.min_group_size.max(1);\n             ready"
+    },
+    {
+      "sha": "8186de7c65dc1cd08896ed8c06471189138646aa",
+      "filename": "src/util/arena.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/3424cf7660f288e884d7b773a15add11449a1754/src%2Futil%2Farena.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/3424cf7660f288e884d7b773a15add11449a1754/src%2Futil%2Farena.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Futil%2Farena.rs?ref=3424cf7660f288e884d7b773a15add11449a1754",
+      "patch": "@@ -277,7 +277,7 @@ impl<T> Arena<T> {\n                     } else {\n                         unreachable!()\n                     };\n-                    \n+\n                     *slot = Slot::Vacant {\n                         next_free: None,\n                         generation: gen.wrapping_add(1),\n@@ -308,7 +308,7 @@ impl<T> Arena<T> {\n         // Link them up\n         for i in 0..vacant_indices.len() - 1 {\n             let curr = vacant_indices[i];\n-            let next = vacant_indices[i+1];\n+            let next = vacant_indices[i + 1];\n             if let Slot::Vacant { next_free, .. } = &mut self.slots[curr] {\n                 *next_free = Some(next as u32);\n             }"
+    },
+    {
+      "sha": "dae3485738ce1492d1c5383de830accb449cfa4e",
+      "filename": "tests/mpsc_fifo_repro.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/3424cf7660f288e884d7b773a15add11449a1754/tests%2Fmpsc_fifo_repro.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/3424cf7660f288e884d7b773a15add11449a1754/tests%2Fmpsc_fifo_repro.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/tests%2Fmpsc_fifo_repro.rs?ref=3424cf7660f288e884d7b773a15add11449a1754",
+      "patch": "@@ -25,7 +25,7 @@ fn test_mpsc_fifo_starvation() {\n     tx.try_send(1).expect(\"first send\");\n \n     let tx_a = tx.clone();\n-    let cx_a = cx.clone();\n+    let cx_a = cx;\n \n     // Sender A: waits for capacity\n     let handle_a = thread::spawn(move || {"
+    }
+  ]
+}

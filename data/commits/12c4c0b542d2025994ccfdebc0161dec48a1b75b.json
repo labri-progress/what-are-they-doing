@@ -1,0 +1,53 @@
+{
+  "message": "refactor(tmux,watcher): use stopCh for cancellation",
+  "files": [
+    {
+      "sha": "3d43f06becaa30f5852d64bc99f628285ae3280d",
+      "filename": "internal/tmux/pane_streamer.go",
+      "status": "modified",
+      "additions": 59,
+      "deletions": 18,
+      "changes": 77,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/12c4c0b542d2025994ccfdebc0161dec48a1b75b/internal%2Ftmux%2Fpane_streamer.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/12c4c0b542d2025994ccfdebc0161dec48a1b75b/internal%2Ftmux%2Fpane_streamer.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Ftmux%2Fpane_streamer.go?ref=12c4c0b542d2025994ccfdebc0161dec48a1b75b",
+      "patch": "@@ -64,7 +64,7 @@ type PaneStreamer struct {\n \tcallback StreamCallback\n \n \tctx    context.Context\n-\tcancel context.CancelFunc\n+\tstopCh chan struct{}\n \twg     sync.WaitGroup\n \n \tfifoPath    string\n@@ -114,25 +114,28 @@ func (ps *PaneStreamer) Start(ctx context.Context) (err error) {\n \t\treturn fmt.Errorf(\"streamer already running for %s\", ps.target)\n \t}\n \tps.running = true\n+\tps.ctx = ctx\n+\tps.stopCh = make(chan struct{})\n+\tps.useFallback.Store(false)\n+\tps.lastHash = \"\"\n+\tps.fifoPath = \"\"\n \tps.mu.Unlock()\n \n-\t// ubs:ignore - cancel invoked by Stop() (or deferred cleanup on Start() error)\n-\tps.ctx, ps.cancel = context.WithCancel(ctx)\n-\n \tdefer func() {\n \t\tif err == nil {\n \t\t\treturn\n \t\t}\n \n \t\tps.mu.Lock()\n \t\tps.running = false\n+\t\tstopCh := ps.stopCh\n+\t\tps.ctx = nil\n+\t\tps.stopCh = nil\n \t\tps.mu.Unlock()\n \n-\t\tif ps.cancel != nil {\n-\t\t\tps.cancel()\n+\t\tif stopCh != nil {\n+\t\t\tclose(stopCh)\n \t\t}\n-\t\tps.ctx = nil\n-\t\tps.cancel = nil\n \t}()\n \n \t// Ensure FIFO directory exists\n@@ -159,10 +162,11 @@ func (ps *PaneStreamer) Stop() {\n \t\treturn\n \t}\n \tps.running = false\n+\tstopCh := ps.stopCh\n \tps.mu.Unlock()\n \n-\tif ps.cancel != nil {\n-\t\tps.cancel()\n+\tif stopCh != nil {\n+\t\tclose(stopCh)\n \t}\n \n \t// Stop pipe-pane\n@@ -172,6 +176,11 @@ func (ps *PaneStreamer) Stop() {\n \t}\n \n \tps.wg.Wait()\n+\n+\tps.mu.Lock()\n+\tps.ctx = nil\n+\tps.stopCh = nil\n+\tps.mu.Unlock()\n }\n \n // Target returns the pane target.\n@@ -227,6 +236,12 @@ func (ps *PaneStreamer) startPipePaneStreaming() error {\n func (ps *PaneStreamer) runFIFOReader() {\n \tdefer ps.wg.Done()\n \n+\tctx := ps.ctx\n+\tif ctx == nil {\n+\t\tctx = context.Background()\n+\t}\n+\tstopCh := ps.stopCh\n+\n \t// Open FIFO with O_RDWR to prevent blocking on open when no writer.\n \t// With O_RDONLY, the open() syscall blocks until a writer opens the FIFO.\n \t// O_RDWR allows the reader to open immediately, and we use SetReadDeadline\n@@ -262,7 +277,10 @@ func (ps *PaneStreamer) runFIFOReader() {\n \n \tfor {\n \t\tselect {\n-\t\tcase <-ps.ctx.Done():\n+\t\tcase <-stopCh:\n+\t\t\tflushLines()\n+\t\t\treturn\n+\t\tcase <-ctx.Done():\n \t\t\tflushLines()\n \t\t\treturn\n \t\tcase <-flushTicker.C:\n@@ -275,8 +293,16 @@ func (ps *PaneStreamer) runFIFOReader() {\n \t\t\t\tif err == io.EOF || os.IsTimeout(err) {\n \t\t\t\t\tcontinue\n \t\t\t\t}\n-\t\t\t\t// Check if context is done\n-\t\t\t\tif ps.ctx.Err() != nil {\n+\t\t\t\t// Check if stop has been requested\n+\t\t\t\tselect {\n+\t\t\t\tcase <-stopCh:\n+\t\t\t\t\tflushLines()\n+\t\t\t\t\treturn\n+\t\t\t\tdefault:\n+\t\t\t\t}\n+\n+\t\t\t\t// Check if parent context is done\n+\t\t\t\tif ctx.Err() != nil {\n \t\t\t\t\tflushLines()\n \t\t\t\t\treturn\n \t\t\t\t}\n@@ -298,19 +324,34 @@ func (ps *PaneStreamer) runFIFOReader() {\n func (ps *PaneStreamer) runPollingLoop() {\n \tdefer ps.wg.Done()\n \n+\tctx := ps.ctx\n+\tif ctx == nil {\n+\t\tctx = context.Background()\n+\t}\n+\tstopCh := ps.stopCh\n+\n \tticker := time.NewTicker(ps.config.FallbackPollInterval)\n \tdefer ticker.Stop()\n \n \tlog.Printf(\"pipe-pane: fallback polling started for %s (interval=%v)\", ps.target, ps.config.FallbackPollInterval)\n \n \tfor {\n \t\tselect {\n-\t\tcase <-ps.ctx.Done():\n+\t\tcase <-stopCh:\n+\t\t\treturn\n+\t\tcase <-ctx.Done():\n \t\t\treturn\n \t\tcase <-ticker.C:\n-\t\t\toutput, err := ps.client.CapturePaneOutputContext(ps.ctx, ps.target, ps.config.FallbackPollLines)\n+\t\t\tcaptureCtx, cancel := context.WithTimeout(ctx, 2*time.Second)\n+\t\t\toutput, err := ps.client.CapturePaneOutputContext(captureCtx, ps.target, ps.config.FallbackPollLines)\n+\t\t\tcancel()\n \t\t\tif err != nil {\n-\t\t\t\tif ps.ctx.Err() != nil {\n+\t\t\t\tselect {\n+\t\t\t\tcase <-stopCh:\n+\t\t\t\t\treturn\n+\t\t\t\tdefault:\n+\t\t\t\t}\n+\t\t\t\tif ctx.Err() != nil {\n \t\t\t\t\treturn\n \t\t\t\t}\n \t\t\t\tlog.Printf(\"pipe-pane: capture-pane error for %s: %v\", ps.target, err)\n@@ -358,8 +399,8 @@ type StreamManager struct {\n \n // NewStreamManager creates a new stream manager.\n func NewStreamManager(client *Client, callback StreamCallback, cfg PaneStreamerConfig) *StreamManager {\n-\t// ubs:ignore - cancel invoked by StopAll()\n-\tctx, cancel := context.WithCancel(context.Background())\n+\tctx := context.Background()\n+\tcancel := func() {}\n \treturn &StreamManager{\n \t\tclient:    client,\n \t\tconfig:    cfg,"
+    },
+    {
+      "sha": "c02c563439698c5268cca56f651e9249088c811b",
+      "filename": "internal/tmux/pane_streamer_test.go",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/12c4c0b542d2025994ccfdebc0161dec48a1b75b/internal%2Ftmux%2Fpane_streamer_test.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/12c4c0b542d2025994ccfdebc0161dec48a1b75b/internal%2Ftmux%2Fpane_streamer_test.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Ftmux%2Fpane_streamer_test.go?ref=12c4c0b542d2025994ccfdebc0161dec48a1b75b",
+      "patch": "@@ -310,8 +310,8 @@ func TestPaneStreamer_Start_RollsBackStateOnFIFODirError(t *testing.T) {\n \tif ps.ctx != nil {\n \t\tt.Fatalf(\"Start() error left ps.ctx non-nil\")\n \t}\n-\tif ps.cancel != nil {\n-\t\tt.Fatalf(\"Start() error left ps.cancel non-nil\")\n+\tif ps.stopCh != nil {\n+\t\tt.Fatalf(\"Start() error left ps.stopCh non-nil\")\n \t}\n }\n "
+    },
+    {
+      "sha": "9a2f99a6fa16e0a038d6bfa9839eea20fecaee47",
+      "filename": "internal/watcher/file_reservation.go",
+      "status": "modified",
+      "additions": 12,
+      "deletions": 14,
+      "changes": 26,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/12c4c0b542d2025994ccfdebc0161dec48a1b75b/internal%2Fwatcher%2Ffile_reservation.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/12c4c0b542d2025994ccfdebc0161dec48a1b75b/internal%2Fwatcher%2Ffile_reservation.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fwatcher%2Ffile_reservation.go?ref=12c4c0b542d2025994ccfdebc0161dec48a1b75b",
+      "patch": "@@ -50,7 +50,7 @@ type FileReservationWatcher struct {\n \tcaptureLines       int\n \tactiveReservations map[string]*PaneReservation // paneID -> reservation\n \tmu                 sync.Mutex\n-\tcancelFunc         context.CancelFunc\n+\tstopCh             chan struct{}\n \twg                 sync.WaitGroup\n \tdebug              bool\n \tconflictCallback   ConflictCallback // Called when conflicts are detected\n@@ -154,21 +154,20 @@ func (w *FileReservationWatcher) Start(ctx context.Context) {\n \t}\n \n \tw.mu.Lock()\n-\tif w.cancelFunc != nil {\n+\tif w.stopCh != nil {\n \t\tw.mu.Unlock()\n \t\tif w.debug {\n \t\t\tlog.Printf(\"[FileReservationWatcher] Start called while already running\")\n \t\t}\n \t\treturn\n \t}\n \n-\t// ubs:ignore - cancel invoked by Stop()\n-\tctx, cancel := context.WithCancel(ctx)\n-\tw.cancelFunc = cancel\n+\tstopCh := make(chan struct{})\n+\tw.stopCh = stopCh\n \tw.mu.Unlock()\n \n \tw.wg.Add(1)\n-\tgo w.run(ctx)\n+\tgo w.run(ctx, stopCh)\n \n \tif w.debug {\n \t\tlog.Printf(\"[FileReservationWatcher] Started with pollInterval=%v idleTimeout=%v\", w.pollInterval, w.idleTimeout)\n@@ -178,18 +177,15 @@ func (w *FileReservationWatcher) Start(ctx context.Context) {\n // Stop halts the file reservation watcher and releases all reservations.\n func (w *FileReservationWatcher) Stop() {\n \tw.mu.Lock()\n-\tcancel := w.cancelFunc\n+\tstopCh := w.stopCh\n+\tw.stopCh = nil\n \tw.mu.Unlock()\n \n-\tif cancel != nil {\n-\t\tcancel()\n+\tif stopCh != nil {\n+\t\tclose(stopCh)\n \t}\n \tw.wg.Wait()\n \n-\tw.mu.Lock()\n-\tw.cancelFunc = nil\n-\tw.mu.Unlock()\n-\n \t// Release all reservations on stop\n \tw.releaseAllReservations()\n \n@@ -199,14 +195,16 @@ func (w *FileReservationWatcher) Stop() {\n }\n \n // run is the main polling loop.\n-func (w *FileReservationWatcher) run(ctx context.Context) {\n+func (w *FileReservationWatcher) run(ctx context.Context, stopCh <-chan struct{}) {\n \tdefer w.wg.Done()\n \n \tticker := time.NewTicker(w.pollInterval)\n \tdefer ticker.Stop()\n \n \tfor {\n \t\tselect {\n+\t\tcase <-stopCh:\n+\t\t\treturn\n \t\tcase <-ctx.Done():\n \t\t\treturn\n \t\tcase <-ticker.C:"
+    },
+    {
+      "sha": "2596aaee7679494119b59209a4f2b2ec61502216",
+      "filename": "internal/watcher/file_reservation_test.go",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 4,
+      "changes": 8,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/12c4c0b542d2025994ccfdebc0161dec48a1b75b/internal%2Fwatcher%2Ffile_reservation_test.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/12c4c0b542d2025994ccfdebc0161dec48a1b75b/internal%2Fwatcher%2Ffile_reservation_test.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fwatcher%2Ffile_reservation_test.go?ref=12c4c0b542d2025994ccfdebc0161dec48a1b75b",
+      "patch": "@@ -402,8 +402,8 @@ func TestFileReservationWatcherStartStop(t *testing.T) {\n \t\tt.Logf(\"RESERVATION_TEST: watcher stopped\")\n \n \t\t// Verify it stopped and is restartable\n-\t\tif w.cancelFunc != nil {\n-\t\t\tt.Fatalf(\"expected cancelFunc to be cleared after Stop()\")\n+\t\tif w.stopCh != nil {\n+\t\t\tt.Fatalf(\"expected stopCh to be cleared after Stop()\")\n \t\t}\n \t})\n \n@@ -417,8 +417,8 @@ func TestFileReservationWatcherStartStop(t *testing.T) {\n \t\ttime.Sleep(50 * time.Millisecond)\n \t\tw.Stop()\n \n-\t\tif w.cancelFunc != nil {\n-\t\t\tt.Fatalf(\"expected cancelFunc to be cleared after Stop()\")\n+\t\tif w.stopCh != nil {\n+\t\t\tt.Fatalf(\"expected stopCh to be cleared after Stop()\")\n \t\t}\n \t})\n "
+    }
+  ]
+}

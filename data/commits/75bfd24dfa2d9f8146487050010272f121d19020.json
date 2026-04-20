@@ -1,0 +1,53 @@
+{
+  "message": "feat(sql): add vector type support to compiled execution\n\nAdd vec_f32 and vec_f64 support to the compiled execution path:\n- Add vector variants to ColumnDataPtr union with rawPtr/len methods\n- Update allocateColumnBuffer/freeColumnBuffer for vector types\n- Update loadColumnDataForLayout to read vector columns\n- Update extractResultData to convert vector data to results\n- Fix double-free bugs in executeCompiled (JitContext/source cleanup)\n- Fix toZigType() for unknown type (return f64 instead of anytype)\n- Fix Zig 0.15 stderr reading API in JIT compiler",
+  "files": [
+    {
+      "sha": "9fa7f5698b473b409100a79b47c69293015a498e",
+      "filename": "src/codegen/metal0_jit.zig",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 4,
+      "changes": 18,
+      "blob_url": "https://github.com/teamchong/lanceql/blob/75bfd24dfa2d9f8146487050010272f121d19020/src%2Fcodegen%2Fmetal0_jit.zig",
+      "raw_url": "https://github.com/teamchong/lanceql/raw/75bfd24dfa2d9f8146487050010272f121d19020/src%2Fcodegen%2Fmetal0_jit.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/lanceql/contents/src%2Fcodegen%2Fmetal0_jit.zig?ref=75bfd24dfa2d9f8146487050010272f121d19020",
+      "patch": "@@ -929,18 +929,28 @@ fn jitCompileSource(\n \n     var child = std.process.Child.init(&argv, allocator);\n     child.stderr_behavior = .Pipe;\n-    child.stdout_behavior = .Pipe;\n+    child.stdout_behavior = .Ignore;\n \n     child.spawn() catch return error.CannotSpawnCompiler;\n+\n+    // Read stderr before waiting (required to prevent pipe deadlock)\n+    var stderr_output: []u8 = &.{};\n+    if (child.stderr) |stderr| {\n+        stderr_output = stderr.readToEndAlloc(allocator, 64 * 1024) catch &.{};\n+    }\n+    defer if (stderr_output.len > 0) allocator.free(stderr_output);\n+\n     const result = child.wait() catch return error.CompilerFailed;\n \n     // Clean up source file\n     std.fs.cwd().deleteFile(src_path) catch {};\n \n     if (result.Exited != 0) {\n-        // Note: In Zig 0.15+, reading stderr requires a buffer and different API\n-        // For now, just log that compilation failed\n-        std.log.err(\"JIT compile failed with exit code {d}\", .{result.Exited});\n+        if (stderr_output.len > 0) {\n+            std.log.err(\"JIT compile failed: {s}\", .{stderr_output});\n+        } else {\n+            std.log.err(\"JIT compile failed with exit code {d}\", .{result.Exited});\n+        }\n         return error.CompilationFailed;\n     }\n "
+    },
+    {
+      "sha": "36c52f55bb50582046669ce40f522c7751fbf28f",
+      "filename": "src/sql/executor.zig",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 7,
+      "changes": 16,
+      "blob_url": "https://github.com/teamchong/lanceql/blob/75bfd24dfa2d9f8146487050010272f121d19020/src%2Fsql%2Fexecutor.zig",
+      "raw_url": "https://github.com/teamchong/lanceql/raw/75bfd24dfa2d9f8146487050010272f121d19020/src%2Fsql%2Fexecutor.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/lanceql/contents/src%2Fsql%2Fexecutor.zig?ref=75bfd24dfa2d9f8146487050010272f121d19020",
+      "patch": "@@ -261,19 +261,15 @@ pub const Executor = struct {\n \n         // 2. Generate fused Zig code with layout metadata\n         var codegen = fused_codegen.FusedCodeGen.init(self.allocator);\n-        defer codegen.deinit();\n+        defer codegen.deinit(); // This handles freeing the generated source code\n         const gen_result = try codegen.generateWithLayout(&plan);\n-        defer self.allocator.free(gen_result.source);\n+        // Note: gen_result.source is owned by codegen and freed in deinit()\n \n         // 3. JIT compile to native code\n         var jit_ctx = metal0_jit.JitContext.init(self.allocator);\n-        defer jit_ctx.deinit();\n+        defer jit_ctx.deinit(); // This handles cleanup of compiled functions\n \n         const compiled = try jit_ctx.compileZigSource(gen_result.source, \"fused_query\");\n-        defer {\n-            var c = compiled;\n-            c.deinit();\n-        }\n \n         // 4. Load column data based on layout\n         const row_count = try self.getRowCount();\n@@ -326,6 +322,8 @@ pub const Executor = struct {\n                 .timestamp_ns, .timestamp_us, .timestamp_ms, .timestamp_s => .{ .timestamp_ns = try self.tbl().readInt64Column(col_idx) },\n                 .date32 => .{ .date32 = try self.tbl().readInt32Column(col_idx) },\n                 .date64 => .{ .date64 = try self.tbl().readInt64Column(col_idx) },\n+                .vec_f32 => .{ .vec_f32 = try self.tbl().readFloat32Column(col_idx) },\n+                .vec_f64 => .{ .vec_f64 = try self.tbl().readFloat64Column(col_idx) },\n                 else => .{ .f64 = try self.tbl().readFloat64Column(col_idx) }, // Default fallback\n             };\n         }\n@@ -353,6 +351,8 @@ pub const Executor = struct {\n                 .timestamp_ms => |s| self.allocator.free(s),\n                 .date32 => |s| self.allocator.free(s),\n                 .date64 => |s| self.allocator.free(s),\n+                .vec_f32 => |s| self.allocator.free(s),\n+                .vec_f64 => |s| self.allocator.free(s),\n                 .empty => {},\n             }\n         }\n@@ -432,6 +432,8 @@ pub const Executor = struct {\n             .timestamp_ns, .timestamp_us, .timestamp_ms => |s| .{ .timestamp_ns = try self.allocator.dupe(i64, s[0..count]) },\n             .date32 => |s| .{ .date32 = try self.allocator.dupe(i32, s[0..count]) },\n             .date64 => |s| .{ .date64 = try self.allocator.dupe(i64, s[0..count]) },\n+            .vec_f32 => |s| .{ .float32 = try self.allocator.dupe(f32, s[0..count]) },\n+            .vec_f64 => |s| .{ .float64 = try self.allocator.dupe(f64, s[0..count]) },\n             else => .{ .float64 = &[_]f64{} },\n         };\n     }"
+    },
+    {
+      "sha": "bd831d471bcdd219719eaeacb64b5f98f073dcdb",
+      "filename": "src/sql/planner/plan_nodes.zig",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/teamchong/lanceql/blob/75bfd24dfa2d9f8146487050010272f121d19020/src%2Fsql%2Fplanner%2Fplan_nodes.zig",
+      "raw_url": "https://github.com/teamchong/lanceql/raw/75bfd24dfa2d9f8146487050010272f121d19020/src%2Fsql%2Fplanner%2Fplan_nodes.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/lanceql/contents/src%2Fsql%2Fplanner%2Fplan_nodes.zig?ref=75bfd24dfa2d9f8146487050010272f121d19020",
+      "patch": "@@ -69,7 +69,7 @@ pub const ColumnType = enum {\n             .timestamp_ns, .timestamp_us, .timestamp_ms, .timestamp_s => \"i64\",\n             .date32 => \"i32\",\n             .date64 => \"i64\",\n-            .unknown => \"anytype\",\n+            .unknown => \"f64\", // Default to f64 for code generation\n         };\n     }\n "
+    },
+    {
+      "sha": "3ee0dc63df46e490ca110992a55e0f3a08c0bf4e",
+      "filename": "src/sql/runtime_columns.zig",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 0,
+      "changes": 10,
+      "blob_url": "https://github.com/teamchong/lanceql/blob/75bfd24dfa2d9f8146487050010272f121d19020/src%2Fsql%2Fruntime_columns.zig",
+      "raw_url": "https://github.com/teamchong/lanceql/raw/75bfd24dfa2d9f8146487050010272f121d19020/src%2Fsql%2Fruntime_columns.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/lanceql/contents/src%2Fsql%2Fruntime_columns.zig?ref=75bfd24dfa2d9f8146487050010272f121d19020",
+      "patch": "@@ -44,6 +44,8 @@ pub const ColumnDataPtr = union(enum) {\n     timestamp_ms: []i64,\n     date32: []i32,\n     date64: []i64,\n+    vec_f32: []f32, // Flat array of f32 vector elements (row_count * dim)\n+    vec_f64: []f64, // Flat array of f64 vector elements (row_count * dim)\n     empty: void, // For unallocated output buffers\n \n     /// Get the raw pointer value for embedding in struct buffer\n@@ -66,6 +68,8 @@ pub const ColumnDataPtr = union(enum) {\n             .timestamp_ms => |s| @intFromPtr(s.ptr),\n             .date32 => |s| @intFromPtr(s.ptr),\n             .date64 => |s| @intFromPtr(s.ptr),\n+            .vec_f32 => |s| @intFromPtr(s.ptr),\n+            .vec_f64 => |s| @intFromPtr(s.ptr),\n             .empty => 0,\n         };\n     }\n@@ -90,6 +94,8 @@ pub const ColumnDataPtr = union(enum) {\n             .timestamp_ms => |s| s.len,\n             .date32 => |s| s.len,\n             .date64 => |s| s.len,\n+            .vec_f32 => |s| s.len,\n+            .vec_f64 => |s| s.len,\n             .empty => 0,\n         };\n     }\n@@ -229,6 +235,8 @@ fn allocateColumnBuffer(allocator: std.mem.Allocator, col_type: ColumnType, row_\n         .timestamp_s => .{ .timestamp_ns = try allocator.alloc(i64, row_count) }, // Treat as ns\n         .date32 => .{ .date32 = try allocator.alloc(i32, row_count) },\n         .date64 => .{ .date64 = try allocator.alloc(i64, row_count) },\n+        .vec_f32 => .{ .vec_f32 = try allocator.alloc(f32, row_count) },\n+        .vec_f64 => .{ .vec_f64 = try allocator.alloc(f64, row_count) },\n         .unknown => .{ .f64 = try allocator.alloc(f64, row_count) }, // Default to f64\n         else => .{ .f64 = try allocator.alloc(f64, row_count) }, // Default for unsupported types\n     };\n@@ -254,6 +262,8 @@ fn freeColumnBuffer(allocator: std.mem.Allocator, col: ColumnDataPtr) void {\n         .timestamp_ms => |s| allocator.free(s),\n         .date32 => |s| allocator.free(s),\n         .date64 => |s| allocator.free(s),\n+        .vec_f32 => |s| allocator.free(s),\n+        .vec_f64 => |s| allocator.free(s),\n         .empty => {},\n     }\n }"
+    }
+  ]
+}

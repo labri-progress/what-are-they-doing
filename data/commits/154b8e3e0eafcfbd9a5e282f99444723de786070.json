@@ -1,0 +1,79 @@
+{
+  "message": "fix: bridge respawned child signals (#933) (thanks @roshanasingh4)\n\nCo-authored-by: Roshan Singh <roshanasingh4@users.noreply.github.com>",
+  "files": [
+    {
+      "sha": "22c05035fd166c86a8a3d731452620cce4c14bce",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/154b8e3e0eafcfbd9a5e282f99444723de786070/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/154b8e3e0eafcfbd9a5e282f99444723de786070/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=154b8e3e0eafcfbd9a5e282f99444723de786070",
+      "patch": "@@ -24,6 +24,7 @@\n - WhatsApp: add `channels.whatsapp.sendReadReceipts` to disable auto read receipts. (#882) \u2014 thanks @chrisrodz.\n \n ### Fixes\n+- Gateway: forward termination signals to respawned CLI child processes to avoid orphaned systemd runs. (#933) \u2014 thanks @roshanasingh4.\n - Browser: add tests for snapshot labels/efficient query params and labeled image responses.\n - macOS: ensure launchd log directory exists with a test-only override. (#909) \u2014 thanks @roshanasingh4.\n - Packaging: run `pnpm build` on `prepack` so npm publishes include fresh `dist/` output."
+    },
+    {
+      "sha": "cac3ff4a859d21b40acfbd59bc693c0cb4034184",
+      "filename": "src/entry.ts",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 3,
+      "changes": 17,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/154b8e3e0eafcfbd9a5e282f99444723de786070/src%2Fentry.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/154b8e3e0eafcfbd9a5e282f99444723de786070/src%2Fentry.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fentry.ts?ref=154b8e3e0eafcfbd9a5e282f99444723de786070",
+      "patch": "@@ -1,8 +1,9 @@\n #!/usr/bin/env node\n+import { spawn } from \"node:child_process\";\n import process from \"node:process\";\n \n import { applyCliProfileEnv, parseCliProfileArgs } from \"./cli/profile.js\";\n-import { spawnWithSignalForwarding } from \"./process/spawn-with-signal-forwarding.js\";\n+import { attachChildProcessBridge } from \"./process/child-process-bridge.js\";\n \n if (process.argv.includes(\"--no-color\")) {\n   process.env.NO_COLOR = \"1\";\n@@ -24,7 +25,7 @@ function ensureExperimentalWarningSuppressed(): boolean {\n   process.env.CLAWDBOT_NODE_OPTIONS_READY = \"1\";\n   process.env.NODE_OPTIONS = `${nodeOptions} ${EXPERIMENTAL_WARNING_FLAG}`.trim();\n \n-  const { child } = spawnWithSignalForwarding(\n+  const child = spawn(\n     process.execPath,\n     [...process.execArgv, ...process.argv.slice(1)],\n     {\n@@ -33,14 +34,24 @@ function ensureExperimentalWarningSuppressed(): boolean {\n     },\n   );\n \n-  child.on(\"exit\", (code, signal) => {\n+  attachChildProcessBridge(child);\n+\n+  child.once(\"exit\", (code, signal) => {\n     if (signal) {\n       process.exitCode = 1;\n       return;\n     }\n     process.exit(code ?? 1);\n   });\n \n+  child.once(\"error\", (error) => {\n+    console.error(\n+      \"[clawdbot] Failed to respawn CLI:\",\n+      error instanceof Error ? (error.stack ?? error.message) : error,\n+    );\n+    process.exit(1);\n+  });\n+\n   // Parent must not continue running the CLI.\n   return true;\n }"
+    },
+    {
+      "sha": "00d376c0f8ded41eaeeb2543a1110f74171993c2",
+      "filename": "src/process/child-process-bridge.test.ts",
+      "status": "renamed",
+      "additions": 17,
+      "deletions": 6,
+      "changes": 23,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/154b8e3e0eafcfbd9a5e282f99444723de786070/src%2Fprocess%2Fchild-process-bridge.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/154b8e3e0eafcfbd9a5e282f99444723de786070/src%2Fprocess%2Fchild-process-bridge.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fprocess%2Fchild-process-bridge.test.ts?ref=154b8e3e0eafcfbd9a5e282f99444723de786070",
+      "patch": "@@ -1,10 +1,11 @@\n+import { spawn } from \"node:child_process\";\n import net from \"node:net\";\n import path from \"node:path\";\n import process from \"node:process\";\n \n import { afterEach, describe, expect, it } from \"vitest\";\n \n-import { spawnWithSignalForwarding } from \"./spawn-with-signal-forwarding.js\";\n+import { attachChildProcessBridge } from \"./child-process-bridge.js\";\n \n function waitForLine(stream: NodeJS.ReadableStream, timeoutMs = 10_000): Promise<string> {\n   return new Promise((resolve, reject) => {\n@@ -52,10 +53,19 @@ function canConnect(port: number): Promise<boolean> {\n   });\n }\n \n-describe(\"spawnWithSignalForwarding\", () => {\n+describe(\"attachChildProcessBridge\", () => {\n   const children: Array<{ kill: (signal?: NodeJS.Signals) => boolean }> = [];\n+  const detachments: Array<() => void> = [];\n \n   afterEach(() => {\n+    for (const detach of detachments) {\n+      try {\n+        detach();\n+      } catch {\n+        // ignore\n+      }\n+    }\n+    detachments.length = 0;\n     for (const child of children) {\n       try {\n         child.kill(\"SIGKILL\");\n@@ -67,15 +77,16 @@ describe(\"spawnWithSignalForwarding\", () => {\n   });\n \n   it(\n-    \"forwards SIGTERM to spawned child\",\n+    \"forwards SIGTERM to the wrapped child\",\n     async () => {\n-      const tsxPath = path.resolve(process.cwd(), \"node_modules/.bin/tsx\");\n-      const childPath = path.resolve(process.cwd(), \"test/fixtures/signal-forwarding/child.ts\");\n+      const childPath = path.resolve(process.cwd(), \"test/fixtures/child-process-bridge/child.js\");\n \n-      const { child } = spawnWithSignalForwarding(tsxPath, [childPath], {\n+      const child = spawn(process.execPath, [childPath], {\n         stdio: [\"ignore\", \"pipe\", \"inherit\"],\n         env: process.env,\n       });\n+      const { detach } = attachChildProcessBridge(child);\n+      detachments.push(detach);\n       children.push(child);\n \n       if (!child.stdout) throw new Error(\"expected stdout\");",
+      "previous_filename": "src/process/spawn-with-signal-forwarding.test.ts"
+    },
+    {
+      "sha": "5bad6c2b49bca9ca6710207cf407c404bf6cfeed",
+      "filename": "src/process/child-process-bridge.ts",
+      "status": "added",
+      "additions": 47,
+      "deletions": 0,
+      "changes": 47,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/154b8e3e0eafcfbd9a5e282f99444723de786070/src%2Fprocess%2Fchild-process-bridge.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/154b8e3e0eafcfbd9a5e282f99444723de786070/src%2Fprocess%2Fchild-process-bridge.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fprocess%2Fchild-process-bridge.ts?ref=154b8e3e0eafcfbd9a5e282f99444723de786070",
+      "patch": "@@ -0,0 +1,47 @@\n+import type { ChildProcess } from \"node:child_process\";\n+import process from \"node:process\";\n+\n+export type ChildProcessBridgeOptions = {\n+  signals?: NodeJS.Signals[];\n+  onSignal?: (signal: NodeJS.Signals) => void;\n+};\n+\n+const defaultSignals: NodeJS.Signals[] =\n+  process.platform === \"win32\"\n+    ? [\"SIGTERM\", \"SIGINT\", \"SIGBREAK\"]\n+    : [\"SIGTERM\", \"SIGINT\", \"SIGHUP\", \"SIGQUIT\"];\n+\n+export function attachChildProcessBridge(\n+  child: ChildProcess,\n+  { signals = defaultSignals, onSignal }: ChildProcessBridgeOptions = {},\n+): { detach: () => void } {\n+  const listeners = new Map<NodeJS.Signals, () => void>();\n+  for (const signal of signals) {\n+    const listener = (): void => {\n+      onSignal?.(signal);\n+      try {\n+        child.kill(signal);\n+      } catch {\n+        // ignore\n+      }\n+    };\n+    try {\n+      process.on(signal, listener);\n+      listeners.set(signal, listener);\n+    } catch {\n+      // Unsupported signal on this platform.\n+    }\n+  }\n+\n+  const detach = (): void => {\n+    for (const [signal, listener] of listeners) {\n+      process.off(signal, listener);\n+    }\n+    listeners.clear();\n+  };\n+\n+  child.once(\"exit\", detach);\n+  child.once(\"error\", detach);\n+\n+  return { detach };\n+}"
+    },
+    {
+      "sha": "af57a9ce08cfb9c8d7be268170c26f6de3cd0d26",
+      "filename": "src/process/spawn-with-signal-forwarding.ts",
+      "status": "removed",
+      "additions": 0,
+      "deletions": 40,
+      "changes": 40,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/d9f2ee40f707467239bf2fc68418cd6c70302f9e/src%2Fprocess%2Fspawn-with-signal-forwarding.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/d9f2ee40f707467239bf2fc68418cd6c70302f9e/src%2Fprocess%2Fspawn-with-signal-forwarding.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fprocess%2Fspawn-with-signal-forwarding.ts?ref=d9f2ee40f707467239bf2fc68418cd6c70302f9e",
+      "patch": "@@ -1,40 +0,0 @@\n-import type { ChildProcess, SpawnOptions } from \"node:child_process\";\n-import { spawn } from \"node:child_process\";\n-import process from \"node:process\";\n-\n-export type SpawnWithSignalForwardingOptions = {\n-  signals?: NodeJS.Signals[];\n-};\n-\n-export function spawnWithSignalForwarding(\n-  command: string,\n-  args: string[],\n-  options: SpawnOptions,\n-  { signals = [\"SIGTERM\", \"SIGINT\", \"SIGHUP\", \"SIGQUIT\"] }: SpawnWithSignalForwardingOptions = {},\n-): { child: ChildProcess; detach: () => void } {\n-  const child = spawn(command, args, options);\n-\n-  const listeners = new Map<NodeJS.Signals, () => void>();\n-  for (const signal of signals) {\n-    const listener = (): void => {\n-      try {\n-        child.kill(signal);\n-      } catch {\n-        // ignore\n-      }\n-    };\n-    listeners.set(signal, listener);\n-    process.on(signal, listener);\n-  }\n-\n-  const detach = (): void => {\n-    for (const [signal, listener] of listeners) {\n-      process.off(signal, listener);\n-    }\n-    listeners.clear();\n-  };\n-\n-  child.once(\"exit\", detach);\n-\n-  return { child, detach };\n-}"
+    },
+    {
+      "sha": "3c24f2172cd6c7523c742dfe1c389dac67591699",
+      "filename": "test/fixtures/child-process-bridge/child.js",
+      "status": "renamed",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/154b8e3e0eafcfbd9a5e282f99444723de786070/test%2Ffixtures%2Fchild-process-bridge%2Fchild.js",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/154b8e3e0eafcfbd9a5e282f99444723de786070/test%2Ffixtures%2Fchild-process-bridge%2Fchild.js",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/test%2Ffixtures%2Fchild-process-bridge%2Fchild.js?ref=154b8e3e0eafcfbd9a5e282f99444723de786070",
+      "patch": "@@ -11,7 +11,7 @@ server.listen(0, \"127.0.0.1\", () => {\n   process.stdout.write(`${addr.port}\\n`);\n });\n \n-const shutdown = (): void => {\n+const shutdown = () => {\n   server.close(() => process.exit(0));\n };\n ",
+      "previous_filename": "test/fixtures/signal-forwarding/child.ts"
+    }
+  ]
+}

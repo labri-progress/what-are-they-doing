@@ -1,0 +1,53 @@
+{
+  "message": "fix(export): ensure SHA-256 hash is always computed for OPFS cache invalidation\n\nCritical fix for GitHub Pages cache staleness (bv-pages-cache-fix issue).\n\nProblem:\nWhen exporting databases smaller than the chunk threshold, the config\nfile was written without computing the SHA-256 hash. This caused all\ndeployments to use the cache key \"default\", resulting in browsers\nserving stale cached data even after updates.\n\nSolution:\nRefactor chunkIfNeeded() to always compute the SHA-256 hash FIRST,\nbefore checking the chunk threshold. This ensures every export has a\nunique cache key derived from the actual database content.\n\nChanges to sqlite_export.go:\n- Move hash computation before the chunk threshold check\n- Reorder file operations: open \u2192 hash \u2192 decide on chunking \u2192 (optionally chunk)\n- Improve file handle lifecycle with earlier Close() for non-chunked path\n- All paths now produce a config with valid Hash field\n\nChanges to sqlite_export_test.go:\n- Add test assertions verifying Hash is always present\n- Validate Hash is exactly 64 hex characters (SHA-256)\n\nChanges to viewer.js:\n- Add cleanStaleOPFS() function to garbage-collect old cache entries\n- Called after successful cache hit to free storage from previous versions\n- Cleans up both legacy \"default\" key and old hash-based entries\n\nVersion bump: v0.14.0 \u2192 v0.14.3\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "294d07ee62db9d17ba73a7ed00632232ca7090dd",
+      "filename": "pkg/export/sqlite_export.go",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 14,
+      "changes": 34,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_viewer/blob/d263a78d5c0a4a70651cf92f71dd244acd6f6585/pkg%2Fexport%2Fsqlite_export.go",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_viewer/raw/d263a78d5c0a4a70651cf92f71dd244acd6f6585/pkg%2Fexport%2Fsqlite_export.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_viewer/contents/pkg%2Fexport%2Fsqlite_export.go?ref=d263a78d5c0a4a70651cf92f71dd244acd6f6585",
+      "patch": "@@ -523,35 +523,41 @@ func (e *SQLiteExporter) chunkIfNeeded(outputDir, dbPath string) error {\n \t\tTotalSize: info.Size(),\n \t}\n \n-\tif info.Size() < e.Config.ChunkThreshold {\n-\t\tconfig.Chunked = false\n-\t\treturn writeJSON(filepath.Join(outputDir, \"beads.sqlite3.config.json\"), config)\n-\t}\n-\n-\t// Chunk the database\n-\tchunksDir := filepath.Join(outputDir, \"chunks\")\n-\tif err := os.MkdirAll(chunksDir, 0755); err != nil {\n-\t\treturn fmt.Errorf(\"create chunks dir: %w\", err)\n-\t}\n-\n+\t// Always compute hash for cache invalidation (bv-pages-cache-fix)\n+\t// The hash is used by viewer.js OPFS caching to determine if cached data is stale.\n+\t// Without this, all deployments use the same \"default\" cache key and old data persists.\n \tf, err := os.Open(dbPath)\n \tif err != nil {\n \t\treturn err\n \t}\n-\tdefer f.Close()\n \n-\t// Calculate file hash\n \thasher := sha256.New()\n \tif _, err := io.Copy(hasher, f); err != nil {\n+\t\tf.Close()\n \t\treturn fmt.Errorf(\"hash database: %w\", err)\n \t}\n \tconfig.Hash = hex.EncodeToString(hasher.Sum(nil))\n \n-\t// Reset file position\n+\tif info.Size() < e.Config.ChunkThreshold {\n+\t\tf.Close()\n+\t\tconfig.Chunked = false\n+\t\treturn writeJSON(filepath.Join(outputDir, \"beads.sqlite3.config.json\"), config)\n+\t}\n+\n+\t// Reset file position for chunking\n \tif _, err := f.Seek(0, 0); err != nil {\n+\t\tf.Close()\n \t\treturn err\n \t}\n \n+\t// Chunk the database (file f is already open and seeked to start)\n+\tdefer f.Close()\n+\n+\tchunksDir := filepath.Join(outputDir, \"chunks\")\n+\tif err := os.MkdirAll(chunksDir, 0755); err != nil {\n+\t\treturn fmt.Errorf(\"create chunks dir: %w\", err)\n+\t}\n+\n \t// Split into chunks\n \tchunkNum := 0\n \tbuf := make([]byte, e.Config.ChunkSize)"
+    },
+    {
+      "sha": "022bb6bacf149633a82e6e73923b073a185cee4f",
+      "filename": "pkg/export/sqlite_export_test.go",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 0,
+      "changes": 11,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_viewer/blob/d263a78d5c0a4a70651cf92f71dd244acd6f6585/pkg%2Fexport%2Fsqlite_export_test.go",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_viewer/raw/d263a78d5c0a4a70651cf92f71dd244acd6f6585/pkg%2Fexport%2Fsqlite_export_test.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_viewer/contents/pkg%2Fexport%2Fsqlite_export_test.go?ref=d263a78d5c0a4a70651cf92f71dd244acd6f6585",
+      "patch": "@@ -231,6 +231,17 @@ func TestExport_ChunkConfigCreated(t *testing.T) {\n \tif config.TotalSize <= 0 {\n \t\tt.Error(\"Total size should be positive\")\n \t}\n+\n+\t// Hash must be present for OPFS cache invalidation (bv-pages-cache-fix)\n+\t// Without this, all deployments use cache key \"default\" and old data persists\n+\tif config.Hash == \"\" {\n+\t\tt.Error(\"Config hash is required for OPFS cache invalidation but was empty\")\n+\t}\n+\n+\t// Hash should be 64 hex chars (SHA-256)\n+\tif len(config.Hash) != 64 {\n+\t\tt.Errorf(\"Expected SHA-256 hash (64 chars), got %d chars: %s\", len(config.Hash), config.Hash)\n+\t}\n }\n \n func TestGetExportedIssues(t *testing.T) {"
+    },
+    {
+      "sha": "173e1c4511e2a1bb67e07b76d50951daf822ea6b",
+      "filename": "pkg/export/viewer_assets/viewer.js",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 0,
+      "changes": 22,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_viewer/blob/d263a78d5c0a4a70651cf92f71dd244acd6f6585/pkg%2Fexport%2Fviewer_assets%2Fviewer.js",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_viewer/raw/d263a78d5c0a4a70651cf92f71dd244acd6f6585/pkg%2Fexport%2Fviewer_assets%2Fviewer.js",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_viewer/contents/pkg%2Fexport%2Fviewer_assets%2Fviewer.js?ref=d263a78d5c0a4a70651cf92f71dd244acd6f6585",
+      "patch": "@@ -457,6 +457,26 @@ async function cacheToOPFS(data, cacheKey) {\n   }\n }\n \n+/**\n+ * Remove stale OPFS cache entries (old hashes and the legacy \"default\" key).\n+ * Runs in the background after a successful cache hit to free storage.\n+ */\n+async function cleanStaleOPFS(currentCacheKey) {\n+  if (!('storage' in navigator) || !navigator.storage.getDirectory) return;\n+  try {\n+    const root = await navigator.storage.getDirectory();\n+    const currentFile = `beads-${currentCacheKey}.sqlite3`;\n+    for await (const [name] of root.entries()) {\n+      if (name.startsWith('beads-') && name.endsWith('.sqlite3') && name !== currentFile) {\n+        await root.removeEntry(name);\n+        console.log(`[OPFS] Removed stale cache: ${name}`);\n+      }\n+    }\n+  } catch (err) {\n+    // Non-critical; ignore cleanup failures\n+  }\n+}\n+\n /**\n  * Fetch JSON file\n  */\n@@ -524,6 +544,8 @@ async function loadDatabase(updateStatus) {\n       DB_STATE.db = new SQL.Database(cached);\n       DB_STATE.source = 'cache';\n       DIAGNOSTICS.dbSource = 'cache';\n+      // Clean up stale cache entries in the background\n+      cleanStaleOPFS(DB_STATE.cacheKey).catch(() => {});\n       return DB_STATE.db;\n     }\n   }"
+    },
+    {
+      "sha": "b726a328bf87a5fe817e429665eb59e4d600eec0",
+      "filename": "pkg/version/version.go",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_viewer/blob/d263a78d5c0a4a70651cf92f71dd244acd6f6585/pkg%2Fversion%2Fversion.go",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_viewer/raw/d263a78d5c0a4a70651cf92f71dd244acd6f6585/pkg%2Fversion%2Fversion.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_viewer/contents/pkg%2Fversion%2Fversion.go?ref=d263a78d5c0a4a70651cf92f71dd244acd6f6585",
+      "patch": "@@ -4,4 +4,4 @@ package version\n // This is a var (not const) so it can be overridden at build time via:\n //\n //\tgo build -ldflags \"-X github.com/Dicklesworthstone/beads_viewer/pkg/version.Version=v1.2.3\"\n-var Version = \"v0.14.0\"\n+var Version = \"v0.14.3\""
+    }
+  ]
+}

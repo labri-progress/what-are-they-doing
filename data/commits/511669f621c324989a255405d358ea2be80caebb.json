@@ -1,0 +1,41 @@
+{
+  "message": "fix(freeze): fix isConstructorCall and add debug checks for var_ref\n\n- Pass ctx parameter to isConstructorCall for proper JS_IsFunction check\n- Add shared cleanup helpers for locals and arg_shadow in opcode_emitter\n- Add debug checks in QuickJS patch for corrupted objects in var_ref",
+  "files": [
+    {
+      "sha": "11644a533ccd23a9bddb002371b0219141e1059d",
+      "filename": "patches/quickjs/001-frozen-interpreter-all.patch",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 2,
+      "changes": 18,
+      "blob_url": "https://github.com/teamchong/edgebox/blob/511669f621c324989a255405d358ea2be80caebb/patches%2Fquickjs%2F001-frozen-interpreter-all.patch",
+      "raw_url": "https://github.com/teamchong/edgebox/raw/511669f621c324989a255405d358ea2be80caebb/patches%2Fquickjs%2F001-frozen-interpreter-all.patch",
+      "contents_url": "https://api.github.com/repos/teamchong/edgebox/contents/patches%2Fquickjs%2F001-frozen-interpreter-all.patch?ref=511669f621c324989a255405d358ea2be80caebb",
+      "patch": "@@ -145,7 +145,7 @@ index 62f4381..cd5bed3 100644\n  #define GLOBAL_VAR_OFFSET 0x40000000\n  #define ARGUMENT_VAR_OFFSET 0x20000000\n  \n-@@ -15598,6 +15640,867 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)\n+@@ -15598,6 +15640,881 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)\n      return 0;\n  }\n  \n@@ -207,7 +207,21 @@ index 62f4381..cd5bed3 100644\n +    (void)ctx;\n +    if (!var_refs || idx < 0 || idx >= var_refs_count || !var_refs[idx])\n +        return JS_UNDEFINED;\n-+    return js_dup(*var_refs[idx]->pvalue);\n++    JSVarRef *var_ref = var_refs[idx];\n++    JSValue val = *var_ref->pvalue;\n++    /* Debug check for corrupted objects */\n++    if (JS_VALUE_GET_TAG(val) == JS_TAG_OBJECT) {\n++        JSObject *p = JS_VALUE_GET_OBJ(val);\n++        if (!p || !p->shape) {\n++            fprintf(stderr, \"FROZEN DEBUG: corrupted object in var_ref[%d], pvalue=%p, is_detached=%d, val_tag=%d\\n\",\n++                    idx, (void*)var_ref->pvalue, var_ref->is_detached, JS_VALUE_GET_TAG(val));\n++            if (p) {\n++                fprintf(stderr, \"  obj=%p, shape=%p\\n\", (void*)p, (void*)p->shape);\n++            }\n++            abort();\n++        }\n++    }\n++    return js_dup(val);\n +}\n +\n +void js_frozen_set_var_ref_safe(JSContext *ctx, JSVarRef **var_refs, int idx, int var_refs_count, JSValue val)"
+    },
+    {
+      "sha": "6ddf5572096315a76befa33a292c2f9936ca23db",
+      "filename": "src/freeze/opcode_emitter.zig",
+      "status": "modified",
+      "additions": 32,
+      "deletions": 1,
+      "changes": 33,
+      "blob_url": "https://github.com/teamchong/edgebox/blob/511669f621c324989a255405d358ea2be80caebb/src%2Ffreeze%2Fopcode_emitter.zig",
+      "raw_url": "https://github.com/teamchong/edgebox/raw/511669f621c324989a255405d358ea2be80caebb/src%2Ffreeze%2Fopcode_emitter.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/edgebox/contents/src%2Ffreeze%2Fopcode_emitter.zig?ref=511669f621c324989a255405d358ea2be80caebb",
+      "patch": "@@ -791,7 +791,7 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b\n         // ============================================================\n         .check_ctor => {\n             try self.flushVstack();\n-            try self.writeLine(\"if (!zig_runtime.isConstructorCall(this_val)) return JSValue.throwTypeError(ctx, \\\"Constructor requires 'new'\\\");\");\n+            try self.writeLine(\"if (!zig_runtime.isConstructorCall(ctx, this_val)) return JSValue.throwTypeError(ctx, \\\"Constructor requires 'new'\\\");\");\n         },\n         .check_ctor_return => {\n             try self.flushVstack();\n@@ -1125,3 +1125,34 @@ fn findClosureVarPosition(comptime CodeGen: type, self: *CodeGen, bytecode_idx:\n     // Fallback: if not found, use original index (shouldn't happen for valid bytecode)\n     return bytecode_idx;\n }\n+\n+// ============================================================================\n+// Shared Return Helpers\n+// ============================================================================\n+// These helpers provide common patterns for return handling that are shared\n+// between codegens (zig_codegen_full.zig and zig_codegen_relooper.zig).\n+\n+/// Emit cleanup code for locals before function return.\n+/// Frees any ref-type locals to prevent memory leaks.\n+/// Uses collect-then-free pattern to avoid g_return_slot corruption.\n+/// @param indent - indentation prefix for generated code (e.g., \"\" or \"    \")\n+pub fn emitLocalsCleanupShared(comptime CodeGen: type, self: *CodeGen, var_count: u16, indent: []const u8) !void {\n+    if (var_count == 0) return;\n+    // Free all locals that might hold ref types\n+    // Collect phase: gather all JSValues first (each toJSValueWithCtx call is safe before any free)\n+    // Free phase: then free them all (g_return_slot no longer in use during frees)\n+    try self.printLine(\"{s}// Cleanup locals before return (collect-then-free to avoid g_return_slot corruption)\", .{indent});\n+    try self.printLine(\"{s}var _locals_to_free: [{d}]JSValue = undefined;\", .{ indent, var_count });\n+    try self.printLine(\"{s}var _locals_free_count: usize = 0;\", .{indent});\n+    try self.printLine(\"{s}for (0..{d}) |_loc_i| {{ const _loc_v = locals[_loc_i]; if (_loc_v.isRefType()) {{ _locals_to_free[_locals_free_count] = _loc_v.toJSValueWithCtx(ctx); _locals_free_count += 1; }} }}\", .{ indent, var_count });\n+    try self.printLine(\"{s}for (0.._locals_free_count) |_lfi| {{ JSValue.free(ctx, _locals_to_free[_lfi]); }}\", .{indent});\n+}\n+\n+/// Emit cleanup code for arg_shadow array before function return.\n+/// Frees any ref-type values that were duped at function entry.\n+/// @param indent - indentation prefix for generated code\n+pub fn emitArgShadowCleanupShared(comptime CodeGen: type, self: *CodeGen, arg_count: anytype, indent: []const u8) !void {\n+    for (0..arg_count) |i| {\n+        try self.printLine(\"{s}if (arg_shadow[{d}].isRefType()) JSValue.free(ctx, arg_shadow[{d}].toJSValueWithCtx(ctx));\", .{ indent, i, i });\n+    }\n+}"
+    },
+    {
+      "sha": "40f167369191ef5c61caaef5325d1192689397f8",
+      "filename": "src/freeze/zig_runtime.zig",
+      "status": "modified",
+      "additions": 12,
+      "deletions": 0,
+      "changes": 12,
+      "blob_url": "https://github.com/teamchong/edgebox/blob/511669f621c324989a255405d358ea2be80caebb/src%2Ffreeze%2Fzig_runtime.zig",
+      "raw_url": "https://github.com/teamchong/edgebox/raw/511669f621c324989a255405d358ea2be80caebb/src%2Ffreeze%2Fzig_runtime.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/edgebox/contents/src%2Ffreeze%2Fzig_runtime.zig?ref=511669f621c324989a255405d358ea2be80caebb",
+      "patch": "@@ -165,6 +165,18 @@ pub const jsFreeValue = js_ops.jsFreeValue;\n pub const jsDupValue = js_ops.jsDupValue;\n pub const getVarRef = js_ops.getVarRef;\n \n+// ============================================================================\n+// Constructor Call Detection\n+// ============================================================================\n+\n+/// Check if function was called as constructor (with 'new').\n+/// In QuickJS, when called as constructor, this_val is new.target (a function).\n+/// When called normally, this_val is the actual this value (undefined/object).\n+pub inline fn isConstructorCall(ctx: *JSContext, this_val: JSValue) bool {\n+    // When called as constructor, this_val is new.target which is a function/constructor\n+    return quickjs.JS_IsFunction(ctx, this_val) != 0;\n+}\n+\n // ============================================================================\n // Strict Equality with FFI for Reference Types\n // ============================================================================"
+    }
+  ]
+}

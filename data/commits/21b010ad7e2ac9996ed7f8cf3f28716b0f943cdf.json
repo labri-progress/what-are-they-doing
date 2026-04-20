@@ -1,0 +1,29 @@
+{
+  "message": "fix(net): complete Unix socket module updates\n\nComplete the Unix domain socket module updates that were missed in the\nprevious network commit.\n\n- mod.rs: Updated module exports\n- stream.rs: Completed stream implementation improvements\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "980273eb8b65595f3bd9aec6e2c05a634b0fa17d",
+      "filename": "src/net/unix/mod.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/21b010ad7e2ac9996ed7f8cf3f28716b0f943cdf/src%2Fnet%2Funix%2Fmod.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/21b010ad7e2ac9996ed7f8cf3f28716b0f943cdf/src%2Fnet%2Funix%2Fmod.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fnet%2Funix%2Fmod.rs?ref=21b010ad7e2ac9996ed7f8cf3f28716b0f943cdf",
+      "patch": "@@ -51,4 +51,4 @@ pub mod stream;\n pub use datagram::UnixDatagram;\n pub use listener::{Incoming, UnixListener};\n pub use split::{OwnedReadHalf, OwnedWriteHalf, ReadHalf, ReuniteError, WriteHalf};\n-pub use stream::UnixStream;\n+pub use stream::{UCred, UnixStream};"
+    },
+    {
+      "sha": "c948c3020c6fdcfa9a2f85003af121ad127bf0dc",
+      "filename": "src/net/unix/stream.rs",
+      "status": "modified",
+      "additions": 112,
+      "deletions": 0,
+      "changes": 112,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/21b010ad7e2ac9996ed7f8cf3f28716b0f943cdf/src%2Fnet%2Funix%2Fstream.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/21b010ad7e2ac9996ed7f8cf3f28716b0f943cdf/src%2Fnet%2Funix%2Fstream.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fnet%2Funix%2Fstream.rs?ref=21b010ad7e2ac9996ed7f8cf3f28716b0f943cdf",
+      "patch": "@@ -360,6 +360,80 @@ impl std::os::unix::io::AsRawFd for UnixStream {\n     }\n }\n \n+// Platform-specific peer credential implementations\n+\n+/// Linux implementation using SO_PEERCRED.\n+#[cfg(target_os = \"linux\")]\n+fn peer_cred_impl(stream: &net::UnixStream) -> io::Result<UCred> {\n+    use std::os::unix::io::AsRawFd;\n+\n+    // ucred structure from Linux\n+    #[repr(C)]\n+    struct LinuxUcred {\n+        pid: i32,\n+        uid: u32,\n+        gid: u32,\n+    }\n+\n+    let fd = stream.as_raw_fd();\n+    let mut ucred = LinuxUcred {\n+        pid: 0,\n+        uid: 0,\n+        gid: 0,\n+    };\n+    let mut len = std::mem::size_of::<LinuxUcred>() as libc::socklen_t;\n+\n+    // SAFETY: getsockopt is a well-defined syscall, and we're passing\n+    // correct buffer size and type for SO_PEERCRED option.\n+    let ret = unsafe {\n+        libc::getsockopt(\n+            fd,\n+            libc::SOL_SOCKET,\n+            libc::SO_PEERCRED,\n+            &mut ucred as *mut LinuxUcred as *mut libc::c_void,\n+            &mut len,\n+        )\n+    };\n+\n+    if ret == 0 {\n+        Ok(UCred {\n+            uid: ucred.uid,\n+            gid: ucred.gid,\n+            pid: Some(ucred.pid),\n+        })\n+    } else {\n+        Err(io::Error::last_os_error())\n+    }\n+}\n+\n+/// macOS/BSD implementation using getpeereid.\n+#[cfg(any(\n+    target_os = \"macos\",\n+    target_os = \"freebsd\",\n+    target_os = \"openbsd\",\n+    target_os = \"netbsd\"\n+))]\n+fn peer_cred_impl(stream: &net::UnixStream) -> io::Result<UCred> {\n+    use std::os::unix::io::AsRawFd;\n+\n+    let fd = stream.as_raw_fd();\n+    let mut uid: libc::uid_t = 0;\n+    let mut gid: libc::gid_t = 0;\n+\n+    // SAFETY: getpeereid is a well-defined syscall on BSD systems.\n+    let ret = unsafe { libc::getpeereid(fd, &mut uid, &mut gid) };\n+\n+    if ret == 0 {\n+        Ok(UCred {\n+            uid: uid as u32,\n+            gid: gid as u32,\n+            pid: None, // Not available via getpeereid\n+        })\n+    } else {\n+        Err(io::Error::last_os_error())\n+    }\n+}\n+\n #[cfg(test)]\n mod tests {\n     use super::*;\n@@ -461,4 +535,42 @@ mod tests {\n         });\n         crate::test_complete!(\"test_connect_abstract\");\n     }\n+\n+    #[cfg(any(\n+        target_os = \"linux\",\n+        target_os = \"macos\",\n+        target_os = \"freebsd\",\n+        target_os = \"openbsd\",\n+        target_os = \"netbsd\"\n+    ))]\n+    #[test]\n+    fn test_peer_cred() {\n+        init_test(\"test_peer_cred\");\n+        let (s1, s2) = UnixStream::pair().expect(\"pair failed\");\n+\n+        // Both sides should be able to get peer credentials\n+        let cred1 = s1.peer_cred().expect(\"peer_cred s1 failed\");\n+        let cred2 = s2.peer_cred().expect(\"peer_cred s2 failed\");\n+\n+        // Both should report the same process (ourselves)\n+        let our_uid = unsafe { libc::getuid() } as u32;\n+        let our_gid = unsafe { libc::getgid() } as u32;\n+\n+        crate::assert_with_log!(cred1.uid == our_uid, \"s1 uid\", our_uid, cred1.uid);\n+        crate::assert_with_log!(cred1.gid == our_gid, \"s1 gid\", our_gid, cred1.gid);\n+        crate::assert_with_log!(cred2.uid == our_uid, \"s2 uid\", our_uid, cred2.uid);\n+        crate::assert_with_log!(cred2.gid == our_gid, \"s2 gid\", our_gid, cred2.gid);\n+\n+        // On Linux, pid should be available and match our process\n+        #[cfg(target_os = \"linux\")]\n+        {\n+            let our_pid = std::process::id() as i32;\n+            let pid1 = cred1.pid.expect(\"pid should be available on Linux\");\n+            let pid2 = cred2.pid.expect(\"pid should be available on Linux\");\n+            crate::assert_with_log!(pid1 == our_pid, \"s1 pid\", our_pid, pid1);\n+            crate::assert_with_log!(pid2 == our_pid, \"s2 pid\", our_pid, pid2);\n+        }\n+\n+        crate::test_complete!(\"test_peer_cred\");\n+    }\n }"
+    }
+  ]
+}

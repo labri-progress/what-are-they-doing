@@ -1,0 +1,29 @@
+{
+  "message": "fix: Atomic write in setup.go and TOCTOU race in CleanStaleLock\n\n- setup.go: Replace os.WriteFile with atomic write pattern (temp+sync+rename)\n  to prevent data corruption if write is interrupted\n\n- profile.go: Fix TOCTOU race in CleanStaleLock where another process could\n  create a new valid lock between our stale check and removal. Now re-verifies\n  the lock file's PID matches before removal.\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "00b92642292ec05e68b853ca76928efff75b5246",
+      "filename": "internal/profile/profile.go",
+      "status": "modified",
+      "additions": 41,
+      "deletions": 3,
+      "changes": 44,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_account_manager/blob/ac556cb1bc2db1286795b2906977f682e15ea69c/internal%2Fprofile%2Fprofile.go",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_account_manager/raw/ac556cb1bc2db1286795b2906977f682e15ea69c/internal%2Fprofile%2Fprofile.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_account_manager/contents/internal%2Fprofile%2Fprofile.go?ref=ac556cb1bc2db1286795b2906977f682e15ea69c",
+      "patch": "@@ -311,16 +311,54 @@ func (p *Profile) IsLockStale() (bool, error) {\n // CleanStaleLock removes a stale lock file if the owning process is dead.\n // Returns true if a stale lock was cleaned, false if no action was taken.\n // Returns an error if there's a valid lock or an I/O error.\n+//\n+// This function is safe against TOCTOU races: it re-verifies the lock file's\n+// PID before removal to ensure we don't accidentally remove a lock that was\n+// created by another process between our check and removal.\n func (p *Profile) CleanStaleLock() (bool, error) {\n-\tstale, err := p.IsLockStale()\n+\t// Read lock info to get the PID\n+\tinfo, err := p.GetLockInfo()\n \tif err != nil {\n \t\treturn false, err\n \t}\n-\tif !stale {\n+\tif info == nil {\n+\t\t// No lock file exists\n+\t\treturn false, nil\n+\t}\n+\n+\t// Check if the process is still running\n+\tif IsProcessAlive(info.PID) {\n+\t\t// Lock is valid, not stale\n+\t\treturn false, nil\n+\t}\n+\n+\t// Lock appears stale. Re-read the lock file to protect against TOCTOU race:\n+\t// Between our check and now, another process could have:\n+\t// 1. Noticed the stale lock and removed it\n+\t// 2. Created a new lock with its own PID\n+\t// If we just call Unlock(), we'd remove the new valid lock.\n+\tinfoNow, err := p.GetLockInfo()\n+\tif err != nil {\n+\t\treturn false, err\n+\t}\n+\tif infoNow == nil {\n+\t\t// Lock was already cleaned by another process\n+\t\treturn false, nil\n+\t}\n+\n+\t// Only remove if the PID still matches what we observed as stale\n+\tif infoNow.PID != info.PID {\n+\t\t// A different process now owns the lock - don't remove it\n+\t\treturn false, nil\n+\t}\n+\n+\t// Re-verify the PID is still dead (paranoid check)\n+\tif IsProcessAlive(infoNow.PID) {\n+\t\t// Process came back alive (unlikely but possible with PID reuse)\n \t\treturn false, nil\n \t}\n \n-\t// Remove the stale lock\n+\t// Safe to remove: we've verified the same stale PID is still in the lock file\n \tif err := p.Unlock(); err != nil {\n \t\treturn false, fmt.Errorf(\"remove stale lock: %w\", err)\n \t}"
+    },
+    {
+      "sha": "8070b699ecb7e235366a897a20f98b5c05a350f3",
+      "filename": "internal/setup/setup.go",
+      "status": "modified",
+      "additions": 27,
+      "deletions": 3,
+      "changes": 30,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_account_manager/blob/ac556cb1bc2db1286795b2906977f682e15ea69c/internal%2Fsetup%2Fsetup.go",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_account_manager/raw/ac556cb1bc2db1286795b2906977f682e15ea69c/internal%2Fsetup%2Fsetup.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_account_manager/contents/internal%2Fsetup%2Fsetup.go?ref=ac556cb1bc2db1286795b2906977f682e15ea69c",
+      "patch": "@@ -528,9 +528,33 @@ func (o *Orchestrator) generateLocalConfig() (string, error) {\n \t\treturn \"\", err\n \t}\n \n-\t// Write config\n-\tif err := os.WriteFile(configPath, data, 0600); err != nil {\n-\t\treturn \"\", err\n+\t// Atomic write: write to temp file, sync, then rename\n+\ttmpPath := configPath + \".tmp\"\n+\tf, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)\n+\tif err != nil {\n+\t\treturn \"\", fmt.Errorf(\"create temp config file: %w\", err)\n+\t}\n+\n+\tif _, err := f.Write(data); err != nil {\n+\t\tf.Close()\n+\t\tos.Remove(tmpPath)\n+\t\treturn \"\", fmt.Errorf(\"write temp config file: %w\", err)\n+\t}\n+\n+\tif err := f.Sync(); err != nil {\n+\t\tf.Close()\n+\t\tos.Remove(tmpPath)\n+\t\treturn \"\", fmt.Errorf(\"sync temp config file: %w\", err)\n+\t}\n+\n+\tif err := f.Close(); err != nil {\n+\t\tos.Remove(tmpPath)\n+\t\treturn \"\", fmt.Errorf(\"close temp config file: %w\", err)\n+\t}\n+\n+\tif err := os.Rename(tmpPath, configPath); err != nil {\n+\t\tos.Remove(tmpPath)\n+\t\treturn \"\", fmt.Errorf(\"rename temp config file: %w\", err)\n \t}\n \n \to.logger.Info(\"wrote local agent config\", \"path\", configPath)"
+    }
+  ]
+}

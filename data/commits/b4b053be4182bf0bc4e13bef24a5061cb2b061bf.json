@@ -1,0 +1,137 @@
+{
+  "message": "perf(alloc): pre-size collections and reduce heap churn across core subsystems\n\nAdd with_capacity to Vecs, VecDeques, HashMaps, and BinaryHeaps at\nconstruction sites throughout the codebase where the expected initial\npopulation is known or can be reasonably estimated. This eliminates\nincremental reallocation during the first N insertions and reduces\nallocator pressure under load.\n\nChannel: mpsc send_wakers VecDeque(4).\nCx/registry: granted/notifications Vec(8); replace chained\n  iterator .filter().map().collect() with explicit loop + pre-sized Vec\n  in cleanup_names_region and cleanup_task_at to avoid two full\n  iterations and intermediate allocations.\nRecord: distributed_region replicas(3) + transitions(MAX_HISTORY);\n  symbol_obligation_tracker obligations/by_symbol/by_object HashMap(16),\n  or_default \u2192 or_insert_with(|| Vec::with_capacity(2)) for index\n  vectors, check_leaks/abort_expired/abort_expired_deadlines Vec\n  pre-sized to obligations.len().\nRuntime: deadline_monitor DurationHistory samples VecDeque,\n  monitored Vec(16), history HashMap(16);\n  io_driver interests HashMap with new interest_map_capacity() helper\n  that scales with events_capacity, plus capacity assertion in test;\n  obligation_table by_holder Vec(32);\n  state snapshot obligations_by_task HashMap pre-sized to obligations_len,\n  cancel_siblings/cancel_request/collect_region_tree Vecs pre-sized to\n  live task/region counts.\nSync: mutex waiters VecDeque(4); pool idle VecDeque(8) + waiters\n  VecDeque(4), close drain uses SmallVec<[Waker; 4]>.\nTime: wheel overflow BinaryHeap(8), ready Vec(8), active HashMap(64).\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "53604d370326c1d7edf18e4ab9e5ac2d7492c560",
+      "filename": "src/channel/mpsc.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/b4b053be4182bf0bc4e13bef24a5061cb2b061bf/src%2Fchannel%2Fmpsc.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/b4b053be4182bf0bc4e13bef24a5061cb2b061bf/src%2Fchannel%2Fmpsc.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fchannel%2Fmpsc.rs?ref=b4b053be4182bf0bc4e13bef24a5061cb2b061bf",
+      "patch": "@@ -131,7 +131,7 @@ impl<T> ChannelInner<T> {\n         Self {\n             queue: VecDeque::with_capacity(capacity),\n             reserved: 0,\n-            send_wakers: VecDeque::new(),\n+            send_wakers: VecDeque::with_capacity(4),\n             recv_waker: None,\n             next_waiter_id: 0,\n         }"
+    },
+    {
+      "sha": "3ebabc08d687b1c799599cfb0762da755fcdd776",
+      "filename": "src/cx/registry.rs",
+      "status": "modified",
+      "additions": 23,
+      "deletions": 24,
+      "changes": 47,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/b4b053be4182bf0bc4e13bef24a5061cb2b061bf/src%2Fcx%2Fregistry.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/b4b053be4182bf0bc4e13bef24a5061cb2b061bf/src%2Fcx%2Fregistry.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fcx%2Fregistry.rs?ref=b4b053be4182bf0bc4e13bef24a5061cb2b061bf",
+      "patch": "@@ -552,11 +552,11 @@ impl NameRegistry {\n             leases: DetHashMap::with_capacity_and_hasher(32, DetBuildHasher),\n             pending: DetHashMap::with_capacity_and_hasher(16, DetBuildHasher),\n             waiters: DetHashMap::with_capacity_and_hasher(16, DetBuildHasher),\n-            granted: Vec::new(),\n+            granted: Vec::with_capacity(8),\n             watchers_by_ref: DetHashMap::with_capacity_and_hasher(16, DetBuildHasher),\n             watchers_by_name: DetHashMap::with_capacity_and_hasher(16, DetBuildHasher),\n             watchers_by_region: DetHashMap::with_capacity_and_hasher(8, DetBuildHasher),\n-            notifications: Vec::new(),\n+            notifications: Vec::with_capacity(8),\n             next_watch_ref: 1,\n         }\n     }\n@@ -664,6 +664,7 @@ impl NameRegistry {\n         };\n         let mut refs = refs;\n         refs.sort();\n+        self.notifications.reserve(refs.len());\n         for watch_ref in refs {\n             if let Some(watcher) = self.watchers_by_ref.get(&watch_ref) {\n                 self.notifications.push(NameOwnershipNotification {\n@@ -1073,18 +1074,16 @@ impl NameRegistry {\n         // Region close semantics: watchers owned by the region are removed before\n         // ownership-change notifications are emitted.\n         let _removed_watchers = self.cleanup_name_watchers_region(region);\n-        let mut active_removed: Vec<(String, TaskId, RegionId)> = self\n-            .leases\n-            .iter()\n-            .filter(|(_, e)| e.region == region)\n-            .map(|(name, e)| (name.clone(), e.holder, e.region))\n-            .collect();\n-        let mut to_remove: Vec<String> = self\n-            .leases\n-            .iter()\n-            .filter(|(_, e)| e.region == region)\n-            .map(|(name, _)| name.clone())\n-            .collect();\n+        let mut active_removed: Vec<(String, TaskId, RegionId)> =\n+            Vec::with_capacity(self.leases.len());\n+        let mut to_remove: Vec<String> =\n+            Vec::with_capacity(self.leases.len().saturating_add(self.pending.len()));\n+        for (name, entry) in &self.leases {\n+            if entry.region == region {\n+                active_removed.push((name.clone(), entry.holder, entry.region));\n+                to_remove.push(name.clone());\n+            }\n+        }\n         to_remove.extend(\n             self.pending\n                 .iter()\n@@ -1145,16 +1144,16 @@ impl NameRegistry {\n     /// by the task. The caller is responsible for resolving the corresponding\n     /// obligations.\n     pub fn cleanup_task_at(&mut self, task: TaskId, now: Time) -> Vec<String> {\n-        let mut active_removed: Vec<(String, TaskId, RegionId)> = self\n-            .leases\n-            .iter()\n-            .filter(|(_, e)| e.holder == task)\n-            .map(|(name, e)| (name.clone(), e.holder, e.region))\n-            .collect();\n-        let mut to_remove: Vec<String> = active_removed\n-            .iter()\n-            .map(|(name, _, _)| name.clone())\n-            .collect();\n+        let mut active_removed: Vec<(String, TaskId, RegionId)> =\n+            Vec::with_capacity(self.leases.len());\n+        let mut to_remove: Vec<String> =\n+            Vec::with_capacity(self.leases.len().saturating_add(self.pending.len()));\n+        for (name, entry) in &self.leases {\n+            if entry.holder == task {\n+                active_removed.push((name.clone(), entry.holder, entry.region));\n+                to_remove.push(name.clone());\n+            }\n+        }\n         to_remove.extend(\n             self.pending\n                 .iter()"
+    },
+    {
+      "sha": "b39628738eb4ff2c379b4a15ef1a964f3f51c282",
+      "filename": "src/record/distributed_region.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/b4b053be4182bf0bc4e13bef24a5061cb2b061bf/src%2Frecord%2Fdistributed_region.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/b4b053be4182bf0bc4e13bef24a5061cb2b061bf/src%2Frecord%2Fdistributed_region.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Frecord%2Fdistributed_region.rs?ref=b4b053be4182bf0bc4e13bef24a5061cb2b061bf",
+      "patch": "@@ -347,8 +347,8 @@ impl DistributedRegionRecord {\n             id,\n             state: DistributedRegionState::Initializing,\n             config,\n-            replicas: Vec::new(),\n-            transitions: VecDeque::new(),\n+            replicas: Vec::with_capacity(3),\n+            transitions: VecDeque::with_capacity(MAX_TRANSITION_HISTORY),\n             last_replicated: None,\n             parent,\n             budget,"
+    },
+    {
+      "sha": "574942b14cb8e774e489accd3fa7b04d4db1eda5",
+      "filename": "src/record/symbol_obligation_tracker.rs",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 8,
+      "changes": 22,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/b4b053be4182bf0bc4e13bef24a5061cb2b061bf/src%2Frecord%2Fsymbol_obligation_tracker.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/b4b053be4182bf0bc4e13bef24a5061cb2b061bf/src%2Frecord%2Fsymbol_obligation_tracker.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Frecord%2Fsymbol_obligation_tracker.rs?ref=b4b053be4182bf0bc4e13bef24a5061cb2b061bf",
+      "patch": "@@ -299,9 +299,9 @@ impl SymbolObligationTracker {\n     #[must_use]\n     pub fn new(region_id: RegionId) -> Self {\n         Self {\n-            obligations: HashMap::new(),\n-            by_symbol: HashMap::new(),\n-            by_object: HashMap::new(),\n+            obligations: HashMap::with_capacity(16),\n+            by_symbol: HashMap::with_capacity(16),\n+            by_object: HashMap::with_capacity(16),\n             region_id,\n         }\n     }\n@@ -320,12 +320,18 @@ impl SymbolObligationTracker {\n         match &obligation.kind {\n             SymbolObligationKind::SymbolTransmit { symbol_id, .. }\n             | SymbolObligationKind::SymbolAck { symbol_id, .. } => {\n-                self.by_symbol.entry(*symbol_id).or_default().push(id);\n+                self.by_symbol\n+                    .entry(*symbol_id)\n+                    .or_insert_with(|| Vec::with_capacity(2))\n+                    .push(id);\n             }\n             SymbolObligationKind::DecodingInProgress { object_id, .. }\n             | SymbolObligationKind::EncodingSession { object_id, .. }\n             | SymbolObligationKind::SymbolLease { object_id, .. } => {\n-                self.by_object.entry(*object_id).or_default().push(id);\n+                self.by_object\n+                    .entry(*object_id)\n+                    .or_insert_with(|| Vec::with_capacity(2))\n+                    .push(id);\n             }\n         }\n \n@@ -402,7 +408,7 @@ impl SymbolObligationTracker {\n     /// Checks for leaked obligations and marks them.\n     /// Called during region close.\n     pub fn check_leaks(&mut self, now: Time) -> Vec<ObligationId> {\n-        let mut leaked = Vec::new();\n+        let mut leaked = Vec::with_capacity(self.obligations.len());\n         for (id, ob) in &mut self.obligations {\n             if ob.is_pending() {\n                 ob.mark_leaked(now);\n@@ -414,7 +420,7 @@ impl SymbolObligationTracker {\n \n     /// Aborts all pending obligations outside the given epoch window.\n     pub fn abort_expired_epoch(&mut self, current_epoch: EpochId, now: Time) -> Vec<ObligationId> {\n-        let mut aborted = Vec::new();\n+        let mut aborted = Vec::with_capacity(self.obligations.len());\n         for (id, ob) in &mut self.obligations {\n             if ob.is_pending() && !ob.is_epoch_valid(current_epoch) {\n                 ob.abort(now);\n@@ -426,7 +432,7 @@ impl SymbolObligationTracker {\n \n     /// Aborts all pending obligations that have passed their deadline.\n     pub fn abort_expired_deadlines(&mut self, now: Time) -> Vec<ObligationId> {\n-        let mut aborted = Vec::new();\n+        let mut aborted = Vec::with_capacity(self.obligations.len());\n         for (id, ob) in &mut self.obligations {\n             if ob.is_pending() && ob.is_expired(now) {\n                 ob.abort(now);"
+    },
+    {
+      "sha": "139ccf02c18f7f472fee44b40f3787dc0bb2e007",
+      "filename": "src/runtime/deadline_monitor.rs",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 4,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/b4b053be4182bf0bc4e13bef24a5061cb2b061bf/src%2Fruntime%2Fdeadline_monitor.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/b4b053be4182bf0bc4e13bef24a5061cb2b061bf/src%2Fruntime%2Fdeadline_monitor.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Fdeadline_monitor.rs?ref=b4b053be4182bf0bc4e13bef24a5061cb2b061bf",
+      "patch": "@@ -105,9 +105,10 @@ struct DurationHistory {\n \n impl DurationHistory {\n     fn new(max_history: usize) -> Self {\n+        let cap = max_history.max(1);\n         Self {\n-            samples: VecDeque::new(),\n-            max_history: max_history.max(1),\n+            samples: VecDeque::with_capacity(cap),\n+            max_history: cap,\n         }\n     }\n \n@@ -181,8 +182,8 @@ impl DeadlineMonitor {\n         Self {\n             config,\n             on_warning: None,\n-            monitored: Vec::new(),\n-            history: HashMap::new(),\n+            monitored: Vec::with_capacity(16),\n+            history: HashMap::with_capacity(16),\n             metrics_provider: None,\n             last_scan_time: None,\n             last_scan_instant: None,"
+    },
+    {
+      "sha": "aed0cd389a39e3948396d173c94b64b7bcc35298",
+      "filename": "src/runtime/io_driver.rs",
+      "status": "modified",
+      "additions": 19,
+      "deletions": 2,
+      "changes": 21,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/b4b053be4182bf0bc4e13bef24a5061cb2b061bf/src%2Fruntime%2Fio_driver.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/b4b053be4182bf0bc4e13bef24a5061cb2b061bf/src%2Fruntime%2Fio_driver.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Fio_driver.rs?ref=b4b053be4182bf0bc4e13bef24a5061cb2b061bf",
+      "patch": "@@ -50,6 +50,17 @@ use std::time::Duration;\n \n /// Default capacity for the events buffer.\n const DEFAULT_EVENTS_CAPACITY: usize = 1024;\n+/// Default lower bound for the token->interest map.\n+const DEFAULT_INTERESTS_CAPACITY: usize = 64;\n+\n+#[inline]\n+const fn interest_map_capacity(events_capacity: usize) -> usize {\n+    if events_capacity > DEFAULT_INTERESTS_CAPACITY {\n+        events_capacity\n+    } else {\n+        DEFAULT_INTERESTS_CAPACITY\n+    }\n+}\n \n /// Statistics for I/O driver diagnostics.\n ///\n@@ -103,7 +114,7 @@ impl IoDriver {\n         Self {\n             reactor,\n             wakers: TokenSlab::new(),\n-            interests: HashMap::new(),\n+            interests: HashMap::with_capacity(interest_map_capacity(DEFAULT_EVENTS_CAPACITY)),\n             events: Events::with_capacity(DEFAULT_EVENTS_CAPACITY),\n             stats: IoStats::default(),\n         }\n@@ -117,7 +128,7 @@ impl IoDriver {\n         Self {\n             reactor,\n             wakers: TokenSlab::new(),\n-            interests: HashMap::new(),\n+            interests: HashMap::with_capacity(interest_map_capacity(events_capacity)),\n             events: Events::with_capacity(events_capacity),\n             stats: IoStats::default(),\n         }\n@@ -953,6 +964,12 @@ mod tests {\n             256usize,\n             driver.events.capacity()\n         );\n+        crate::assert_with_log!(\n+            driver.interests.capacity() >= 256,\n+            \"interest map capacity\",\n+            true,\n+            driver.interests.capacity() >= 256\n+        );\n         crate::test_complete!(\"io_driver_with_capacity\");\n     }\n "
+    },
+    {
+      "sha": "edde7803a8987c5dab11a49e5fc3696995e327d9",
+      "filename": "src/runtime/obligation_table.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/b4b053be4182bf0bc4e13bef24a5061cb2b061bf/src%2Fruntime%2Fobligation_table.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/b4b053be4182bf0bc4e13bef24a5061cb2b061bf/src%2Fruntime%2Fobligation_table.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Fobligation_table.rs?ref=b4b053be4182bf0bc4e13bef24a5061cb2b061bf",
+      "patch": "@@ -109,7 +109,7 @@ impl ObligationTable {\n     pub fn new() -> Self {\n         Self {\n             obligations: Arena::new(),\n-            by_holder: Vec::new(),\n+            by_holder: Vec::with_capacity(32),\n         }\n     }\n "
+    },
+    {
+      "sha": "82d47ea3ad1aad37568b466f0613c6316f94098c",
+      "filename": "src/runtime/state.rs",
+      "status": "modified",
+      "additions": 12,
+      "deletions": 8,
+      "changes": 20,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/b4b053be4182bf0bc4e13bef24a5061cb2b061bf/src%2Fruntime%2Fstate.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/b4b053be4182bf0bc4e13bef24a5061cb2b061bf/src%2Fruntime%2Fstate.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Fstate.rs?ref=b4b053be4182bf0bc4e13bef24a5061cb2b061bf",
+      "patch": "@@ -721,7 +721,8 @@ impl RuntimeState {\n     /// recent trace events. It is designed to be lightweight and serializable.\n     #[must_use]\n     pub fn snapshot(&self) -> RuntimeSnapshot {\n-        let mut obligations_by_task: HashMap<TaskId, Vec<ObligationId>> = HashMap::new();\n+        let mut obligations_by_task: HashMap<TaskId, Vec<ObligationId>> =\n+            HashMap::with_capacity(self.obligations_len());\n         let obligations: Vec<ObligationSnapshot> = self\n             .obligations_iter()\n             .map(|(_, record)| {\n@@ -1498,12 +1499,13 @@ impl RuntimeState {\n         child: TaskId,\n         reason: &CancelReason,\n     ) -> Vec<(TaskId, u8)> {\n-        let mut tasks_to_cancel = Vec::new();\n         let Some(region_record) = self.regions.get(region.arena_index()) else {\n-            return tasks_to_cancel;\n+            return Vec::new();\n         };\n+        let sibling_candidates = region_record.task_ids();\n+        let mut tasks_to_cancel = Vec::with_capacity(sibling_candidates.len().saturating_sub(1));\n \n-        for task_id in region_record.task_ids() {\n+        for task_id in sibling_candidates {\n             if task_id == child {\n                 continue;\n             }\n@@ -1563,7 +1565,7 @@ impl RuntimeState {\n         reason: &CancelReason,\n         _source_task: Option<TaskId>,\n     ) -> Vec<(TaskId, u8)> {\n-        let mut tasks_to_cancel = Vec::new();\n+        let mut tasks_to_cancel = Vec::with_capacity(self.live_task_count());\n         let _cleanup_budget = reason.cleanup_budget();\n         let root_span = debug_span!(\n             \"cancel_request\",\n@@ -1595,7 +1597,8 @@ impl RuntimeState {\n \n         // Build a map of region -> cancel reason for cause chain construction.\n         // Each child region's reason chains to its parent's reason.\n-        let mut region_reasons: HashMap<RegionId, CancelReason> = HashMap::new();\n+        let mut region_reasons: HashMap<RegionId, CancelReason> =\n+            HashMap::with_capacity(regions_to_cancel.len());\n \n         // First pass: mark regions with cancellation reason and transition to Closing\n         for node in &regions_to_cancel {\n@@ -1780,8 +1783,9 @@ impl RuntimeState {\n         &self,\n         region_id: RegionId,\n     ) -> Vec<CancelRegionNode> {\n-        let mut result = Vec::new();\n-        let mut stack = vec![(region_id, None, 0usize)];\n+        let mut result = Vec::with_capacity(self.regions_len());\n+        let mut stack = Vec::with_capacity(self.regions_len());\n+        stack.push((region_id, None, 0usize));\n \n         while let Some((rid, parent, depth)) = stack.pop() {\n             result.push(CancelRegionNode {"
+    },
+    {
+      "sha": "d8d418065c0cf8328882d329499d6b09e9454876",
+      "filename": "src/sync/mutex.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/b4b053be4182bf0bc4e13bef24a5061cb2b061bf/src%2Fsync%2Fmutex.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/b4b053be4182bf0bc4e13bef24a5061cb2b061bf/src%2Fsync%2Fmutex.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fsync%2Fmutex.rs?ref=b4b053be4182bf0bc4e13bef24a5061cb2b061bf",
+      "patch": "@@ -115,7 +115,7 @@ impl<T> Mutex<T> {\n             poisoned: AtomicBool::new(false),\n             state: ParkingMutex::new(MutexState {\n                 locked: false,\n-                waiters: VecDeque::new(),\n+                waiters: VecDeque::with_capacity(4),\n                 next_waiter_id: 0,\n             }),\n         }"
+    },
+    {
+      "sha": "5f1cd27b2239f40852ac9e2dbde4e55328d22d52",
+      "filename": "src/sync/pool.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 3,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/b4b053be4182bf0bc4e13bef24a5061cb2b061bf/src%2Fsync%2Fpool.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/b4b053be4182bf0bc4e13bef24a5061cb2b061bf/src%2Fsync%2Fpool.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fsync%2Fpool.rs?ref=b4b053be4182bf0bc4e13bef24a5061cb2b061bf",
+      "patch": "@@ -986,14 +986,14 @@ where\n             factory,\n             config,\n             state: PoolMutex::new(GenericPoolState {\n-                idle: std::collections::VecDeque::new(),\n+                idle: std::collections::VecDeque::with_capacity(8),\n                 active: 0,\n                 creating: 0,\n                 total_created: 0,\n                 total_acquisitions: 0,\n                 total_wait_time: Duration::ZERO,\n                 closed: false,\n-                waiters: std::collections::VecDeque::new(),\n+                waiters: std::collections::VecDeque::with_capacity(4),\n                 next_waiter_id: 0,\n             }),\n             return_tx,\n@@ -1544,7 +1544,7 @@ where\n                 self.closed.store(true, Ordering::Release);\n \n                 // Drain waiters, then wake after releasing the state lock.\n-                let waiters: Vec<Waker> =\n+                let waiters: SmallVec<[Waker; 4]> =\n                     state.waiters.drain(..).map(|waiter| waiter.waker).collect();\n \n                 // Record how many idle resources we're clearing (only needed for metrics)"
+    },
+    {
+      "sha": "bca8f2d087d12678fcfa543afde69ea213251a8f",
+      "filename": "src/time/wheel.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 3,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/b4b053be4182bf0bc4e13bef24a5061cb2b061bf/src%2Ftime%2Fwheel.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/b4b053be4182bf0bc4e13bef24a5061cb2b061bf/src%2Ftime%2Fwheel.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Ftime%2Fwheel.rs?ref=b4b053be4182bf0bc4e13bef24a5061cb2b061bf",
+      "patch": "@@ -369,11 +369,11 @@ impl TimerWheel {\n         Self {\n             current_tick,\n             levels,\n-            overflow: BinaryHeap::new(),\n-            ready: Vec::new(),\n+            overflow: BinaryHeap::with_capacity(8),\n+            ready: Vec::with_capacity(8),\n             next_id: 0,\n             next_generation: 0,\n-            active: HashMap::new(),\n+            active: HashMap::with_capacity(64),\n             config,\n             coalescing,\n         }"
+    }
+  ]
+}
