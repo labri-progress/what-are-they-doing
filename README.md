@@ -54,6 +54,12 @@ The following developers are candidates identified during screening; data collec
 | [Jesse Vincent](https://github.com/obra) | Creator of "superpowers" skill set, and has cool glasses |
 | [Brian Krabach](https://github.com/bkrabach) | Works on Microsoft Amplifier, and has a cool beard |
 | [Wilson Lin](https://github.com/wilsonzlin) | The "cursor web browser guy" and a few other such projects |
+| [Nirholas](https://github.com/nirholas) | 37 repos with agent activity starting ~ January, ~30K commits | 
+| [Amos Wenger](https://github.com/fasterthanlime) | has a more than 10x jump in commits since december |
+| [Avi Fenesh](https://github.com/avifenesh) | has a more than 10x jump in commits since this year |
+| [Hunter Bown](https://github.com/Hmbown) | less impressive numbers ("only" hundreds of commits/month), but a big relative jump |
+| [Jordan Hubbard](https://github.com/jordanhubbard) | hundreds to 1k+ commits per month |
+
 
 ### False Positives
 
