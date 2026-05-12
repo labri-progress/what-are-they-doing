@@ -102,6 +102,15 @@ Key findings from the figure:
 
 ---
 
+### Velocity & Acceleration
+
+![steipete](figures/rq1-steipete.png)
+![ruvnet](figures/rq1-ruvnet.png)
+![mavam](figures/rq1-mavam.png)
+![obra](figures/rq1-obra.png)
+![philipp-spiess](figures/rq1-philipp-spiess.png)
+![teamchong](figures/rq1-teamchong.png)
+![Dicklesworthstone](figures/rq1-Dicklesworthstone.png)
 
 ## Dataset Contents
 
