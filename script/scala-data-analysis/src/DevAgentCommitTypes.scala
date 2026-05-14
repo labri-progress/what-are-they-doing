@@ -323,7 +323,7 @@ object DevAgentCommitTypes {
     }
   }
 
-  private def agentPeriodRowsForDeveloper(handle: String): Vector[AgentPeriodRow] = {
+  def agentPeriodRowsForDeveloper(handle: String): Vector[AgentPeriodRow] = {
     val rows = periodRows.filter(_.developer == handle)
     val weekKeys = rows.map(_.period_iso).distinct.sorted
     weekKeys.map { week =>
@@ -337,41 +337,5 @@ object DevAgentCommitTypes {
     }.toVector.dropWhile(row => row.totalCommits == 0 && row.sampledCommits == 0 && row.countsByAgent.values.sum == 0)
   }
 
-  private def toStackedRows(rows: Vector[AgentPeriodRow]): Vector[Rq2CommitTypeSvg.StackedTimeRow] =
-    rows.map(row =>
-      Rq2CommitTypeSvg.StackedTimeRow(
-        periodIso = row.periodIso,
-        totalCommits = row.totalCommits,
-        sampledCommits = row.sampledCommits,
-        counts = row.countsByAgent
-      )
-    )
-
-  @main def makeWeeklyPlotSvgs(): Unit = {
-
-    println(s"Running with dataDir=${dataPath.toString} granularity=week")
-
-    Files.createDirectories(outputPath)
-
-    println(s"Tracked developers: ${trackedHandles.mkString(", ")}")
-    println(s"Loaded ${heuristicsByAgent.size} agent definitions")
-
-    trackedHandles.toVector.sorted.foreach { handle =>
-      val rows = agentPeriodRowsForDeveloper(handle)
-      if rows.nonEmpty then
-          val outputFile = outputPath.resolve(s"rq2-agent-use-$handle.svg")
-          Rq2CommitTypeSvg.writeSvg(
-            outputFile,
-            Rq2CommitTypeSvg.renderStackedTimeSeriesSvg(
-              s"Agent Usage Over Time — @$handle",
-              toStackedRows(rows),
-              agentColorOrder,
-              agentColors,
-              "Top agent"
-            )
-          )
-          println(s"Wrote agent-use SVG for @$handle to $outputFile")
-    }
-  }
 
 }
