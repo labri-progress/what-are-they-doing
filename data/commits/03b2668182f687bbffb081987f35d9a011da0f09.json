@@ -1,0 +1,101 @@
+{
+  "message": "Extend subnet conversion inputs (#6076)\n\n## \ud83d\udd0d Problem\n\n`subnet()` only accepted CIDR strings, so pipelines with typed `ip`\nfields had to stringify values and assemble CIDR notation manually\nbefore converting them to subnets.\n\n## \ud83d\udee0\ufe0f Solution\n\n- Accept typed `ip` values, plain IP strings, and existing subnet values\nin `subnet()`.\n- Add optional row-wise prefix handling for string, IP, and subnet\ninputs.\n- Keep existing CIDR-string parsing and subnet passthrough behavior.\n- Use Tenzir vocabulary types (`Option`/`None`) for the new optional\nconversion flow.\n- Cover host defaults, dynamic prefixes, nulls, invalid inputs, and\nsubnet inputs with integration tests.\n\n## \ud83d\udcac Review\n\nFocus on prefix normalization for IPv4 versus IPv6 and the null-return\nbehavior for invalid strings or out-of-range prefixes.\n\n<sub>\n\ud83d\udcda Docs PR: tenzir/docs#279<br>\n\u2705 Closes TNZ-510\n</sub>",
+  "files": [
+    {
+      "sha": "3255657b9e8c6ca2b4b2e5426e082bb187b90efa",
+      "filename": "changelog/unreleased/ip-address-support-in-subnet.md",
+      "status": "added",
+      "additions": 20,
+      "deletions": 0,
+      "changes": 20,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/03b2668182f687bbffb081987f35d9a011da0f09/changelog%2Funreleased%2Fip-address-support-in-subnet.md",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/03b2668182f687bbffb081987f35d9a011da0f09/changelog%2Funreleased%2Fip-address-support-in-subnet.md",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/changelog%2Funreleased%2Fip-address-support-in-subnet.md?ref=03b2668182f687bbffb081987f35d9a011da0f09",
+      "patch": "@@ -0,0 +1,20 @@\n+---\n+title: IP address support in subnet\n+type: feature\n+authors:\n+  - mavam\n+  - codex\n+created: 2026-04-24T08:25:26.842453Z\n+---\n+\n+The `subnet` function now accepts typed IP addresses, plain IP strings, and\n+existing subnet values with an optional prefix length:\n+\n+```tql\n+from {source_ip: 10.10.1.124}\n+net = subnet(source_ip, 24)\n+```\n+\n+This returns `10.10.1.0/24` without converting the IP address to a string first.\n+When you omit the prefix, IPv4 addresses become `/32` host subnets and IPv6\n+addresses become `/128` host subnets."
+    },
+    {
+      "sha": "3fa427bb0f855f60daf2bf9cdc0013d8e867dc4b",
+      "filename": "libtenzir/builtins/functions/subnet.cpp",
+      "status": "modified",
+      "additions": 211,
+      "deletions": 40,
+      "changes": 251,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/03b2668182f687bbffb081987f35d9a011da0f09/libtenzir%2Fbuiltins%2Ffunctions%2Fsubnet.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/03b2668182f687bbffb081987f35d9a011da0f09/libtenzir%2Fbuiltins%2Ffunctions%2Fsubnet.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Fbuiltins%2Ffunctions%2Fsubnet.cpp?ref=03b2668182f687bbffb081987f35d9a011da0f09",
+      "patch": "@@ -7,18 +7,208 @@\n // SPDX-License-Identifier: BSD-3-Clause\n \n #include <tenzir/arrow_utils.hpp>\n+#include <tenzir/concept/parseable/tenzir/ip.hpp>\n #include <tenzir/concept/parseable/tenzir/subnet.hpp>\n-#include <tenzir/concept/parseable/tenzir/time.hpp>\n+#include <tenzir/detail/narrow.hpp>\n+#include <tenzir/detail/type_traits.hpp>\n+#include <tenzir/option.hpp>\n #include <tenzir/plugin/register.hpp>\n-#include <tenzir/series_builder.hpp>\n #include <tenzir/subnet.hpp>\n #include <tenzir/tql2/plugin.hpp>\n #include <tenzir/type.hpp>\n+#include <tenzir/view3.hpp>\n+\n+#include <string_view>\n+#include <tuple>\n+#include <type_traits>\n \n namespace tenzir::plugins::subnet {\n \n namespace {\n \n+auto to_internal_prefix(tenzir::ip const& value, uint64_t prefix)\n+  -> Option<uint8_t> {\n+  if (value.is_v4()) {\n+    if (prefix > 32) {\n+      return None{};\n+    }\n+    return detail::narrow<uint8_t>(prefix + 96);\n+  }\n+  if (prefix > 128) {\n+    return None{};\n+  }\n+  return detail::narrow<uint8_t>(prefix);\n+}\n+\n+auto make_subnet(tenzir::ip const& value) -> tenzir::subnet {\n+  return {value, 128};\n+}\n+\n+auto make_subnet(tenzir::ip const& value, uint64_t prefix)\n+  -> Option<tenzir::subnet> {\n+  auto length = to_internal_prefix(value, prefix);\n+  if (not length) {\n+    return None{};\n+  }\n+  return tenzir::subnet{value, *length};\n+}\n+\n+auto make_subnet(tenzir::ip const& value, int64_t prefix)\n+  -> Option<tenzir::subnet> {\n+  if (prefix < 0) {\n+    return None{};\n+  }\n+  return make_subnet(value, detail::narrow<uint64_t>(prefix));\n+}\n+\n+auto parse_subnet(std::string_view value) -> Option<tenzir::subnet> {\n+  auto result = tenzir::subnet{};\n+  if (parsers::net(value, result)) {\n+    return result;\n+  }\n+  auto ip = tenzir::ip{};\n+  if (parsers::ip(value, ip)) {\n+    return make_subnet(ip);\n+  }\n+  return None{};\n+}\n+\n+template <class Prefix>\n+auto parse_subnet(std::string_view value, Prefix prefix)\n+  -> Option<tenzir::subnet> {\n+  auto ip = tenzir::ip{};\n+  if (not parsers::ip(value, ip)) {\n+    return None{};\n+  }\n+  return make_subnet(ip, prefix);\n+}\n+\n+auto append_subnet(subnet_type::builder_type& builder,\n+                   Option<tenzir::subnet> value) -> void {\n+  if (not value) {\n+    check(builder.AppendNull());\n+    return;\n+  }\n+  check(append_builder(subnet_type{}, builder, *value));\n+}\n+\n+auto append_without_prefix(subnet_type::builder_type& builder,\n+                           series const& value, ast::expression const& expr,\n+                           session ctx) -> void {\n+  auto f = detail::overload{\n+    [&](const arrow::NullArray& array) {\n+      check(builder.AppendNulls(array.length()));\n+    },\n+    [&](const arrow::StringArray& array) {\n+      for (auto i = int64_t{0}; i < array.length(); ++i) {\n+        if (array.IsNull(i)) {\n+          check(builder.AppendNull());\n+          continue;\n+        }\n+        append_subnet(builder, parse_subnet(array.GetView(i)));\n+      }\n+    },\n+    [&](const ip_type::array_type& array) {\n+      for (auto i = int64_t{0}; i < array.length(); ++i) {\n+        if (auto ip = view_at(array, i)) {\n+          check(append_builder(subnet_type{}, builder, make_subnet(*ip)));\n+        } else {\n+          check(builder.AppendNull());\n+        }\n+      }\n+    },\n+    [&](const subnet_type::array_type& array) {\n+      check(append_array(builder, subnet_type{}, array));\n+    },\n+    [&](const auto& array) {\n+      diagnostic::warning(\"`subnet` expected `string`, `ip`, or `subnet`, but \"\n+                          \"got `{}`\",\n+                          value.type.kind())\n+        .primary(expr)\n+        .emit(ctx);\n+      check(builder.AppendNulls(array.length()));\n+    },\n+  };\n+  match(*value.array, f);\n+}\n+\n+template <class PrefixArray>\n+auto append_with_prefix(subnet_type::builder_type& builder,\n+                        arrow::StringArray const& values,\n+                        PrefixArray const& prefixes) -> void {\n+  for (auto i = int64_t{0}; i < values.length(); ++i) {\n+    if (values.IsNull(i) or prefixes.IsNull(i)) {\n+      check(builder.AppendNull());\n+      continue;\n+    }\n+    append_subnet(builder, parse_subnet(values.GetView(i), prefixes.Value(i)));\n+  }\n+}\n+\n+template <class PrefixArray>\n+auto append_with_prefix(subnet_type::builder_type& builder,\n+                        ip_type::array_type const& values,\n+                        PrefixArray const& prefixes) -> void {\n+  for (auto i = int64_t{0}; i < values.length(); ++i) {\n+    auto ip = view_at(values, i);\n+    if (not ip or prefixes.IsNull(i)) {\n+      check(builder.AppendNull());\n+      continue;\n+    }\n+    append_subnet(builder, make_subnet(*ip, prefixes.Value(i)));\n+  }\n+}\n+\n+template <class PrefixArray>\n+auto append_with_prefix(subnet_type::builder_type& builder,\n+                        subnet_type::array_type const& values,\n+                        PrefixArray const& prefixes) -> void {\n+  for (auto i = int64_t{0}; i < values.length(); ++i) {\n+    auto subnet = view_at(values, i);\n+    if (not subnet or prefixes.IsNull(i)) {\n+      check(builder.AppendNull());\n+      continue;\n+    }\n+    append_subnet(builder, make_subnet(subnet->network(), prefixes.Value(i)));\n+  }\n+}\n+\n+auto append_with_prefix(subnet_type::builder_type& builder, series const& value,\n+                        series const& prefix, ast::expression const& value_expr,\n+                        ast::expression const& prefix_expr, session ctx)\n+  -> void {\n+  auto f = detail::overload{\n+    [&](concepts::one_of<arrow::StringArray, ip_type::array_type,\n+                         subnet_type::array_type> auto const& values,\n+        concepts::one_of<arrow::Int64Array, arrow::UInt64Array> auto const&\n+          prefixes) {\n+      append_with_prefix(builder, values, prefixes);\n+    },\n+    [&](const auto& values, const auto& prefixes) {\n+      using values_type = std::remove_cvref_t<decltype(values)>;\n+      using prefixes_type = std::remove_cvref_t<decltype(prefixes)>;\n+      if constexpr (not detail::is_any_v<\n+                      values_type, arrow::StringArray, ip_type::array_type,\n+                      subnet_type::array_type, arrow::NullArray>) {\n+        diagnostic::warning(\"`subnet` expected `string`, `ip`, or `subnet`, \"\n+                            \"but got `{}`\",\n+                            value.type.kind())\n+          .primary(value_expr)\n+          .emit(ctx);\n+      }\n+      if constexpr (not detail::is_any_v<prefixes_type, arrow::Int64Array,\n+                                         arrow::UInt64Array, arrow::NullArray>) {\n+        diagnostic::warning(\"`subnet` expected `int`, but got `{}`\",\n+                            prefix.type.kind())\n+          .primary(prefix_expr)\n+          .emit(ctx);\n+      }\n+      check(builder.AppendNulls(values.length()));\n+    },\n+  };\n+  match(std::tie(*value.array, *prefix.array), f);\n+}\n+\n class subnet final : public function_plugin {\n public:\n   auto name() const -> std::string override {\n@@ -32,47 +222,28 @@ class subnet final : public function_plugin {\n   auto make_function(function_invocation inv, session ctx) const\n     -> failure_or<function_ptr> override {\n     auto expr = ast::expression{};\n+    auto prefix_expr = Option<ast::expression>{};\n     TRY(argument_parser2::function(\"subnet\")\n-          .positional(\"x\", expr, \"string\")\n+          .positional(\"x\", expr, \"string|ip|subnet\")\n+          .positional(\"prefix\", prefix_expr, \"int\")\n           .parse(inv, ctx));\n     return function_use::make(\n-      [expr = std::move(expr)](evaluator eval, session ctx) {\n-        return map_series(eval(expr), [&](series arg) {\n-          auto f = detail::overload{\n-            [](const arrow::NullArray& arg) {\n-              return series::null(subnet_type{}, arg.length());\n-            },\n-            [](const arrow::StringArray& arg) {\n-              auto b = subnet_type::make_arrow_builder(arrow_memory_pool());\n-              check(b->Reserve(arg.length()));\n-              for (auto i = 0; i < arg.length(); ++i) {\n-                if (arg.IsNull(i)) {\n-                  check(b->AppendNull());\n-                  continue;\n-                }\n-                auto result = tenzir::subnet{};\n-                if (parsers::net(arg.GetView(i), result)) {\n-                  check(append_builder(subnet_type{}, *b, result));\n-                } else {\n-                  // TODO: ?\n-                  check(b->AppendNull());\n-                }\n-              }\n-              return series{subnet_type{}, check(b->Finish())};\n-            },\n-            [&](const subnet_type::array_type&) {\n-              return arg;\n-            },\n-            [&](const auto&) {\n-              diagnostic::warning(\"`subnet` expected `string`, but got `{}`\",\n-                                  arg.type.kind())\n-                .primary(expr)\n-                .emit(ctx);\n-              return series::null(subnet_type{}, arg.length());\n-            },\n-          };\n-          return match(*arg.array, f);\n-        });\n+      [expr = std::move(expr), prefix_expr = std::move(prefix_expr)](\n+        evaluator eval, session ctx) -> series {\n+        auto b = subnet_type::make_arrow_builder(arrow_memory_pool());\n+        check(b->Reserve(eval.length()));\n+        if (prefix_expr) {\n+          for (auto [value, prefix] :\n+               split_multi_series(eval(expr), eval(*prefix_expr))) {\n+            TENZIR_ASSERT(value.length() == prefix.length());\n+            append_with_prefix(*b, value, prefix, expr, *prefix_expr, ctx);\n+          }\n+        } else {\n+          for (auto const& value : eval(expr)) {\n+            append_without_prefix(*b, value, expr, ctx);\n+          }\n+        }\n+        return series{subnet_type{}, check(b->Finish())};\n       });\n   }\n };"
+    },
+    {
+      "sha": "d864000e01dacc47c2c9b0fb0dcc776f9c559d4e",
+      "filename": "test/tests/functions/subnet/basic.tql",
+      "status": "added",
+      "additions": 8,
+      "deletions": 0,
+      "changes": 8,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/03b2668182f687bbffb081987f35d9a011da0f09/test%2Ftests%2Ffunctions%2Fsubnet%2Fbasic.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/03b2668182f687bbffb081987f35d9a011da0f09/test%2Ftests%2Ffunctions%2Fsubnet%2Fbasic.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Ffunctions%2Fsubnet%2Fbasic.tql?ref=03b2668182f687bbffb081987f35d9a011da0f09",
+      "patch": "@@ -0,0 +1,8 @@\n+from {\n+  cidr: subnet(\"10.0.1.5/24\"),\n+  plain_v4: subnet(\"10.20.1.124\"),\n+  typed_v4: subnet(10.10.1.124),\n+  plain_v6: subnet(\"2001:db8::1\"),\n+  typed_v6: subnet(ip(\"2001:db8::1\")),\n+  existing: subnet(172.16.4.5/16),\n+}"
+    },
+    {
+      "sha": "b0c4412d04a7d8b50deaf768d2284350f3518bf9",
+      "filename": "test/tests/functions/subnet/basic.txt",
+      "status": "added",
+      "additions": 8,
+      "deletions": 0,
+      "changes": 8,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/03b2668182f687bbffb081987f35d9a011da0f09/test%2Ftests%2Ffunctions%2Fsubnet%2Fbasic.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/03b2668182f687bbffb081987f35d9a011da0f09/test%2Ftests%2Ffunctions%2Fsubnet%2Fbasic.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Ffunctions%2Fsubnet%2Fbasic.txt?ref=03b2668182f687bbffb081987f35d9a011da0f09",
+      "patch": "@@ -0,0 +1,8 @@\n+{\n+  cidr: 10.0.1.0/24,\n+  plain_v4: 10.20.1.124/32,\n+  typed_v4: 10.10.1.124/32,\n+  plain_v6: 2001:db8::1/128,\n+  typed_v6: 2001:db8::1/128,\n+  existing: 172.16.0.0/16,\n+}"
+    },
+    {
+      "sha": "1e830a07a8f1bede3b3a60bb0ece7a1b89cbbfc1",
+      "filename": "test/tests/functions/subnet/nulls_and_invalid.tql",
+      "status": "added",
+      "additions": 32,
+      "deletions": 0,
+      "changes": 32,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/03b2668182f687bbffb081987f35d9a011da0f09/test%2Ftests%2Ffunctions%2Fsubnet%2Fnulls_and_invalid.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/03b2668182f687bbffb081987f35d9a011da0f09/test%2Ftests%2Ffunctions%2Fsubnet%2Fnulls_and_invalid.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Ffunctions%2Fsubnet%2Fnulls_and_invalid.tql?ref=03b2668182f687bbffb081987f35d9a011da0f09",
+      "patch": "@@ -0,0 +1,32 @@\n+from (\n+  {\n+    case: \"bad-string\",\n+    result: subnet(\"not an ip\", 24),\n+    host: subnet(\"not an ip\"),\n+  },\n+  {\n+    case: \"v4-too-wide\",\n+    result: subnet(\"10.1.2.3\", 33),\n+    host: subnet(\"10.1.2.3\"),\n+  },\n+  {\n+    case: \"v6-too-wide\",\n+    result: subnet(\"2001:db8::1\", 129),\n+    host: subnet(\"2001:db8::1\"),\n+  },\n+  {\n+    case: \"duplicate-prefix\",\n+    result: subnet(\"10.1.2.3/24\", 16),\n+    host: subnet(\"10.1.2.3/24\"),\n+  },\n+  {\n+    case: \"null-input\",\n+    result: subnet(null.string(), 24),\n+    host: subnet(null.string()),\n+  },\n+  {\n+    case: \"null-prefix\",\n+    result: subnet(\"10.1.2.3\", null.int()),\n+    host: subnet(\"10.1.2.3\"),\n+  },\n+)"
+    },
+    {
+      "sha": "f5b4a46d4c1cc31ed7149cefa54119fc62b99fcb",
+      "filename": "test/tests/functions/subnet/nulls_and_invalid.txt",
+      "status": "added",
+      "additions": 30,
+      "deletions": 0,
+      "changes": 30,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/03b2668182f687bbffb081987f35d9a011da0f09/test%2Ftests%2Ffunctions%2Fsubnet%2Fnulls_and_invalid.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/03b2668182f687bbffb081987f35d9a011da0f09/test%2Ftests%2Ffunctions%2Fsubnet%2Fnulls_and_invalid.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Ffunctions%2Fsubnet%2Fnulls_and_invalid.txt?ref=03b2668182f687bbffb081987f35d9a011da0f09",
+      "patch": "@@ -0,0 +1,30 @@\n+{\n+  case: \"bad-string\",\n+  result: null,\n+  host: null,\n+}\n+{\n+  case: \"v4-too-wide\",\n+  result: null,\n+  host: 10.1.2.3/32,\n+}\n+{\n+  case: \"v6-too-wide\",\n+  result: null,\n+  host: 2001:db8::1/128,\n+}\n+{\n+  case: \"duplicate-prefix\",\n+  result: null,\n+  host: 10.1.2.0/24,\n+}\n+{\n+  case: \"null-input\",\n+  result: null,\n+  host: null,\n+}\n+{\n+  case: \"null-prefix\",\n+  result: null,\n+  host: 10.1.2.3/32,\n+}"
+    },
+    {
+      "sha": "fc988f34767c569fbacb8a4aca8ec54dba8292b9",
+      "filename": "test/tests/functions/subnet/prefix.tql",
+      "status": "added",
+      "additions": 20,
+      "deletions": 0,
+      "changes": 20,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/03b2668182f687bbffb081987f35d9a011da0f09/test%2Ftests%2Ffunctions%2Fsubnet%2Fprefix.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/03b2668182f687bbffb081987f35d9a011da0f09/test%2Ftests%2Ffunctions%2Fsubnet%2Fprefix.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Ffunctions%2Fsubnet%2Fprefix.tql?ref=03b2668182f687bbffb081987f35d9a011da0f09",
+      "patch": "@@ -0,0 +1,20 @@\n+from (\n+  {\n+    label: \"v4-24\",\n+    from_ip: subnet(10.10.1.124, 24),\n+    from_string: subnet(\"10.20.1.124\", 24),\n+    from_subnet: subnet(10.30.1.124/32, 24),\n+  },\n+  {\n+    label: \"v4-16\",\n+    from_ip: subnet(10.10.1.124, 16),\n+    from_string: subnet(\"10.20.1.124\", 16),\n+    from_subnet: subnet(10.30.1.124/32, 16),\n+  },\n+  {\n+    label: \"v6-64\",\n+    from_ip: subnet(ip(\"2001:db8::1\"), 64),\n+    from_string: subnet(\"2001:db8::1\", 64),\n+    from_subnet: subnet(2001:db8::1/128, 64),\n+  },\n+)"
+    },
+    {
+      "sha": "2cab17b34f5dd1a077886e9edff49e33ae8b2ef1",
+      "filename": "test/tests/functions/subnet/prefix.txt",
+      "status": "added",
+      "additions": 18,
+      "deletions": 0,
+      "changes": 18,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/03b2668182f687bbffb081987f35d9a011da0f09/test%2Ftests%2Ffunctions%2Fsubnet%2Fprefix.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/03b2668182f687bbffb081987f35d9a011da0f09/test%2Ftests%2Ffunctions%2Fsubnet%2Fprefix.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Ffunctions%2Fsubnet%2Fprefix.txt?ref=03b2668182f687bbffb081987f35d9a011da0f09",
+      "patch": "@@ -0,0 +1,18 @@\n+{\n+  label: \"v4-24\",\n+  from_ip: 10.10.1.0/24,\n+  from_string: 10.20.1.0/24,\n+  from_subnet: 10.30.1.0/24,\n+}\n+{\n+  label: \"v4-16\",\n+  from_ip: 10.10.0.0/16,\n+  from_string: 10.20.0.0/16,\n+  from_subnet: 10.30.0.0/16,\n+}\n+{\n+  label: \"v6-64\",\n+  from_ip: 2001:db8::/64,\n+  from_string: 2001:db8::/64,\n+  from_subnet: 2001:db8::/64,\n+}"
+    }
+  ]
+}

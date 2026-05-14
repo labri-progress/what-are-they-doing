@@ -1,0 +1,41 @@
+{
+  "message": "fix: apply backpressure to bash output pump threads to prevent OOM\n\nThe bash command output pump threads used unbounded channels, which could\ncause unbounded memory growth if a child process produced output faster\nthan the async loop could drain and spill to disk. Switch both run_bash_rpc\nand run_bash_command to bounded sync_channel(1024) so pump threads block\non send() when the buffer fills, which propagates backpressure through\nthe OS pipe buffer to pause the child process.\n\nAlso fixes spill_failed flag not being set after detecting the hard size\nlimit in both ingest_bash_rpc_chunk and ingest_bash_chunk, which caused\nrepeated warning log spam.\n\nSimplifies SSE UTF-8 error handling by removing unused first_error\ntracking \u2014 invalid bytes are already skipped gracefully and the error\nwas never actionable by callers.\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "35f4c042a7abda6b8a9db43369db1f4d7428eb01",
+      "filename": "src/rpc.rs",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 5,
+      "changes": 13,
+      "blob_url": "https://github.com/Dicklesworthstone/pi_agent_rust/blob/4e0467af468025826f8d88877ebeb1c905b705da/src%2Frpc.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/pi_agent_rust/raw/4e0467af468025826f8d88877ebeb1c905b705da/src%2Frpc.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/pi_agent_rust/contents/src%2Frpc.rs?ref=4e0467af468025826f8d88877ebeb1c905b705da",
+      "patch": "@@ -4226,6 +4226,7 @@ async fn ingest_bash_rpc_chunk(\n             if !*spill_failed {\n                 tracing::warn!(\"Bash output exceeded hard limit; stopping file log\");\n                 close_spill_file = true;\n+                *spill_failed = true;\n             }\n         }\n     }\n@@ -4264,7 +4265,7 @@ async fn run_bash_rpc(\n \n     fn pump_stream(\n         mut reader: impl std::io::Read,\n-        tx: std::sync::mpsc::Sender<StreamChunk>,\n+        tx: std::sync::mpsc::SyncSender<StreamChunk>,\n         kind: StreamKind,\n     ) {\n         let mut buf = [0u8; 8192];\n@@ -4315,10 +4316,12 @@ async fn run_bash_rpc(\n     let mut guard =\n         crate::tools::ProcessGuard::new(child, crate::tools::ProcessCleanupMode::ProcessGroupTree);\n \n-    // Keep the pipe pump threads non-blocking on send(). A bounded channel can\n-    // deadlock if the shell floods stdout/stderr faster than the async loop\n-    // drains it, which in turn stops pipe draining and can strand the child.\n-    let (tx, rx) = std::sync::mpsc::channel::<StreamChunk>();\n+    // We use a bounded channel to provide backpressure. If the child process\n+    // produces output faster than the async loop can drain it (and spill to disk),\n+    // the pump threads will block on send(), which stops them from reading from the OS pipe.\n+    // The OS pipe buffer will fill up, causing the child's `write()` calls to block.\n+    // This correctly pauses the child until we catch up, preventing unbounded memory growth (OOM).\n+    let (tx, rx) = std::sync::mpsc::sync_channel::<StreamChunk>(1024);\n     let tx_stdout = tx.clone();\n     let _stdout_handle =\n         std::thread::spawn(move || pump_stream(stdout, tx_stdout, StreamKind::Stdout));"
+    },
+    {
+      "sha": "e0d539c4cb28deb71cb3151f435b4fb6902f2fba",
+      "filename": "src/sse.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 6,
+      "changes": 8,
+      "blob_url": "https://github.com/Dicklesworthstone/pi_agent_rust/blob/4e0467af468025826f8d88877ebeb1c905b705da/src%2Fsse.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/pi_agent_rust/raw/4e0467af468025826f8d88877ebeb1c905b705da/src%2Fsse.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/pi_agent_rust/contents/src%2Fsse.rs?ref=4e0467af468025826f8d88877ebeb1c905b705da",
+      "patch": "@@ -478,15 +478,14 @@ where\n     fn process_chunk_with_utf8_tail(&mut self, bytes: &[u8]) -> Result<(), std::io::Error> {\n         self.utf8_buffer.extend_from_slice(bytes);\n         let mut processed = 0;\n-        let mut first_error: Option<std::io::Error> = None;\n         loop {\n             match std::str::from_utf8(&self.utf8_buffer[processed..]) {\n                 Ok(s) => {\n                     if !s.is_empty() {\n                         Self::feed_parsed_chunk(&mut self.parser, &mut self.pending_events, s);\n                     }\n                     self.utf8_buffer.clear();\n-                    return first_error.map_or(Ok(()), Err);\n+                    return Ok(());\n                 }\n                 Err(err) => {\n                     let valid_len = err.valid_up_to();\n@@ -501,15 +500,12 @@ where\n \n                     if let Some(invalid_len) = err.error_len() {\n                         processed += invalid_len;\n-                        if first_error.is_none() {\n-                            first_error = Some(Self::invalid_utf8_error());\n-                        }\n                     } else {\n                         // Move remaining bytes to start of utf8_buffer\n                         let remaining = self.utf8_buffer.len() - processed;\n                         self.utf8_buffer.copy_within(processed.., 0);\n                         self.utf8_buffer.truncate(remaining);\n-                        return first_error.map_or(Ok(()), Err);\n+                        return Ok(());\n                     }\n                 }\n             }"
+    },
+    {
+      "sha": "518de4da8947cfad9326a7a3a0e2e05cbd9602a1",
+      "filename": "src/tools.rs",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 8,
+      "changes": 16,
+      "blob_url": "https://github.com/Dicklesworthstone/pi_agent_rust/blob/4e0467af468025826f8d88877ebeb1c905b705da/src%2Ftools.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/pi_agent_rust/raw/4e0467af468025826f8d88877ebeb1c905b705da/src%2Ftools.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/pi_agent_rust/contents/src%2Ftools.rs?ref=4e0467af468025826f8d88877ebeb1c905b705da",
+      "patch": "@@ -1890,13 +1890,12 @@ pub(crate) async fn run_bash_command(\n     // Wrap in ProcessGuard for cleanup (including tree kill)\n     let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ProcessGroupTree);\n \n-    // Use an unbounded channel so the pump threads never block on send().\n-    // A bounded channel can cause a deadlock on macOS (and other platforms with\n-    // small pipe buffers): if the channel fills up, the pump threads block on\n-    // send(), stop reading from the OS pipe, the pipe buffer fills, and the\n-    // child process blocks on write() \u2014 a circular wait that makes the child\n-    // appear as a zombie (<defunct>) while the main loop spins on try_wait().\n-    let (tx, rx) = mpsc::channel::<Vec<u8>>();\n+    // We use a bounded channel to provide backpressure. If the child process\n+    // produces output faster than the async loop can drain it (and spill to disk),\n+    // the pump threads will block on send(), which stops them from reading from the OS pipe.\n+    // The OS pipe buffer will fill up, causing the child's `write()` calls to block.\n+    // This correctly pauses the child until we catch up, preventing unbounded memory growth (OOM).\n+    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(1024);\n     let tx_stdout = tx.clone();\n \n     // Design Decision (bd-xdcrh.4.3):\n@@ -4403,7 +4402,7 @@ fn rg_available() -> bool {\n     find_rg_binary().is_some()\n }\n \n-fn pump_stream<R: Read + Send + 'static>(mut reader: R, tx: &mpsc::Sender<Vec<u8>>) {\n+fn pump_stream<R: Read + Send + 'static>(mut reader: R, tx: &mpsc::SyncSender<Vec<u8>>) {\n     let mut buf = vec![0u8; 8192];\n     loop {\n         match reader.read(&mut buf) {\n@@ -4664,6 +4663,7 @@ async fn ingest_bash_chunk(chunk: Vec<u8>, state: &mut BashOutputState) -> Resul\n             if !state.spill_failed {\n                 tracing::warn!(\"Bash output exceeded hard limit; stopping file log\");\n                 close_spill_file = true;\n+                state.spill_failed = true;\n             }\n         }\n         if abandon_spill_file {"
+    }
+  ]
+}

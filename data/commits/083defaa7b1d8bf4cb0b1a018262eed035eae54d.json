@@ -1,0 +1,41 @@
+{
+  "message": "fix(fcp-registry): remove direct tokio runtime bootstrap",
+  "files": [
+    {
+      "sha": "404d5800675d41c08f22d19b30fee17b79da3486",
+      "filename": "Cargo.lock",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/083defaa7b1d8bf4cb0b1a018262eed035eae54d/Cargo.lock",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/083defaa7b1d8bf4cb0b1a018262eed035eae54d/Cargo.lock",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/Cargo.lock?ref=083defaa7b1d8bf4cb0b1a018262eed035eae54d",
+      "patch": "@@ -5086,7 +5086,6 @@ dependencies = [\n  \"serde_json\",\n  \"testcontainers\",\n  \"thiserror 2.0.18\",\n- \"tokio\",\n  \"tracing\",\n  \"tracing-subscriber\",\n  \"uuid\",\n@@ -5216,6 +5215,8 @@ dependencies = [\n  \"fcp-raptorq\",\n  \"fcp-store\",\n  \"hex\",\n+ \"hyper\",\n+ \"hyper-util\",\n  \"insta\",\n  \"semver\",\n  \"serde\",\n@@ -5225,7 +5226,6 @@ dependencies = [\n  \"sigstore-trust-root\",\n  \"tempfile\",\n  \"thiserror 2.0.18\",\n- \"tokio\",\n  \"tough\",\n  \"tower\",\n  \"url\","
+    },
+    {
+      "sha": "7767adc6cdc6a1a08404bba6fd568459a7221670",
+      "filename": "crates/fcp-registry/Cargo.toml",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 3,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/083defaa7b1d8bf4cb0b1a018262eed035eae54d/crates%2Ffcp-registry%2FCargo.toml",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/083defaa7b1d8bf4cb0b1a018262eed035eae54d/crates%2Ffcp-registry%2FCargo.toml",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-registry%2FCargo.toml?ref=083defaa7b1d8bf4cb0b1a018262eed035eae54d",
+      "patch": "@@ -25,6 +25,7 @@ test-mocks = []\n axum = { version = \"0.8\", features = [\"json\"] }\n bytes = { workspace = true }\n clap = { workspace = true, features = [\"derive\"] }\n+fcp-async-core = { workspace = true }\n fcp-cbor = { workspace = true }\n fcp-core = { workspace = true }\n fcp-crypto = { workspace = true }\n@@ -40,18 +41,18 @@ thiserror = { workspace = true }\n hex = { workspace = true }\n semver = { workspace = true }\n base64 = { workspace = true }\n-tokio = { workspace = true }\n url = { workspace = true }\n+hyper = \"1.8.1\"\n+hyper-util = { version = \"0.1.20\", features = [\"server\", \"service\", \"http1\", \"http2\"] }\n+tower = { version = \"0.5.3\", features = [\"util\"] }\n # Supply-chain hardening (optional for live verification)\n tough = { workspace = true, optional = true }\n sigstore = { workspace = true, optional = true }\n sigstore-trust-root = { workspace = true, optional = true }\n \n [dev-dependencies]\n-fcp-async-core = { path = \"../fcp-async-core\" }\n insta = { workspace = true, features = [\"json\"] }\n tempfile = \"3\"\n-tower = { version = \"0.5.3\", features = [\"util\"] }\n uuid = { workspace = true }\n \n # Integration test that exercises the Mock*Verifier fixtures only runs when"
+    },
+    {
+      "sha": "b3b23ba1c0044136de156da9f1214c3994985b43",
+      "filename": "crates/fcp-registry/src/bin/fcp-registry-server.rs",
+      "status": "modified",
+      "additions": 63,
+      "deletions": 3,
+      "changes": 66,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/083defaa7b1d8bf4cb0b1a018262eed035eae54d/crates%2Ffcp-registry%2Fsrc%2Fbin%2Ffcp-registry-server.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/083defaa7b1d8bf4cb0b1a018262eed035eae54d/crates%2Ffcp-registry%2Fsrc%2Fbin%2Ffcp-registry-server.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-registry%2Fsrc%2Fbin%2Ffcp-registry-server.rs?ref=083defaa7b1d8bf4cb0b1a018262eed035eae54d",
+      "patch": "@@ -1,9 +1,22 @@\n use std::error::Error;\n use std::net::SocketAddr;\n use std::path::PathBuf;\n+use std::pin::pin;\n+use std::time::Duration;\n \n+use axum::{Router, body::Body};\n use clap::Parser;\n+use fcp_async_core::{\n+    hyper_bridge::{HyperExecutor, HyperIo},\n+    net::TcpListener,\n+    task,\n+};\n use fcp_registry::LocalRegistryCatalog;\n+use hyper::body::Incoming;\n+use hyper_util::{\n+    server::conn::auto::Builder as HyperConnectionBuilder, service::TowerToHyperService,\n+};\n+use tower::ServiceExt;\n \n #[derive(Debug, Parser)]\n #[command(\n@@ -20,16 +33,63 @@ struct Args {\n     package_dirs: Vec<PathBuf>,\n }\n \n-#[tokio::main]\n+fn hyper_executor() -> HyperExecutor {\n+    HyperExecutor::with_spawn_fn(|future| {\n+        task::spawn_detached(future);\n+    })\n+}\n+\n+fn spawn_http_connection<IO>(io: IO, app: Router)\n+where\n+    IO: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,\n+{\n+    let tower_service = app.map_request(|request: hyper::Request<Incoming>| request.map(Body::new));\n+    let hyper_service = TowerToHyperService::new(tower_service);\n+\n+    task::spawn_detached(async move {\n+        let mut builder = HyperConnectionBuilder::new(hyper_executor());\n+        builder.http2().enable_connect_protocol();\n+\n+        let mut connection = pin!(builder.serve_connection_with_upgrades(io, hyper_service));\n+        if let Err(err) = connection.as_mut().await {\n+            eprintln!(\"fcp-registry-server connection error: {err}\");\n+        }\n+    });\n+}\n+\n+async fn handle_accept_error(err: std::io::Error) {\n+    if matches!(\n+        err.kind(),\n+        std::io::ErrorKind::ConnectionRefused\n+            | std::io::ErrorKind::ConnectionAborted\n+            | std::io::ErrorKind::ConnectionReset\n+    ) {\n+        return;\n+    }\n+\n+    eprintln!(\"fcp-registry-server accept error: {err}\");\n+    fcp_async_core::time::sleep(Duration::from_secs(1)).await;\n+}\n+\n+async fn serve_tcp(listener: TcpListener, app: Router) -> std::io::Result<()> {\n+    loop {\n+        match listener.accept().await {\n+            Ok((stream, _addr)) => spawn_http_connection(HyperIo::new(stream), app.clone()),\n+            Err(err) => handle_accept_error(err).await,\n+        }\n+    }\n+}\n+\n+#[fcp_async_core::runtime::main]\n async fn main() -> Result<(), Box<dyn Error>> {\n     let args = Args::parse();\n     let catalog = LocalRegistryCatalog::from_signed_package_dirs(&args.package_dirs)?;\n     let connector_count = catalog.connectors_response().connectors.len();\n     let app = catalog.router();\n \n-    let listener = tokio::net::TcpListener::bind(args.listen).await?;\n+    let listener = TcpListener::bind(args.listen).await?;\n     let local_addr = listener.local_addr()?;\n     eprintln!(\"fcp-registry-server serving {connector_count} connector(s) at http://{local_addr}\");\n-    axum::serve(listener, app).await?;\n+    serve_tcp(listener, app).await?;\n     Ok(())\n }"
+    }
+  ]
+}

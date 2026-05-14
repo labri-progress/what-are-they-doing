@@ -1,0 +1,53 @@
+{
+  "message": "fix(security): four hardening fixes across TLS, SCRAM, DNS, and gRPC\n\nFour independent security fixes surfaced during audit batches 496-503:\n\n1. database/postgres.rs \u2014 SCRAM constant-time comparison used\n   short-circuit && for the length check, allowing a timing\n   side-channel where differing lengths would skip the byte-by-byte\n   content scan entirely.  Fix: use bitwise & so both the length\n   comparison and content scan always execute in constant time.\n\n2. tls/connector.rs \u2014 Building a TlsConnector with an empty root\n   certificate store previously emitted a warning log but continued,\n   producing a connector that could never verify any server\n   certificate.  Fix: promote to a hard Err, making it impossible\n   to construct a TlsConnector that silently accepts all certificates.\n\n3. net/dns/resolver.rs \u2014 DNS answer pre-allocation used\n   Vec::with_capacity(answer_count) directly from the wire, allowing\n   a malicious DNS response with a large answer_count to trigger\n   excessive memory allocation.  Fix: cap pre-allocation to 512\n   entries (well above any legitimate DNS response).\n\n4. grpc/web.rs \u2014 A missing grpc-status trailer was interpreted as\n   code 0 (OK), silently treating protocol violations as success.\n   Fix: default to code 13 (INTERNAL) when the status trailer is\n   absent, correctly surfacing the protocol error to callers.\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "b601b7410bb1b76ef6c2211668dd5b88c074711d",
+      "filename": "src/database/postgres.rs",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 8,
+      "changes": 18,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/1c63ae396b6350a6bc652de4e6f9a19473542b9a/src%2Fdatabase%2Fpostgres.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/1c63ae396b6350a6bc652de4e6f9a19473542b9a/src%2Fdatabase%2Fpostgres.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fdatabase%2Fpostgres.rs?ref=1c63ae396b6350a6bc652de4e6f9a19473542b9a",
+      "patch": "@@ -1376,14 +1376,16 @@ impl ScramAuth {\n         })?;\n         let expected_sig = Self::hmac_sha256(&server_key, auth_message.as_bytes());\n \n-        // Use constant-time comparison to prevent timing side-channel\n-        // attacks against SCRAM mutual authentication.\n-        let sig_matches = server_sig.len() == expected_sig.len()\n-            && server_sig\n-                .iter()\n-                .zip(expected_sig.iter())\n-                .fold(0u8, |acc, (a, b)| acc | (a ^ b))\n-                == 0;\n+        // Constant-time comparison to prevent timing side-channel attacks\n+        // against SCRAM mutual authentication. The length check must not\n+        // short-circuit the content comparison.\n+        let len_ok = server_sig.len() == expected_sig.len();\n+        let content_ok = server_sig\n+            .iter()\n+            .zip(expected_sig.iter())\n+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))\n+            == 0;\n+        let sig_matches = len_ok & content_ok;\n         if !sig_matches {\n             return Err(PgError::AuthenticationFailed(\n                 \"server signature mismatch\".to_string(),"
+    },
+    {
+      "sha": "c5133d76217b38129c035e91a33d9beb15452d03",
+      "filename": "src/grpc/web.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 1,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/1c63ae396b6350a6bc652de4e6f9a19473542b9a/src%2Fgrpc%2Fweb.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/1c63ae396b6350a6bc652de4e6f9a19473542b9a/src%2Fgrpc%2Fweb.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fgrpc%2Fweb.rs?ref=1c63ae396b6350a6bc652de4e6f9a19473542b9a",
+      "patch": "@@ -194,7 +194,9 @@ pub fn decode_trailers(body: &[u8]) -> Result<TrailerFrame, GrpcError> {\n         }\n     }\n \n-    let code = Code::from_i32(status_code.unwrap_or(0));\n+    // Per gRPC spec, trailers MUST include grpc-status. If absent, treat as\n+    // internal error rather than success \u2014 a missing status is a protocol violation.\n+    let code = Code::from_i32(status_code.unwrap_or(13)); // 13 = INTERNAL\n     let status = if status_message.is_empty() {\n         Status::new(code, code.as_str())\n     } else {"
+    },
+    {
+      "sha": "745d001ca141b770e11a263bd7e3a5dc2ebb988b",
+      "filename": "src/net/dns/resolver.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 1,
+      "changes": 5,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/1c63ae396b6350a6bc652de4e6f9a19473542b9a/src%2Fnet%2Fdns%2Fresolver.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/1c63ae396b6350a6bc652de4e6f9a19473542b9a/src%2Fnet%2Fdns%2Fresolver.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fnet%2Fdns%2Fresolver.rs?ref=1c63ae396b6350a6bc652de4e6f9a19473542b9a",
+      "patch": "@@ -1151,7 +1151,10 @@ fn parse_dns_response(packet: &[u8], expected_id: u16) -> Result<ParsedDnsRespon\n         let _ = read_u16(packet, &mut offset)?;\n     }\n \n-    let mut answers = Vec::with_capacity(answer_count);\n+    // Cap pre-allocation to prevent attacker-controlled answer_count\n+    // from causing excessive memory allocation (max 512 answers is\n+    // well beyond any legitimate DNS response).\n+    let mut answers = Vec::with_capacity(answer_count.min(512));\n     for _ in 0..answer_count {\n         if let Some(answer) = parse_dns_answer(packet, &mut offset)? {\n             answers.push(answer);"
+    },
+    {
+      "sha": "e9d3a5f978a1da1c0d8e3c9edb2312d4c878c415",
+      "filename": "src/tls/connector.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 2,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/1c63ae396b6350a6bc652de4e6f9a19473542b9a/src%2Ftls%2Fconnector.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/1c63ae396b6350a6bc652de4e6f9a19473542b9a/src%2Ftls%2Fconnector.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Ftls%2Fconnector.rs?ref=1c63ae396b6350a6bc652de4e6f9a19473542b9a",
+      "patch": "@@ -495,8 +495,10 @@ impl TlsConnectorBuilder {\n         }\n \n         if self.root_certs.is_empty() {\n-            #[cfg(feature = \"tracing-integration\")]\n-            tracing::warn!(\"Building TlsConnector with no root certificates\");\n+            return Err(TlsError::Certificate(\n+                \"no root certificates configured \u2014 server certificates cannot be verified\"\n+                    .to_string(),\n+            ));\n         }\n \n         // Create the config builder with the crypto provider and protocol versions."
+    }
+  ]
+}

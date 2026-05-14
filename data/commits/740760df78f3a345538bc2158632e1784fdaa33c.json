@@ -1,0 +1,89 @@
+{
+  "message": "test(robot-envelope): pin wire format via six golden JSON fixtures\n\nAdds golden-file coverage for `RobotEnvelope<T>` serialization across\nthe six payload shapes the robot bridge actually emits in the wild,\nso a future refactor of the envelope struct (field rename, field\nreorder, nested-payload handling change) cannot silently shift the\nwire format without a failing test.\n\n## What a \"golden fixture\" means here\n\nEach test constructs a `RobotEnvelope` with a frozen timestamp and\na representative payload, serializes via `serde_json::to_value`,\nruns the result through a small canonicalizer, then compares to a\ncommitted `.json` file under\n`crates/frankenterm-core/tests/golden_robot_envelope/`.\n\nThe canonicalizer handles the bits that would otherwise produce\nspurious diffs on re-run:\n\n- `timestamp` string values (at any depth) are replaced with the\n  literal `\"[TIMESTAMP]\"` marker. The fixtures on disk also carry\n  `\"[TIMESTAMP]\"`, so clock skew and wall-time reads do not produce\n  churn.\n- Arrays nested under the keys `agents`, `tags`, `pane_ids` are\n  sorted by serialized-form lexicographically. These are the shapes\n  the bridge emits as semantically-unordered sets. Other arrays\n  (where order is meaningful) are left alone.\n- `f64` values with a fractional part are rounded to 4 decimal\n  places. Floating-point round-trip noise at the last ULP is not\n  part of the contract we want to pin.\n\nAll six fixtures are ~100\u2013285 bytes \u2014 small enough to read inline\nin a PR review and to commit without bloat concerns.\n\n## Fixtures\n\n- `scalar_payload.json` \u2014 `data: 42`. The baseline shape.\n- `degraded_payload.json` \u2014 `degraded: true` with a structured\n  `{\"reason\": \"fallback\", \"attempts\": 3}` payload. Pins the\n  degraded-path framing the robot bridge emits on connector failure.\n- `float_payload.json` \u2014 pins the 4-decimal rounding.\n- `sorted_set_payload.json` \u2014 pins the agents/tags/pane_ids\n  set-sort canonicalization.\n- `nested_timestamp_payload.json` \u2014 pins the recursive-timestamp\n  scrubbing for nested payloads that themselves contain a\n  `timestamp` field.\n- `structured_payload.json` \u2014 end-to-end pin of a realistic pane-\n  event-shaped payload.\n\n## Running & updating\n\nNormal test runs compare fixture-on-disk vs. in-memory canonicalized\nJSON. To regenerate after an intentional shape change:\n\n    UPDATE_GOLDENS=1 cargo test -p frankenterm-core \\\n        --test lib robot_envelope::tests::golden_\n\nThe `UPDATE_GOLDENS` branch in `assert_golden_json` writes the\ncurrent canonicalized bytes back to the fixture path. Commit the\ndiff as part of the same change that renamed/restructured the\nenvelope, so reviewers can see both sides.\n\n## Why this is colocated with robot_envelope.rs\n\n`RobotEnvelope` lives in `crates/frankenterm-core/src/robot_envelope.rs`\nand is `#[cfg(test)]`-only test glue for fixture loading (new imports:\n`serde_json::{json, Value}`, `std::fs`, `std::path::PathBuf`). No\nproduction code path references the fixtures or the canonicalizer.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "a28f6102084d0cc21b744b755307211f960c9e16",
+      "filename": "crates/frankenterm-core/src/robot_envelope.rs",
+      "status": "modified",
+      "additions": 163,
+      "deletions": 0,
+      "changes": 163,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/740760df78f3a345538bc2158632e1784fdaa33c/crates%2Ffrankenterm-core%2Fsrc%2Frobot_envelope.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/740760df78f3a345538bc2158632e1784fdaa33c/crates%2Ffrankenterm-core%2Fsrc%2Frobot_envelope.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Ffrankenterm-core%2Fsrc%2Frobot_envelope.rs?ref=740760df78f3a345538bc2158632e1784fdaa33c",
+      "patch": "@@ -47,13 +47,84 @@ impl<T> RobotEnvelope<T> {\n #[cfg(test)]\n mod tests {\n     use super::*;\n+    use serde_json::{json, Value};\n+    use std::fs;\n+    use std::path::PathBuf;\n \n     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]\n     struct DemoPayload {\n         id: u32,\n         name: String,\n     }\n \n+    fn golden_fixture_path(name: &str) -> PathBuf {\n+        PathBuf::from(env!(\"CARGO_MANIFEST_DIR\"))\n+            .join(\"tests/golden_robot_envelope\")\n+            .join(format!(\"{name}.json\"))\n+    }\n+\n+    fn canonicalize_json(value: &mut Value, parent_key: Option<&str>) {\n+        match value {\n+            Value::Object(map) => {\n+                let keys: Vec<String> = map.keys().cloned().collect();\n+                for key in keys {\n+                    let child = map.get_mut(&key).expect(\"key exists\");\n+                    if key == \"timestamp\" && child.is_string() {\n+                        *child = Value::String(\"[TIMESTAMP]\".to_string());\n+                    } else {\n+                        canonicalize_json(child, Some(&key));\n+                    }\n+                }\n+            }\n+            Value::Array(items) => {\n+                for item in items.iter_mut() {\n+                    canonicalize_json(item, parent_key);\n+                }\n+                if matches!(parent_key, Some(\"agents\" | \"tags\" | \"pane_ids\")) {\n+                    items.sort_by(|left, right| {\n+                        serde_json::to_string(left)\n+                            .expect(\"serialize left\")\n+                            .cmp(&serde_json::to_string(right).expect(\"serialize right\"))\n+                    });\n+                }\n+            }\n+            Value::Number(number) => {\n+                if let Some(float) = number.as_f64() {\n+                    if float.fract() != 0.0 {\n+                        let rounded = (float * 10_000.0).round() / 10_000.0;\n+                        *value = Value::Number(\n+                            serde_json::Number::from_f64(rounded).expect(\"rounded float\"),\n+                        );\n+                    }\n+                }\n+            }\n+            _ => {}\n+        }\n+    }\n+\n+    fn assert_golden_json(name: &str, envelope: &RobotEnvelope<Value>) {\n+        let mut actual = serde_json::to_value(envelope).expect(\"serialize envelope\");\n+        canonicalize_json(&mut actual, None);\n+        let actual_text = format!(\n+            \"{}\\n\",\n+            serde_json::to_string_pretty(&actual).expect(\"format envelope\")\n+        );\n+        let path = golden_fixture_path(name);\n+\n+        if std::env::var_os(\"UPDATE_GOLDENS\").is_some() {\n+            fs::create_dir_all(path.parent().expect(\"fixture dir\")).expect(\"create fixture dir\");\n+            fs::write(&path, &actual_text).expect(\"write golden\");\n+        }\n+\n+        let expected = fs::read_to_string(&path).expect(\"read golden\");\n+        assert_eq!(\n+            actual_text,\n+            expected,\n+            \"golden mismatch for {}\",\n+            path.display()\n+        );\n+    }\n+\n     #[test]\n     fn test_robot_envelope_wraps_output() {\n         let envelope = RobotEnvelope::wrap(\"demo\", 42);\n@@ -309,4 +380,96 @@ mod tests {\n         assert_eq!(back.data.1, \"two\");\n         assert!((back.data.2 - 3.0).abs() < f64::EPSILON);\n     }\n+\n+    #[test]\n+    fn golden_robot_envelope_scalar_payload_json() {\n+        let envelope = RobotEnvelope {\n+            timestamp: \"2026-04-20T12:34:56Z\".to_string(),\n+            source: \"bridge.scalar\".to_string(),\n+            data: json!(42),\n+            degraded: false,\n+        };\n+        assert_golden_json(\"scalar_payload\", &envelope);\n+    }\n+\n+    #[test]\n+    fn golden_robot_envelope_degraded_payload_json() {\n+        let envelope = RobotEnvelope {\n+            timestamp: \"2026-04-20T12:35:01Z\".to_string(),\n+            source: \"bridge.degraded\".to_string(),\n+            data: json!({\"reason\": \"fallback\", \"attempts\": 3}),\n+            degraded: true,\n+        };\n+        assert_golden_json(\"degraded_payload\", &envelope);\n+    }\n+\n+    #[test]\n+    fn golden_robot_envelope_float_payload_json() {\n+        let envelope = RobotEnvelope {\n+            timestamp: \"2026-04-20T12:35:15Z\".to_string(),\n+            source: \"bridge.float\".to_string(),\n+            data: json!({\n+                \"score\": 0.3333333333,\n+                \"ratio\": 1.23456789,\n+                \"nested\": { \"latency_ms\": 12.987654321 }\n+            }),\n+            degraded: false,\n+        };\n+        assert_golden_json(\"float_payload\", &envelope);\n+    }\n+\n+    #[test]\n+    fn golden_robot_envelope_sorted_set_payload_json() {\n+        let envelope = RobotEnvelope {\n+            timestamp: \"2026-04-20T12:35:30Z\".to_string(),\n+            source: \"bridge.sorted\".to_string(),\n+            data: json!({\n+                \"agents\": [\"agent-c\", \"agent-a\", \"agent-b\"],\n+                \"tags\": [\"zeta\", \"alpha\", \"mu\"],\n+            }),\n+            degraded: false,\n+        };\n+        assert_golden_json(\"sorted_set_payload\", &envelope);\n+    }\n+\n+    #[test]\n+    fn golden_robot_envelope_nested_timestamp_payload_json() {\n+        let inner = RobotEnvelope {\n+            timestamp: \"2026-04-20T12:36:01Z\".to_string(),\n+            source: \"bridge.inner\".to_string(),\n+            data: json!({\n+                \"pane_ids\": [9, 3, 5],\n+                \"status\": \"ok\"\n+            }),\n+            degraded: true,\n+        };\n+        let envelope = RobotEnvelope {\n+            timestamp: \"2026-04-20T12:36:05Z\".to_string(),\n+            source: \"bridge.outer\".to_string(),\n+            data: serde_json::to_value(inner).expect(\"serialize nested envelope\"),\n+            degraded: false,\n+        };\n+        assert_golden_json(\"nested_timestamp_payload\", &envelope);\n+    }\n+\n+    #[test]\n+    fn golden_robot_envelope_structured_payload_json() {\n+        let envelope = RobotEnvelope {\n+            timestamp: \"2026-04-20T12:36:20Z\".to_string(),\n+            source: \"bridge.structured\".to_string(),\n+            data: json!({\n+                \"pane\": {\n+                    \"id\": 7,\n+                    \"title\": \"main\",\n+                    \"cwd\": \"/tmp/demo\"\n+                },\n+                \"metrics\": {\n+                    \"cpu\": 0.12555555,\n+                    \"memory_mb\": 64.4444444\n+                }\n+            }),\n+            degraded: false,\n+        };\n+        assert_golden_json(\"structured_payload\", &envelope);\n+    }\n }"
+    },
+    {
+      "sha": "1a65d073da6e1376e393504b12fd79b0f8451fd0",
+      "filename": "crates/frankenterm-core/tests/golden_robot_envelope/degraded_payload.json",
+      "status": "added",
+      "additions": 9,
+      "deletions": 0,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/740760df78f3a345538bc2158632e1784fdaa33c/crates%2Ffrankenterm-core%2Ftests%2Fgolden_robot_envelope%2Fdegraded_payload.json",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/740760df78f3a345538bc2158632e1784fdaa33c/crates%2Ffrankenterm-core%2Ftests%2Fgolden_robot_envelope%2Fdegraded_payload.json",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Ffrankenterm-core%2Ftests%2Fgolden_robot_envelope%2Fdegraded_payload.json?ref=740760df78f3a345538bc2158632e1784fdaa33c",
+      "patch": "@@ -0,0 +1,9 @@\n+{\n+  \"timestamp\": \"[TIMESTAMP]\",\n+  \"source\": \"bridge.degraded\",\n+  \"data\": {\n+    \"reason\": \"fallback\",\n+    \"attempts\": 3\n+  },\n+  \"degraded\": true\n+}"
+    },
+    {
+      "sha": "08fc73682f3add7f7f3e9c4b8e5afacccd858f56",
+      "filename": "crates/frankenterm-core/tests/golden_robot_envelope/float_payload.json",
+      "status": "added",
+      "additions": 12,
+      "deletions": 0,
+      "changes": 12,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/740760df78f3a345538bc2158632e1784fdaa33c/crates%2Ffrankenterm-core%2Ftests%2Fgolden_robot_envelope%2Ffloat_payload.json",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/740760df78f3a345538bc2158632e1784fdaa33c/crates%2Ffrankenterm-core%2Ftests%2Fgolden_robot_envelope%2Ffloat_payload.json",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Ffrankenterm-core%2Ftests%2Fgolden_robot_envelope%2Ffloat_payload.json?ref=740760df78f3a345538bc2158632e1784fdaa33c",
+      "patch": "@@ -0,0 +1,12 @@\n+{\n+  \"timestamp\": \"[TIMESTAMP]\",\n+  \"source\": \"bridge.float\",\n+  \"data\": {\n+    \"score\": 0.3333,\n+    \"ratio\": 1.2346,\n+    \"nested\": {\n+      \"latency_ms\": 12.9877\n+    }\n+  },\n+  \"degraded\": false\n+}"
+    },
+    {
+      "sha": "11a0b777e4078fecc9a910d926c49e88260930f6",
+      "filename": "crates/frankenterm-core/tests/golden_robot_envelope/nested_timestamp_payload.json",
+      "status": "added",
+      "additions": 18,
+      "deletions": 0,
+      "changes": 18,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/740760df78f3a345538bc2158632e1784fdaa33c/crates%2Ffrankenterm-core%2Ftests%2Fgolden_robot_envelope%2Fnested_timestamp_payload.json",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/740760df78f3a345538bc2158632e1784fdaa33c/crates%2Ffrankenterm-core%2Ftests%2Fgolden_robot_envelope%2Fnested_timestamp_payload.json",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Ffrankenterm-core%2Ftests%2Fgolden_robot_envelope%2Fnested_timestamp_payload.json?ref=740760df78f3a345538bc2158632e1784fdaa33c",
+      "patch": "@@ -0,0 +1,18 @@\n+{\n+  \"timestamp\": \"[TIMESTAMP]\",\n+  \"source\": \"bridge.outer\",\n+  \"data\": {\n+    \"timestamp\": \"[TIMESTAMP]\",\n+    \"source\": \"bridge.inner\",\n+    \"data\": {\n+      \"pane_ids\": [\n+        3,\n+        5,\n+        9\n+      ],\n+      \"status\": \"ok\"\n+    },\n+    \"degraded\": true\n+  },\n+  \"degraded\": false\n+}"
+    },
+    {
+      "sha": "9df962782f8111bc15dc13cb3894ef49443c312d",
+      "filename": "crates/frankenterm-core/tests/golden_robot_envelope/scalar_payload.json",
+      "status": "added",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/740760df78f3a345538bc2158632e1784fdaa33c/crates%2Ffrankenterm-core%2Ftests%2Fgolden_robot_envelope%2Fscalar_payload.json",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/740760df78f3a345538bc2158632e1784fdaa33c/crates%2Ffrankenterm-core%2Ftests%2Fgolden_robot_envelope%2Fscalar_payload.json",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Ffrankenterm-core%2Ftests%2Fgolden_robot_envelope%2Fscalar_payload.json?ref=740760df78f3a345538bc2158632e1784fdaa33c",
+      "patch": "@@ -0,0 +1,6 @@\n+{\n+  \"timestamp\": \"[TIMESTAMP]\",\n+  \"source\": \"bridge.scalar\",\n+  \"data\": 42,\n+  \"degraded\": false\n+}"
+    },
+    {
+      "sha": "1bec1c3fb3c74b3d4c181ea324b47d657765bd49",
+      "filename": "crates/frankenterm-core/tests/golden_robot_envelope/sorted_set_payload.json",
+      "status": "added",
+      "additions": 17,
+      "deletions": 0,
+      "changes": 17,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/740760df78f3a345538bc2158632e1784fdaa33c/crates%2Ffrankenterm-core%2Ftests%2Fgolden_robot_envelope%2Fsorted_set_payload.json",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/740760df78f3a345538bc2158632e1784fdaa33c/crates%2Ffrankenterm-core%2Ftests%2Fgolden_robot_envelope%2Fsorted_set_payload.json",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Ffrankenterm-core%2Ftests%2Fgolden_robot_envelope%2Fsorted_set_payload.json?ref=740760df78f3a345538bc2158632e1784fdaa33c",
+      "patch": "@@ -0,0 +1,17 @@\n+{\n+  \"timestamp\": \"[TIMESTAMP]\",\n+  \"source\": \"bridge.sorted\",\n+  \"data\": {\n+    \"agents\": [\n+      \"agent-a\",\n+      \"agent-b\",\n+      \"agent-c\"\n+    ],\n+    \"tags\": [\n+      \"alpha\",\n+      \"mu\",\n+      \"zeta\"\n+    ]\n+  },\n+  \"degraded\": false\n+}"
+    },
+    {
+      "sha": "52821f472d20aa93b411aea9808925581d39c316",
+      "filename": "crates/frankenterm-core/tests/golden_robot_envelope/structured_payload.json",
+      "status": "added",
+      "additions": 16,
+      "deletions": 0,
+      "changes": 16,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/740760df78f3a345538bc2158632e1784fdaa33c/crates%2Ffrankenterm-core%2Ftests%2Fgolden_robot_envelope%2Fstructured_payload.json",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/740760df78f3a345538bc2158632e1784fdaa33c/crates%2Ffrankenterm-core%2Ftests%2Fgolden_robot_envelope%2Fstructured_payload.json",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Ffrankenterm-core%2Ftests%2Fgolden_robot_envelope%2Fstructured_payload.json?ref=740760df78f3a345538bc2158632e1784fdaa33c",
+      "patch": "@@ -0,0 +1,16 @@\n+{\n+  \"timestamp\": \"[TIMESTAMP]\",\n+  \"source\": \"bridge.structured\",\n+  \"data\": {\n+    \"pane\": {\n+      \"id\": 7,\n+      \"title\": \"main\",\n+      \"cwd\": \"/tmp/demo\"\n+    },\n+    \"metrics\": {\n+      \"cpu\": 0.1256,\n+      \"memory_mb\": 64.4444\n+    }\n+  },\n+  \"degraded\": false\n+}"
+    }
+  ]
+}

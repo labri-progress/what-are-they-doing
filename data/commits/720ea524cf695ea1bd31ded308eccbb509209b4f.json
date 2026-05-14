@@ -1,0 +1,161 @@
+{
+  "message": "Support mixed TLS TCP accepts\n\nAdd an auto-detection mode to accept_tcp that sniffs the first client bytes and upgrades TLS ClientHello connections while forwarding plaintext prefixes into the user pipeline.\n\nKeep delayed plaintext clients on the connection after the probe timeout and cover failed TLS-looking handshakes so the listener continues to accept later clients.\n\nAssisted-by: ChatGPT (pi)",
+  "files": [
+    {
+      "sha": "75a2d1a766088fbea900d8c33e682faf5062c89c",
+      "filename": "libtenzir/builtins/operators/accept_tcp.cpp",
+      "status": "modified",
+      "additions": 134,
+      "deletions": 4,
+      "changes": 138,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/720ea524cf695ea1bd31ded308eccbb509209b4f/libtenzir%2Fbuiltins%2Foperators%2Faccept_tcp.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/720ea524cf695ea1bd31ded308eccbb509209b4f/libtenzir%2Fbuiltins%2Foperators%2Faccept_tcp.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Fbuiltins%2Foperators%2Faccept_tcp.cpp?ref=720ea524cf695ea1bd31ded308eccbb509209b4f",
+      "patch": "@@ -38,10 +38,13 @@\n #include <folly/coro/Retry.h>\n #include <folly/coro/WithCancellation.h>\n #include <folly/executors/GlobalExecutor.h>\n+#include <folly/io/IOBuf.h>\n #include <folly/io/async/AsyncServerSocket.h>\n+#include <folly/io/async/AsyncSocket.h>\n #include <folly/io/coro/ServerSocket.h>\n #include <folly/io/coro/Transport.h>\n \n+#include <array>\n #include <cstring>\n #include <limits>\n #include <memory>\n@@ -67,12 +70,17 @@ constexpr auto message_queue_capacity = uint32_t{1_Ki};\n // Retry accepts quickly after transient socket errors so the listener recovers\n // fast, while still backing off enough to avoid a tight warning loop.\n constexpr auto accept_retry_delay = std::chrono::milliseconds{100};\n+// Bound the time spent waiting for the first client byte when auto-detecting\n+// TLS. Without this, idle clients could occupy connection slots before the\n+// normal read loop starts.\n+constexpr auto tls_probe_timeout = std::chrono::seconds{5};\n \n struct AcceptTcpArgs {\n   located<std::string> endpoint;\n   Option<located<data>> tls;\n   Option<located<uint64_t>> max_connections;\n   bool resolve_hostnames = false;\n+  bool auto_detect_tls = false;\n   located<ir::pipeline> user_pipeline;\n   let_id peer_info;\n };\n@@ -114,6 +122,7 @@ class AcceptTcpListener final : public Operator<void, table_slice> {\n     ip peer_ip;\n     int64_t peer_port;\n     Arc<ReverseDnsResult> peer_reverse_dns;\n+    Option<chunk_ptr> initial_payload;\n   };\n \n   struct Payload {\n@@ -128,6 +137,11 @@ class AcceptTcpListener final : public Operator<void, table_slice> {\n \n   struct AcceptLoopFinished {};\n \n+  struct TlsProbeResult {\n+    bool is_tls = false;\n+    Option<chunk_ptr> initial_plaintext;\n+  };\n+\n   using Message\n     = variant<AcceptLoopFinished, Accepted, Payload, ConnectionClosed>;\n   using MessageQueue = folly::coro::BoundedQueue<Message>;\n@@ -283,10 +297,29 @@ class AcceptTcpListener final : public Operator<void, table_slice> {\n         auto [_, inserted]\n           = connections_.emplace(conn_id, std::move(transport));\n         TENZIR_ASSERT(inserted);\n+        if (accepted.initial_payload) {\n+          bytes_read.add((*accepted.initial_payload)->size());\n+          auto sub_key = sub_key_for(conn_id);\n+          if (auto sub = ctx.get_sub(make_view(sub_key))) {\n+            auto& pipe = as<SubHandle<chunk_ptr>>(*sub);\n+            auto push_result\n+              = co_await pipe.push(std::move(*accepted.initial_payload));\n+            if (push_result.is_err()) {\n+              if (auto it = connections_.find(conn_id);\n+                  it != connections_.end()) {\n+                close_transport(it->second);\n+              }\n+            }\n+          }\n+        }\n+        auto it = connections_.find(conn_id);\n+        if (it == connections_.end()) {\n+          co_return;\n+        }\n         auto message_queue = message_queue_;\n         ctx.spawn_task(folly::coro::co_withExecutor(\n           transport_evb,\n-          read_loop(conn_id, connections_.at(conn_id), std::move(message_queue),\n+          read_loop(conn_id, it->second, std::move(message_queue),\n                     std::move(bytes_read))));\n       },\n       [&](Payload payload) -> Task<void> {\n@@ -472,11 +505,23 @@ class AcceptTcpListener final : public Operator<void, table_slice> {\n       close_transport(std::move(transport));\n       co_return;\n     }\n+    auto initial_payload = Option<chunk_ptr>{};\n     if (tls_context_) {\n       try {\n-        transport = Box<folly::coro::Transport>{\n-          co_await upgrade_transport_to_tls_server(std::move(*transport),\n-                                                   tls_context_)};\n+        auto should_upgrade = true;\n+        if (args_.auto_detect_tls) {\n+          auto* transport_evb = transport->getEventBase();\n+          TENZIR_ASSERT(transport_evb);\n+          auto probe = co_await folly::coro::co_withExecutor(\n+            transport_evb, probe_tls_client_hello(*transport));\n+          should_upgrade = probe.is_tls;\n+          initial_payload = std::move(probe.initial_plaintext);\n+        }\n+        if (should_upgrade) {\n+          transport = Box<folly::coro::Transport>{\n+            co_await upgrade_transport_to_tls_server(std::move(*transport),\n+                                                     tls_context_)};\n+        }\n       } catch (folly::AsyncSocketException const& ex) {\n         // Peer-driven TLS failures are expected at runtime; keep serving other\n         // connections instead of failing the whole operator.\n@@ -521,10 +566,84 @@ class AcceptTcpListener final : public Operator<void, table_slice> {\n       .peer_ip = peer_info.address,\n       .peer_port = peer_info.port,\n       .peer_reverse_dns = std::move(peer_reverse_dns),\n+      .initial_payload = std::move(initial_payload),\n     });\n     release_connection_slot_guard.disable();\n   }\n \n+  // TLS records start with a 5-byte header. A ClientHello record then begins\n+  // with handshake type 0x01 as the first byte of the record payload:\n+  //\n+  //   byte:   0        1        2        3..4       5\n+  //          +--------+--------+--------+----------+--------+\n+  //          | 0x16   | 0x03   | ver    | length   | 0x01   |\n+  //          +--------+--------+--------+----------+--------+\n+  //          | record | major  | minor  | payload  | Client |\n+  //          | type   |        |        | length   | Hello  |\n+  //\n+  // We only sniff enough to distinguish a plausible TLS ClientHello from\n+  // plaintext. OpenSSL performs full validation after we put these bytes back.\n+  static auto looks_like_tls_client_hello(std::span<std::byte const> bytes)\n+    -> bool {\n+    return bytes.size() >= 6 and bytes[0] == std::byte{0x16}\n+           and bytes[1] == std::byte{0x03} and bytes[2] <= std::byte{0x04}\n+           and bytes[5] == std::byte{0x01};\n+  }\n+\n+  static auto probe_tls_client_hello(folly::coro::Transport& transport)\n+    -> Task<TlsProbeResult> {\n+    auto prefix = std::array<std::byte, 6>{};\n+    auto size = size_t{0};\n+    auto read_some = [&](size_t min_size) -> Task<void> {\n+      while (size < min_size) {\n+        auto* data = reinterpret_cast<unsigned char*>(prefix.data() + size);\n+        auto n = co_await transport.read(\n+          folly::MutableByteRange{data, min_size - size}, tls_probe_timeout);\n+        if (n == 0) {\n+          co_return;\n+        }\n+        size += n;\n+      }\n+    };\n+    auto timed_out = false;\n+    try {\n+      co_await read_some(1);\n+      if (size == 0) {\n+        co_return {};\n+      }\n+      if (prefix[0] == std::byte{0x16}) {\n+        co_await read_some(prefix.size());\n+      }\n+    } catch (folly::AsyncSocketException const& ex) {\n+      if (ex.getType() != folly::AsyncSocketException::TIMED_OUT) {\n+        throw;\n+      }\n+      timed_out = true;\n+    }\n+    auto bytes = std::span{prefix.data(), size};\n+    if (looks_like_tls_client_hello(bytes)\n+        or (timed_out and size > 0 and prefix[0] == std::byte{0x16})) {\n+      auto* socket\n+        = dynamic_cast<folly::AsyncSocket*>(transport.getTransport());\n+      if (not socket) {\n+        throw folly::AsyncSocketException{\n+          folly::AsyncSocketException::INTERNAL_ERROR,\n+          \"transport is not backed by AsyncSocket\",\n+        };\n+      }\n+      socket->setPreReceivedData(\n+        folly::IOBuf::copyBuffer(bytes.data(), bytes.size()));\n+      co_return TlsProbeResult{.is_tls = true};\n+    }\n+    if (size == 0) {\n+      co_return {};\n+    }\n+    co_return TlsProbeResult{\n+      .is_tls = false,\n+      .initial_plaintext = chunk::copy(bytes.data(), bytes.size()),\n+    };\n+  }\n+\n   auto accept_loop(OpCtx& ctx) -> Task<void> {\n     TENZIR_ASSERT(server_);\n     TENZIR_ASSERT(evb_);\n@@ -625,6 +744,8 @@ class AcceptTcpPlugin final : public virtual OperatorPlugin {\n     auto max_connections_arg\n       = d.named(\"max_connections\", &AcceptTcpArgs::max_connections);\n     d.named(\"resolve_hostnames\", &AcceptTcpArgs::resolve_hostnames);\n+    auto auto_detect_tls_arg\n+      = d.named(\"auto_detect_tls\", &AcceptTcpArgs::auto_detect_tls);\n     auto pipeline_arg = d.pipeline(&AcceptTcpArgs::user_pipeline,\n                                    {{\"peer\", &AcceptTcpArgs::peer_info}});\n     d.validate([=](DescribeCtx& ctx) -> Empty {\n@@ -636,11 +757,13 @@ class AcceptTcpPlugin final : public virtual OperatorPlugin {\n       } else if (not ep->port) {\n         diagnostic::error(\"port number is required\").primary(loc).emit(ctx);\n       }\n+      auto tls_enabled = false;\n       if (auto tls_val = ctx.get(tls_arg)) {\n         auto tls_opts = tls_options{*tls_val, {.is_server = true}};\n         if (auto valid = tls_opts.validate(ctx); not valid) {\n           return {};\n         }\n+        tls_enabled = tls_opts.get_tls(nullptr).inner;\n       }\n       if (auto max_connections = ctx.get(max_connections_arg);\n           max_connections) {\n@@ -659,6 +782,13 @@ class AcceptTcpPlugin final : public virtual OperatorPlugin {\n             .emit(ctx);\n         }\n       }\n+      if (auto auto_detect_tls = ctx.get(auto_detect_tls_arg);\n+          auto_detect_tls and *auto_detect_tls and not tls_enabled) {\n+        diagnostic::error(\"`auto_detect_tls` requires TLS to be enabled\")\n+          .primary(\n+            ctx.get_location(auto_detect_tls_arg).value_or(location::unknown))\n+          .emit(ctx);\n+      }\n       TRY(auto pipeline, ctx.get(pipeline_arg));\n       auto output = pipeline.inner.infer_type(tag_v<chunk_ptr>, ctx);\n       if (output.is_error()) {"
+    },
+    {
+      "sha": "eafa74fddf9ca21fbca0da7faabc9497e3f6f049",
+      "filename": "test/fixtures/tcp.py",
+      "status": "modified",
+      "additions": 24,
+      "deletions": 3,
+      "changes": 27,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/720ea524cf695ea1bd31ded308eccbb509209b4f/test%2Ffixtures%2Ftcp.py",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/720ea524cf695ea1bd31ded308eccbb509209b4f/test%2Ffixtures%2Ftcp.py",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ffixtures%2Ftcp.py?ref=720ea524cf695ea1bd31ded308eccbb509209b4f",
+      "patch": "@@ -26,6 +26,9 @@\n @dataclass(frozen=True)\n class TcpOptions:\n     tls: bool = False\n+    certs: bool = False\n+    invalid_tls_handshake_first: bool = False\n+    client_send_delay: float = 0.0\n     mode: str = \"client\"  # \"client\" sends data; \"server\" receives data\n     payload: str = \"foo\\n\"\n \n@@ -55,12 +58,12 @@ def tcp() -> FixtureHandle:\n     stop_event = threading.Event()\n     state = _TcpState()\n     payload = opts.payload.encode()\n-    temp_dir = Path(tempfile.mkdtemp(prefix=\"tcp-\")) if opts.tls else None\n+    temp_dir = Path(tempfile.mkdtemp(prefix=\"tcp-\")) if opts.tls or opts.certs else None\n     cert_path: Path | None = None\n     key_path: Path | None = None\n     ca_path: Path | None = None\n     cert_and_key_path: Path | None = None\n-    if opts.tls:\n+    if opts.tls or opts.certs:\n         assert temp_dir is not None\n         cert_path, key_path, ca_path, cert_and_key_path = generate_self_signed_cert(\n             temp_dir, _COMMON_NAME\n@@ -85,6 +88,8 @@ def tcp() -> FixtureHandle:\n                 \"tls\": opts.tls,\n                 \"ca_path\": ca_path,\n                 \"capture_path\": client_capture_path,\n+                \"invalid_tls_handshake_first\": opts.invalid_tls_handshake_first,\n+                \"send_delay\": opts.client_send_delay,\n             },\n             daemon=True,\n         )\n@@ -110,7 +115,7 @@ def tcp() -> FixtureHandle:\n         env[\"TCP_FILE\"] = server_capture_path\n     if client_capture_path is not None:\n         env[\"TCP_CLIENT_FILE\"] = client_capture_path\n-    if opts.tls:\n+    if opts.tls or opts.certs:\n         assert cert_path is not None\n         assert key_path is not None\n         assert ca_path is not None\n@@ -192,6 +197,16 @@ def _teardown() -> None:\n     )\n \n \n+def _send_invalid_tls_handshake(port: int, stop_event: threading.Event) -> None:\n+    while not stop_event.is_set():\n+        try:\n+            with socket.create_connection((_HOST, port), timeout=1) as sock:\n+                sock.sendall(b\"\\x16\\x03\\x03\\x00\\x01\\x01\")\n+                return\n+        except (ConnectionRefusedError, OSError):\n+            time.sleep(_CLIENT_RETRY_DELAY)\n+\n+\n def _run_client_worker(\n     port: int,\n     stop_event: threading.Event,\n@@ -200,13 +215,17 @@ def _run_client_worker(\n     tls: bool,\n     ca_path: Path | None,\n     capture_path: str | None,\n+    invalid_tls_handshake_first: bool,\n+    send_delay: float,\n ) -> None:\n     context: ssl.SSLContext | None = None\n     if tls:\n         assert ca_path is not None\n         context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)\n         context.check_hostname = False\n         context.load_verify_locations(cafile=ca_path)\n+    if invalid_tls_handshake_first:\n+        _send_invalid_tls_handshake(port, stop_event)\n     while not stop_event.is_set():\n         try:\n             raw_sock = socket.create_connection((_HOST, port), timeout=1)\n@@ -222,6 +241,8 @@ def _run_client_worker(\n                     sock = raw_sock\n                 with sock:\n                     sock.settimeout(0.2)\n+                    if send_delay > 0:\n+                        stop_event.wait(send_delay)\n                     if payload:\n                         sock.sendall(payload)\n                     if context is None:"
+    },
+    {
+      "sha": "f334e5c1346fc8db5aa51fadb1f2f0db6e4e1681",
+      "filename": "test/tests/operators/accept_tcp/tls/auto_detect_delayed_plain_read_lines.tql",
+      "status": "added",
+      "additions": 19,
+      "deletions": 0,
+      "changes": 19,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/720ea524cf695ea1bd31ded308eccbb509209b4f/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Fauto_detect_delayed_plain_read_lines.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/720ea524cf695ea1bd31ded308eccbb509209b4f/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Fauto_detect_delayed_plain_read_lines.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Fauto_detect_delayed_plain_read_lines.tql?ref=720ea524cf695ea1bd31ded308eccbb509209b4f",
+      "patch": "@@ -0,0 +1,19 @@\n+---\n+fixtures:\n+  - tcp:\n+      mode: client\n+      certs: true\n+      client_send_delay: 6.0\n+timeout: 30\n+---\n+\n+let $tls = {\n+  certfile: env(\"TCP_CERTFILE\"),\n+  keyfile: env(\"TCP_KEYFILE\"),\n+  skip_peer_verification: true,\n+}\n+\n+accept_tcp env(\"TCP_ENDPOINT\"), tls=$tls, auto_detect_tls=true {\n+  read_lines\n+}\n+head 1"
+    },
+    {
+      "sha": "5e3a53c2f8bae501a2564022f237eed984272294",
+      "filename": "test/tests/operators/accept_tcp/tls/auto_detect_delayed_plain_read_lines.txt",
+      "status": "added",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/720ea524cf695ea1bd31ded308eccbb509209b4f/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Fauto_detect_delayed_plain_read_lines.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/720ea524cf695ea1bd31ded308eccbb509209b4f/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Fauto_detect_delayed_plain_read_lines.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Fauto_detect_delayed_plain_read_lines.txt?ref=720ea524cf695ea1bd31ded308eccbb509209b4f",
+      "patch": "@@ -0,0 +1,3 @@\n+{\n+  line: \"foo\",\n+}"
+    },
+    {
+      "sha": "41de88b6015cc59b838f4ad68f359de25cb1deae",
+      "filename": "test/tests/operators/accept_tcp/tls/auto_detect_plain_read_lines.tql",
+      "status": "added",
+      "additions": 18,
+      "deletions": 0,
+      "changes": 18,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/720ea524cf695ea1bd31ded308eccbb509209b4f/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Fauto_detect_plain_read_lines.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/720ea524cf695ea1bd31ded308eccbb509209b4f/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Fauto_detect_plain_read_lines.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Fauto_detect_plain_read_lines.tql?ref=720ea524cf695ea1bd31ded308eccbb509209b4f",
+      "patch": "@@ -0,0 +1,18 @@\n+---\n+fixtures:\n+  - tcp:\n+      mode: client\n+      certs: true\n+timeout: 60\n+---\n+\n+let $tls = {\n+  certfile: env(\"TCP_CERTFILE\"),\n+  keyfile: env(\"TCP_KEYFILE\"),\n+  skip_peer_verification: true,\n+}\n+\n+accept_tcp env(\"TCP_ENDPOINT\"), tls=$tls, auto_detect_tls=true {\n+  read_lines\n+}\n+head 1"
+    },
+    {
+      "sha": "5e3a53c2f8bae501a2564022f237eed984272294",
+      "filename": "test/tests/operators/accept_tcp/tls/auto_detect_plain_read_lines.txt",
+      "status": "added",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/720ea524cf695ea1bd31ded308eccbb509209b4f/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Fauto_detect_plain_read_lines.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/720ea524cf695ea1bd31ded308eccbb509209b4f/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Fauto_detect_plain_read_lines.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Fauto_detect_plain_read_lines.txt?ref=720ea524cf695ea1bd31ded308eccbb509209b4f",
+      "patch": "@@ -0,0 +1,3 @@\n+{\n+  line: \"foo\",\n+}"
+    },
+    {
+      "sha": "b40c550ad8d9fce8e46d5a8dc63def0bffdb6fde",
+      "filename": "test/tests/operators/accept_tcp/tls/auto_detect_tls_read_lines.tql",
+      "status": "added",
+      "additions": 18,
+      "deletions": 0,
+      "changes": 18,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/720ea524cf695ea1bd31ded308eccbb509209b4f/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Fauto_detect_tls_read_lines.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/720ea524cf695ea1bd31ded308eccbb509209b4f/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Fauto_detect_tls_read_lines.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Fauto_detect_tls_read_lines.tql?ref=720ea524cf695ea1bd31ded308eccbb509209b4f",
+      "patch": "@@ -0,0 +1,18 @@\n+---\n+fixtures:\n+  - tcp:\n+      mode: client\n+      tls: true\n+timeout: 60\n+---\n+\n+let $tls = {\n+  certfile: env(\"TCP_CERTFILE\"),\n+  keyfile: env(\"TCP_KEYFILE\"),\n+  skip_peer_verification: true,\n+}\n+\n+accept_tcp env(\"TCP_ENDPOINT\"), tls=$tls, auto_detect_tls=true {\n+  read_lines\n+}\n+head 1"
+    },
+    {
+      "sha": "5e3a53c2f8bae501a2564022f237eed984272294",
+      "filename": "test/tests/operators/accept_tcp/tls/auto_detect_tls_read_lines.txt",
+      "status": "added",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/720ea524cf695ea1bd31ded308eccbb509209b4f/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Fauto_detect_tls_read_lines.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/720ea524cf695ea1bd31ded308eccbb509209b4f/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Fauto_detect_tls_read_lines.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Fauto_detect_tls_read_lines.txt?ref=720ea524cf695ea1bd31ded308eccbb509209b4f",
+      "patch": "@@ -0,0 +1,3 @@\n+{\n+  line: \"foo\",\n+}"
+    },
+    {
+      "sha": "68161f1046bb0196a499f9473b391837c07a5180",
+      "filename": "test/tests/operators/accept_tcp/tls/error_tls_auto_detect_disabled.tql",
+      "status": "added",
+      "additions": 9,
+      "deletions": 0,
+      "changes": 9,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/720ea524cf695ea1bd31ded308eccbb509209b4f/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Ferror_tls_auto_detect_disabled.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/720ea524cf695ea1bd31ded308eccbb509209b4f/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Ferror_tls_auto_detect_disabled.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Ferror_tls_auto_detect_disabled.tql?ref=720ea524cf695ea1bd31ded308eccbb509209b4f",
+      "patch": "@@ -0,0 +1,9 @@\n+---\n+error: true\n+---\n+\n+accept_tcp \"127.0.0.1:31337\",\n+           tls=false,\n+           auto_detect_tls=true {\n+  read_lines\n+}"
+    },
+    {
+      "sha": "b6daa649da21f9195bf339b8967a63ccd65b08b4",
+      "filename": "test/tests/operators/accept_tcp/tls/error_tls_auto_detect_disabled.txt",
+      "status": "added",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/720ea524cf695ea1bd31ded308eccbb509209b4f/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Ferror_tls_auto_detect_disabled.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/720ea524cf695ea1bd31ded308eccbb509209b4f/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Ferror_tls_auto_detect_disabled.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Ferror_tls_auto_detect_disabled.txt?ref=720ea524cf695ea1bd31ded308eccbb509209b4f",
+      "patch": "@@ -0,0 +1,6 @@\n+error: `auto_detect_tls` requires TLS to be enabled\n+ --> tests/operators/accept_tcp/tls/error_tls_auto_detect_disabled.tql:7:28\n+  |\n+7 |            auto_detect_tls=true {\n+  |                            ^^^^ \n+  |"
+    },
+    {
+      "sha": "5aff83ef0c95ccdd3432e387d3c357bdeb91c04b",
+      "filename": "test/tests/operators/accept_tcp/tls/failed_auto_detect_tls_then_plain/read_after_failed_handshake.py",
+      "status": "added",
+      "additions": 75,
+      "deletions": 0,
+      "changes": 75,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/720ea524cf695ea1bd31ded308eccbb509209b4f/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Ffailed_auto_detect_tls_then_plain%2Fread_after_failed_handshake.py",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/720ea524cf695ea1bd31ded308eccbb509209b4f/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Ffailed_auto_detect_tls_then_plain%2Fread_after_failed_handshake.py",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Ffailed_auto_detect_tls_then_plain%2Fread_after_failed_handshake.py?ref=720ea524cf695ea1bd31ded308eccbb509209b4f",
+      "patch": "@@ -0,0 +1,75 @@\n+# runner: python\n+\"\"\"Verify a bad TLS-looking client does not stop auto-detect TCP accepts.\"\"\"\n+\n+from __future__ import annotations\n+\n+import os\n+import re\n+import shutil\n+import subprocess\n+\n+\n+def _resolve_tenzir_binary() -> str:\n+    binary = shutil.which(\"tenzir\")\n+    if binary:\n+        return binary\n+    raise RuntimeError(\"tenzir executable not found\")\n+\n+\n+def main() -> None:\n+    pipeline = r\"\"\"\n+let $tls = {\n+  certfile: env(\"TCP_CERTFILE\"),\n+  keyfile: env(\"TCP_KEYFILE\"),\n+  skip_peer_verification: true,\n+}\n+\n+accept_tcp env(\"TCP_ENDPOINT\"), tls=$tls, auto_detect_tls=true {\n+  read_lines\n+}\n+head 1\n+\"\"\".strip()\n+    result = subprocess.run(\n+        [\n+            _resolve_tenzir_binary(),\n+            \"--bare-mode\",\n+            \"--console-verbosity=warning\",\n+            \"--multi\",\n+            \"--neo\",\n+            pipeline,\n+        ],\n+        text=True,\n+        capture_output=True,\n+        check=False,\n+        env=os.environ,\n+    )\n+    if result.returncode != 0:\n+        raise RuntimeError(\n+            f\"accept_tcp failed with exit code {result.returncode}\\n\"\n+            f\"stdout:\\n{result.stdout}\\n\"\n+            f\"stderr:\\n{result.stderr}\"\n+        )\n+    expected_output = '{\\n  line: \"foo\",\\n}'\n+    if expected_output not in result.stdout:\n+        raise AssertionError(\n+            \"expected accepted plaintext output\\n\"\n+            f\"stdout:\\n{result.stdout}\\n\"\n+            f\"stderr:\\n{result.stderr}\"\n+        )\n+    combined_output = f\"{result.stdout}\\n{result.stderr}\"\n+    expected_warning = re.compile(\n+        r\"warning: TLS handshake failed.*\"\n+        r\"TLS handshake with peer 127\\.0\\.0\\.1:\\d+ failed\",\n+        re.DOTALL,\n+    )\n+    if not expected_warning.search(combined_output):\n+        raise AssertionError(\n+            \"expected failed TLS handshake warning\\n\"\n+            f\"stdout:\\n{result.stdout}\\n\"\n+            f\"stderr:\\n{result.stderr}\"\n+        )\n+    print(expected_output)\n+\n+\n+if __name__ == \"__main__\":\n+    main()"
+    },
+    {
+      "sha": "5e3a53c2f8bae501a2564022f237eed984272294",
+      "filename": "test/tests/operators/accept_tcp/tls/failed_auto_detect_tls_then_plain/read_after_failed_handshake.txt",
+      "status": "added",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/720ea524cf695ea1bd31ded308eccbb509209b4f/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Ffailed_auto_detect_tls_then_plain%2Fread_after_failed_handshake.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/720ea524cf695ea1bd31ded308eccbb509209b4f/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Ffailed_auto_detect_tls_then_plain%2Fread_after_failed_handshake.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Ffailed_auto_detect_tls_then_plain%2Fread_after_failed_handshake.txt?ref=720ea524cf695ea1bd31ded308eccbb509209b4f",
+      "patch": "@@ -0,0 +1,3 @@\n+{\n+  line: \"foo\",\n+}"
+    },
+    {
+      "sha": "73de61d2834fe5d6363262ba47578fa67afbc0cf",
+      "filename": "test/tests/operators/accept_tcp/tls/failed_auto_detect_tls_then_plain/test.yaml",
+      "status": "added",
+      "additions": 7,
+      "deletions": 0,
+      "changes": 7,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/720ea524cf695ea1bd31ded308eccbb509209b4f/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Ffailed_auto_detect_tls_then_plain%2Ftest.yaml",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/720ea524cf695ea1bd31ded308eccbb509209b4f/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Ffailed_auto_detect_tls_then_plain%2Ftest.yaml",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Ffailed_auto_detect_tls_then_plain%2Ftest.yaml?ref=720ea524cf695ea1bd31ded308eccbb509209b4f",
+      "patch": "@@ -0,0 +1,7 @@\n+suite: accept-tcp-failed-auto-detect-tls-then-plain\n+fixtures:\n+  - tcp:\n+      mode: client\n+      certs: true\n+      invalid_tls_handshake_first: true\n+timeout: 60"
+    }
+  ]
+}

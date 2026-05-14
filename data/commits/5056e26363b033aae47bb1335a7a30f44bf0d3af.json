@@ -1,0 +1,29 @@
+{
+  "message": "fix(process): close PATH-walk vs setenv UAF in execvp_via_execve\n\nREVIEW round 4 (same defense class as 7c5b8200/d088570b):\nprocess_abi::path_bytes_from_env_vector walked the libc-global\n`environ` array reading entries via CStr::from_ptr without holding\nENVIRON_LOCK. A concurrent setenv from another thread that triggered\nhost_passthrough_realloc on the environ array would free the memory\nunder our cursor \u2014 UAF.\n\nReachability: every multi-threaded program that calls execvp / execlp\non a path that requires PATH search (no '/' in the file argument)\nruns this walk before the execve. Threads still active at execvp time\ncan race the env walk.\n\nFix: expose ENVIRON_LOCK and a helper `with_environ_locked` from\nstdlib_abi, then have path_bytes_from_env_vector route the\nprocess-global walk through it. Caller-supplied envp pointers are\nwalked directly (the caller owns that array's lifetime, not libc).\n\nFull abi suite: 2976/2976 pass.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "aa34c1da405d68170a3593cd451d449f6be32895",
+      "filename": "crates/frankenlibc-abi/src/process_abi.rs",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 5,
+      "changes": 20,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/5056e26363b033aae47bb1335a7a30f44bf0d3af/crates%2Ffrankenlibc-abi%2Fsrc%2Fprocess_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/5056e26363b033aae47bb1335a7a30f44bf0d3af/crates%2Ffrankenlibc-abi%2Fsrc%2Fprocess_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Fprocess_abi.rs?ref=5056e26363b033aae47bb1335a7a30f44bf0d3af",
+      "patch": "@@ -19,12 +19,22 @@ unsafe extern \"C\" {\n     static mut environ: *mut *mut c_char;\n }\n \n-unsafe fn path_bytes_from_env_vector(mut envp: *const *mut c_char) -> Vec<u8> {\n-    if envp.is_null() {\n-        // SAFETY: reading the process-global `environ` pointer is valid here.\n-        envp = unsafe { environ as *const *mut c_char };\n-    }\n+unsafe fn path_bytes_from_env_vector(envp: *const *mut c_char) -> Vec<u8> {\n+    // If a caller-supplied envp was provided, walk it directly: that array\n+    // is owned by the caller, not by libc's mutable environ table, so\n+    // ENVIRON_LOCK does not apply.\n+    if !envp.is_null() {\n+        return unsafe { walk_env_for_path(envp) };\n+    }\n+    // Walking the process-global `environ` requires ENVIRON_LOCK to avoid\n+    // UAFing on a concurrent setenv realloc \u2014 same defense class as the\n+    // native_getenv / clearenv fixes. (REVIEW round 4.)\n+    crate::stdlib_abi::with_environ_locked(|envp| unsafe {\n+        walk_env_for_path(envp as *const *mut c_char)\n+    })\n+}\n \n+unsafe fn walk_env_for_path(mut envp: *const *mut c_char) -> Vec<u8> {\n     while !envp.is_null() {\n         // SAFETY: `envp` points to a NULL-terminated environment vector.\n         let entry = unsafe { *envp };"
+    },
+    {
+      "sha": "62f9116591c7f009132edd9efc8582e523d27084",
+      "filename": "crates/frankenlibc-abi/src/stdlib_abi.rs",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 1,
+      "changes": 15,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/5056e26363b033aae47bb1335a7a30f44bf0d3af/crates%2Ffrankenlibc-abi%2Fsrc%2Fstdlib_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/5056e26363b033aae47bb1335a7a30f44bf0d3af/crates%2Ffrankenlibc-abi%2Fsrc%2Fstdlib_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Fstdlib_abi.rs?ref=5056e26363b033aae47bb1335a7a30f44bf0d3af",
+      "patch": "@@ -77,7 +77,20 @@ static ENVIRON_OWNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB\n /// while holding the lock can transitively re-enter our getenv during early\n /// glibc malloc initialization (MALLOC_PERTURB_/MALLOC_CHECK_ probes); a\n /// non-reentrant Mutex would self-deadlock in that window.\n-static ENVIRON_LOCK: parking_lot::ReentrantMutex<()> = parking_lot::ReentrantMutex::new(());\n+pub(crate) static ENVIRON_LOCK: parking_lot::ReentrantMutex<()> =\n+    parking_lot::ReentrantMutex::new(());\n+\n+/// Cross-module helper: run `f` with the environ array held stable. Other\n+/// ABI modules (process_abi for PATH lookup, etc.) need to walk environ\n+/// without UAFing on a concurrent setenv realloc; this acquires the same\n+/// lock the mutators use.\n+pub(crate) fn with_environ_locked<R>(f: impl FnOnce(*mut *mut c_char) -> R) -> R {\n+    let _lock = ENVIRON_LOCK.lock();\n+    // SAFETY: HOST_ENVIRON is the libc environ pointer; the lock guards the\n+    // array layout against concurrent realloc by setenv/unsetenv/clearenv.\n+    let envp = unsafe { HOST_ENVIRON };\n+    f(envp)\n+}\n \n #[inline]\n unsafe fn native_c_strlen(s: *const c_char) -> usize {"
+    }
+  ]
+}

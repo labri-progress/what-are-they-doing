@@ -1,0 +1,41 @@
+{
+  "message": "refactor(store): add schema version migration guardrails",
+  "files": [
+    {
+      "sha": "16755f71f9d8add111b3d275027acd4f70837023",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/openclaw/discrawl/blob/86b4c470eb991a4b0c9c9891d0054e6e83c6ea69/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/discrawl/raw/86b4c470eb991a4b0c9c9891d0054e6e83c6ea69/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/discrawl/contents/CHANGELOG.md?ref=86b4c470eb991a4b0c9c9891d0054e6e83c6ea69",
+      "patch": "@@ -2,6 +2,12 @@\n \n All notable changes to `discrawl` will be documented in this file.\n \n+## Unreleased\n+\n+- `sync --full` no longer aborts when forum thread discovery hits Discord `403 Missing Access`; inaccessible channels are skipped and marked unavailable while accessible channels continue syncing\n+- startup now validates and stamps SQLite schema version via `PRAGMA user_version`, and fails fast if the local DB schema is newer than the running binary\n+- `init --from-openclaw` now supports `--account`, and OpenClaw token fields can use `${ENV_VAR}` placeholders\n+\n ## 0.2.0 - 2026-03-26\n \n - much faster `sync --full` behavior on large archives: incomplete backfills are auto-batched, active-thread discovery is more precise, and steady-state refreshes avoid re-scanning every archived thread once history is already complete"
+    },
+    {
+      "sha": "6d2ec6227b26e345a7e4a8c5958b51064bfed3aa",
+      "filename": "internal/store/store.go",
+      "status": "modified",
+      "additions": 57,
+      "deletions": 12,
+      "changes": 69,
+      "blob_url": "https://github.com/openclaw/discrawl/blob/86b4c470eb991a4b0c9c9891d0054e6e83c6ea69/internal%2Fstore%2Fstore.go",
+      "raw_url": "https://github.com/openclaw/discrawl/raw/86b4c470eb991a4b0c9c9891d0054e6e83c6ea69/internal%2Fstore%2Fstore.go",
+      "contents_url": "https://api.github.com/repos/openclaw/discrawl/contents/internal%2Fstore%2Fstore.go?ref=86b4c470eb991a4b0c9c9891d0054e6e83c6ea69",
+      "patch": "@@ -15,9 +15,10 @@ import (\n )\n \n const (\n-\ttimeLayout        = time.RFC3339Nano\n-\tmessageFTSVersion = \"2\"\n-\tmemberFTSVersion  = \"1\"\n+\ttimeLayout         = time.RFC3339Nano\n+\tmessageFTSVersion  = \"2\"\n+\tmemberFTSVersion   = \"1\"\n+\tstoreSchemaVersion = 1\n )\n \n type Store struct {\n@@ -187,6 +188,56 @@ func (s *Store) DB() *sql.DB {\n }\n \n func (s *Store) migrate(ctx context.Context) error {\n+\tcurrentVersion, err := s.schemaVersion(ctx)\n+\tif err != nil {\n+\t\treturn err\n+\t}\n+\tif currentVersion > storeSchemaVersion {\n+\t\treturn fmt.Errorf(\"database schema version %d is newer than supported version %d\", currentVersion, storeSchemaVersion)\n+\t}\n+\tif currentVersion < 1 {\n+\t\tif err := s.applyBaselineSchema(ctx); err != nil {\n+\t\t\treturn err\n+\t\t}\n+\t\tif err := s.setSchemaVersion(ctx, storeSchemaVersion); err != nil {\n+\t\t\treturn err\n+\t\t}\n+\t}\n+\tif version, err := s.schemaVersion(ctx); err != nil {\n+\t\treturn err\n+\t} else if version != storeSchemaVersion {\n+\t\treturn fmt.Errorf(\"database schema version mismatch: got %d want %d\", version, storeSchemaVersion)\n+\t}\n+\tif err := s.ensureFTSRowIDs(ctx); err != nil {\n+\t\treturn err\n+\t}\n+\tif err := s.ensureMemberFTSRowIDs(ctx); err != nil {\n+\t\treturn err\n+\t}\n+\treturn nil\n+}\n+\n+func (s *Store) schemaVersion(ctx context.Context) (int, error) {\n+\tvar version int\n+\tif err := s.db.QueryRowContext(ctx, `pragma user_version`).Scan(&version); err != nil {\n+\t\treturn 0, fmt.Errorf(\"read schema version: %w\", err)\n+\t}\n+\treturn version, nil\n+}\n+\n+func (s *Store) setSchemaVersion(ctx context.Context, version int) error {\n+\tif _, err := s.db.ExecContext(ctx, fmt.Sprintf(\"pragma user_version = %d\", version)); err != nil {\n+\t\treturn fmt.Errorf(\"set schema version %d: %w\", version, err)\n+\t}\n+\treturn nil\n+}\n+\n+func (s *Store) applyBaselineSchema(ctx context.Context) error {\n+\ttx, err := s.db.BeginTx(ctx, nil)\n+\tif err != nil {\n+\t\treturn err\n+\t}\n+\tdefer rollback(tx)\n \tstmts := []string{\n \t\t`create table if not exists guilds (\n \t\t\tid text primary key,\n@@ -319,17 +370,11 @@ func (s *Store) migrate(ctx context.Context) error {\n \t\t`create index if not exists idx_mentions_author on mention_events(author_id, event_at);`,\n \t}\n \tfor _, stmt := range stmts {\n-\t\tif _, err := s.db.ExecContext(ctx, stmt); err != nil {\n-\t\t\treturn fmt.Errorf(\"migrate: %w\", err)\n+\t\tif _, err := tx.ExecContext(ctx, stmt); err != nil {\n+\t\t\treturn fmt.Errorf(\"migrate baseline schema: %w\", err)\n \t\t}\n \t}\n-\tif err := s.ensureFTSRowIDs(ctx); err != nil {\n-\t\treturn err\n-\t}\n-\tif err := s.ensureMemberFTSRowIDs(ctx); err != nil {\n-\t\treturn err\n-\t}\n-\treturn nil\n+\treturn tx.Commit()\n }\n \n func (s *Store) ensureFTSRowIDs(ctx context.Context) error {"
+    },
+    {
+      "sha": "4ad9b33024de7db581ed758f0a58213b97276211",
+      "filename": "internal/store/store_test.go",
+      "status": "modified",
+      "additions": 60,
+      "deletions": 0,
+      "changes": 60,
+      "blob_url": "https://github.com/openclaw/discrawl/blob/86b4c470eb991a4b0c9c9891d0054e6e83c6ea69/internal%2Fstore%2Fstore_test.go",
+      "raw_url": "https://github.com/openclaw/discrawl/raw/86b4c470eb991a4b0c9c9891d0054e6e83c6ea69/internal%2Fstore%2Fstore_test.go",
+      "contents_url": "https://api.github.com/repos/openclaw/discrawl/contents/internal%2Fstore%2Fstore_test.go?ref=86b4c470eb991a4b0c9c9891d0054e6e83c6ea69",
+      "patch": "@@ -2,6 +2,7 @@ package store\n \n import (\n \t\"context\"\n+\t\"database/sql\"\n \t\"os\"\n \t\"path/filepath\"\n \t\"runtime\"\n@@ -137,6 +138,65 @@ func TestStoreReadWriteAndSearch(t *testing.T) {\n \trequire.Equal(t, \"Peter\", messageRows[0].AuthorName)\n }\n \n+func TestOpenSetsSchemaVersion(t *testing.T) {\n+\tt.Parallel()\n+\n+\tctx := context.Background()\n+\ts, err := Open(ctx, filepath.Join(t.TempDir(), \"discrawl.db\"))\n+\trequire.NoError(t, err)\n+\tdefer func() { _ = s.Close() }()\n+\n+\tvar version int\n+\trequire.NoError(t, s.DB().QueryRowContext(ctx, `pragma user_version`).Scan(&version))\n+\trequire.Equal(t, storeSchemaVersion, version)\n+}\n+\n+func TestOpenFailsOnFutureSchemaVersion(t *testing.T) {\n+\tt.Parallel()\n+\n+\tctx := context.Background()\n+\tdbPath := filepath.Join(t.TempDir(), \"discrawl.db\")\n+\n+\ts, err := Open(ctx, dbPath)\n+\trequire.NoError(t, err)\n+\trequire.NoError(t, s.Close())\n+\n+\tdb, err := sql.Open(\"sqlite\", dbPath)\n+\trequire.NoError(t, err)\n+\t_, err = db.ExecContext(ctx, `pragma user_version = 999`)\n+\trequire.NoError(t, err)\n+\trequire.NoError(t, db.Close())\n+\n+\t_, err = Open(ctx, dbPath)\n+\trequire.Error(t, err)\n+\trequire.Contains(t, err.Error(), \"newer than supported\")\n+}\n+\n+func TestOpenBackfillsMissingSchemaVersion(t *testing.T) {\n+\tt.Parallel()\n+\n+\tctx := context.Background()\n+\tdbPath := filepath.Join(t.TempDir(), \"discrawl.db\")\n+\n+\ts, err := Open(ctx, dbPath)\n+\trequire.NoError(t, err)\n+\trequire.NoError(t, s.Close())\n+\n+\tdb, err := sql.Open(\"sqlite\", dbPath)\n+\trequire.NoError(t, err)\n+\t_, err = db.ExecContext(ctx, `pragma user_version = 0`)\n+\trequire.NoError(t, err)\n+\trequire.NoError(t, db.Close())\n+\n+\ts, err = Open(ctx, dbPath)\n+\trequire.NoError(t, err)\n+\tdefer func() { _ = s.Close() }()\n+\n+\tvar version int\n+\trequire.NoError(t, s.DB().QueryRowContext(ctx, `pragma user_version`).Scan(&version))\n+\trequire.Equal(t, storeSchemaVersion, version)\n+}\n+\n func TestReadOnlyQueryGuards(t *testing.T) {\n \tt.Parallel()\n "
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "message": "fix: bound setproctitle progname scan",
+  "files": [
+    {
+      "sha": "8405af35bdefaff92aa4467f3d4b42765d919641",
+      "filename": "crates/frankenlibc-abi/src/unistd_abi.rs",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 6,
+      "changes": 26,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/63e142143fdfd0c291e5c62dd1e217872a69a270/crates%2Ffrankenlibc-abi%2Fsrc%2Funistd_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/63e142143fdfd0c291e5c62dd1e217872a69a270/crates%2Ffrankenlibc-abi%2Fsrc%2Funistd_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Funistd_abi.rs?ref=63e142143fdfd0c291e5c62dd1e217872a69a270",
+      "patch": "@@ -4,7 +4,7 @@\n //! directory navigation (getcwd/chdir), process identity (getpid/getppid/getuid/...),\n //! link operations (link/symlink/readlink/unlink/rmdir), and sync (fsync/fdatasync).\n \n-use std::ffi::{CStr, CString, c_char, c_int, c_long, c_uchar, c_uint, c_ulong, c_void};\n+use std::ffi::{CString, c_char, c_int, c_long, c_uchar, c_uint, c_ulong, c_void};\n \n use frankenlibc_core::errno;\n use frankenlibc_core::stdio::{ValueArgKind, count_printf_args, positional_printf_arg_plan};\n@@ -23467,6 +23467,7 @@ unsafe impl Send for ProcTitleStorage {}\n static PROCTITLE_STATE: _ProcTitleMutex<Option<ProcTitleStorage>> = _ProcTitleMutex::new(None);\n \n const PR_SET_NAME_FOR_TITLE: c_int = 15;\n+const PROCTITLE_PROGNAME_SCAN_LIMIT: usize = libc::PATH_MAX as usize;\n \n fn clear_proctitle_state() {\n     let mut guard = PROCTITLE_STATE.lock().unwrap_or_else(|p| p.into_inner());\n@@ -23593,11 +23594,24 @@ pub unsafe extern \"C\" fn setproctitle(fmt: *const c_char, mut args: ...) {\n             let progname_ptr = crate::startup_abi::program_invocation_short_name\n                 .load(std::sync::atomic::Ordering::Acquire);\n             if !progname_ptr.is_null() {\n-                // SAFETY: published progname is a NUL-terminated C string\n-                // in process-static storage.\n-                let pn = unsafe { CStr::from_ptr(progname_ptr) }.to_bytes();\n-                out.extend_from_slice(pn);\n-                out.extend_from_slice(b\": \");\n+                let progname_addr = progname_ptr as usize;\n+                let storage_addr = storage.base as usize;\n+                let storage_bound = progname_addr\n+                    .checked_sub(storage_addr)\n+                    .filter(|&offset| offset < storage.capacity)\n+                    .map(|offset| storage.capacity - offset);\n+                let bound = storage_bound\n+                    .or_else(|| known_remaining(progname_addr))\n+                    .unwrap_or(PROCTITLE_PROGNAME_SCAN_LIMIT);\n+                let (progname_len, progname_terminated) =\n+                    unsafe { scan_c_string(progname_ptr, Some(bound)) };\n+                if progname_terminated {\n+                    let pn = unsafe {\n+                        std::slice::from_raw_parts(progname_ptr.cast::<u8>(), progname_len)\n+                    };\n+                    out.extend_from_slice(pn);\n+                    out.extend_from_slice(b\": \");\n+                }\n             }\n             out.extend_from_slice(&body);\n             out"
+    },
+    {
+      "sha": "dc78e0b918616881dbd327845d53d19c26aa160e",
+      "filename": "crates/frankenlibc-abi/tests/unistd_abi_test.rs",
+      "status": "modified",
+      "additions": 23,
+      "deletions": 0,
+      "changes": 23,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/63e142143fdfd0c291e5c62dd1e217872a69a270/crates%2Ffrankenlibc-abi%2Ftests%2Funistd_abi_test.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/63e142143fdfd0c291e5c62dd1e217872a69a270/crates%2Ffrankenlibc-abi%2Ftests%2Funistd_abi_test.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Ftests%2Funistd_abi_test.rs?ref=63e142143fdfd0c291e5c62dd1e217872a69a270",
+      "patch": "@@ -6667,6 +6667,29 @@ fn setproctitle_default_prefix_includes_progname() {\n     assert_eq!(s, b\"myprog: hello world\");\n }\n \n+#[test]\n+fn setproctitle_skips_unterminated_published_progname() {\n+    let _guard = SETPROCTITLE_LOCK.lock().unwrap_or_else(|p| p.into_inner());\n+    let (mut argv, mut envp, backing) = build_synthetic_argv(\"originalname\", 64);\n+    unsafe { setproctitle_init(1, argv.as_mut_ptr(), envp.as_mut_ptr()) };\n+\n+    let raw_progname = malloc_tracked_unterminated(b\"badprog\");\n+    let old_progname = frankenlibc_abi::startup_abi::program_invocation_short_name\n+        .swap(raw_progname, std::sync::atomic::Ordering::AcqRel);\n+\n+    let fmt = c\"hello\";\n+    unsafe {\n+        setproctitle(fmt.as_ptr());\n+        frankenlibc_abi::startup_abi::program_invocation_short_name\n+            .store(old_progname, std::sync::atomic::Ordering::Release);\n+        frankenlibc_abi::malloc_abi::free(raw_progname.cast());\n+    }\n+\n+    let raw = backing[0].as_ptr();\n+    let s = unsafe { std::ffi::CStr::from_ptr(raw as *const c_char) }.to_bytes();\n+    assert_eq!(s, b\"hello\");\n+}\n+\n #[test]\n fn setproctitle_truncates_at_capacity_minus_one() {\n     let _guard = SETPROCTITLE_LOCK.lock().unwrap_or_else(|p| p.into_inner());"
+    }
+  ]
+}

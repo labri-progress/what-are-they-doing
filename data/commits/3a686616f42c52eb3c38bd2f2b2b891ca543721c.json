@@ -1,0 +1,89 @@
+{
+  "message": "fix: harden memory authorization and maintenance state",
+  "files": [
+    {
+      "sha": "4fca09f178b9d92b150ee82e100a7c3a4e084f5a",
+      "filename": "src/core/session-collapse.ts",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 4,
+      "changes": 12,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/3a686616f42c52eb3c38bd2f2b2b891ca543721c/src%2Fcore%2Fsession-collapse.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/3a686616f42c52eb3c38bd2f2b2b891ca543721c/src%2Fcore%2Fsession-collapse.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/src%2Fcore%2Fsession-collapse.ts?ref=3a686616f42c52eb3c38bd2f2b2b891ca543721c",
+      "patch": "@@ -100,7 +100,6 @@ export async function collapseSessionToMemory(\n \t\tproject,\n \t\tnow,\n \t});\n-\tawait input.genome.addSegment(segment);\n \n \tconst extractionDrafts = await extractMemoryDrafts({\n \t\tclient: input.client,\n@@ -117,7 +116,7 @@ export async function collapseSessionToMemory(\n \t\tembeddingProvider: await input.genome.memoryEmbeddingProvider(),\n \t});\n \n-\tfor (const [index, draft] of filtered.entries()) {\n+\tconst memories = filtered.map((draft, index) => {\n \t\tconst memory = memoryFromDraft(draft, {\n \t\t\tid: `${segment.id}-mem-${index}`,\n \t\t\tsource: `segment:${input.sessionId}`,\n@@ -126,14 +125,19 @@ export async function collapseSessionToMemory(\n \t\t\tsourceSessionId: input.sessionId,\n \t\t\tsourceSegmentId: segment.id,\n \t\t});\n-\t\tawait input.genome.addMemory({\n+\t\treturn {\n \t\t\t...memory,\n \t\t\tproject_ids:\n \t\t\t\tproject.id === \"unknown\"\n \t\t\t\t\t? memory.project_ids\n \t\t\t\t\t: [...new Set([...(memory.project_ids ?? []), project.id])],\n-\t\t});\n+\t\t};\n+\t});\n+\n+\tfor (const memory of memories) {\n+\t\tawait input.genome.addMemory(memory);\n \t}\n+\tawait input.genome.addSegment(segment);\n \n \treturn {\n \t\tsegment,"
+    },
+    {
+      "sha": "0e524dd012b99f26e2ffab25d3e798476d0d4201",
+      "filename": "src/genome/entity-gc.ts",
+      "status": "modified",
+      "additions": 60,
+      "deletions": 2,
+      "changes": 62,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/3a686616f42c52eb3c38bd2f2b2b891ca543721c/src%2Fgenome%2Fentity-gc.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/3a686616f42c52eb3c38bd2f2b2b891ca543721c/src%2Fgenome%2Fentity-gc.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/src%2Fgenome%2Fentity-gc.ts?ref=3a686616f42c52eb3c38bd2f2b2b891ca543721c",
+      "patch": "@@ -54,12 +54,14 @@ export interface EntityGcApplyResult {\n }\n \n const DEFAULT_FUZZY_THRESHOLD = 0.78;\n+const ENTITY_GC_REJECT_PREFIX = \"Entity GC rejected \";\n \n export function discoverEntityGcGroups(\n \tmemories: readonly Memory[],\n \toptions: EntityGcDiscoveryOptions = {},\n ): EntityGcGroup[] {\n \tconst occurrences = collectEntityOccurrences(memories);\n+\tconst memoryById = new Map(memories.map((memory) => [memory.id, memory]));\n \tconst groups: EntityGcGroup[] = [];\n \tconst byType = new Map<EntityLinkEntry[\"type\"], EntityOccurrence[]>();\n \tfor (const occurrence of occurrences) {\n@@ -99,8 +101,10 @@ export function discoverEntityGcGroups(\n \t\t\tconst candidates = component.sort(\n \t\t\t\t(a, b) => b.count - a.count || a.name.localeCompare(b.name) || a.uuid.localeCompare(b.uuid),\n \t\t\t);\n+\t\t\tconst id = `entity-gc-${type.toLowerCase()}-${slug(canonical.name)}`;\n+\t\t\tif (hasRejectedEntityGcGroup(id, component, memoryById)) continue;\n \t\t\tgroups.push({\n-\t\t\t\tid: `entity-gc-${type.toLowerCase()}-${slug(canonical.name)}`,\n+\t\t\t\tid,\n \t\t\t\ttype,\n \t\t\t\tcanonical,\n \t\t\t\tcandidates,\n@@ -205,7 +209,7 @@ export async function applyEntityGcDecision(\n \toptions: { now?: number; source?: string } = {},\n ): Promise<EntityGcApplyResult> {\n \tif (decision.action === \"reject\") {\n-\t\treturn { updated_memory_ids: [], archived_aliases: [] };\n+\t\treturn rejectEntityGcGroup(genome, group, decision.reasoning, options);\n \t}\n \tif (!decision.canonical || !decision.aliases?.length) {\n \t\tthrow new Error(\"Entity GC merge decision missing canonical or aliases\");\n@@ -265,6 +269,43 @@ export async function applyEntityGcDecision(\n \treturn { updated_memory_ids: updatedIds, archived_aliases: archivedAliases };\n }\n \n+async function rejectEntityGcGroup(\n+\tgenome: Genome,\n+\tgroup: EntityGcGroup,\n+\treasoning: string,\n+\toptions: { now?: number; source?: string } = {},\n+): Promise<EntityGcApplyResult> {\n+\tconst now = options.now ?? Date.now();\n+\tconst candidateKeys = new Set(group.candidates.map(entityKey));\n+\tconst updatedIds: string[] = [];\n+\n+\tfor (const memory of genome.memories.all()) {\n+\t\tif (\n+\t\t\tmemory.archived_at ||\n+\t\t\t!memory.entity_links?.some((entity) => candidateKeys.has(entityKey(entity)))\n+\t\t) {\n+\t\t\tcontinue;\n+\t\t}\n+\t\tconst text = `${ENTITY_GC_REJECT_PREFIX}${group.id}: ${reasoning}`;\n+\t\tif ((memory.annotations ?? []).some((annotation) => annotation.text === text)) continue;\n+\t\tmemory.annotations = [\n+\t\t\t...(memory.annotations ?? []),\n+\t\t\t{\n+\t\t\t\ttext,\n+\t\t\t\tcreated_at: now,\n+\t\t\t\tsource: options.source ?? \"entity-gc\",\n+\t\t\t},\n+\t\t];\n+\t\tmemory.updated_at = now;\n+\t\tupdatedIds.push(memory.id);\n+\t}\n+\n+\tif (updatedIds.length > 0) {\n+\t\tawait genome.saveMemoryMutation(`genome: reject entity GC group '${group.id}'`);\n+\t}\n+\treturn { updated_memory_ids: updatedIds, archived_aliases: [] };\n+}\n+\n export function projectDueForEntityGc(\n \tproject: ProjectActivityRecord,\n \tcadenceActiveDays = 30,\n@@ -273,6 +314,23 @@ export function projectDueForEntityGc(\n \treturn project.cumulative_active_days - lastRun >= cadenceActiveDays;\n }\n \n+function hasRejectedEntityGcGroup(\n+\tgroupId: string,\n+\toccurrences: readonly EntityOccurrence[],\n+\tmemoryById: ReadonlyMap<string, Memory>,\n+): boolean {\n+\tconst marker = `${ENTITY_GC_REJECT_PREFIX}${groupId}:`;\n+\tfor (const occurrence of occurrences) {\n+\t\tfor (const memoryId of occurrence.memory_ids) {\n+\t\t\tconst memory = memoryById.get(memoryId);\n+\t\t\tif (memory?.annotations?.some((annotation) => annotation.text.startsWith(marker))) {\n+\t\t\t\treturn true;\n+\t\t\t}\n+\t\t}\n+\t}\n+\treturn false;\n+}\n+\n function collectEntityOccurrences(memories: readonly Memory[]): EntityOccurrence[] {\n \tconst byKey = new Map<string, EntityOccurrence>();\n \tfor (const memory of memories) {"
+    },
+    {
+      "sha": "e8718592e23027deab4503557669c7f4a3e89be6",
+      "filename": "src/genome/memory-tools.ts",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 1,
+      "changes": 14,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/3a686616f42c52eb3c38bd2f2b2b891ca543721c/src%2Fgenome%2Fmemory-tools.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/3a686616f42c52eb3c38bd2f2b2b891ca543721c/src%2Fgenome%2Fmemory-tools.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/src%2Fgenome%2Fmemory-tools.ts?ref=3a686616f42c52eb3c38bd2f2b2b891ca543721c",
+      "patch": "@@ -1,6 +1,7 @@\n import type { Primitive } from \"../kernel/primitives.ts\";\n import type {\n \tAnnotationEntry,\n+\tEntityLinkEntry,\n \tMemory,\n \tMemoryLinkEntry,\n \tPrimitiveResult,\n@@ -43,6 +44,16 @@ const MANUAL_MEMORY_LINK_TYPES = [\n \n const MANUAL_MEMORY_LINK_TYPE_SET = new Set<string>(MANUAL_MEMORY_LINK_TYPES);\n \n+const ENTITY_TYPES = [\n+\t\"PROJECT\",\n+\t\"LIBRARY\",\n+\t\"FILE_PATH\",\n+\t\"COMMAND\",\n+\t\"ERROR_TYPE\",\n+\t\"TECHNOLOGY\",\n+\t\"PERSON\",\n+] as const satisfies readonly EntityLinkEntry[\"type\"][];\n+\n export function buildReadMemoryPrimitives(ctx: MemoryToolContext): Primitive[] {\n \treturn [\n \t\tmemorySearchPrimitive(ctx),\n@@ -54,6 +65,7 @@ export function buildReadMemoryPrimitives(ctx: MemoryToolContext): Primitive[] {\n }\n \n export function buildWriteMemoryPrimitives(ctx: MemoryToolContext): Primitive[] {\n+\tif (ctx.agentName !== \"archivist\") return [];\n \treturn [\n \t\tmemoryAnnotatePrimitive(ctx),\n \t\tmemoryArchivePrimitive(ctx),\n@@ -143,7 +155,7 @@ function memoryEntityQueryPrimitive(ctx: MemoryToolContext): Primitive {\n \t\t\ttype: \"object\",\n \t\t\tproperties: {\n \t\t\t\tname: { type: \"string\" },\n-\t\t\t\ttype: { type: \"string\", enum: MANUAL_MEMORY_LINK_TYPES },\n+\t\t\t\ttype: { type: \"string\", enum: ENTITY_TYPES },\n \t\t\t},\n \t\t\trequired: [\"name\"],\n \t\t},"
+    },
+    {
+      "sha": "93dc4b55f973c606587576fdb0a95852e329b7c4",
+      "filename": "src/kernel/primitives.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/3a686616f42c52eb3c38bd2f2b2b891ca543721c/src%2Fkernel%2Fprimitives.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/3a686616f42c52eb3c38bd2f2b2b891ca543721c/src%2Fkernel%2Fprimitives.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/src%2Fkernel%2Fprimitives.ts?ref=3a686616f42c52eb3c38bd2f2b2b891ca543721c",
+      "patch": "@@ -98,7 +98,7 @@ export function buildWorkspacePrimitives(ctx: GenomeContext): Primitive[] {\n \t\tsaveFilePrimitive(ctx),\n \t\tsaveAgentPrimitive(ctx),\n \t\t...buildReadMemoryPrimitives(ctx),\n-\t\t...buildWriteMemoryPrimitives(ctx),\n+\t\t...(ctx.agentName === \"archivist\" ? buildWriteMemoryPrimitives(ctx) : []),\n \t];\n }\n "
+    },
+    {
+      "sha": "8e6c91c4393a06115d1b9a26c606e648455c42d6",
+      "filename": "test/genome/entity-gc.test.ts",
+      "status": "modified",
+      "additions": 40,
+      "deletions": 0,
+      "changes": 40,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/3a686616f42c52eb3c38bd2f2b2b891ca543721c/test%2Fgenome%2Fentity-gc.test.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/3a686616f42c52eb3c38bd2f2b2b891ca543721c/test%2Fgenome%2Fentity-gc.test.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/test%2Fgenome%2Fentity-gc.test.ts?ref=3a686616f42c52eb3c38bd2f2b2b891ca543721c",
+      "patch": "@@ -122,6 +122,46 @@ describe(\"entity GC\", () => {\n \t\t}\n \t});\n \n+\ttest(\"reject persists a marker so the same alias group is suppressed\", async () => {\n+\t\tconst root = await mkdtemp(join(tmpdir(), \"sprout-entity-gc-reject-\"));\n+\t\ttry {\n+\t\t\tconst genome = createTestGenome(root);\n+\t\t\tawait genome.init();\n+\t\t\tawait genome.addMemory(\n+\t\t\t\tmemory({\n+\t\t\t\t\tid: \"canonical-memory\",\n+\t\t\t\t\tentity_links: [{ uuid: \"entity_sprout\", type: \"PROJECT\", name: \"Sprout\" }],\n+\t\t\t\t}),\n+\t\t\t);\n+\t\t\tawait genome.addMemory(\n+\t\t\t\tmemory({\n+\t\t\t\t\tid: \"alias-memory\",\n+\t\t\t\t\tentity_links: [{ uuid: \"entity_sprout_alias\", type: \"PROJECT\", name: \"sprout\" }],\n+\t\t\t\t}),\n+\t\t\t);\n+\t\t\tconst group = discoverEntityGcGroups(genome.memories.all())[0]!;\n+\n+\t\t\tconst result = await applyEntityGcDecision(\n+\t\t\t\tgenome,\n+\t\t\t\tgroup,\n+\t\t\t\t{\n+\t\t\t\t\taction: \"reject\",\n+\t\t\t\t\treasoning: \"These names intentionally refer to separate project contexts.\",\n+\t\t\t\t},\n+\t\t\t\t{ now: 4000, source: \"memory-maintenance\" },\n+\t\t\t);\n+\n+\t\t\texpect(result.updated_memory_ids.sort()).toEqual([\"alias-memory\", \"canonical-memory\"]);\n+\t\t\texpect(discoverEntityGcGroups(genome.memories.all())).toEqual([]);\n+\t\t\texpect(genome.memories.getById(\"canonical-memory\")?.annotations?.[0]).toMatchObject({\n+\t\t\t\tcreated_at: 4000,\n+\t\t\t\tsource: \"memory-maintenance\",\n+\t\t\t});\n+\t\t} finally {\n+\t\t\tawait rm(root, { recursive: true, force: true });\n+\t\t}\n+\t});\n+\n \ttest(\"project-active-day schedule controls entity GC cadence\", () => {\n \t\texpect(\n \t\t\tprojectDueForEntityGc({"
+    },
+    {
+      "sha": "94eedfe574e81935b3470e3b576a507c953c0a81",
+      "filename": "test/genome/memory-tools.test.ts",
+      "status": "modified",
+      "additions": 19,
+      "deletions": 0,
+      "changes": 19,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/3a686616f42c52eb3c38bd2f2b2b891ca543721c/test%2Fgenome%2Fmemory-tools.test.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/3a686616f42c52eb3c38bd2f2b2b891ca543721c/test%2Fgenome%2Fmemory-tools.test.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/test%2Fgenome%2Fmemory-tools.test.ts?ref=3a686616f42c52eb3c38bd2f2b2b891ca543721c",
+      "patch": "@@ -124,6 +124,17 @@ describe(\"memory tools\", () => {\n \t\texpect(JSON.parse(result.output)[0].id).toBe(\"memory-alpha\");\n \t});\n \n+\ttest(\"memory_entity_query schema advertises entity types\", () => {\n+\t\tconst primitive = buildReadMemoryPrimitives(makeContext()).find(\n+\t\t\t(item) => item.name === \"memory_entity_query\",\n+\t\t)!;\n+\t\tconst properties = primitive.parameters.properties as Record<string, { enum?: string[] }>;\n+\n+\t\texpect(properties.type?.enum).toContain(\"PROJECT\");\n+\t\texpect(properties.type?.enum).toContain(\"TECHNOLOGY\");\n+\t\texpect(properties.type?.enum).not.toContain(\"refines\");\n+\t});\n+\n \ttest(\"memory_find_by_segment returns segment provenance\", async () => {\n \t\tconst ctx = makeContext([memory({ source_segment_id: \"segment-1\" })]);\n \n@@ -155,6 +166,14 @@ describe(\"memory tools\", () => {\n \t\texpect(result.error).toContain(\"confirmation\");\n \t});\n \n+\ttest(\"write memory primitives are only built for archivist\", () => {\n+\t\tconst ctx = makeContext();\n+\t\texpect(buildWriteMemoryPrimitives({ ...ctx, agentName: \"engineer\" })).toEqual([]);\n+\t\texpect(\n+\t\t\tbuildWriteMemoryPrimitives({ ...ctx, agentName: \"archivist\" }).map((item) => item.name),\n+\t\t).toContain(\"memory_archive\");\n+\t});\n+\n \ttest(\"memory_link persists valid relationship types\", async () => {\n \t\tconst ctx = makeContext([\n \t\t\tmemory({ id: \"memory-alpha\", short_id: \"mem_alpha00\" }),"
+    },
+    {
+      "sha": "31cfea5576dbaed9337f6112ea5bbe9db19571e2",
+      "filename": "test/host/session-collapse.test.ts",
+      "status": "modified",
+      "additions": 37,
+      "deletions": 0,
+      "changes": 37,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/3a686616f42c52eb3c38bd2f2b2b891ca543721c/test%2Fhost%2Fsession-collapse.test.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/3a686616f42c52eb3c38bd2f2b2b891ca543721c/test%2Fhost%2Fsession-collapse.test.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/test%2Fhost%2Fsession-collapse.test.ts?ref=3a686616f42c52eb3c38bd2f2b2b891ca543721c",
+      "patch": "@@ -266,4 +266,41 @@ describe(\"session collapse transcript\", () => {\n \t\texpect(genome.segments.all()[1]?.started_at).toBe(300);\n \t\texpect(genome.segments.all()[1]?.message_count).toBe(2);\n \t});\n+\n+\ttest(\"does not persist segment marker when extraction fails\", async () => {\n+\t\tconst genomeDir = join(tempDir, \"genome-extraction-fail\");\n+\t\tconst rootDir = join(import.meta.dir, \"../../root\");\n+\t\tconst workDir = join(tempDir, \"work-extraction-fail\");\n+\t\tawait mkdir(workDir, { recursive: true });\n+\t\tconst genome = createTestGenome(genomeDir, rootDir);\n+\t\tawait genome.init();\n+\t\tawait genome.initFromRoot();\n+\t\tconst client = makeClientSequence([\n+\t\t\tJSON.stringify({\n+\t\t\t\tsummary: \"Summary before extraction failure.\",\n+\t\t\t\ttitle: \"Extraction failure\",\n+\t\t\t\tcomplexity: 1,\n+\t\t\t}),\n+\t\t\t\"not json\",\n+\t\t]);\n+\n+\t\tawait expect(\n+\t\t\tcollapseSessionToMemory({\n+\t\t\t\tevents: [\n+\t\t\t\t\tevent(\"perceive\", 100, { goal: \"Remember this.\" }),\n+\t\t\t\t\tevent(\"session_end\", 200, { output: \"Done.\" }),\n+\t\t\t\t],\n+\t\t\t\tgenome,\n+\t\t\t\tclient,\n+\t\t\t\tmodel: \"claude-sonnet-4-6\",\n+\t\t\t\tprovider: \"anthropic\",\n+\t\t\t\tsessionId: \"session-collapse-fail\",\n+\t\t\t\tcwd: workDir,\n+\t\t\t\tnow: 300,\n+\t\t\t}),\n+\t\t).rejects.toThrow();\n+\n+\t\texpect(genome.segments.all()).toHaveLength(0);\n+\t\texpect(genome.memories.all()).toHaveLength(0);\n+\t});\n });"
+    }
+  ]
+}

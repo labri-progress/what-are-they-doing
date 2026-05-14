@@ -1,0 +1,77 @@
+{
+  "message": "Harden numeric accumulators against overflow and precision loss\n\nReplaces silent failure modes across core numeric paths with explicit\nguards so a single corrupted counter can no longer masquerade as healthy\nprogress.\n\n- fcp-audit: swap saturating_add for checked_add when computing the next\n  expected chain sequence number.  saturating_add silently accepts a\n  chain that stalls at u64::MAX, effectively letting a malicious or\n  buggy signer replay the tail indefinitely.  We now emit a new\n  audit.seq_overflow VerifyIssue and stop further sequence validation,\n  matching the semantics of AuditEntry::follows().  Adds regression test\n  verify_chain_seq_overflow_stops_validation.\n- fcp-core: round() the u8 success-rate cast in LifecycleRecord.  The\n  bare \\`as u8\\` truncates, so 49.9 -> 49; with round() we preserve the\n  intent of a percent readout without ever exceeding 100 (the outer\n  .min(100.0) still clamps).\n- fcp-raptorq: drop the f64-based K' computation in Decoder::needed().\n  For large K values f64 loses integer precision, so the ceil() could\n  report a smaller K' than the actual protocol constant.  Replaced with\n  integer ceil-division \\`(K*2 + 999) / 1000\\` and a try_from saturating\n  to u32::MAX.  Also make Encoder::total_symbols() saturating so the\n  source + repair tally cannot silently wrap.\n- fcp-store: use saturating_add for SymbolDistribution totals so a\n  misbehaving node cannot wrap total_symbols back to 0 and defeat the\n  coverage metrics.\n- fcp-streaming: use saturating_add for ReconnectHandler::attempts so\n  the exponential-backoff branch cannot wrap to zero and immediately\n  reconnect after u32::MAX failures.",
+  "files": [
+    {
+      "sha": "bc98574ab8ce63ab7254a1e709a2259fe0b0c8a2",
+      "filename": "crates/fcp-audit/src/lib.rs",
+      "status": "modified",
+      "additions": 44,
+      "deletions": 1,
+      "changes": 45,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/74d62e6ebe89870723367e380b4bbcf8ed709454/crates%2Ffcp-audit%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/74d62e6ebe89870723367e380b4bbcf8ed709454/crates%2Ffcp-audit%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-audit%2Fsrc%2Flib.rs?ref=74d62e6ebe89870723367e380b4bbcf8ed709454",
+      "patch": "@@ -925,7 +925,27 @@ pub fn verify_chain(\n \n         let mut prev = first;\n         for entry in iter {\n-            let expected_seq = prev.seq.saturating_add(1);\n+            // Use checked_add so seq == u64::MAX is correctly treated as a\n+            // terminal state, consistent with AuditEntry::follows().\n+            // saturating_add would silently accept a stalled chain.\n+            let expected_seq = match prev.seq.checked_add(1) {\n+                Some(next) => next,\n+                None => {\n+                    issues.push(\n+                        VerifyIssue::new(\n+                            \"audit.seq_overflow\",\n+                            format!(\n+                                \"sequence number overflow: previous seq {} cannot be incremented\",\n+                                prev.seq\n+                            ),\n+                        )\n+                        .with_seq(prev.seq)\n+                        .with_entry_id(&prev.id),\n+                    );\n+                    // Cannot validate further entries after overflow.\n+                    break;\n+                }\n+            };\n             if entry.seq != expected_seq {\n                 issues.push(\n                     VerifyIssue::new(\n@@ -2569,6 +2589,29 @@ mod tests {\n         assert_eq!(report.chain_len, 3);\n     }\n \n+    #[test]\n+    fn verify_chain_seq_overflow_stops_validation() {\n+        let mut e0 = genesis_entry();\n+        e0.seq = u64::MAX;\n+        let e1 = chain_entry(7, \"entry-0\");\n+\n+        let report = verify_chain(&[e0, e1], None, None);\n+\n+        assert_eq!(report.status, VerifyStatus::Fail);\n+        assert!(\n+            report\n+                .issues\n+                .iter()\n+                .any(|issue| issue.code == \"audit.seq_overflow\"),\n+            \"expected audit.seq_overflow issue, got {:?}\",\n+            report.issues\n+        );\n+        assert!(\n+            !report.issues.iter().any(|issue| issue.code == \"audit.seq_gap\"),\n+            \"overflow should terminate chain validation before seq-gap checks\"\n+        );\n+    }\n+\n     #[test]\n     fn verify_chain_invalid_genesis_nonzero_seq() {\n         let mut entry = genesis_entry();"
+    },
+    {
+      "sha": "209c247b20d498ccee447a1aa740b4bf1e1a5c07",
+      "filename": "crates/fcp-core/src/lifecycle.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/74d62e6ebe89870723367e380b4bbcf8ed709454/crates%2Ffcp-core%2Fsrc%2Flifecycle.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/74d62e6ebe89870723367e380b4bbcf8ed709454/crates%2Ffcp-core%2Fsrc%2Flifecycle.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-core%2Fsrc%2Flifecycle.rs?ref=74d62e6ebe89870723367e380b4bbcf8ed709454",
+      "patch": "@@ -458,7 +458,7 @@ impl LifecycleRecord {\n         if self.health.samples > 0 {\n             let rate =\n                 (self.health.successes as f64 / self.health.samples as f64 * 100.0).min(100.0);\n-            self.health.success_rate = rate as u8;\n+            self.health.success_rate = rate.round() as u8;\n         }\n \n         // Update latency tracking"
+    },
+    {
+      "sha": "18312baffa41a336986e8380b85570f49f036c3f",
+      "filename": "crates/fcp-raptorq/src/decode.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 2,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/74d62e6ebe89870723367e380b4bbcf8ed709454/crates%2Ffcp-raptorq%2Fsrc%2Fdecode.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/74d62e6ebe89870723367e380b4bbcf8ed709454/crates%2Ffcp-raptorq%2Fsrc%2Fdecode.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-raptorq%2Fsrc%2Fdecode.rs?ref=74d62e6ebe89870723367e380b4bbcf8ed709454",
+      "patch": "@@ -454,8 +454,10 @@ impl RaptorQDecoder {\n     /// K' is approximately K x 1.002.\n     #[must_use]\n     pub fn needed(&self) -> u32 {\n-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]\n-        let k_prime = (f64::from(self.k) * 1.002).ceil() as u32;\n+        // K' \u2248 ceil(K \u00d7 1.002) using integer arithmetic to avoid f64\n+        // precision loss for large K values.\n+        let overhead = (u64::from(self.k) * 2 + 999) / 1000;\n+        let k_prime = u32::try_from(u64::from(self.k) + overhead).unwrap_or(u32::MAX);\n         k_prime.max(1)\n     }\n "
+    },
+    {
+      "sha": "e6474ae1ca4027683449ae21e3e5a134d17ec7c7",
+      "filename": "crates/fcp-raptorq/src/encode.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/74d62e6ebe89870723367e380b4bbcf8ed709454/crates%2Ffcp-raptorq%2Fsrc%2Fencode.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/74d62e6ebe89870723367e380b4bbcf8ed709454/crates%2Ffcp-raptorq%2Fsrc%2Fencode.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-raptorq%2Fsrc%2Fencode.rs?ref=74d62e6ebe89870723367e380b4bbcf8ed709454",
+      "patch": "@@ -113,7 +113,7 @@ impl RaptorQEncoder {\n     /// Get total symbols (source + repair).\n     #[must_use]\n     pub fn total_symbols(&self) -> u32 {\n-        self.source_symbols() + self.repair_symbols()\n+        self.source_symbols().saturating_add(self.repair_symbols())\n     }\n \n     /// Generate all source + repair symbols."
+    },
+    {
+      "sha": "669c0cb02f82dc53c6d8ff93e413d8a89743f144",
+      "filename": "crates/fcp-store/src/coverage.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 3,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/74d62e6ebe89870723367e380b4bbcf8ed709454/crates%2Ffcp-store%2Fsrc%2Fcoverage.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/74d62e6ebe89870723367e380b4bbcf8ed709454/crates%2Ffcp-store%2Fsrc%2Fcoverage.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-store%2Fsrc%2Fcoverage.rs?ref=74d62e6ebe89870723367e380b4bbcf8ed709454",
+      "patch": "@@ -38,9 +38,9 @@ impl SymbolDistribution {\n     /// Record a symbol stored on a node.\n     pub fn add_symbol(&mut self, node_id: u64, symbol_bytes: u64) {\n         let entry = self.nodes.entry(node_id).or_insert((0, 0));\n-        entry.0 += 1;\n-        entry.1 += symbol_bytes;\n-        self.total_symbols += 1;\n+        entry.0 = entry.0.saturating_add(1);\n+        entry.1 = entry.1.saturating_add(symbol_bytes);\n+        self.total_symbols = self.total_symbols.saturating_add(1);\n         // O(1) max update: new count can only increase the max.\n         if entry.0 > self.cached_max {\n             self.cached_max = entry.0;"
+    },
+    {
+      "sha": "985254e9c18d760f297b8674400253713c70392b",
+      "filename": "crates/fcp-streaming/src/reconnect.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/74d62e6ebe89870723367e380b4bbcf8ed709454/crates%2Ffcp-streaming%2Fsrc%2Freconnect.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/74d62e6ebe89870723367e380b4bbcf8ed709454/crates%2Ffcp-streaming%2Fsrc%2Freconnect.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-streaming%2Fsrc%2Freconnect.rs?ref=74d62e6ebe89870723367e380b4bbcf8ed709454",
+      "patch": "@@ -170,7 +170,7 @@ impl ReconnectHandler {\n         );\n \n         sleep(delay).await;\n-        self.attempts += 1;\n+        self.attempts = self.attempts.saturating_add(1);\n \n         Ok(())\n     }"
+    }
+  ]
+}

@@ -1,0 +1,77 @@
+{
+  "message": "feat(fcp-core): add SafeUri parser + to_kebab_case helper with conformance tests\n\nAdds two small standalone utility helpers to the fcp-core util module\nthat have been needed by callers cleaning up canonical-id and\nURI-handling code paths.\n\nSafeUri (crates/fcp-core/src/util/uri.rs):\n\n- Newtype wrapper around `url::Url` with a deterministic Display impl\n  that always round-trips through `url::Url::as_str()`. The intent is\n  that callers can rely on `SafeUri.to_string()` returning a stable\n  canonical form regardless of how the URI was constructed.\n- Exposes scheme/host/path/query accessors plus `as_url()` for callers\n  that need the underlying parsed URL.\n- Implements FromStr (delegating to `url::Url::parse`), AsRef<Url>, and\n  From<SafeUri> for Url so it composes with the existing url ecosystem\n  without forcing callers to keep two parallel copies.\n\nto_kebab_case (crates/fcp-core/src/util.rs):\n\n- Simple, allocation-conscious converter that lowercases ASCII labels\n  and inserts `-` separators on camelCase boundaries (lower\u2192Upper and\n  Upper\u2192Upper-when-followed-by-lower), collapses runs of non-\n  alphanumeric input into a single `-`, and strips leading/trailing\n  whitespace. Non-ASCII input passes through the non-alphanumeric\n  fallback path so the output stays predictable.\n- Exposed through a private KebabCharKind enum that codifies the\n  Lower/Upper/Digit boundary rules.\n\nBuild wiring:\n\n- crates/fcp-core/Cargo.toml gains `url.workspace = true` (the version\n  is already pinned in the workspace manifest).\n- Cargo.lock records the dependency edge from fcp-core \u2192 url; no other\n  crates pick up new transitive deps.\n\nTests:\n\n- crates/fcp-core/tests/kebab_case_converter.rs \u2014 table-driven cases\n  covering camelCase, PascalCase, runs of separators, leading/trailing\n  whitespace, digits, and the \"ABCDef\" \u2192 \"abc-def\" boundary that\n  motivated the `next_is_lowercase` lookahead.\n- crates/fcp-core/tests/uri_parser_roundtrip.rs \u2014 pins\n  scheme/host/path/query extraction and Display round-tripping for the\n  four canonical SafeUri shapes (https with query, http loopback,\n  http+port, opaque scheme without authority).\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "b764453fadfd602927319af63bd6989209a3e768",
+      "filename": "Cargo.lock",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/76a8f373fc910649b4a3af7486ac17ee5e20a07b/Cargo.lock",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/76a8f373fc910649b4a3af7486ac17ee5e20a07b/Cargo.lock",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/Cargo.lock?ref=76a8f373fc910649b4a3af7486ac17ee5e20a07b",
+      "patch": "@@ -2892,6 +2892,7 @@ dependencies = [\n  \"thiserror 2.0.18\",\n  \"tracing\",\n  \"trybuild\",\n+ \"url\",\n  \"uuid\",\n  \"zeroize\",\n ]"
+    },
+    {
+      "sha": "717c7a5521683ad2356b58b0d27acb61190b194e",
+      "filename": "crates/fcp-core/Cargo.toml",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/76a8f373fc910649b4a3af7486ac17ee5e20a07b/crates%2Ffcp-core%2FCargo.toml",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/76a8f373fc910649b4a3af7486ac17ee5e20a07b/crates%2Ffcp-core%2FCargo.toml",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-core%2FCargo.toml?ref=76a8f373fc910649b4a3af7486ac17ee5e20a07b",
+      "patch": "@@ -31,6 +31,7 @@ semver.workspace = true\n sha2.workspace = true\n thiserror.workspace = true\n tracing.workspace = true\n+url.workspace = true\n uuid.workspace = true\n zeroize = { version = \"1.8\", features = [\"derive\"] }\n "
+    },
+    {
+      "sha": "d82b26eb8656b8c599851de99180bbd90b180e4e",
+      "filename": "crates/fcp-core/src/util.rs",
+      "status": "modified",
+      "additions": 56,
+      "deletions": 0,
+      "changes": 56,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/76a8f373fc910649b4a3af7486ac17ee5e20a07b/crates%2Ffcp-core%2Fsrc%2Futil.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/76a8f373fc910649b4a3af7486ac17ee5e20a07b/crates%2Ffcp-core%2Fsrc%2Futil.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-core%2Fsrc%2Futil.rs?ref=76a8f373fc910649b4a3af7486ac17ee5e20a07b",
+      "patch": "@@ -5,6 +5,62 @@ use std::{error::Error, fmt, str::FromStr, time::Duration};\n pub mod hex_or_bytes;\n pub mod hex_or_bytes_vec;\n pub mod objectid_prefixed;\n+pub mod uri;\n+\n+pub use uri::SafeUri;\n+\n+/// Convert an ASCII label to kebab-case.\n+#[must_use]\n+pub fn to_kebab_case(input: &str) -> String {\n+    let mut output = String::with_capacity(input.len());\n+    let mut previous_kind = None;\n+    let mut pending_separator = false;\n+    let mut chars = input.trim().chars().peekable();\n+\n+    while let Some(ch) = chars.next() {\n+        if ch.is_ascii_alphanumeric() {\n+            let kind = KebabCharKind::from_ascii_alphanumeric(ch);\n+            let next_is_lowercase = chars.peek().is_some_and(|next| next.is_ascii_lowercase());\n+            let camel_boundary = matches!(\n+                (previous_kind, kind),\n+                (Some(KebabCharKind::Lower | KebabCharKind::Digit), KebabCharKind::Upper)\n+                    | (Some(KebabCharKind::Upper), KebabCharKind::Upper) if next_is_lowercase\n+            );\n+\n+            if (pending_separator || camel_boundary) && !output.is_empty() {\n+                output.push('-');\n+            }\n+\n+            output.push(ch.to_ascii_lowercase());\n+            previous_kind = Some(kind);\n+            pending_separator = false;\n+        } else {\n+            pending_separator = true;\n+            previous_kind = None;\n+        }\n+    }\n+\n+    output\n+}\n+\n+#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n+enum KebabCharKind {\n+    Lower,\n+    Upper,\n+    Digit,\n+}\n+\n+impl KebabCharKind {\n+    fn from_ascii_alphanumeric(ch: char) -> Self {\n+        if ch.is_ascii_digit() {\n+            Self::Digit\n+        } else if ch.is_ascii_uppercase() {\n+            Self::Upper\n+        } else {\n+            Self::Lower\n+        }\n+    }\n+}\n \n /// Maximum accepted canonical duration.\n pub const MAX_CANONICAL_DURATION: Duration = Duration::from_secs(86_400);"
+    },
+    {
+      "sha": "6ff5c4b905cb4f59305c5194a7c947671d439545",
+      "filename": "crates/fcp-core/src/util/uri.rs",
+      "status": "added",
+      "additions": 63,
+      "deletions": 0,
+      "changes": 63,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/76a8f373fc910649b4a3af7486ac17ee5e20a07b/crates%2Ffcp-core%2Fsrc%2Futil%2Furi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/76a8f373fc910649b4a3af7486ac17ee5e20a07b/crates%2Ffcp-core%2Fsrc%2Futil%2Furi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-core%2Fsrc%2Futil%2Furi.rs?ref=76a8f373fc910649b4a3af7486ac17ee5e20a07b",
+      "patch": "@@ -0,0 +1,63 @@\n+use std::{fmt, str::FromStr};\n+\n+/// URI parsed through the shared URL parser with deterministic display output.\n+#[derive(Debug, Clone, PartialEq, Eq, Hash)]\n+pub struct SafeUri(url::Url);\n+\n+impl SafeUri {\n+    /// Return the URI scheme.\n+    #[must_use]\n+    pub fn scheme(&self) -> &str {\n+        self.0.scheme()\n+    }\n+\n+    /// Return the host component when the URI shape carries one.\n+    #[must_use]\n+    pub fn host(&self) -> Option<&str> {\n+        self.0.host_str()\n+    }\n+\n+    /// Return the path component.\n+    #[must_use]\n+    pub fn path(&self) -> &str {\n+        self.0.path()\n+    }\n+\n+    /// Return the raw query component without the leading `?`.\n+    #[must_use]\n+    pub fn query(&self) -> Option<&str> {\n+        self.0.query()\n+    }\n+\n+    /// Return the parsed URL object.\n+    #[must_use]\n+    pub fn as_url(&self) -> &url::Url {\n+        &self.0\n+    }\n+}\n+\n+impl FromStr for SafeUri {\n+    type Err = url::ParseError;\n+\n+    fn from_str(input: &str) -> Result<Self, Self::Err> {\n+        url::Url::parse(input).map(Self)\n+    }\n+}\n+\n+impl fmt::Display for SafeUri {\n+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {\n+        f.write_str(self.0.as_str())\n+    }\n+}\n+\n+impl AsRef<url::Url> for SafeUri {\n+    fn as_ref(&self) -> &url::Url {\n+        self.as_url()\n+    }\n+}\n+\n+impl From<SafeUri> for url::Url {\n+    fn from(value: SafeUri) -> Self {\n+        value.0\n+    }\n+}"
+    },
+    {
+      "sha": "092d850080f40254a7f8836d3c85156808310a2f",
+      "filename": "crates/fcp-core/tests/kebab_case_converter.rs",
+      "status": "added",
+      "additions": 18,
+      "deletions": 0,
+      "changes": 18,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/76a8f373fc910649b4a3af7486ac17ee5e20a07b/crates%2Ffcp-core%2Ftests%2Fkebab_case_converter.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/76a8f373fc910649b4a3af7486ac17ee5e20a07b/crates%2Ffcp-core%2Ftests%2Fkebab_case_converter.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-core%2Ftests%2Fkebab_case_converter.rs?ref=76a8f373fc910649b4a3af7486ac17ee5e20a07b",
+      "patch": "@@ -0,0 +1,18 @@\n+use fcp_core::util::to_kebab_case;\n+\n+#[test]\n+fn kebab_case_converter_pins_boundary_inputs() {\n+    let cases = [\n+        (\"\", \"\"),\n+        (\"A\", \"a\"),\n+        (\"audit\", \"audit\"),\n+        (\"AuditReceiptEnvelope\", \"audit-receipt-envelope\"),\n+        (\"FCP3Receipt42Envelope\", \"fcp3-receipt42-envelope\"),\n+        (\"  Audit Receipt  \", \"audit-receipt\"),\n+        (\"audit--receipt\", \"audit-receipt\"),\n+    ];\n+\n+    for (input, expected) in cases {\n+        assert_eq!(to_kebab_case(input), expected, \"input: {input:?}\");\n+    }\n+}"
+    },
+    {
+      "sha": "f9f26588a20748f33953f364338bff5758715d08",
+      "filename": "crates/fcp-core/tests/uri_parser_roundtrip.rs",
+      "status": "added",
+      "additions": 74,
+      "deletions": 0,
+      "changes": 74,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/76a8f373fc910649b4a3af7486ac17ee5e20a07b/crates%2Ffcp-core%2Ftests%2Furi_parser_roundtrip.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/76a8f373fc910649b4a3af7486ac17ee5e20a07b/crates%2Ffcp-core%2Ftests%2Furi_parser_roundtrip.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-core%2Ftests%2Furi_parser_roundtrip.rs?ref=76a8f373fc910649b4a3af7486ac17ee5e20a07b",
+      "patch": "@@ -0,0 +1,74 @@\n+use std::str::FromStr;\n+\n+use fcp_core::util::SafeUri;\n+\n+#[derive(Debug, Clone, Copy)]\n+struct SafeUriCase {\n+    raw: &'static str,\n+    scheme: &'static str,\n+    host: Option<&'static str>,\n+    path: &'static str,\n+    query: Option<&'static str>,\n+}\n+\n+fn safe_uri_cases() -> [SafeUriCase; 4] {\n+    [\n+        SafeUriCase {\n+            raw: \"https://api.example.com/v1/messages?limit=50&cursor=abc\",\n+            scheme: \"https\",\n+            host: Some(\"api.example.com\"),\n+            path: \"/v1/messages\",\n+            query: Some(\"limit=50&cursor=abc\"),\n+        },\n+        SafeUriCase {\n+            raw: \"http://localhost:8080/healthz?ready=true\",\n+            scheme: \"http\",\n+            host: Some(\"localhost\"),\n+            path: \"/healthz\",\n+            query: Some(\"ready=true\"),\n+        },\n+        SafeUriCase {\n+            raw: \"file:///var/lib/fcp/state.db\",\n+            scheme: \"file\",\n+            host: None,\n+            path: \"/var/lib/fcp/state.db\",\n+            query: None,\n+        },\n+        SafeUriCase {\n+            raw: \"fcp+connector://calendar/events/primary?zone=z%3Awork\",\n+            scheme: \"fcp+connector\",\n+            host: Some(\"calendar\"),\n+            path: \"/events/primary\",\n+            query: Some(\"zone=z%3Awork\"),\n+        },\n+    ]\n+}\n+\n+#[test]\n+fn safe_uri_shapes_roundtrip_through_display_and_from_str() -> Result<(), Box<dyn std::error::Error>>\n+{\n+    for case in safe_uri_cases() {\n+        let parsed = SafeUri::from_str(case.raw)?;\n+        let displayed = parsed.to_string();\n+        let reparsed = SafeUri::from_str(&displayed)?;\n+\n+        assert_eq!(displayed, case.raw);\n+        assert_eq!(reparsed, parsed);\n+    }\n+\n+    Ok(())\n+}\n+\n+#[test]\n+fn safe_uri_shapes_preserve_scheme_host_path_and_query() -> Result<(), Box<dyn std::error::Error>> {\n+    for case in safe_uri_cases() {\n+        let parsed = SafeUri::from_str(case.raw)?;\n+\n+        assert_eq!(parsed.scheme(), case.scheme);\n+        assert_eq!(parsed.host(), case.host);\n+        assert_eq!(parsed.path(), case.path);\n+        assert_eq!(parsed.query(), case.query);\n+    }\n+\n+    Ok(())\n+}"
+    }
+  ]
+}

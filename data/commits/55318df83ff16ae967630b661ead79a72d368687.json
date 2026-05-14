@@ -1,0 +1,41 @@
+{
+  "message": "fix(slack): share HTTP route registry across module loads\n\nFixes #67955, #46245, #46246.\n\nCo-authored-by: Axel <axel@kaleidoscope.studio>\n\nCo-authored-by: Cesar Arevalo <cesar@cesararevalo.com>",
+  "files": [
+    {
+      "sha": "cd510f11a98f398f014641b4f486c2fdf6358c75",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/55318df83ff16ae967630b661ead79a72d368687/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/55318df83ff16ae967630b661ead79a72d368687/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=55318df83ff16ae967630b661ead79a72d368687",
+      "patch": "@@ -65,6 +65,7 @@ Docs: https://docs.openclaw.ai\n - Codex harness/models: keep legacy `codex/*` harness shorthand out of model picker and `/models` choice surfaces while migrating primary legacy refs to canonical `openai/*` plus explicit Codex harness config. (#71193) Thanks @vincentkoc.\n - Plugins/runtime deps: respect explicit plugin and channel disablement when repairing bundled runtime dependencies, so doctor and health checks no longer install deps for disabled configured channels.\n - WhatsApp/plugins: support an explicit opt-in for inbound `message_received` hooks with canonical channel, conversation, session, and sender fields. Thanks @vincentkoc.\n+- Slack/HTTP: keep webhook handlers in a process-global registry so HTTP mode survives plugin-loader/native-import splits and `/slack/events/<account>` no longer returns 404 after logging as active. Fixes #67955, #46245, and #46246. Thanks @chrisabad and @cesararevalo.\n - Diagnostics: harden tool and model diagnostic events against hostile errors, blocking listeners, and unsafe stability reason fields. Thanks @vincentkoc.\n - Plugins/onboarding: record local plugin install source metadata without duplicating raw absolute local paths in persisted `plugins.installs`, while preserving linked load-path cleanup. (#70970) Thanks @vincentkoc.\n - Browser/tool: tell agents not to pass per-call `timeoutMs` on existing-session type, evaluate, and other Chrome MCP actions that reject timeout overrides."
+    },
+    {
+      "sha": "dd117e99908cedff4d7296d3f1fcacd2f2c26950",
+      "filename": "extensions/slack/src/http/registry.test.ts",
+      "status": "modified",
+      "additions": 39,
+      "deletions": 0,
+      "changes": 39,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/55318df83ff16ae967630b661ead79a72d368687/extensions%2Fslack%2Fsrc%2Fhttp%2Fregistry.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/55318df83ff16ae967630b661ead79a72d368687/extensions%2Fslack%2Fsrc%2Fhttp%2Fregistry.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fslack%2Fsrc%2Fhttp%2Fregistry.test.ts?ref=55318df83ff16ae967630b661ead79a72d368687",
+      "patch": "@@ -85,4 +85,43 @@ describe(\"registerSlackHttpHandler\", () => {\n       'slack: webhook path /slack/events already registered for account \"duplicate\"',\n     );\n   });\n+\n+  it(\"preserves registered handlers across module reloads\", async () => {\n+    const handler = vi.fn();\n+    unregisters.push(\n+      registerSlackHttpHandler({\n+        path: \"/slack/events/reload\",\n+        handler,\n+      }),\n+    );\n+\n+    vi.resetModules();\n+    const reloadedRegistry = await import(\"./registry.js\");\n+    const req = { url: \"/slack/events/reload\" } as IncomingMessage;\n+    const res = {} as ServerResponse;\n+\n+    const handled = await reloadedRegistry.handleSlackHttpRequest(req, res);\n+\n+    expect(handled).toBe(true);\n+    expect(handler).toHaveBeenCalledWith(req, res);\n+  });\n+\n+  it(\"recreates the shared registry if the global slot is corrupted\", async () => {\n+    const globalStore = globalThis as Record<PropertyKey, unknown>;\n+    globalStore[Symbol.for(\"openclaw.slack.httpRoutes.v1\")] = {};\n+    const handler = vi.fn();\n+    unregisters.push(\n+      registerSlackHttpHandler({\n+        path: \"/slack/events/recovered\",\n+        handler,\n+      }),\n+    );\n+    const req = { url: \"/slack/events/recovered\" } as IncomingMessage;\n+    const res = {} as ServerResponse;\n+\n+    const handled = await handleSlackHttpRequest(req, res);\n+\n+    expect(handled).toBe(true);\n+    expect(handler).toHaveBeenCalledWith(req, res);\n+  });\n });"
+    },
+    {
+      "sha": "2a95eda730b14b3f7aae3ade29323230115d1a97",
+      "filename": "extensions/slack/src/http/registry.ts",
+      "status": "modified",
+      "additions": 17,
+      "deletions": 5,
+      "changes": 22,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/55318df83ff16ae967630b661ead79a72d368687/extensions%2Fslack%2Fsrc%2Fhttp%2Fregistry.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/55318df83ff16ae967630b661ead79a72d368687/extensions%2Fslack%2Fsrc%2Fhttp%2Fregistry.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fslack%2Fsrc%2Fhttp%2Fregistry.ts?ref=55318df83ff16ae967630b661ead79a72d368687",
+      "patch": "@@ -15,18 +15,30 @@ type RegisterSlackHttpHandlerArgs = {\n   accountId?: string;\n };\n \n-const slackHttpRoutes = new Map<string, SlackHttpRequestHandler>();\n+const SLACK_HTTP_ROUTES_GLOBAL_KEY = Symbol.for(\"openclaw.slack.httpRoutes.v1\");\n+\n+function getSlackHttpRoutes(): Map<string, SlackHttpRequestHandler> {\n+  const globalStore = globalThis as Record<PropertyKey, unknown>;\n+  const existing = globalStore[SLACK_HTTP_ROUTES_GLOBAL_KEY];\n+  if (existing instanceof Map) {\n+    return existing as Map<string, SlackHttpRequestHandler>;\n+  }\n+  const routes = new Map<string, SlackHttpRequestHandler>();\n+  globalStore[SLACK_HTTP_ROUTES_GLOBAL_KEY] = routes;\n+  return routes;\n+}\n \n export function registerSlackHttpHandler(params: RegisterSlackHttpHandlerArgs): () => void {\n   const normalizedPath = normalizeSlackWebhookPath(params.path);\n-  if (slackHttpRoutes.has(normalizedPath)) {\n+  const routes = getSlackHttpRoutes();\n+  if (routes.has(normalizedPath)) {\n     const suffix = params.accountId ? ` for account \"${params.accountId}\"` : \"\";\n     params.log?.(`slack: webhook path ${normalizedPath} already registered${suffix}`);\n     return () => {};\n   }\n-  slackHttpRoutes.set(normalizedPath, params.handler);\n+  routes.set(normalizedPath, params.handler);\n   return () => {\n-    slackHttpRoutes.delete(normalizedPath);\n+    getSlackHttpRoutes().delete(normalizedPath);\n   };\n }\n \n@@ -35,7 +47,7 @@ export async function handleSlackHttpRequest(\n   res: ServerResponse,\n ): Promise<boolean> {\n   const url = new URL(req.url ?? \"/\", \"http://localhost\");\n-  const handler = slackHttpRoutes.get(url.pathname);\n+  const handler = getSlackHttpRoutes().get(url.pathname);\n   if (!handler) {\n     return false;\n   }"
+    }
+  ]
+}

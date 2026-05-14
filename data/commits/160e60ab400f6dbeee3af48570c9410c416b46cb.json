@@ -1,0 +1,53 @@
+{
+  "message": "bench(storage): rename harness to storage_perf and scale ready-query setup\n\nRename the Criterion harness from the generic `benchmarks` name to\n`storage_perf`, matching the actual source file and clarifying intent\nwhen running `cargo bench --bench <name>`. Set `autobenches = false` in\nCargo.toml so Cargo does not auto-register any future bench files under\nthe old default name.\n\nThread the rename through the only two external callers:\n\n- `scripts/bench_regression.sh` \u2014 both `--save-baseline` and `--baseline`\n  invocations.\n- `.github/workflows/ci.yml` \u2014 the bench-regression job's baseline\n  save/compare calls.\n\nAlso retune the dependency fixture used by `bench_ready_query`:\n\n- Generate a fully acyclic DAG by having higher-indexed issues depend on\n  lower-indexed issues (deterministic, no cycle-check overhead).\n- Load dependencies via `sync_dependencies_for_import` so setup time is\n  not dominated by per-edge cycle detection \u2014 critical for the new\n  `(10000, 20000)` point added to the size sweep.\n- Rebuild the blocked cache once at the end rather than implicitly per\n  insert, matching how import paths perform it in production.\n\nThese are pure test/bench plumbing changes \u2014 no behavioural changes to\nlibrary code, no public API movement.",
+  "files": [
+    {
+      "sha": "a5c8a7fec41205eb0a0e554099a2f0da630b916f",
+      "filename": ".github/workflows/ci.yml",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_rust/blob/160e60ab400f6dbeee3af48570c9410c416b46cb/.github%2Fworkflows%2Fci.yml",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_rust/raw/160e60ab400f6dbeee3af48570c9410c416b46cb/.github%2Fworkflows%2Fci.yml",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_rust/contents/.github%2Fworkflows%2Fci.yml?ref=160e60ab400f6dbeee3af48570c9410c416b46cb",
+      "patch": "@@ -281,9 +281,9 @@ jobs:\n         run: |\n           set -euo pipefail\n           if find target/criterion -path \"*/main/estimates.json\" -type f 2>/dev/null | grep -q .; then\n-            cargo bench --bench benchmarks -- --baseline main --save-baseline main\n+            cargo bench --bench storage_perf -- --baseline main --save-baseline main\n           else\n-            cargo bench --bench benchmarks -- --save-baseline main\n+            cargo bench --bench storage_perf -- --save-baseline main\n           fi\n         continue-on-error: true\n "
+    },
+    {
+      "sha": "12365b946c1c56d224dbc9a91e7561e70c2b0efb",
+      "filename": "Cargo.toml",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_rust/blob/160e60ab400f6dbeee3af48570c9410c416b46cb/Cargo.toml",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_rust/raw/160e60ab400f6dbeee3af48570c9410c416b46cb/Cargo.toml",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_rust/contents/Cargo.toml?ref=160e60ab400f6dbeee3af48570c9410c416b46cb",
+      "patch": "@@ -3,6 +3,7 @@ name = \"beads_rust\"\n version = \"0.1.45\"\n edition = \"2024\"\n rust-version = \"1.88\"\n+autobenches = false\n description = \"Agent-first issue tracker (SQLite + JSONL)\"\n license = \"MIT\"\n repository = \"https://github.com/Dicklesworthstone/beads_rust\"\n@@ -125,7 +126,7 @@ proptest = \"1.10\"\n rand = \"0.10\"\n \n [[bench]]\n-name = \"benchmarks\"\n+name = \"storage_perf\"\n path = \"benches/storage_perf.rs\"\n harness = false\n "
+    },
+    {
+      "sha": "633587d316354a847292ae9c2bbce871ec074773",
+      "filename": "benches/storage_perf.rs",
+      "status": "modified",
+      "additions": 39,
+      "deletions": 13,
+      "changes": 52,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_rust/blob/160e60ab400f6dbeee3af48570c9410c416b46cb/benches%2Fstorage_perf.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_rust/raw/160e60ab400f6dbeee3af48570c9410c416b46cb/benches%2Fstorage_perf.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_rust/contents/benches%2Fstorage_perf.rs?ref=160e60ab400f6dbeee3af48570c9410c416b46cb",
+      "patch": "@@ -1,6 +1,6 @@\n // Storage and sync performance benchmarks.\n //\n-// Run with: cargo bench\n+// Run with: cargo bench --bench storage_perf\n //\n // Performance Targets:\n // | Operation           | Target    | Description                      |\n@@ -19,7 +19,7 @@\n     clippy::cast_possible_wrap\n )]\n \n-use beads_rust::model::{Issue, IssueType, Priority, Status};\n+use beads_rust::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};\n use beads_rust::storage::{IssueUpdate, ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};\n use chrono::Utc;\n use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};\n@@ -138,18 +138,44 @@ fn setup_db_with_deps(issue_count: usize, dep_count: usize) -> (TempDir, SqliteS\n             .expect(\"Failed to create issue\");\n     }\n \n-    // Create dependencies (avoiding cycles)\n-    for d in 0..dep_count {\n-        let from_idx = (d * 2 + 1) % issue_count;\n-        let to_idx = (d * 2) % issue_count;\n-        if from_idx != to_idx && from_idx > to_idx {\n-            let from_id = format!(\"bench-{from_idx:06}\");\n+    // Create unique acyclic dependencies. Higher-index issues depend on\n+    // lower-index issues, so this can scale to deep DAGs without cycles.\n+    // Load them through the import helper so setup does not dominate\n+    // `--quick` runs with per-edge cycle detection.\n+    let mut added = 0usize;\n+    'deps: for from_idx in 1..issue_count {\n+        let from_id = format!(\"bench-{from_idx:06}\");\n+        let mut dependencies = Vec::new();\n+        for to_idx in 0..from_idx {\n             let to_id = format!(\"bench-{to_idx:06}\");\n-            // Ignore errors from duplicate dependencies\n-            let _ = storage.add_dependency(&from_id, &to_id, \"blocks\", \"benchmark\");\n+            dependencies.push(Dependency {\n+                issue_id: from_id.clone(),\n+                depends_on_id: to_id,\n+                dep_type: DependencyType::Blocks,\n+                created_at: Utc::now(),\n+                created_by: Some(\"benchmark\".to_string()),\n+                metadata: None,\n+                thread_id: None,\n+            });\n+            added += 1;\n+            if added == dep_count {\n+                break;\n+            }\n+        }\n+        if !dependencies.is_empty() {\n+            storage\n+                .sync_dependencies_for_import(&from_id, &dependencies)\n+                .expect(\"benchmark dependency import should succeed\");\n+        }\n+        if added == dep_count {\n+            break 'deps;\n         }\n     }\n \n+    storage\n+        .rebuild_blocked_cache(true)\n+        .expect(\"benchmark blocked cache rebuild should succeed\");\n+\n     (dir, storage)\n }\n \n@@ -453,7 +479,7 @@ fn bench_ready_query(c: &mut Criterion) {\n     let mut group = c.benchmark_group(group_name);\n     configure_group(&mut group);\n \n-    for (issues, deps) in [(100, 200), (500, 1000), (1000, 2000)] {\n+    for (issues, deps) in [(100, 200), (500, 1000), (1000, 2000), (10000, 20000)] {\n         let (_dir, storage) = setup_db_with_deps(issues, deps);\n         let label = format!(\"{issues}i_{deps}d\");\n \n@@ -522,7 +548,7 @@ fn bench_export(c: &mut Criterion) {\n     let mut group = c.benchmark_group(group_name);\n     configure_group(&mut group);\n \n-    for size in [100, 500, 1000, 2000, 5000] {\n+    for size in [100, 500, 1000, 2000, 5000, 10000] {\n         let (_dir, storage) = setup_db_with_issues(size);\n \n         group.throughput(Throughput::Elements(size as u64));\n@@ -550,7 +576,7 @@ fn bench_import(c: &mut Criterion) {\n     let mut group = c.benchmark_group(group_name);\n     configure_group(&mut group);\n \n-    for size in [100, 500, 1000, 2000, 5000] {\n+    for size in [100, 500, 1000, 2000, 5000, 10000] {\n         // Create source data\n         let (_src_dir, src_storage) = setup_db_with_issues(size);\n         let mut buffer = Cursor::new(Vec::new());"
+    },
+    {
+      "sha": "73b260c69a254746db71969088777b3373023ad4",
+      "filename": "scripts/bench_regression.sh",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_rust/blob/160e60ab400f6dbeee3af48570c9410c416b46cb/scripts%2Fbench_regression.sh",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_rust/raw/160e60ab400f6dbeee3af48570c9410c416b46cb/scripts%2Fbench_regression.sh",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_rust/contents/scripts%2Fbench_regression.sh?ref=160e60ab400f6dbeee3af48570c9410c416b46cb",
+      "patch": "@@ -12,10 +12,10 @@ echo \"Running benchmarks with baseline comparison...\"\n # Check if baseline exists\n if [ ! -d \"target/criterion\" ]; then\n     echo \"No existing baseline found. Saving current run as baseline.\"\n-    cargo bench --bench benchmarks -- --save-baseline \"$BASELINE_NAME\" \"$@\"\n+    cargo bench --bench storage_perf -- --save-baseline \"$BASELINE_NAME\" \"$@\"\n else\n     echo \"Comparing against existing baseline '$BASELINE_NAME'...\"\n-    cargo bench --bench benchmarks -- --baseline \"$BASELINE_NAME\" \"$@\"\n+    cargo bench --bench storage_perf -- --baseline \"$BASELINE_NAME\" \"$@\"\n fi\n \n # Run regression check"
+    }
+  ]
+}

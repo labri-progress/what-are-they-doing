@@ -1,0 +1,53 @@
+{
+  "message": "fix(deps,bottlenecks): widen blocker-edge scope and fix bottleneck direction\n\nTwo bugs in the same dep-edge pipeline that bit the same downstream\nconsumers (stats summary, MCP bottleneck context/resource).\n\nsrc/storage/sqlite.rs::get_blocks_dep_edges\n  Previously the helper returned only edges of type `blocks`. Stats\n  and the MCP bottleneck queries treat its output as \"the set of\n  edges that prevent forward progress\", so blockers expressed via\n  `conditional-blocks`, `waits-for`, or implied by a `parent-child`\n  relationship all silently dropped out of the picture.\n  Now the query unions four sources:\n    - `blocks`              edges as-is\n    - `conditional-blocks`  edges as-is\n    - `waits-for`           edges as-is\n    - `parent-child`        edges, with issue_id and depends_on_id\n                            *swapped* (the parent depends on the\n                            child finishing, not the other way\n                            around)\n  Same `(issue_id, depends_on_id)` shape as before, just with the\n  full set of forward-blocking edges.\n\n  Also drops `get_blocked_by_blocks_deps_only`, which is now\n  redundant \u2014 the only callers were the stats tests, and the\n  rewritten tests below don't need a separate \"blocks-only\" helper.\n\nsrc/mcp/prompts.rs::bottleneck_context\nsrc/mcp/resources.rs::compute_bottlenecks\n  The for-loop destructured each edge as `(blocker, blocked)`, but\n  `get_blocks_dep_edges` returns `(issue_id, depends_on_id)` \u2014 i.e.\n  `(blocked, blocker)`. Result: the \"blocks_count\" map was keyed by\n  the *blocked* issue, not the blocker, so the bottleneck list named\n  the wrong issue as the bottleneck. Both call sites flip the\n  destructure to `(blocked, blocker)` so the existing\n  `blocks_count.entry(blocker.as_str())` increments the right key.\n\nsrc/cli/commands/stats.rs (tests)\n  Two stats tests previously called `get_blocked_by_blocks_deps_only`\n  directly to assert \"did t-2 end up blocked?\". With that helper\n  gone, they now build a row vector and run `compute_summary`, then\n  assert on `summary.blocked_issues` (and `summary.ready_issues`\n  in the active-blocker case). Same coverage, exercised through the\n  same code path the CLI actually runs.",
+  "files": [
+    {
+      "sha": "f938b07fe5f5c7fdcd695c336847a03810b0800e",
+      "filename": "src/cli/commands/stats.rs",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 5,
+      "changes": 20,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_rust/blob/54e3ff830e739b0570fcf29cc99ad9eacbc6f9f8/src%2Fcli%2Fcommands%2Fstats.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_rust/raw/54e3ff830e739b0570fcf29cc99ad9eacbc6f9f8/src%2Fcli%2Fcommands%2Fstats.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_rust/contents/src%2Fcli%2Fcommands%2Fstats.rs?ref=54e3ff830e739b0570fcf29cc99ad9eacbc6f9f8",
+      "patch": "@@ -1338,9 +1338,14 @@ mod tests {\n             .add_dependency(\"t-2\", \"t-1\", \"blocks\", \"tester\")\n             .unwrap();\n \n-        let blocked_ids = storage.get_blocked_by_blocks_deps_only().unwrap();\n-        assert!(blocked_ids.contains(\"t-2\"));\n-        assert!(!blocked_ids.contains(\"t-1\"));\n+        let all_issues = [&blocking_issue, &dependent_issue]\n+            .into_iter()\n+            .map(stats_row)\n+            .collect::<Vec<_>>();\n+        let summary = compute_summary(&storage, &all_issues, None).unwrap();\n+\n+        assert_eq!(summary.blocked_issues, 1);\n+        assert_eq!(summary.ready_issues, 1); // t-1 is ready, t-2 is blocked\n     }\n \n     #[test]\n@@ -1421,9 +1426,14 @@ mod tests {\n             .add_dependency(\"t-2\", \"t-1\", \"blocks\", \"tester\")\n             .unwrap();\n \n-        let blocked_ids = storage.get_blocked_by_blocks_deps_only().unwrap();\n+        let all_issues = [&blocking_issue, &dependent_issue]\n+            .into_iter()\n+            .map(stats_row)\n+            .collect::<Vec<_>>();\n+        let summary = compute_summary(&storage, &all_issues, None).unwrap();\n+\n         // t-2 should NOT be blocked because t-1 is closed\n-        assert!(!blocked_ids.contains(\"t-2\"));\n+        assert_eq!(summary.blocked_issues, 0);\n     }\n \n     #[test]"
+    },
+    {
+      "sha": "2946e58a0611b2246a9bfbd05f28d3d82df75890",
+      "filename": "src/mcp/prompts.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_rust/blob/54e3ff830e739b0570fcf29cc99ad9eacbc6f9f8/src%2Fmcp%2Fprompts.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_rust/raw/54e3ff830e739b0570fcf29cc99ad9eacbc6f9f8/src%2Fmcp%2Fprompts.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_rust/contents/src%2Fmcp%2Fprompts.rs?ref=54e3ff830e739b0570fcf29cc99ad9eacbc6f9f8",
+      "patch": "@@ -433,7 +433,7 @@ fn bottleneck_context(storage: &SqliteStorage) -> McpResult<String> {\n \n     // Count how many open issues each open issue blocks\n     let mut blocks_count: HashMap<&str, usize> = HashMap::new();\n-    for (blocker, blocked) in &edges {\n+    for (blocked, blocker) in &edges {\n         if open_ids.contains(blocker.as_str()) && open_ids.contains(blocked.as_str()) {\n             *blocks_count.entry(blocker.as_str()).or_default() += 1;\n         }"
+    },
+    {
+      "sha": "e842bb2db411f45a6922aacf01353a9b5fa7a68a",
+      "filename": "src/mcp/resources.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_rust/blob/54e3ff830e739b0570fcf29cc99ad9eacbc6f9f8/src%2Fmcp%2Fresources.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_rust/raw/54e3ff830e739b0570fcf29cc99ad9eacbc6f9f8/src%2Fmcp%2Fresources.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_rust/contents/src%2Fmcp%2Fresources.rs?ref=54e3ff830e739b0570fcf29cc99ad9eacbc6f9f8",
+      "patch": "@@ -826,7 +826,7 @@ fn compute_bottlenecks(storage: &SqliteStorage) -> McpResult<serde_json::Value>\n \n     // Count how many open issues each open issue blocks\n     let mut blocks_count: HashMap<&str, usize> = HashMap::new();\n-    for (blocker, blocked) in &edges {\n+    for (blocked, blocker) in &edges {\n         if open_map.contains_key(blocker.as_str()) && open_map.contains_key(blocked.as_str()) {\n             *blocks_count.entry(blocker.as_str()).or_default() += 1;\n         }"
+    },
+    {
+      "sha": "cb940c33b999ebe5fa1fd3d5eb9242bcd6298cb4",
+      "filename": "src/storage/sqlite.rs",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 34,
+      "changes": 43,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_rust/blob/54e3ff830e739b0570fcf29cc99ad9eacbc6f9f8/src%2Fstorage%2Fsqlite.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_rust/raw/54e3ff830e739b0570fcf29cc99ad9eacbc6f9f8/src%2Fstorage%2Fsqlite.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_rust/contents/src%2Fstorage%2Fsqlite.rs?ref=54e3ff830e739b0570fcf29cc99ad9eacbc6f9f8",
+      "patch": "@@ -2769,37 +2769,6 @@ impl SqliteStorage {\n         Ok(ids)\n     }\n \n-    /// Get issue IDs blocked by `blocks` dependency type only (not full cache).\n-    ///\n-    /// This is used for stats computation where blocked count should be based\n-    /// only on `blocks` deps per classic bd semantics.\n-    ///\n-    /// # Errors\n-    ///\n-    /// Returns an error if the database query fails.\n-    pub fn get_blocked_by_blocks_deps_only(&self) -> Result<HashSet<String>> {\n-        // Returns issues that:\n-        // 1. Have a 'blocks' type dependency\n-        // 2. Where the blocker is not closed/tombstone\n-        // 3. AND the blocked issue itself is not closed/tombstone\n-        let rows = self.conn.query(\n-            r\"SELECT DISTINCT d.issue_id\n-              FROM dependencies d\n-              LEFT JOIN issues blocker ON d.depends_on_id = blocker.id\n-              LEFT JOIN issues blocked ON d.issue_id = blocked.id\n-              WHERE d.type = 'blocks'\n-                AND blocker.status NOT IN ('closed', 'tombstone')\n-                AND blocked.status NOT IN ('closed', 'tombstone')\",\n-        )?;\n-        let mut ids = HashSet::new();\n-        for row in &rows {\n-            if let Some(id) = row.get(0).and_then(SqliteValue::as_text) {\n-                ids.insert(id.to_string());\n-            }\n-        }\n-        Ok(ids)\n-    }\n-\n     /// Get raw `blocks` dependency edges as (issue_id, depends_on_id) pairs.\n     ///\n     /// This is a lightweight single-table query (no JOINs) suitable for\n@@ -2810,9 +2779,15 @@ impl SqliteStorage {\n     ///\n     /// Returns an error if the database query fails.\n     pub fn get_blocks_dep_edges(&self) -> Result<Vec<(String, String)>> {\n-        let rows = self\n-            .conn\n-            .query(\"SELECT issue_id, depends_on_id FROM dependencies WHERE type = 'blocks'\")?;\n+        let rows = self.conn.query(\n+            r\"\n+            SELECT issue_id, depends_on_id FROM dependencies \n+            WHERE type IN ('blocks', 'conditional-blocks', 'waits-for')\n+            UNION\n+            SELECT depends_on_id, issue_id FROM dependencies \n+            WHERE type = 'parent-child'\n+            \",\n+        )?;\n         Ok(rows\n             .iter()\n             .filter_map(|row| {"
+    }
+  ]
+}

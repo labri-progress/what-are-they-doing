@@ -1,0 +1,125 @@
+{
+  "message": "Port sigma to the new executor (#6031)\n\n## \ud83d\udd0d Problem\n\n- `sigma` still used the legacy executor path.\n- That left the operator unavailable in neo mode and untested there.\n\n## \ud83d\udee0\ufe0f Solution\n\n- add a new-executor `Operator<table_slice, table_slice>` implementation\n- keep the legacy operator path in place while wiring the new IR/plugin\npath\n- add neo integration tests for basic matching, invalid\n`refresh_interval`, and directory recursion\n- use checked narrowing when building Arrow record batches\n\n## \ud83d\udcac Review\n\n- Focus on the new executor flow in `plugins/sigma/src/plugin.cpp`.\n- The directory test sorts by `rule.title` to keep the assertion\ndeterministic.\n\n<sub>resolves TNZ-151</sub>",
+  "files": [
+    {
+      "sha": "f5c93090906b89cc5dc9c6e3c7218fc209543c23",
+      "filename": "plugins/sigma/src/plugin.cpp",
+      "status": "modified",
+      "additions": 195,
+      "deletions": 112,
+      "changes": 307,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/6a8b483027209e864a3ca03124aa4687078202c2/plugins%2Fsigma%2Fsrc%2Fplugin.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/6a8b483027209e864a3ca03124aa4687078202c2/plugins%2Fsigma%2Fsrc%2Fplugin.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/plugins%2Fsigma%2Fsrc%2Fplugin.cpp?ref=6a8b483027209e864a3ca03124aa4687078202c2",
+      "patch": "@@ -18,8 +18,10 @@\n #include <tenzir/concept/parseable/tenzir/pipeline.hpp>\n #include <tenzir/concept/parseable/to.hpp>\n #include <tenzir/data.hpp>\n+#include <tenzir/detail/narrow.hpp>\n #include <tenzir/error.hpp>\n #include <tenzir/io/read.hpp>\n+#include <tenzir/operator_plugin.hpp>\n #include <tenzir/pipeline.hpp>\n #include <tenzir/plugin.hpp>\n #include <tenzir/series_builder.hpp>\n@@ -30,131 +32,149 @@\n #include <caf/typed_event_based_actor.hpp>\n #include <fmt/format.h>\n \n+#include <chrono>\n+#include <filesystem>\n #include <string_view>\n+#include <unordered_map>\n+#include <utility>\n \n namespace tenzir::plugins::sigma {\n \n-class sigma_operator final : public crtp_operator<sigma_operator> {\n-public:\n-  sigma_operator() = default;\n+namespace {\n \n-  explicit sigma_operator(duration refresh_interval, std::string path)\n-    : refresh_interval_{refresh_interval}, path_{std::move(path)} {\n-  }\n+struct RuleEntry {\n+  data yaml;\n+  expression rule;\n+};\n \n-  struct monitor_state {\n-    auto update(const std::filesystem::path& path, operator_control_plane& ctrl)\n-      -> void {\n-      auto old_rules = std::exchange(rules, {});\n-      load_rules(path, ctrl);\n-      for (const auto& [rule_path, rule] : rules) {\n-        const auto old_rule = old_rules.find(rule_path);\n-        if (old_rule == old_rules.end()) {\n-          TENZIR_VERBOSE(\"added Sigma rule {}\", rule_path);\n-        } else if (old_rule->second != rule) {\n-          TENZIR_VERBOSE(\"updated Sigma rule {}\", rule_path);\n-        }\n-      }\n-      for (const auto& [rule_path, _] : old_rules) {\n-        if (not rules.contains(rule_path)) {\n-          TENZIR_VERBOSE(\"removed Sigma rule {}\", rule_path);\n-        }\n-      }\n+using RuleMap = std::unordered_map<std::string, RuleEntry>;\n+\n+auto load_rules(const std::filesystem::path& path, RuleMap& rules,\n+                diagnostic_handler& dh) -> void {\n+  if (std::filesystem::is_directory(path)) {\n+    for (const auto& entry : std::filesystem::directory_iterator(path)) {\n+      load_rules(entry.path(), rules, dh);\n     }\n+    return;\n+  }\n+  if (path.extension() != \".yml\" and path.extension() != \".yaml\") {\n+    // We silently ignore non-yaml files.\n+    return;\n+  }\n+  auto query = tenzir::io::read(path);\n+  if (not query) {\n+    diagnostic::warning(\"sigma operator ignores rule '{}'\", path.string())\n+      .note(\"failed to read file: {}\", query.error())\n+      .emit(dh);\n+    return;\n+  }\n+  auto query_str = std::string_view{\n+    reinterpret_cast<const char*>(query->data()),\n+    reinterpret_cast<const char*>(query->data() + query->size())}; // NOLINT\n+  auto yaml = from_yaml(query_str);\n+  if (not yaml) {\n+    diagnostic::warning(\"sigma operator ignores rule '{}'\", path.string())\n+      .note(\"failed to parse yaml: {}\", yaml.error())\n+      .emit(dh);\n+    return;\n+  }\n+  if (not is<record>(*yaml)) {\n+    diagnostic::warning(\"sigma operator ignores rule '{}'\", path.string())\n+      .note(\"rule is not a YAML dictionary\")\n+      .emit(dh);\n+    return;\n+  }\n+  auto rule = parse_rule(*yaml);\n+  if (not rule) {\n+    diagnostic::warning(\"sigma operator ignores rule '{}'\", path.string())\n+      .note(\"failed to parse sigma rule: {}\", rule.error())\n+      .emit(dh);\n+    return;\n+  }\n+  rules[path.string()] = {std::move(*yaml), std::move(*rule)};\n+}\n \n-    auto load_rules(const std::filesystem::path& path,\n-                    operator_control_plane& ctrl) -> void {\n-      if (std::filesystem::is_directory(path)) {\n-        for (const auto& entry : std::filesystem::directory_iterator(path)) {\n-          load_rules(entry.path(), ctrl);\n-        }\n-        return;\n-      }\n-      if (path.extension() != \".yml\" and path.extension() != \".yaml\") {\n-        // We silently ignore non-yaml files.\n-        return;\n-      }\n-      auto query = tenzir::io::read(path);\n-      if (not query) {\n-        diagnostic::warning(\"sigma operator ignores rule '{}'\", path.string())\n-          .note(\"failed to read file: {}\", query.error())\n-          .emit(ctrl.diagnostics());\n-        return;\n-      }\n-      auto query_str = std::string_view{\n-        reinterpret_cast<const char*>(query->data()),\n-        reinterpret_cast<const char*>(query->data() + query->size())}; // NOLINT\n-      auto yaml = from_yaml(query_str);\n-      if (not yaml) {\n-        diagnostic::warning(\"sigma operator ignores rule '{}'\", path.string())\n-          .note(\"failed to parse yaml: {}\", yaml.error())\n-          .emit(ctrl.diagnostics());\n-        return;\n-      }\n-      if (not is<record>(*yaml)) {\n-        diagnostic::warning(\"sigma operator ignores rule '{}'\", path.string())\n-          .note(\"rule is not a YAML dictionary\")\n-          .emit(ctrl.diagnostics());\n-        return;\n-      }\n-      auto rule = parse_rule(*yaml);\n-      if (not rule) {\n-        diagnostic::warning(\"sigma operator ignores rule '{}'\", path.string())\n-          .note(\"failed to parse sigma rule: {}\", rule.error())\n-          .emit(ctrl.diagnostics());\n-        return;\n-      }\n-      rules[path.string()] = {std::move(*yaml), std::move(*rule)};\n+auto update_rules(const std::filesystem::path& path, RuleMap& rules,\n+                  diagnostic_handler& dh) -> void {\n+  auto old_rules = std::exchange(rules, {});\n+  load_rules(path, rules, dh);\n+  for (const auto& [rule_path, rule] : rules) {\n+    const auto old_rule = old_rules.find(rule_path);\n+    if (old_rule == old_rules.end()) {\n+      TENZIR_VERBOSE(\"added Sigma rule {}\", rule_path);\n+    } else if (old_rule->second.yaml != rule.yaml\n+               or old_rule->second.rule != rule.rule) {\n+      TENZIR_VERBOSE(\"updated Sigma rule {}\", rule_path);\n+    }\n+  }\n+  for (const auto& [rule_path, _] : old_rules) {\n+    if (not rules.contains(rule_path)) {\n+      TENZIR_VERBOSE(\"removed Sigma rule {}\", rule_path);\n     }\n+  }\n+}\n \n-    std::filesystem::path path;\n-    std::unordered_map<std::string, std::pair<data, expression>> rules = {};\n+auto make_sigma_slice(const table_slice& input, const data& yaml,\n+                      const expression& rule) -> std::optional<table_slice> {\n+  auto expr = tailor(rule, input.schema());\n+  if (not expr) {\n+    return std::nullopt;\n+  }\n+  auto event = filter(input, *expr);\n+  if (not event) {\n+    return std::nullopt;\n+  }\n+  auto [event_schema, event_array] = offset{}.get(*event);\n+  auto [rule_schema, rule_array] = [&] {\n+    auto rule_builder = series_builder{};\n+    for (auto i = size_t{0}; i < event->rows(); ++i) {\n+      rule_builder.data(yaml);\n+    }\n+    return rule_builder.finish_assert_one_array();\n+  }();\n+  const auto result_schema = type{\n+    \"tenzir.sigma\",\n+    record_type{\n+      {\"event\", event_schema},\n+      {\"rule\", rule_schema},\n+    },\n   };\n+  auto batch\n+    = arrow::RecordBatch::Make(result_schema.to_arrow_schema(),\n+                               detail::narrow<int64_t>(event->rows()),\n+                               {std::move(event_array), std::move(rule_array)});\n+  return table_slice{batch, result_schema};\n+}\n+\n+class sigma_operator final : public crtp_operator<sigma_operator> {\n+public:\n+  sigma_operator() = default;\n+\n+  explicit sigma_operator(duration refresh_interval, std::string path)\n+    : refresh_interval_{refresh_interval}, path_{std::move(path)} {\n+  }\n \n   auto\n   operator()(generator<table_slice> input, operator_control_plane& ctrl) const\n     -> generator<table_slice> {\n-    auto state = monitor_state{};\n-    state.path = path_;\n-    state.update(state.path, ctrl);\n+    auto rules = RuleMap{};\n+    auto path = std::filesystem::path{path_};\n+    update_rules(path, rules, ctrl.diagnostics());\n     auto last_update = std::chrono::steady_clock::now();\n     co_yield {}; // signal that we're done initializing\n     for (auto&& slice : input) {\n       if (slice.rows() == 0) {\n         co_yield {};\n         continue;\n       }\n-      if (last_update + refresh_interval_ < std::chrono::steady_clock::now()) {\n-        state.update(state.path, ctrl);\n-        last_update = std::chrono::steady_clock::now();\n+      auto now = std::chrono::steady_clock::now();\n+      if (now - last_update > refresh_interval_) {\n+        update_rules(path, rules, ctrl.diagnostics());\n+        last_update = now;\n       }\n-      for (const auto& [path, entry] : state.rules) {\n-        const auto& [yaml, rule] = entry;\n-        auto expr = tailor(rule, slice.schema());\n-        if (not expr) {\n-          continue;\n-        }\n-        if (auto event = filter(slice, *expr)) {\n-          auto [event_schema, event_array] = offset{}.get(*event);\n-          auto [rule_schema, rule_array] = [&] {\n-            auto rule_builder = series_builder{};\n-            for (size_t i = 0; i < event->rows(); ++i) {\n-              rule_builder.data(yaml);\n-            }\n-            return rule_builder.finish_assert_one_array();\n-          }();\n-          const auto result_schema = type{\n-            \"tenzir.sigma\",\n-            record_type{\n-              {\"event\", event_schema},\n-              {\"rule\", rule_schema},\n-            },\n-          };\n-          auto batch = arrow::RecordBatch::Make(\n-            result_schema.to_arrow_schema(),\n-            detail::narrow_cast<int64_t>(event->rows()),\n-            {std::move(event_array), std::move(rule_array)});\n-          co_yield table_slice{batch, result_schema};\n+      for (const auto& [_, entry] : rules) {\n+        if (auto result = make_sigma_slice(slice, entry.yaml, entry.rule)) {\n+          co_yield std::move(*result);\n         }\n       }\n     }\n@@ -172,8 +192,7 @@ class sigma_operator final : public crtp_operator<sigma_operator> {\n \n   auto optimize(expression const& filter, event_order order) const\n     -> optimize_result override {\n-    (void)order;\n-    (void)filter;\n+    TENZIR_UNUSED(filter, order);\n     return do_not_optimize(*this);\n   }\n \n@@ -189,8 +208,49 @@ class sigma_operator final : public crtp_operator<sigma_operator> {\n   std::string path_ = {};\n };\n \n+struct SigmaArgs {\n+  std::string path;\n+  duration refresh_interval = std::chrono::seconds{5};\n+};\n+\n+class Sigma final : public Operator<table_slice, table_slice> {\n+public:\n+  explicit Sigma(SigmaArgs args) : args_{std::move(args)}, path_{args_.path} {\n+  }\n+\n+  auto start(OpCtx& ctx) -> Task<void> override {\n+    update_rules(path_, rules_, ctx.dh());\n+    last_update_ = std::chrono::steady_clock::now();\n+    co_return;\n+  }\n+\n+  auto process(table_slice input, Push<table_slice>& push, OpCtx& ctx)\n+    -> Task<void> override {\n+    auto now = std::chrono::steady_clock::now();\n+    if (now - last_update_ > args_.refresh_interval) {\n+      update_rules(path_, rules_, ctx.dh());\n+      last_update_ = now;\n+    }\n+    for (const auto& [_, entry] : rules_) {\n+      if (auto result = make_sigma_slice(input, entry.yaml, entry.rule)) {\n+        co_await push(std::move(*result));\n+      }\n+    }\n+  }\n+\n+private:\n+  SigmaArgs args_;\n+  std::filesystem::path path_;\n+  RuleMap rules_;\n+  // Rules are reloaded from disk in `start()`, and `last_update_` uses\n+  // `steady_clock`, so the default no-op snapshot behavior is sufficient.\n+  std::chrono::steady_clock::time_point last_update_ = {};\n+};\n+\n class plugin final : public virtual operator_plugin<sigma_operator>,\n-                     public virtual operator_factory_plugin {\n+                     public virtual operator_factory_plugin,\n+                     public virtual OperatorPlugin {\n+public:\n   auto signature() const -> operator_signature override {\n     return {.transformation = true};\n   }\n@@ -204,21 +264,37 @@ class plugin final : public virtual operator_plugin<sigma_operator>,\n       .named(\"refresh_interval\", refresh_interval)\n       .parse(inv, ctx)\n       .ignore();\n-    if (not refresh_interval) {\n-      refresh_interval->inner = std::chrono::seconds(5);\n-    } else if (refresh_interval->inner.count() < 0) {\n-      diagnostic::error(\"refresh_interval must be greater than 0\")\n+    auto interval\n+      = refresh_interval ? refresh_interval->inner : std::chrono::seconds{5};\n+    if (refresh_interval and interval <= duration::zero()) {\n+      diagnostic::error(\"`refresh_interval` must be a positive duration\")\n         .primary(refresh_interval.value())\n         .emit(ctx);\n       return failure::promise();\n     }\n-    return std::make_unique<sigma_operator>(refresh_interval->inner,\n-                                            std::move(path));\n+    return std::make_unique<sigma_operator>(interval, std::move(path));\n+  }\n+\n+  auto describe() const -> Description override {\n+    auto d = Describer<SigmaArgs, Sigma>{};\n+    d.positional(\"path\", &SigmaArgs::path);\n+    auto refresh_interval\n+      = d.named_optional(\"refresh_interval\", &SigmaArgs::refresh_interval);\n+    d.validate([refresh_interval](DescribeCtx& ctx) -> Empty {\n+      if (auto value = ctx.get(refresh_interval);\n+          value and *value <= duration::zero()) {\n+        diagnostic::error(\"`refresh_interval` must be a positive duration\")\n+          .primary(ctx.get_location(refresh_interval).value())\n+          .emit(ctx);\n+      }\n+      return {};\n+    });\n+    return d.without_optimize();\n   }\n \n   auto parse_operator(parser_interface& p) const -> operator_ptr override {\n     auto parser = argument_parser{\"sigma\", \"https://docs.tenzir.com/\"\n-                                           \"operators/batch\"};\n+                                           \"reference/operators\"};\n     auto refresh_interval = duration{std::chrono::seconds{5}};\n     auto refresh_interval_arg = std::optional<located<std::string>>{};\n     auto path = std::string{};\n@@ -233,11 +309,18 @@ class plugin final : public virtual operator_plugin<sigma_operator>,\n           .primary(refresh_interval_arg->source)\n           .throw_();\n       }\n+      if (refresh_interval <= duration::zero()) {\n+        diagnostic::error(\"`refresh_interval` must be a positive duration\")\n+          .primary(refresh_interval_arg->source)\n+          .throw_();\n+      }\n     }\n     return std::make_unique<sigma_operator>(refresh_interval, std::move(path));\n   }\n };\n \n+} // namespace\n+\n } // namespace tenzir::plugins::sigma\n \n TENZIR_REGISTER_PLUGIN(tenzir::plugins::sigma::plugin)"
+    },
+    {
+      "sha": "d7737a2bdab3553d27137cd17dee5cf8e9613b7f",
+      "filename": "test/inputs/sigma/basic-rule.yaml",
+      "status": "added",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/6a8b483027209e864a3ca03124aa4687078202c2/test%2Finputs%2Fsigma%2Fbasic-rule.yaml",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/6a8b483027209e864a3ca03124aa4687078202c2/test%2Finputs%2Fsigma%2Fbasic-rule.yaml",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Finputs%2Fsigma%2Fbasic-rule.yaml?ref=6a8b483027209e864a3ca03124aa4687078202c2",
+      "patch": "@@ -0,0 +1,5 @@\n+title: basic sigma rule\n+detection:\n+  selection:\n+    foo: needle\n+  condition: selection"
+    },
+    {
+      "sha": "42f5fbdfca66a0cf0287095f84303fd6dde7aa34",
+      "filename": "test/inputs/sigma/directory/alpha.yml",
+      "status": "added",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/6a8b483027209e864a3ca03124aa4687078202c2/test%2Finputs%2Fsigma%2Fdirectory%2Falpha.yml",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/6a8b483027209e864a3ca03124aa4687078202c2/test%2Finputs%2Fsigma%2Fdirectory%2Falpha.yml",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Finputs%2Fsigma%2Fdirectory%2Falpha.yml?ref=6a8b483027209e864a3ca03124aa4687078202c2",
+      "patch": "@@ -0,0 +1,5 @@\n+title: alpha sigma rule\n+detection:\n+  selection:\n+    foo: needle\n+  condition: selection"
+    },
+    {
+      "sha": "86f0d4991afcfc134108e212178ef2aec3d8f6ae",
+      "filename": "test/inputs/sigma/directory/nested/bravo.yaml",
+      "status": "added",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/6a8b483027209e864a3ca03124aa4687078202c2/test%2Finputs%2Fsigma%2Fdirectory%2Fnested%2Fbravo.yaml",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/6a8b483027209e864a3ca03124aa4687078202c2/test%2Finputs%2Fsigma%2Fdirectory%2Fnested%2Fbravo.yaml",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Finputs%2Fsigma%2Fdirectory%2Fnested%2Fbravo.yaml?ref=6a8b483027209e864a3ca03124aa4687078202c2",
+      "patch": "@@ -0,0 +1,5 @@\n+title: bravo sigma rule\n+detection:\n+  selection:\n+    foo: needle\n+  condition: selection"
+    },
+    {
+      "sha": "9d657ecec98c8a4974d6304a1b475947e421710f",
+      "filename": "test/tests/operators/sigma/basic.tql",
+      "status": "added",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/6a8b483027209e864a3ca03124aa4687078202c2/test%2Ftests%2Foperators%2Fsigma%2Fbasic.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/6a8b483027209e864a3ca03124aa4687078202c2/test%2Ftests%2Foperators%2Fsigma%2Fbasic.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fsigma%2Fbasic.tql?ref=6a8b483027209e864a3ca03124aa4687078202c2",
+      "patch": "@@ -0,0 +1,2 @@\n+from {foo: \"needle\"}\n+sigma f\"{env(\"TENZIR_INPUTS\")}/sigma/basic-rule.yaml\""
+    },
+    {
+      "sha": "d2e2a8ade96f0dd9165d15f7cbb415d4e0583e4b",
+      "filename": "test/tests/operators/sigma/basic.txt",
+      "status": "added",
+      "additions": 14,
+      "deletions": 0,
+      "changes": 14,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/6a8b483027209e864a3ca03124aa4687078202c2/test%2Ftests%2Foperators%2Fsigma%2Fbasic.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/6a8b483027209e864a3ca03124aa4687078202c2/test%2Ftests%2Foperators%2Fsigma%2Fbasic.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fsigma%2Fbasic.txt?ref=6a8b483027209e864a3ca03124aa4687078202c2",
+      "patch": "@@ -0,0 +1,14 @@\n+{\n+  event: {\n+    foo: \"needle\",\n+  },\n+  rule: {\n+    title: \"basic sigma rule\",\n+    detection: {\n+      selection: {\n+        foo: \"needle\",\n+      },\n+      condition: \"selection\",\n+    },\n+  },\n+}"
+    },
+    {
+      "sha": "03f869b476ca042cdd89e2b6170b527758fe0839",
+      "filename": "test/tests/operators/sigma/directory.tql",
+      "status": "added",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/6a8b483027209e864a3ca03124aa4687078202c2/test%2Ftests%2Foperators%2Fsigma%2Fdirectory.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/6a8b483027209e864a3ca03124aa4687078202c2/test%2Ftests%2Foperators%2Fsigma%2Fdirectory.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fsigma%2Fdirectory.tql?ref=6a8b483027209e864a3ca03124aa4687078202c2",
+      "patch": "@@ -0,0 +1,3 @@\n+from {foo: \"needle\"}\n+sigma f\"{env(\"TENZIR_INPUTS\")}/sigma/directory\"\n+sort rule.title"
+    },
+    {
+      "sha": "54650f985d0d309c055512fb7420cec5542722ba",
+      "filename": "test/tests/operators/sigma/directory.txt",
+      "status": "added",
+      "additions": 28,
+      "deletions": 0,
+      "changes": 28,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/6a8b483027209e864a3ca03124aa4687078202c2/test%2Ftests%2Foperators%2Fsigma%2Fdirectory.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/6a8b483027209e864a3ca03124aa4687078202c2/test%2Ftests%2Foperators%2Fsigma%2Fdirectory.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fsigma%2Fdirectory.txt?ref=6a8b483027209e864a3ca03124aa4687078202c2",
+      "patch": "@@ -0,0 +1,28 @@\n+{\n+  event: {\n+    foo: \"needle\",\n+  },\n+  rule: {\n+    title: \"alpha sigma rule\",\n+    detection: {\n+      selection: {\n+        foo: \"needle\",\n+      },\n+      condition: \"selection\",\n+    },\n+  },\n+}\n+{\n+  event: {\n+    foo: \"needle\",\n+  },\n+  rule: {\n+    title: \"bravo sigma rule\",\n+    detection: {\n+      selection: {\n+        foo: \"needle\",\n+      },\n+      condition: \"selection\",\n+    },\n+  },\n+}"
+    },
+    {
+      "sha": "1298368662727163a4ed15529b40e11fcdc92504",
+      "filename": "test/tests/operators/sigma/refresh_interval_zero.tql",
+      "status": "added",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/6a8b483027209e864a3ca03124aa4687078202c2/test%2Ftests%2Foperators%2Fsigma%2Frefresh_interval_zero.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/6a8b483027209e864a3ca03124aa4687078202c2/test%2Ftests%2Foperators%2Fsigma%2Frefresh_interval_zero.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fsigma%2Frefresh_interval_zero.tql?ref=6a8b483027209e864a3ca03124aa4687078202c2",
+      "patch": "@@ -0,0 +1,6 @@\n+---\n+error: true\n+---\n+\n+from {foo: \"needle\"}\n+sigma f\"{env(\"TENZIR_INPUTS\")}/sigma/basic-rule.yaml\", refresh_interval=0s"
+    },
+    {
+      "sha": "599e8d1ad03bfe511c989a4c6f34c640a674bf08",
+      "filename": "test/tests/operators/sigma/refresh_interval_zero.txt",
+      "status": "added",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/6a8b483027209e864a3ca03124aa4687078202c2/test%2Ftests%2Foperators%2Fsigma%2Frefresh_interval_zero.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/6a8b483027209e864a3ca03124aa4687078202c2/test%2Ftests%2Foperators%2Fsigma%2Frefresh_interval_zero.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fsigma%2Frefresh_interval_zero.txt?ref=6a8b483027209e864a3ca03124aa4687078202c2",
+      "patch": "@@ -0,0 +1,6 @@\n+error: `refresh_interval` must be a positive duration\n+ --> tests/operators/sigma/refresh_interval_zero.tql:6:73\n+  |\n+6 | sigma f\"{env(\"TENZIR_INPUTS\")}/sigma/basic-rule.yaml\", refresh_interval=0s\n+  |                                                                         ^^ \n+  |"
+    }
+  ]
+}

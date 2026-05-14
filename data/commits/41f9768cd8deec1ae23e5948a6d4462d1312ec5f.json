@@ -1,0 +1,89 @@
+{
+  "message": "fix: preserve context engine safeguard compaction",
+  "files": [
+    {
+      "sha": "f1d4e0f88fef69f4e7daa00834311a84bff5e36b",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/41f9768cd8deec1ae23e5948a6d4462d1312ec5f/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/41f9768cd8deec1ae23e5948a6d4462d1312ec5f/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=41f9768cd8deec1ae23e5948a6d4462d1312ec5f",
+      "patch": "@@ -66,6 +66,7 @@ Docs: https://docs.openclaw.ai\n - Gateway/sessions: recover main-agent turns interrupted by a gateway restart from stale transcript-lock evidence, avoiding stuck `status: \"running\"` sessions without broad post-boot transcript scans. Fixes #70555. Thanks @bitloi.\n - Plugins/Google Meet: include live Chrome-node readiness in `googlemeet setup` and document the Parallels recovery checks, so stale node tokens or disconnected VM browsers are visible before an agent opens a meeting. Thanks @steipete.\n - Codex approvals: compact home-directory permission paths to `~` without repeating them as a separate high-risk warning, while preserving filesystem root and wildcard host warnings. Thanks @steipete.\n+- Context engine: keep safeguard compaction checks active after context-engine windowing and for `ownsCompaction` engines, so large transcripts can compact before prompt submission instead of waiting for provider overflow. Fixes #71325. Thanks @steipete.\n - Plugins/runtime deps: isolate the internal npm cache used for bundled plugin runtime-dependency repair and let package updates refresh/verify already-current installs, so failed update or sudo doctor runs can be repaired by rerunning `openclaw update`. Thanks @steipete.\n - Agents/delete: keep `--json` output machine-readable and retain workspaces that overlap another agent's workspace instead of moving shared state to Trash. Fixes #70889 and #70890. (#70897) Thanks @kaseonedge.\n - Plugins/runtime deps: stage bundled plugin runtime dependencies for packaged/global installs in an external runtime root and retain already staged deps across repairs, avoiding package-tree update races and npm pruning after upgrades. Thanks @steipete."
+    },
+    {
+      "sha": "b420cc1a4faf099a2da6b335cb3ca66d9891825c",
+      "filename": "docs/concepts/context-engine.md",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 1,
+      "changes": 5,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/41f9768cd8deec1ae23e5948a6d4462d1312ec5f/docs%2Fconcepts%2Fcontext-engine.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/41f9768cd8deec1ae23e5948a6d4462d1312ec5f/docs%2Fconcepts%2Fcontext-engine.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/docs%2Fconcepts%2Fcontext-engine.md?ref=41f9768cd8deec1ae23e5948a6d4462d1312ec5f",
+      "patch": "@@ -210,7 +210,10 @@ enabled for the run:\n - `true` \u2014 the engine owns compaction behavior. OpenClaw disables Pi's built-in\n   auto-compaction for that run, and the engine's `compact()` implementation is\n   responsible for `/compact`, overflow recovery compaction, and any proactive\n-  compaction it wants to do in `afterTurn()`.\n+  compaction it wants to do in `afterTurn()`. OpenClaw may still run the\n+  pre-prompt overflow safeguard; when it predicts the full transcript will\n+  overflow, the recovery path calls the active engine's `compact()` before\n+  submitting another prompt.\n - `false` or unset \u2014 Pi's built-in auto-compaction may still run during prompt\n   execution, but the active engine's `compact()` method is still called for\n   `/compact` and overflow recovery."
+    },
+    {
+      "sha": "012e23b60ee9b082fd57046f5159a38fbb52a687",
+      "filename": "src/agents/pi-embedded-runner/run/attempt.spawn-workspace.context-engine.test.ts",
+      "status": "modified",
+      "additions": 76,
+      "deletions": 0,
+      "changes": 76,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/41f9768cd8deec1ae23e5948a6d4462d1312ec5f/src%2Fagents%2Fpi-embedded-runner%2Frun%2Fattempt.spawn-workspace.context-engine.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/41f9768cd8deec1ae23e5948a6d4462d1312ec5f/src%2Fagents%2Fpi-embedded-runner%2Frun%2Fattempt.spawn-workspace.context-engine.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fagents%2Fpi-embedded-runner%2Frun%2Fattempt.spawn-workspace.context-engine.test.ts?ref=41f9768cd8deec1ae23e5948a6d4462d1312ec5f",
+      "patch": "@@ -18,6 +18,7 @@ import {\n import {\n   cleanupTempPaths,\n   createContextEngineBootstrapAndAssemble,\n+  createContextEngineAttemptRunner,\n   expectCalledWithSessionKey,\n   getHoisted,\n   resetEmbeddedAttemptHarness,\n@@ -276,6 +277,81 @@ describe(\"runEmbeddedAttempt context engine sessionKey forwarding\", () => {\n     expect(params.sessionKey).toBe(sessionKey);\n   });\n \n+  it(\"prechecks unwindowed context before submitting a windowed context-engine prompt\", async () => {\n+    const sessionPrompt = vi.fn(async () => {});\n+    const fullHistory = [\n+      {\n+        role: \"assistant\",\n+        content: [{ type: \"text\", text: \"large historical context \".repeat(600) }],\n+        timestamp: 1,\n+      },\n+    ] as AgentMessage[];\n+    const windowedMessages = [\n+      { role: \"assistant\", content: [{ type: \"text\", text: \"small window\" }], timestamp: 2 },\n+    ] as AgentMessage[];\n+    const assemble = vi.fn(async () => ({\n+      messages: windowedMessages,\n+      estimatedTokens: 3,\n+    }));\n+\n+    const result = await createContextEngineAttemptRunner({\n+      contextEngine: { assemble },\n+      sessionKey,\n+      tempPaths,\n+      sessionMessages: fullHistory,\n+      sessionPrompt,\n+      attemptOverrides: {\n+        contextTokenBudget: 512,\n+      },\n+    });\n+\n+    expect(assemble).toHaveBeenCalledWith(\n+      expect.objectContaining({\n+        messages: fullHistory,\n+      }),\n+    );\n+    expect(sessionPrompt).not.toHaveBeenCalled();\n+    expect(result.promptErrorSource).toBe(\"precheck\");\n+    expect(result.preflightRecovery).toEqual({ route: \"compact_only\" });\n+  });\n+\n+  it(\"keeps preflight overflow checks active for engines that own compaction\", async () => {\n+    const sessionPrompt = vi.fn(async () => {});\n+    const fullHistory = [\n+      {\n+        role: \"assistant\",\n+        content: [{ type: \"text\", text: \"engine-owned large historical context \".repeat(600) }],\n+        timestamp: 1,\n+      },\n+    ] as AgentMessage[];\n+    const assemble = vi.fn(async () => ({\n+      messages: [\n+        { role: \"assistant\", content: [{ type: \"text\", text: \"small window\" }], timestamp: 2 },\n+      ] as AgentMessage[],\n+      estimatedTokens: 3,\n+    }));\n+\n+    const result = await createContextEngineAttemptRunner({\n+      contextEngine: {\n+        assemble,\n+        info: {\n+          ownsCompaction: true,\n+        },\n+      },\n+      sessionKey,\n+      tempPaths,\n+      sessionMessages: fullHistory,\n+      sessionPrompt,\n+      attemptOverrides: {\n+        contextTokenBudget: 512,\n+      },\n+    });\n+\n+    expect(sessionPrompt).not.toHaveBeenCalled();\n+    expect(result.promptErrorSource).toBe(\"precheck\");\n+    expect(result.preflightRecovery).toEqual({ route: \"compact_only\" });\n+  });\n+\n   it(\"skips maintenance when afterTurn fails\", async () => {\n     const { bootstrap, assemble } = createContextEngineBootstrapAndAssemble();\n     const afterTurn = vi.fn(async () => {"
+    },
+    {
+      "sha": "099f684686edbb9a680dfa2245843ad1c2e304bc",
+      "filename": "src/agents/pi-embedded-runner/run/attempt.spawn-workspace.test-support.ts",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 1,
+      "changes": 5,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/41f9768cd8deec1ae23e5948a6d4462d1312ec5f/src%2Fagents%2Fpi-embedded-runner%2Frun%2Fattempt.spawn-workspace.test-support.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/41f9768cd8deec1ae23e5948a6d4462d1312ec5f/src%2Fagents%2Fpi-embedded-runner%2Frun%2Fattempt.spawn-workspace.test-support.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fagents%2Fpi-embedded-runner%2Frun%2Fattempt.spawn-workspace.test-support.ts?ref=41f9768cd8deec1ae23e5948a6d4462d1312ec5f",
+      "patch": "@@ -193,13 +193,15 @@ vi.mock(\"@mariozechner/pi-coding-agent\", async () => {\n     async reload() {}\n   }\n   function ModelRegistry() {}\n+  const estimateTokens = (value: unknown) =>\n+    Math.max(1, Math.ceil(JSON.stringify(value ?? \"\").length / 4));\n \n   return {\n     ...actual,\n     AuthStorage,\n     createAgentSession: (...args: unknown[]) => hoisted.createAgentSessionMock(...args),\n     DefaultResourceLoader,\n-    estimateTokens: () => 0,\n+    estimateTokens,\n     generateSummary: async () => \"\",\n     ModelRegistry,\n     SessionManager: {\n@@ -975,6 +977,7 @@ export async function createContextEngineAttemptRunner(params: {\n         })),\n       ...(maintain ? { maintain } : {}),\n       info: {\n+        ...params.contextEngine.info,\n         id: infoId,\n         name: infoName,\n         version: infoVersion,"
+    },
+    {
+      "sha": "60f51f76e19d61f28cafad90d7ba72425a56c076",
+      "filename": "src/agents/pi-embedded-runner/run/attempt.ts",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 23,
+      "changes": 38,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/41f9768cd8deec1ae23e5948a6d4462d1312ec5f/src%2Fagents%2Fpi-embedded-runner%2Frun%2Fattempt.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/41f9768cd8deec1ae23e5948a6d4462d1312ec5f/src%2Fagents%2Fpi-embedded-runner%2Frun%2Fattempt.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fagents%2Fpi-embedded-runner%2Frun%2Fattempt.ts?ref=41f9768cd8deec1ae23e5948a6d4462d1312ec5f",
+      "patch": "@@ -1374,6 +1374,7 @@ export async function runEmbeddedAttempt(\n           await baseConvertToLlm(normalizeAssistantReplayContent(messages));\n       }\n       let prePromptMessageCount = activeSession.messages.length;\n+      let unwindowedContextEngineMessagesForPrecheck: AgentMessage[] | undefined;\n       abortSessionForYield = () => {\n         yieldAbortSettled = Promise.resolve(activeSession.abort());\n       };\n@@ -1855,6 +1856,7 @@ export async function runEmbeddedAttempt(\n \n         if (params.contextEngine) {\n           try {\n+            unwindowedContextEngineMessagesForPrecheck = activeSession.messages.slice();\n             const assembled = await assembleAttemptContextEngine({\n               contextEngine: params.contextEngine,\n               sessionId: params.sessionId,\n@@ -2453,29 +2455,19 @@ export async function runEmbeddedAttempt(\n \n           const reserveTokens = settingsManager.getCompactionReserveTokens();\n           const contextTokenBudget = params.contextTokenBudget ?? DEFAULT_CONTEXT_TOKENS;\n-          const preemptiveCompaction =\n-            params.contextEngine?.info?.ownsCompaction === true\n-              ? {\n-                  route: \"fits\" as const,\n-                  shouldCompact: false,\n-                  estimatedPromptTokens: 0,\n-                  promptBudgetBeforeReserve: 0,\n-                  overflowTokens: 0,\n-                  toolResultReducibleChars: 0,\n-                  effectiveReserveTokens: reserveTokens,\n-                }\n-              : shouldPreemptivelyCompactBeforePrompt({\n-                  messages: activeSession.messages,\n-                  systemPrompt: systemPromptText,\n-                  prompt: effectivePrompt,\n-                  contextTokenBudget,\n-                  reserveTokens,\n-                  toolResultMaxChars: resolveLiveToolResultMaxChars({\n-                    contextWindowTokens: contextTokenBudget,\n-                    cfg: params.config,\n-                    agentId: sessionAgentId,\n-                  }),\n-                });\n+          const preemptiveCompaction = shouldPreemptivelyCompactBeforePrompt({\n+            messages: activeSession.messages,\n+            unwindowedMessages: unwindowedContextEngineMessagesForPrecheck,\n+            systemPrompt: systemPromptText,\n+            prompt: effectivePrompt,\n+            contextTokenBudget,\n+            reserveTokens,\n+            toolResultMaxChars: resolveLiveToolResultMaxChars({\n+              contextWindowTokens: contextTokenBudget,\n+              cfg: params.config,\n+              agentId: sessionAgentId,\n+            }),\n+          });\n           if (preemptiveCompaction.route === \"truncate_tool_results_only\") {\n             const toolResultMaxChars = resolveLiveToolResultMaxChars({\n               contextWindowTokens: contextTokenBudget,"
+    },
+    {
+      "sha": "2cc4cb218dabd0fba6d470698d87c42ef26c5d59",
+      "filename": "src/agents/pi-embedded-runner/run/preemptive-compaction.test.ts",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 0,
+      "changes": 15,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/41f9768cd8deec1ae23e5948a6d4462d1312ec5f/src%2Fagents%2Fpi-embedded-runner%2Frun%2Fpreemptive-compaction.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/41f9768cd8deec1ae23e5948a6d4462d1312ec5f/src%2Fagents%2Fpi-embedded-runner%2Frun%2Fpreemptive-compaction.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fagents%2Fpi-embedded-runner%2Frun%2Fpreemptive-compaction.test.ts?ref=41f9768cd8deec1ae23e5948a6d4462d1312ec5f",
+      "patch": "@@ -93,6 +93,21 @@ describe(\"preemptive-compaction\", () => {\n     expect(result.estimatedPromptTokens).toBeLessThan(result.promptBudgetBeforeReserve);\n   });\n \n+  it(\"uses the larger unwindowed message estimate when context engine assembly windows history\", () => {\n+    const result = shouldPreemptivelyCompactBeforePrompt({\n+      messages: [makeAssistantHistory(\"small assembled window\")],\n+      unwindowedMessages: [makeAssistantHistory(verboseHistory.repeat(4))],\n+      systemPrompt: \"sys\",\n+      prompt: \"hello\",\n+      contextTokenBudget: 500,\n+      reserveTokens: 50,\n+    });\n+\n+    expect(result.shouldCompact).toBe(true);\n+    expect(result.route).toBe(\"compact_only\");\n+    expect(result.estimatedPromptTokens).toBeGreaterThan(result.promptBudgetBeforeReserve);\n+  });\n+\n   it(\"caps reserve tokens so small context models keep usable prompt budget\", () => {\n     const result = shouldPreemptivelyCompactBeforePrompt({\n       messages: [makeAssistantHistory(\"short history\")],"
+    },
+    {
+      "sha": "9cc1ac334bc4e8ce29f80e970e9b8e2fb7d92d4f",
+      "filename": "src/agents/pi-embedded-runner/run/preemptive-compaction.ts",
+      "status": "modified",
+      "additions": 19,
+      "deletions": 2,
+      "changes": 21,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/41f9768cd8deec1ae23e5948a6d4462d1312ec5f/src%2Fagents%2Fpi-embedded-runner%2Frun%2Fpreemptive-compaction.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/41f9768cd8deec1ae23e5948a6d4462d1312ec5f/src%2Fagents%2Fpi-embedded-runner%2Frun%2Fpreemptive-compaction.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fagents%2Fpi-embedded-runner%2Frun%2Fpreemptive-compaction.ts?ref=41f9768cd8deec1ae23e5948a6d4462d1312ec5f",
+      "patch": "@@ -40,6 +40,7 @@ export function estimatePrePromptTokens(params: {\n \n export function shouldPreemptivelyCompactBeforePrompt(params: {\n   messages: AgentMessage[];\n+  unwindowedMessages?: AgentMessage[];\n   systemPrompt?: string;\n   prompt: string;\n   contextTokenBudget: number;\n@@ -54,7 +55,23 @@ export function shouldPreemptivelyCompactBeforePrompt(params: {\n   toolResultReducibleChars: number;\n   effectiveReserveTokens: number;\n } {\n-  const estimatedPromptTokens = estimatePrePromptTokens(params);\n+  let messagesForPressure = params.messages;\n+  let estimatedPromptTokens = estimatePrePromptTokens({\n+    messages: params.messages,\n+    systemPrompt: params.systemPrompt,\n+    prompt: params.prompt,\n+  });\n+  if (params.unwindowedMessages && params.unwindowedMessages !== params.messages) {\n+    const unwindowedEstimatedPromptTokens = estimatePrePromptTokens({\n+      messages: params.unwindowedMessages,\n+      systemPrompt: params.systemPrompt,\n+      prompt: params.prompt,\n+    });\n+    if (unwindowedEstimatedPromptTokens > estimatedPromptTokens) {\n+      estimatedPromptTokens = unwindowedEstimatedPromptTokens;\n+      messagesForPressure = params.unwindowedMessages;\n+    }\n+  }\n   const contextTokenBudget = Math.max(1, Math.floor(params.contextTokenBudget));\n   const requestedReserveTokens = Math.max(0, Math.floor(params.reserveTokens));\n   const minPromptBudget = Math.min(\n@@ -68,7 +85,7 @@ export function shouldPreemptivelyCompactBeforePrompt(params: {\n   const promptBudgetBeforeReserve = Math.max(1, contextTokenBudget - effectiveReserveTokens);\n   const overflowTokens = Math.max(0, estimatedPromptTokens - promptBudgetBeforeReserve);\n   const toolResultPotential = estimateToolResultReductionPotential({\n-    messages: params.messages,\n+    messages: messagesForPressure,\n     contextWindowTokens: params.contextTokenBudget,\n     maxCharsOverride: params.toolResultMaxChars,\n   });"
+    }
+  ]
+}

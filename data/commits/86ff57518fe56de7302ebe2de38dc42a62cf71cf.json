@@ -1,0 +1,65 @@
+{
+  "message": "fix: keep Discord proxy fallback local (#57465) (thanks @geekhuashan)",
+  "files": [
+    {
+      "sha": "034eac5f31687714118307e4e49a53e4e9561ce0",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/86ff57518fe56de7302ebe2de38dc42a62cf71cf/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/86ff57518fe56de7302ebe2de38dc42a62cf71cf/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=86ff57518fe56de7302ebe2de38dc42a62cf71cf",
+      "patch": "@@ -38,6 +38,7 @@ Docs: https://docs.openclaw.ai\n - Slack/app manifest: add the missing `groups:read` scope to the onboarding and example Slack app manifest so apps copied from the OpenClaw templates can resolve private group conversations reliably.\n - Mobile pairing/Android: stop generating Tailscale and public mobile setup codes that point at unusable cleartext remote gateways, keep private LAN pairing allowed, and make Android reject insecure remote endpoints with clearer guidance while mixed bootstrap approvals honor operator scopes correctly. (#60128) Thanks @obviyus.\n - Telegram/media: add `channels.telegram.network.dangerouslyAllowPrivateNetwork` for trusted fake-IP or transparent-proxy environments where Telegram media downloads resolve `api.telegram.org` to private/internal/special-use addresses.\n+- Discord/proxy: keep Carbon REST, monitor startup, and webhook sends on the configured Discord proxy while falling back cleanly when the proxy URL is invalid, so Discord replies and deploys do not hard-fail on malformed proxy config. (#57465) Thanks @geekhuashan.\n \n ## 2026.4.2\n "
+    },
+    {
+      "sha": "1f752ab1f855164a8aba00cea483ffac99660fcd",
+      "filename": "extensions/discord/src/client.proxy.test.ts",
+      "status": "modified",
+      "additions": 36,
+      "deletions": 1,
+      "changes": 37,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/86ff57518fe56de7302ebe2de38dc42a62cf71cf/extensions%2Fdiscord%2Fsrc%2Fclient.proxy.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/86ff57518fe56de7302ebe2de38dc42a62cf71cf/extensions%2Fdiscord%2Fsrc%2Fclient.proxy.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fdiscord%2Fsrc%2Fclient.proxy.test.ts?ref=86ff57518fe56de7302ebe2de38dc42a62cf71cf",
+      "patch": "@@ -1,7 +1,23 @@\n-import { describe, expect, it } from \"vitest\";\n+import { describe, expect, it, vi } from \"vitest\";\n import type { OpenClawConfig } from \"../../../src/config/config.js\";\n import { createDiscordRestClient } from \"./client.js\";\n \n+const makeProxyFetchMock = vi.hoisted(() => vi.fn());\n+\n+vi.mock(\"openclaw/plugin-sdk/infra-runtime\", async (importOriginal) => {\n+  const actual = await importOriginal<typeof import(\"openclaw/plugin-sdk/infra-runtime\")>();\n+  makeProxyFetchMock.mockImplementation((proxyUrl: string) => {\n+    if (proxyUrl === \"bad-proxy\") {\n+      throw new Error(\"bad proxy\");\n+    }\n+    return actual.makeProxyFetch(proxyUrl);\n+  });\n+  return {\n+    ...actual,\n+    makeProxyFetch: makeProxyFetchMock,\n+  };\n+});\n+\n describe(\"createDiscordRestClient proxy support\", () => {\n   it(\"injects a custom fetch into RequestClient when a Discord proxy is configured\", () => {\n     const cfg = {\n@@ -39,4 +55,23 @@ describe(\"createDiscordRestClient proxy support\", () => {\n \n     expect(requestClient.options?.fetch).toBeUndefined();\n   });\n+\n+  it(\"falls back to direct fetch when the Discord proxy URL is invalid\", () => {\n+    const cfg = {\n+      channels: {\n+        discord: {\n+          token: \"Bot test-token\",\n+          proxy: \"bad-proxy\",\n+        },\n+      },\n+    } as OpenClawConfig;\n+\n+    const { rest } = createDiscordRestClient({}, cfg);\n+    const requestClient = rest as unknown as {\n+      options?: { fetch?: typeof fetch };\n+    };\n+\n+    expect(makeProxyFetchMock).toHaveBeenCalledWith(\"bad-proxy\");\n+    expect(requestClient.options?.fetch).toBeUndefined();\n+  });\n });"
+    },
+    {
+      "sha": "cb22f985a95383041fad54fd16a4a0a7d82a0a45",
+      "filename": "extensions/discord/src/client.ts",
+      "status": "modified",
+      "additions": 21,
+      "deletions": 3,
+      "changes": 24,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/86ff57518fe56de7302ebe2de38dc42a62cf71cf/extensions%2Fdiscord%2Fsrc%2Fclient.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/86ff57518fe56de7302ebe2de38dc42a62cf71cf/extensions%2Fdiscord%2Fsrc%2Fclient.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fdiscord%2Fsrc%2Fclient.ts?ref=86ff57518fe56de7302ebe2de38dc42a62cf71cf",
+      "patch": "@@ -3,6 +3,7 @@ import { loadConfig } from \"openclaw/plugin-sdk/config-runtime\";\n import { makeProxyFetch } from \"openclaw/plugin-sdk/infra-runtime\";\n import type { RetryConfig, RetryRunner } from \"openclaw/plugin-sdk/retry-runtime\";\n import { normalizeAccountId } from \"openclaw/plugin-sdk/routing\";\n+import { danger, type RuntimeEnv } from \"openclaw/plugin-sdk/runtime-env\";\n import {\n   mergeDiscordAccountConfig,\n   resolveDiscordAccount,\n@@ -46,24 +47,41 @@ function resolveDiscordProxyUrl(\n   return trimmed || undefined;\n }\n \n+function resolveDiscordProxyFetchByUrl(\n+  proxyUrl: string | undefined,\n+  runtime?: Pick<RuntimeEnv, \"error\">,\n+): typeof fetch | undefined {\n+  const proxy = proxyUrl?.trim();\n+  if (!proxy) {\n+    return undefined;\n+  }\n+  try {\n+    return makeProxyFetch(proxy);\n+  } catch (err) {\n+    runtime?.error?.(danger(`discord: invalid rest proxy: ${String(err)}`));\n+    return undefined;\n+  }\n+}\n+\n export function resolveDiscordProxyFetchForAccount(\n   account: Pick<ResolvedDiscordAccount, \"config\">,\n   cfg?: ReturnType<typeof loadConfig>,\n+  runtime?: Pick<RuntimeEnv, \"error\">,\n ): typeof fetch | undefined {\n-  const proxy = resolveDiscordProxyUrl(account, cfg);\n-  return proxy ? makeProxyFetch(proxy) : undefined;\n+  return resolveDiscordProxyFetchByUrl(resolveDiscordProxyUrl(account, cfg), runtime);\n }\n \n export function resolveDiscordProxyFetch(\n   opts: Pick<DiscordClientOpts, \"cfg\" | \"accountId\">,\n   cfg?: ReturnType<typeof loadConfig>,\n+  runtime?: Pick<RuntimeEnv, \"error\">,\n ): typeof fetch | undefined {\n   const resolvedCfg = opts.cfg ?? cfg ?? loadConfig();\n   const account = resolveAccountWithoutToken({\n     cfg: resolvedCfg,\n     accountId: opts.accountId,\n   });\n-  return resolveDiscordProxyFetchForAccount(account, resolvedCfg);\n+  return resolveDiscordProxyFetchForAccount(account, resolvedCfg, runtime);\n }\n \n function resolveRest("
+    },
+    {
+      "sha": "ba7b1e49659ad9dcdaafb7abdff656bce8ee8012",
+      "filename": "extensions/discord/src/monitor/provider.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/86ff57518fe56de7302ebe2de38dc42a62cf71cf/extensions%2Fdiscord%2Fsrc%2Fmonitor%2Fprovider.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/86ff57518fe56de7302ebe2de38dc42a62cf71cf/extensions%2Fdiscord%2Fsrc%2Fmonitor%2Fprovider.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fdiscord%2Fsrc%2Fmonitor%2Fprovider.ts?ref=86ff57518fe56de7302ebe2de38dc42a62cf71cf",
+      "patch": "@@ -593,7 +593,7 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {\n   const discordAccountThreadBindings =\n     cfg.channels?.discord?.accounts?.[account.accountId]?.threadBindings;\n   const discordRestFetch = resolveDiscordRestFetch(rawDiscordCfg.proxy, runtime);\n-  const discordProxyFetch = resolveDiscordProxyFetchForAccount(account, cfg);\n+  const discordProxyFetch = resolveDiscordProxyFetchForAccount(account, cfg, runtime);\n   const dmConfig = rawDiscordCfg.dm;\n   let guildEntries = rawDiscordCfg.guilds;\n   const defaultGroupPolicy = resolveDefaultGroupPolicy(cfg);"
+    },
+    {
+      "sha": "bda04da0794228a90940aed91df1ec49d3c907d5",
+      "filename": "extensions/discord/src/send.webhook.proxy.test.ts",
+      "status": "modified",
+      "additions": 30,
+      "deletions": 0,
+      "changes": 30,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/86ff57518fe56de7302ebe2de38dc42a62cf71cf/extensions%2Fdiscord%2Fsrc%2Fsend.webhook.proxy.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/86ff57518fe56de7302ebe2de38dc42a62cf71cf/extensions%2Fdiscord%2Fsrc%2Fsend.webhook.proxy.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fdiscord%2Fsrc%2Fsend.webhook.proxy.test.ts?ref=86ff57518fe56de7302ebe2de38dc42a62cf71cf",
+      "patch": "@@ -13,6 +13,36 @@ vi.mock(\"openclaw/plugin-sdk/infra-runtime\", async (importOriginal) => {\n });\n \n describe(\"sendWebhookMessageDiscord proxy support\", () => {\n+  it(\"falls back to global fetch when the Discord proxy URL is invalid\", async () => {\n+    makeProxyFetchMock.mockImplementation(() => {\n+      throw new Error(\"bad proxy\");\n+    });\n+    const globalFetchMock = vi\n+      .spyOn(globalThis, \"fetch\")\n+      .mockResolvedValue(new Response(JSON.stringify({ id: \"msg-0\" }), { status: 200 }));\n+\n+    const cfg = {\n+      channels: {\n+        discord: {\n+          token: \"Bot test-token\",\n+          proxy: \"bad-proxy\",\n+        },\n+      },\n+    } as OpenClawConfig;\n+\n+    await sendWebhookMessageDiscord(\"hello\", {\n+      cfg,\n+      accountId: \"default\",\n+      webhookId: \"123\",\n+      webhookToken: \"abc\",\n+      wait: true,\n+    });\n+\n+    expect(makeProxyFetchMock).toHaveBeenCalledWith(\"bad-proxy\");\n+    expect(globalFetchMock).toHaveBeenCalledOnce();\n+    globalFetchMock.mockRestore();\n+  });\n+\n   it(\"uses proxy fetch when a Discord proxy is configured\", async () => {\n     const proxiedFetch = vi\n       .fn()"
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "message": "perf: inline fp16\u2194f32 converters as integer bit-ops\n\nZig's @floatCast(f16 \u2194 f32) lowers to a software libcall on wasm\n(LLVM has no native f16 ABI), so both conversions lived as standalone\nwasm functions and got called once per scale, bias, and stored\nactivation \u2014 roughly 21 calls per output row in the int4 matmuls.\n\nRewrote both as explicit integer bit manipulations with the same\nsemantics as the upstream f16 cast. LLVM inlines these into the hot\nloops. Function-call sites in dist/pii.wasm: 106 \u2192 10.\n\nNode forward (T=61): 860 \u2192 779 ms (-10%).\nBrowser bench:\n  short  156 \u2192 141 ms  (0.19\u00d7 \u2192 0.21\u00d7 vs tjs)\n  medium 420 \u2192 390 ms  (0.09\u00d7 \u2192 0.10\u00d7)\n  long   958 \u2192 902 ms  (0.06\u00d7 \u2192 0.06\u00d7)\n\nParity unchanged: 8/8 argmax, max logit diff 0.97.",
+  "files": [
+    {
+      "sha": "2b7bb54878a2f97fa336c96600c8812dfaffd7a7",
+      "filename": "src/js/backends/pii-wasm-inline.ts",
+      "status": "modified",
+      "additions": 3128,
+      "deletions": 2257,
+      "changes": 5385,
+      "blob_url": "https://github.com/teamchong/textsift/blob/1698a39f96df5f5ddcd319a4db2bd715a2532d97/src%2Fjs%2Fbackends%2Fpii-wasm-inline.ts",
+      "raw_url": "https://github.com/teamchong/textsift/raw/1698a39f96df5f5ddcd319a4db2bd715a2532d97/src%2Fjs%2Fbackends%2Fpii-wasm-inline.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/src%2Fjs%2Fbackends%2Fpii-wasm-inline.ts?ref=1698a39f96df5f5ddcd319a4db2bd715a2532d97"
+    },
+    {
+      "sha": "9523e2b15274453c27f33c956adfa5ea57b1df34",
+      "filename": "src/zig/math.zig",
+      "status": "modified",
+      "additions": 37,
+      "deletions": 6,
+      "changes": 43,
+      "blob_url": "https://github.com/teamchong/textsift/blob/1698a39f96df5f5ddcd319a4db2bd715a2532d97/src%2Fzig%2Fmath.zig",
+      "raw_url": "https://github.com/teamchong/textsift/raw/1698a39f96df5f5ddcd319a4db2bd715a2532d97/src%2Fzig%2Fmath.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/src%2Fzig%2Fmath.zig?ref=1698a39f96df5f5ddcd319a4db2bd715a2532d97",
+      "patch": "@@ -37,17 +37,48 @@ pub inline fn bf16x4ToF32x4(u: @Vector(4, u16)) @Vector(4, f32) {\n }\n \n // fp16 = IEEE 754 binary16 (1 sign + 5 exp + 10 mantissa, bias 15).\n-// Conversions go through Zig's native `f16` type, which the backend\n-// lowers to inline integer bit-math on wasm \u2014 no libcall.\n+// Zig's `@floatCast(f16 \u2194 f32)` still emits a libcall on wasm targets\n+// \u2014 LLVM doesn't have a native f16 ABI \u2014 which pulls the conversion\n+// out into a real function invocation inside hot loops. Do the bit\n+// manipulation explicitly so the compiler inlines it.\n \n pub inline fn fp16ToF32(bits: u16) f32 {\n-    const h: f16 = @bitCast(bits);\n-    return @floatCast(h);\n+    const u32_bits: u32 = bits;\n+    const sign_shifted: u32 = (u32_bits & 0x8000) << 16;\n+    const rest: u32 = u32_bits & 0x7fff;\n+    const biased: u32 = if (rest == 0) 0 else (rest << 13) +% (112 << 23);\n+    const result_bits: u32 = sign_shifted | biased;\n+    return @bitCast(result_bits);\n }\n \n pub inline fn f32ToFp16(f: f32) u16 {\n-    const h: f16 = @floatCast(f);\n-    return @bitCast(h);\n+    const u32_bits: u32 = @bitCast(f);\n+    const sign: u32 = (u32_bits >> 16) & 0x8000;\n+    const exp32: u32 = (u32_bits >> 23) & 0xff;\n+    const mant: u32 = u32_bits & 0x7fffff;\n+    if (exp32 == 0xff) {\n+        // inf or NaN\n+        return @intCast(sign | 0x7c00 | @as(u32, if (mant != 0) 0x200 else 0));\n+    }\n+    const exp16_signed: i32 = @as(i32, @intCast(exp32)) - 127 + 15;\n+    if (exp16_signed >= 0x1f) return @intCast(sign | 0x7c00);\n+    if (exp16_signed <= 0) {\n+        if (exp16_signed < -10) return @intCast(sign);\n+        const shift: u5 = @intCast(@as(u32, @intCast(14 - exp16_signed)));\n+        const mant24: u32 = mant | 0x800000;\n+        const rounded: u32 = (mant24 + (@as(u32, 1) << (shift - 1))) >> shift;\n+        return @intCast(sign | rounded);\n+    }\n+    // Normal: round-to-nearest-even of the top 10 mantissa bits.\n+    const lsb: u32 = (mant >> 13) & 1;\n+    var m10: u32 = (mant + 0xfff + lsb) >> 13;\n+    var e16: u32 = @intCast(exp16_signed);\n+    if (m10 >= 0x400) {\n+        m10 = 0;\n+        e16 += 1;\n+        if (e16 >= 0x1f) return @intCast(sign | 0x7c00);\n+    }\n+    return @intCast(sign | (e16 << 10) | m10);\n }\n \n pub inline fn fp16x4ToF32x4(u: @Vector(4, u16)) @Vector(4, f32) {"
+    }
+  ]
+}

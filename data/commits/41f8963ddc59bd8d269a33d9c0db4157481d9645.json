@@ -1,0 +1,53 @@
+{
+  "message": "fix: harden mux lifecycle against leak classes in subscribers, tab state, and tmux queue\n\n- Wrap subscriber callbacks in catch_unwind to prevent panicking subscribers\n  from leaking in the notification map (mux/lib.rs)\n- Remove dead pane IDs from collapsed_panes on pane removal (mux/tab.rs)\n- Add CMD_QUEUE_MAX_DEPTH (50k) hard cap on tmux command queue with\n  oldest-first drain to prevent unbounded growth during event storms (mux/tmux.rs)\n- Remove duplicate tcp_tls bench entry in frankenterm-core Cargo.toml\n- Add regression tests for subscriber panic safety and queue cap\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "77d311d8c3e39a046bd8a1948a7a8f5530573487",
+      "filename": "crates/frankenterm-core/Cargo.toml",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 0,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/41f8963ddc59bd8d269a33d9c0db4157481d9645/crates%2Ffrankenterm-core%2FCargo.toml",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/41f8963ddc59bd8d269a33d9c0db4157481d9645/crates%2Ffrankenterm-core%2FCargo.toml",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Ffrankenterm-core%2FCargo.toml?ref=41f8963ddc59bd8d269a33d9c0db4157481d9645",
+      "patch": "@@ -10,6 +10,7 @@ repository.workspace = true\n readme = \"../../README.md\"\n keywords = [\"terminal\", \"frankenterm\", \"automation\", \"ai-agents\"]\n categories = [\"development-tools\"]\n+autobenches = false\n \n [lints]\n workspace = true\n@@ -117,6 +118,7 @@ proptest = \"1.8.0\"\n tempfile = \"3.23.0\"\n criterion = { version = \"0.7.0\", features = [\"async_tokio\"] }\n loom = \"0.7\"\n+rcgen = { workspace = true }\n \n # Benchmarks\n [[bench]]\n@@ -172,6 +174,11 @@ name = \"task_spawn\"\n harness = false\n required-features = [\"asupersync-runtime\"]\n \n+[[bench]]\n+name = \"tcp_tls\"\n+harness = false\n+required-features = [\"asupersync-runtime\", \"distributed\"]\n+\n [[bench]]\n name = \"sizing_benchmark\"\n harness = false"
+    },
+    {
+      "sha": "59af3b3b721bb2c45f42e1d782c860526efa3151",
+      "filename": "frankenterm/mux/src/lib.rs",
+      "status": "modified",
+      "additions": 38,
+      "deletions": 2,
+      "changes": 40,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/41f8963ddc59bd8d269a33d9c0db4157481d9645/frankenterm%2Fmux%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/41f8963ddc59bd8d269a33d9c0db4157481d9645/frankenterm%2Fmux%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/frankenterm%2Fmux%2Fsrc%2Flib.rs?ref=41f8963ddc59bd8d269a33d9c0db4157481d9645",
+      "patch": "@@ -841,8 +841,15 @@ impl Mux {\n \n         let mut dead_subscribers = Vec::new();\n         for (id, subscriber) in subscribers {\n-            if !subscriber(notification.clone()) {\n-                dead_subscribers.push(id);\n+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {\n+                subscriber(notification.clone())\n+            })) {\n+                Ok(true) => {} // subscriber still alive\n+                Ok(false) => dead_subscribers.push(id),\n+                Err(_) => {\n+                    log::error!(\"mux subscriber {id} panicked \u2014 removing\");\n+                    dead_subscribers.push(id);\n+                }\n             }\n         }\n \n@@ -2064,4 +2071,33 @@ mod tests {\n         assert_eq!(pty_size.rows, 0);\n         assert_eq!(pty_size.cols, 0);\n     }\n+\n+    #[test]\n+    fn panicking_subscriber_is_removed_and_does_not_poison_others() {\n+        let mux = Mux::new(None);\n+        let healthy_count = Arc::new(AtomicUsize::new(0));\n+        let observed = Arc::clone(&healthy_count);\n+\n+        // Panicking subscriber\n+        mux.subscribe(move |_| {\n+            panic!(\"intentional test panic in subscriber\");\n+        });\n+\n+        // Healthy subscriber registered after the panicker\n+        mux.subscribe(move |_| {\n+            observed.fetch_add(1, Ordering::Relaxed);\n+            true\n+        });\n+\n+        // First dispatch: panicker fires and is removed, healthy fires\n+        mux.dispatch_notification(MuxNotification::Empty);\n+        assert_eq!(healthy_count.load(Ordering::Relaxed), 1);\n+\n+        // Second dispatch: panicker is gone, only healthy fires\n+        mux.dispatch_notification(MuxNotification::Empty);\n+        assert_eq!(healthy_count.load(Ordering::Relaxed), 2);\n+\n+        // Only the healthy subscriber remains\n+        assert_eq!(mux.subscribers.read().len(), 1);\n+    }\n }"
+    },
+    {
+      "sha": "797867f6cdd78c761854b71f61af2be1b8228dbe",
+      "filename": "frankenterm/mux/src/tab.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 1,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/41f8963ddc59bd8d269a33d9c0db4157481d9645/frankenterm%2Fmux%2Fsrc%2Ftab.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/41f8963ddc59bd8d269a33d9c0db4157481d9645/frankenterm%2Fmux%2Fsrc%2Ftab.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/frankenterm%2Fmux%2Fsrc%2Ftab.rs?ref=41f8963ddc59bd8d269a33d9c0db4157481d9645",
+      "patch": "@@ -3359,7 +3359,9 @@ impl TabInner {\n             .detach();\n         }\n         for pane in &dead_panes {\n-            self.constraint_overrides.remove(&pane.pane_id());\n+            let pid = pane.pane_id();\n+            self.constraint_overrides.remove(&pid);\n+            self.collapsed_panes.remove(&pid);\n         }\n         dead_panes\n     }"
+    },
+    {
+      "sha": "2c3a875bbfdb1f7cf47005b1f0419f1e06a5e51a",
+      "filename": "frankenterm/mux/src/tmux.rs",
+      "status": "modified",
+      "additions": 51,
+      "deletions": 1,
+      "changes": 52,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/41f8963ddc59bd8d269a33d9c0db4157481d9645/frankenterm%2Fmux%2Fsrc%2Ftmux.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/41f8963ddc59bd8d269a33d9c0db4157481d9645/frankenterm%2Fmux%2Fsrc%2Ftmux.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/frankenterm%2Fmux%2Fsrc%2Ftmux.rs?ref=41f8963ddc59bd8d269a33d9c0db4157481d9645",
+      "patch": "@@ -29,6 +29,10 @@ fn max_backlog_bytes_per_pane() -> usize {\n /// indicates protocol churn or a stalled consumer.\n const CMD_QUEUE_WARNING_DEPTH: usize = 10_000;\n \n+/// Hard cap on tmux command queue size to prevent unbounded memory growth\n+/// during event storms. Oldest commands are dropped when the cap is reached.\n+const CMD_QUEUE_MAX_DEPTH: usize = 50_000;\n+\n fn cap_backlog_payload(payload: &[u8]) -> Vec<u8> {\n     if payload.len() <= max_backlog_bytes_per_pane() {\n         payload.to_vec()\n@@ -283,7 +287,16 @@ impl TmuxDomainState {\n             return;\n         }\n         let mut cmd_queue = self.cmd_queue.as_ref().lock();\n-        if cmd_queue.len() > CMD_QUEUE_WARNING_DEPTH {\n+        if cmd_queue.len() > CMD_QUEUE_MAX_DEPTH {\n+            let excess = cmd_queue.len() - CMD_QUEUE_MAX_DEPTH;\n+            log::error!(\n+                \"tmux command queue ({}) exceeds hard cap {}; dropping {} oldest commands\",\n+                cmd_queue.len(),\n+                CMD_QUEUE_MAX_DEPTH,\n+                excess,\n+            );\n+            cmd_queue.drain(..excess);\n+        } else if cmd_queue.len() > CMD_QUEUE_WARNING_DEPTH {\n             log::warn!(\n                 \"tmux command queue depth ({}) exceeds {} threshold; possible protocol churn\",\n                 cmd_queue.len(),\n@@ -798,4 +811,41 @@ mod tests {\n         assert_eq!(exact.len(), capped.len());\n         assert_eq!(exact, capped);\n     }\n+\n+    #[test]\n+    fn cmd_queue_hard_cap_drains_oldest_when_exceeded() {\n+        let default_domain: Arc<dyn Domain> =\n+            Arc::new(LocalDomain::new(\"tmux-queue-cap-default\").expect(\"local domain\"));\n+        let mux = Arc::new(Mux::new(Some(Arc::clone(&default_domain))));\n+        let _guard = ScopedMux::install(Arc::clone(&mux));\n+\n+        let launcher = RecordingPane::new(99, default_domain.domain_id());\n+        let launcher_dyn: Arc<dyn Pane> = launcher.clone();\n+        mux.add_pane(&launcher_dyn).expect(\"add launcher pane\");\n+\n+        let tmux_domain = TmuxDomain::new(99);\n+        // Set state to Idle so send_next_command processes the queue\n+        *tmux_domain.inner.state.lock() = State::Idle;\n+\n+        // Fill the queue beyond the hard cap\n+        {\n+            let mut queue = tmux_domain.inner.cmd_queue.lock();\n+            for _ in 0..CMD_QUEUE_MAX_DEPTH + 100 {\n+                queue.push_back(Box::new(ListCommands));\n+            }\n+            assert_eq!(queue.len(), CMD_QUEUE_MAX_DEPTH + 100);\n+        }\n+\n+        // send_next_command should drain excess before processing\n+        tmux_domain.inner.send_next_command();\n+\n+        let queue = tmux_domain.inner.cmd_queue.lock();\n+        // Queue should be at or below the cap (minus the one that was sent)\n+        assert!(\n+            queue.len() <= CMD_QUEUE_MAX_DEPTH,\n+            \"queue length {} should be at most {}\",\n+            queue.len(),\n+            CMD_QUEUE_MAX_DEPTH,\n+        );\n+    }\n }"
+    }
+  ]
+}

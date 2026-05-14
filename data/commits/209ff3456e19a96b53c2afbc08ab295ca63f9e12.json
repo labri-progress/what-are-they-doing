@@ -1,0 +1,41 @@
+{
+  "message": "fix(search/query + tests): tantivy writer lock scoping + let-chain cleanup + segment-count doc\n\ntests/search_latency_under_indexing.rs\n  The two #[ignore] latency tests opened a TantivyIndex for seeding\n  and then tried to open a background IndexWriter further down the\n  same function. Tantivy serializes writers via a filesystem lockfile\n  \u2014 only one IndexWriter may exist per directory at a time \u2014 so the\n  second open was racing the first writer's Drop and occasionally\n  failing with a lock-held error on slower hosts. Wrapping the\n  seeding writer in its own scope forces the lock to drop before the\n  background indexer starts, which is what the test was always\n  implicitly assuming. Applied to both\n  search_p95_stays_within_budget_while_indexing_in_background and\n  governor_disabled_run_matches_idle_baseline with identical rationale\n  comments so the next reader doesn't \"simplify\" the braces back out.\n\nsrc/search/query.rs\n  Merge an `else if let Some(...) { if let Some(...) { ... } }`\n  ladder into an `else if let ... && let ...` chain. Pure clippy /\n  style cleanup \u2014 no semantic change, just one less level of nesting\n  on the federated-readers reload path.\n\nsrc/indexer/mod.rs\n  LexicalRebuildFinalMergeArtifact::segments is only consumed by\n  regression tests that prove the final-merge segment frontier is\n  not silently remerged; production code paths take only path +\n  doc count. #[allow(dead_code)] with a comment so the next cargo\n  clippy pass doesn't propose deleting the field (which would then\n  force the regression tests to reach into internals the wrong way).\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "620ff4cb012a0958f3a5c45969c2b6172872a835",
+      "filename": "src/indexer/mod.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/209ff3456e19a96b53c2afbc08ab295ca63f9e12/src%2Findexer%2Fmod.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/209ff3456e19a96b53c2afbc08ab295ca63f9e12/src%2Findexer%2Fmod.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/src%2Findexer%2Fmod.rs?ref=209ff3456e19a96b53c2afbc08ab295ca63f9e12",
+      "patch": "@@ -9650,6 +9650,10 @@ fn publish_staged_lexical_index(staged_index_path: &Path, index_path: &Path) ->\n struct LexicalRebuildFinalMergeArtifact {\n     publish_path: PathBuf,\n     docs: usize,\n+    // Kept for test assertions + future diagnostics; production code only\n+    // consumes the path + doc count, but regression tests still read this to\n+    // prove the segment frontier is not silently remerged.\n+    #[allow(dead_code)]\n     segments: usize,\n }\n "
+    },
+    {
+      "sha": "869e920242472776b16a9c90fb2c757b420008d3",
+      "filename": "src/search/query.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 4,
+      "changes": 8,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/209ff3456e19a96b53c2afbc08ab295ca63f9e12/src%2Fsearch%2Fquery.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/209ff3456e19a96b53c2afbc08ab295ca63f9e12/src%2Fsearch%2Fquery.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/src%2Fsearch%2Fquery.rs?ref=209ff3456e19a96b53c2afbc08ab295ca63f9e12",
+      "patch": "@@ -2852,10 +2852,10 @@ impl SearchClient {\n             let _ = self.maybe_reload_reader(reader);\n             let searcher = self.searcher_for_thread(reader);\n             self.track_generation(searcher.generation().generation_id());\n-        } else if let Some(readers) = self.federated_readers() {\n-            if let Some(signature) = self.maybe_reload_federated_readers(readers.as_ref())? {\n-                self.track_generation(signature);\n-            }\n+        } else if let Some(readers) = self.federated_readers()\n+            && let Some(signature) = self.maybe_reload_federated_readers(readers.as_ref())?\n+        {\n+            self.track_generation(signature);\n         }\n \n         // Fast path: reuse cached prefix when user is typing forward (offset 0 only)."
+    },
+    {
+      "sha": "1e0b22c4b4fcdb3a52a1cba27025fae7a2cf1207",
+      "filename": "tests/search_latency_under_indexing.rs",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 4,
+      "changes": 18,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/209ff3456e19a96b53c2afbc08ab295ca63f9e12/tests%2Fsearch_latency_under_indexing.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/209ff3456e19a96b53c2afbc08ab295ca63f9e12/tests%2Fsearch_latency_under_indexing.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/tests%2Fsearch_latency_under_indexing.rs?ref=209ff3456e19a96b53c2afbc08ab295ca63f9e12",
+      "patch": "@@ -174,8 +174,14 @@ fn measure_foreground_latency(\n fn search_p95_stays_within_budget_while_indexing_in_background() {\n     let dir = TempDir::new().unwrap();\n     let index_path = dir.path().to_path_buf();\n-    let mut index = TantivyIndex::open_or_create(&index_path).unwrap();\n-    seed_baseline_corpus(&mut index, dir.path(), 100);\n+    {\n+        // Tantivy serializes the writer via a filesystem lockfile: only one\n+        // `IndexWriter` may exist per directory at a time. We seed inside a\n+        // scope so the writer is dropped (and the lock released) before the\n+        // background indexer opens its own writer further down.\n+        let mut index = TantivyIndex::open_or_create(&index_path).unwrap();\n+        seed_baseline_corpus(&mut index, dir.path(), 100);\n+    }\n \n     // ---- Control: idle (no background indexer) ----\n     let idle_report = measure_foreground_latency(&index_path, 50, Duration::from_millis(5));\n@@ -259,8 +265,12 @@ fn governor_disabled_run_matches_idle_baseline() {\n \n     let dir = TempDir::new().unwrap();\n     let index_path = dir.path().to_path_buf();\n-    let mut index = TantivyIndex::open_or_create(&index_path).unwrap();\n-    seed_baseline_corpus(&mut index, dir.path(), 100);\n+    {\n+        // Same lockfile rationale as in the primary test: drop the writer\n+        // before the background indexer opens its own.\n+        let mut index = TantivyIndex::open_or_create(&index_path).unwrap();\n+        seed_baseline_corpus(&mut index, dir.path(), 100);\n+    }\n \n     let stop = Arc::new(AtomicBool::new(false));\n     let ready = Arc::new(Barrier::new(2));"
+    }
+  ]
+}

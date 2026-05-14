@@ -1,0 +1,41 @@
+{
+  "message": "fix(storage): reopen connection after bulk import to clear stale fsqlite snapshot state\n\nsrc/storage/sqlite.rs::SqliteStorage\n  Add `reopen_at(path, lock_timeout_ms)` which drops `self` and\n  replaces it with a freshly opened connection at the same path\n  (via `Self::open_with_timeout`). The doc-comment spells out the\n  load-bearing reason: fsqlite's pager / MVCC state is per-\n  connection, and after a large bulk import the in-memory view\n  can lag behind what was actually flushed to disk. Subsequent\n  VACUUM, REINDEX, and even fresh OpenRead cursors then fail\n  with stale-snapshot errors:\n    \"database is busy (snapshot conflict on pages: page N >\n     snapshot db_size M)\"\n    \"OpenRead failed: could not open storage cursor on root\n     page N\"\n  Dropping the connection forces fsqlite to re-read its view on\n  the next open, which makes the post-rebuild cleanup actually\n  work. The drop-then-open ordering is required because fsqlite\n  tracks pages by file path and two live connections to the same\n  DB can themselves surface BusySnapshot conflicts.\n\nsrc/config/mod.rs::rebuild_database_family\n  Call `storage.reopen_at(db_path, lock_timeout)` after\n  `import_from_jsonl` and before the VACUUM / REINDEX cleanup\n  block. Without this the cleanup ran against the stale snapshot\n  and silently failed (was logged at `tracing::debug!` so the\n  failure was effectively invisible). Also bump both VACUUM and\n  REINDEX failure logs from `debug!` \u2192 `warn!` and add the\n  `db_path` field, so a real failure (now rare) is actually\n  surfaced.\n\nsrc/output/context.rs::OutputContext::section\n  Re-enable the previously commented-out `.style(self.theme()\n  .section.clone())` on the section-rule renderer. Same shape as\n  the `error` panel re-enable from the previous commit \u2014 the\n  previous gating through a `theme()` accessor left the call\n  commented out as `// .style(self.theme.section.clone())`. The\n  tone now renders correctly.\n\nCargo.lock left modified intentionally \u2014 same local-sibling-path\npatch override situation flagged in the previous beads_rust\npasses.",
+  "files": [
+    {
+      "sha": "7d7f968c1e85d297b1513cc8776a05492acfdd67",
+      "filename": "src/config/mod.rs",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 2,
+      "changes": 22,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_rust/blob/3546f1582d973af77fd750687ef82d349457a180/src%2Fconfig%2Fmod.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_rust/raw/3546f1582d973af77fd750687ef82d349457a180/src%2Fconfig%2Fmod.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_rust/contents/src%2Fconfig%2Fmod.rs?ref=3546f1582d973af77fd750687ef82d349457a180",
+      "patch": "@@ -812,12 +812,26 @@ fn rebuild_database_family(\n     storage.set_config(\"issue_prefix\", prefix)?;\n     let import_result = import_from_jsonl(&mut storage, jsonl_path, import_config, Some(prefix))?;\n \n+    // After a large bulk import, fsqlite's pager/MVCC state can lag behind\n+    // what was actually written: VACUUM/REINDEX run against an old snapshot\n+    // and fail with \"database is busy (snapshot conflict on pages: page N >\n+    // snapshot db_size M)\", while the next cursor OpenRead refuses freshly\n+    // allocated root pages as \"invalid transaction-backed root page\". Dropping\n+    // this connection and reopening a fresh one at the same path forces\n+    // fsqlite to reload its view from disk, so the post-rebuild cleanup\n+    // actually runs and subsequent reads succeed.\n+    storage.reopen_at(db_path, lock_timeout)?;\n+\n     // Post-rebuild VACUUM to eliminate freeblock accounting anomalies that\n     // frankensqlite's B-tree layer may leave behind during bulk import.\n     // Without this, C sqlite3's `PRAGMA integrity_check` can report\n     // \"free space corruption\" even though the data is intact (issue #237).\n     if let Err(e) = storage.execute_raw(\"VACUUM\") {\n-        tracing::debug!(error = %e, \"VACUUM after rebuild failed (non-fatal)\");\n+        tracing::warn!(\n+            error = %e,\n+            db_path = %db_path.display(),\n+            \"VACUUM after rebuild failed (non-fatal); on-disk DB may still contain free-space corruption\"\n+        );\n     }\n \n     // Post-rebuild REINDEX to fix partial-index row mismatches that\n@@ -826,7 +840,11 @@ fn rebuild_database_family(\n     // REINDEX, `PRAGMA integrity_check` reports \"row N missing from index\"\n     // for partial indexes like idx_issues_list_active_order (issue #246).\n     if let Err(e) = storage.execute_raw(\"REINDEX\") {\n-        tracing::debug!(error = %e, \"REINDEX after rebuild failed (non-fatal)\");\n+        tracing::warn!(\n+            error = %e,\n+            db_path = %db_path.display(),\n+            \"REINDEX after rebuild failed (non-fatal); partial-index entries may be inconsistent\"\n+        );\n     }\n \n     Ok((storage, import_result))"
+    },
+    {
+      "sha": "4b9efd9b5912a16bdc7e766087d656de24306020",
+      "filename": "src/output/context.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 2,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_rust/blob/3546f1582d973af77fd750687ef82d349457a180/src%2Foutput%2Fcontext.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_rust/raw/3546f1582d973af77fd750687ef82d349457a180/src%2Foutput%2Fcontext.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_rust/contents/src%2Foutput%2Fcontext.rs?ref=3546f1582d973af77fd750687ef82d349457a180",
+      "patch": "@@ -412,8 +412,7 @@ impl OutputContext {\n     pub fn section(&self, title: &str) {\n         if self.is_rich() {\n             let rule = Rule::with_title(Text::new(title))\n-                // .style(self.theme.section.clone())\n-                ;\n+                .style(self.theme().section.clone());\n             self.console().print_renderable(&rule);\n         } else if self.is_plain() {\n             println!(\"\\n\u2500\u2500\u2500 {} \u2500\u2500\u2500\\n\", title);"
+    },
+    {
+      "sha": "009437daf95605d15bbaaa03d8c93dea1c99e212",
+      "filename": "src/storage/sqlite.rs",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 0,
+      "changes": 22,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_rust/blob/3546f1582d973af77fd750687ef82d349457a180/src%2Fstorage%2Fsqlite.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_rust/raw/3546f1582d973af77fd750687ef82d349457a180/src%2Fstorage%2Fsqlite.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_rust/contents/src%2Fstorage%2Fsqlite.rs?ref=3546f1582d973af77fd750687ef82d349457a180",
+      "patch": "@@ -470,6 +470,28 @@ impl SqliteStorage {\n         })\n     }\n \n+    /// Replace the underlying connection with a fresh one opened at `path`.\n+    ///\n+    /// After a large bulk import, fsqlite's in-memory pager and MVCC state can\n+    /// lag behind what was actually written to disk \u2014 subsequent VACUUM,\n+    /// REINDEX, and even OpenRead cursors fail with stale-snapshot errors\n+    /// (\"database is busy (snapshot conflict on pages: page N > snapshot db_size M)\"\n+    /// or \"OpenRead failed: could not open storage cursor on root page N\").\n+    /// Dropping the connection and reopening forces fsqlite to reload its\n+    /// view from disk, which makes those operations succeed.\n+    ///\n+    /// # Errors\n+    ///\n+    /// Returns an error if the new connection cannot be established.\n+    pub fn reopen_at(&mut self, path: &Path, lock_timeout_ms: Option<u64>) -> Result<()> {\n+        // Dropping the old connection is required before the new one is opened\n+        // because fsqlite tracks pages by file path; two live connections to\n+        // the same DB file can surface BusySnapshot conflicts.\n+        let fresh = Self::open_with_timeout(path, lock_timeout_ms)?;\n+        *self = fresh;\n+        Ok(())\n+    }\n+\n     /// Open an in-memory database for testing.\n     ///\n     /// # Errors"
+    }
+  ]
+}

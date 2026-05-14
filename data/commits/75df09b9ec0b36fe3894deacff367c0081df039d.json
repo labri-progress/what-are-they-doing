@@ -1,0 +1,65 @@
+{
+  "message": "perf(plugins): cache runtime mirror file decisions",
+  "files": [
+    {
+      "sha": "8239bc1b347fa0930cb998549a07c18cbbdab25f",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/75df09b9ec0b36fe3894deacff367c0081df039d/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/75df09b9ec0b36fe3894deacff367c0081df039d/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=75df09b9ec0b36fe3894deacff367c0081df039d",
+      "patch": "@@ -21,6 +21,7 @@ Docs: https://docs.openclaw.ai\n - Tasks: keep terminal mirrored TaskFlow timestamps pinned to task completion time and let maintenance repair stale mirrors, so ACP terminal delivery updates no longer leave inconsistent flow audits. Refs #73609. Thanks @joerod26.\n - Gateway/sessions: add conservative stuck-session recovery that releases only stale session lanes while active embedded runs, reply operations, and lane tasks remain serialized, so queued follow-ups can drain without aborting legitimate long-running turns. Refs #73581, #73655, #73652, #73705, #73647, #73602, #73592, and #73601. Thanks @WS-Q0758, @bryangauvin, @spenceryang1996-dot, @bmilne1981, @mattmcintyre, @Vksh07, and @Spolen23.\n - Plugins: cache unchanged plugin manifest loads by file signature, reducing repeated JSON/JSON5 parsing and manifest normalization in bursty startup and runtime registry paths. Refs #73532 and #73647; carries forward #73678. Thanks @TheDutchRuler.\n+- Plugins/runtime-deps: cache unchanged bundled runtime mirror dist-file materialization decisions and close file-lock handles on owner-write failures, reducing repeated startup chunk scans and avoiding FileHandle-GC recovery stalls. Refs #73532. Thanks @oadiazp and @bstanbury.\n - CLI/TUI: keep `chat.history` off model-catalog discovery so initial Gateway-backed TUI history loads cannot block behind slow provider/plugin model scans on low-core hosts. Refs #73524. Thanks @harshcatsystems-collab.\n - Channels/WhatsApp: flag recently reconnected linked accounts in channel status even when the socket is currently healthy, so flapping WhatsApp Web sessions no longer look clean after a brief reconnect. Refs #73602. Thanks @Vksh07.\n - Agents/model selection: resolve slash-form aliases before provider/model parsing and keep alias-resolved primary models subject to transient provider cooldowns, so cron and persisted sessions do not retry cooled-down raw aliases. Fixes #73573 and #73657. Thanks @akai-shuuichi and @hashslingers."
+    },
+    {
+      "sha": "ca3611f5e21e587705da82dd1c0ae0892346381d",
+      "filename": "src/plugin-sdk/file-lock.test.ts",
+      "status": "modified",
+      "additions": 25,
+      "deletions": 1,
+      "changes": 26,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/75df09b9ec0b36fe3894deacff367c0081df039d/src%2Fplugin-sdk%2Ffile-lock.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/75df09b9ec0b36fe3894deacff367c0081df039d/src%2Fplugin-sdk%2Ffile-lock.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fplugin-sdk%2Ffile-lock.test.ts?ref=75df09b9ec0b36fe3894deacff367c0081df039d",
+      "patch": "@@ -1,7 +1,7 @@\n import fs from \"node:fs/promises\";\n import os from \"node:os\";\n import path from \"node:path\";\n-import { afterEach, beforeEach, describe, expect, it } from \"vitest\";\n+import { afterEach, beforeEach, describe, expect, it, vi } from \"vitest\";\n import {\n   acquireFileLock,\n   drainFileLockStateForTest,\n@@ -55,4 +55,28 @@ describe(\"acquireFileLock\", () => {\n       return true;\n     });\n   }, 5_000);\n+\n+  it(\"closes an opened lock handle when writing the owner payload fails\", async () => {\n+    const filePath = path.join(tempDir, \"write-fails\");\n+    const writeError = new Error(\"owner write failed\");\n+    const close = vi.fn().mockResolvedValue(undefined);\n+    vi.spyOn(fs, \"open\").mockResolvedValue({\n+      close,\n+      writeFile: vi.fn().mockRejectedValue(writeError),\n+    } as unknown as Awaited<ReturnType<typeof fs.open>>);\n+\n+    await expect(\n+      acquireFileLock(filePath, {\n+        retries: {\n+          retries: 0,\n+          factor: 1,\n+          minTimeout: 1,\n+          maxTimeout: 1,\n+        },\n+        stale: 100,\n+      }),\n+    ).rejects.toThrow(writeError);\n+\n+    expect(close).toHaveBeenCalledTimes(1);\n+  });\n });"
+    },
+    {
+      "sha": "28d1f939d77097629bd5162a3b9c97717d50a583",
+      "filename": "src/plugin-sdk/file-lock.ts",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 4,
+      "changes": 14,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/75df09b9ec0b36fe3894deacff367c0081df039d/src%2Fplugin-sdk%2Ffile-lock.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/75df09b9ec0b36fe3894deacff367c0081df039d/src%2Fplugin-sdk%2Ffile-lock.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fplugin-sdk%2Ffile-lock.ts?ref=75df09b9ec0b36fe3894deacff367c0081df039d",
+      "patch": "@@ -183,10 +183,16 @@ export async function acquireFileLock(\n   for (let attempt = 0; attempt <= options.retries.retries; attempt += 1) {\n     try {\n       const handle = await fs.open(lockPath, \"wx\");\n-      await handle.writeFile(\n-        JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }, null, 2),\n-        \"utf8\",\n-      );\n+      try {\n+        await handle.writeFile(\n+          JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }, null, 2),\n+          \"utf8\",\n+        );\n+      } catch (writeError) {\n+        await handle.close().catch(() => undefined);\n+        await fs.rm(lockPath, { force: true }).catch(() => undefined);\n+        throw writeError;\n+      }\n       HELD_LOCKS.set(normalizedFile, { count: 1, handle, lockPath });\n       return {\n         lockPath,"
+    },
+    {
+      "sha": "fde5b797335ec06919c0248101a8a2b182df3ac8",
+      "filename": "src/plugins/bundled-runtime-deps.test.ts",
+      "status": "modified",
+      "additions": 32,
+      "deletions": 0,
+      "changes": 32,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/75df09b9ec0b36fe3894deacff367c0081df039d/src%2Fplugins%2Fbundled-runtime-deps.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/75df09b9ec0b36fe3894deacff367c0081df039d/src%2Fplugins%2Fbundled-runtime-deps.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fplugins%2Fbundled-runtime-deps.test.ts?ref=75df09b9ec0b36fe3894deacff367c0081df039d",
+      "patch": "@@ -25,6 +25,7 @@ import {\n   resolveBundledRuntimeDependencyInstallRootPlan,\n   resolveBundledRuntimeDepsNpmRunner,\n   scanBundledPluginRuntimeDeps,\n+  shouldMaterializeBundledRuntimeMirrorDistFile,\n   type BundledRuntimeDepsInstallParams,\n } from \"./bundled-runtime-deps.js\";\n \n@@ -99,11 +100,42 @@ afterEach(() => {\n   spawnMock.mockReset();\n   spawnSyncMock.mockReset();\n   bundledRuntimeDepsActivityTesting.resetBundledRuntimeDepsInstallActivity();\n+  bundledRuntimeDepsTesting.clearBundledRuntimeMirrorMaterializeCache();\n   for (const dir of tempDirs.splice(0)) {\n     fs.rmSync(dir, { recursive: true, force: true });\n   }\n });\n \n+describe(\"shouldMaterializeBundledRuntimeMirrorDistFile\", () => {\n+  it(\"reuses unchanged root dist file decisions without rereading source\", () => {\n+    const root = makeTempDir();\n+    const sourcePath = path.join(root, \"shared-runtime.js\");\n+    fs.writeFileSync(\n+      sourcePath,\n+      [\n+        `//#region extensions/browser/src/runtime.ts`,\n+        `export const marker = \"shared-runtime\";`,\n+        `//#endregion`,\n+        \"\",\n+      ].join(\"\\n\"),\n+      \"utf8\",\n+    );\n+    const realReadFileSync = fs.readFileSync.bind(fs);\n+    let sourceReads = 0;\n+    vi.spyOn(fs, \"readFileSync\").mockImplementation(((target, options) => {\n+      if (path.resolve(target.toString()) === path.resolve(sourcePath)) {\n+        sourceReads += 1;\n+      }\n+      return realReadFileSync(target, options as never);\n+    }) as typeof fs.readFileSync);\n+\n+    expect(shouldMaterializeBundledRuntimeMirrorDistFile(sourcePath)).toBe(true);\n+    expect(shouldMaterializeBundledRuntimeMirrorDistFile(sourcePath)).toBe(true);\n+\n+    expect(sourceReads).toBe(1);\n+  });\n+});\n+\n describe(\"resolveBundledRuntimeDepsNpmRunner\", () => {\n   it(\"ignores npm_execpath and uses the Node-adjacent npm CLI on Windows\", () => {\n     const execPath = \"C:\\\\Program Files\\\\nodejs\\\\node.exe\";"
+    },
+    {
+      "sha": "fc930e664ec01ae3e59429e299eea9220171f0e3",
+      "filename": "src/plugins/bundled-runtime-deps.ts",
+      "status": "modified",
+      "additions": 35,
+      "deletions": 4,
+      "changes": 39,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/75df09b9ec0b36fe3894deacff367c0081df039d/src%2Fplugins%2Fbundled-runtime-deps.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/75df09b9ec0b36fe3894deacff367c0081df039d/src%2Fplugins%2Fbundled-runtime-deps.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fplugins%2Fbundled-runtime-deps.ts?ref=75df09b9ec0b36fe3894deacff367c0081df039d",
+      "patch": "@@ -78,17 +78,26 @@ const BUNDLED_RUNTIME_MIRROR_IMPORT_SPECIFIER_RE =\n const NPM_EXECPATH_ENV_KEY = \"npm_execpath\";\n \n const registeredBundledRuntimeDepNodePaths = new Set<string>();\n+const bundledRuntimeMirrorMaterializeCache = new Map<\n+  string,\n+  { signature: string; materialize: boolean }\n+>();\n \n export type BundledRuntimeDepsNpmRunner = {\n   command: string;\n   args: string[];\n   env?: NodeJS.ProcessEnv;\n };\n \n-export function shouldMaterializeBundledRuntimeMirrorDistFile(sourcePath: string): boolean {\n-  if (!BUNDLED_RUNTIME_MIRROR_MATERIALIZED_EXTENSIONS.has(path.extname(sourcePath))) {\n-    return false;\n-  }\n+function clearBundledRuntimeMirrorMaterializeCache(): void {\n+  bundledRuntimeMirrorMaterializeCache.clear();\n+}\n+\n+function statSignature(stat: Pick<fs.Stats, \"dev\" | \"ino\" | \"size\" | \"mtimeMs\">): string {\n+  return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}`;\n+}\n+\n+function computeBundledRuntimeMirrorDistFileMaterialization(sourcePath: string): boolean {\n   let source: string;\n   try {\n     source = fs.readFileSync(sourcePath, \"utf8\");\n@@ -113,6 +122,27 @@ export function shouldMaterializeBundledRuntimeMirrorDistFile(sourcePath: string\n   return true;\n }\n \n+export function shouldMaterializeBundledRuntimeMirrorDistFile(sourcePath: string): boolean {\n+  if (!BUNDLED_RUNTIME_MIRROR_MATERIALIZED_EXTENSIONS.has(path.extname(sourcePath))) {\n+    return false;\n+  }\n+  const cacheKey = path.resolve(sourcePath);\n+  let signature: string;\n+  try {\n+    signature = statSignature(fs.statSync(sourcePath));\n+  } catch {\n+    bundledRuntimeMirrorMaterializeCache.delete(cacheKey);\n+    return false;\n+  }\n+  const cached = bundledRuntimeMirrorMaterializeCache.get(cacheKey);\n+  if (cached?.signature === signature) {\n+    return cached.materialize;\n+  }\n+  const materialize = computeBundledRuntimeMirrorDistFileMaterialization(sourcePath);\n+  bundledRuntimeMirrorMaterializeCache.set(cacheKey, { signature, materialize });\n+  return materialize;\n+}\n+\n export function materializeBundledRuntimeMirrorDistFile(\n   sourcePath: string,\n   targetPath: string,\n@@ -404,6 +434,7 @@ function formatRuntimeDepsLockTimeoutMessage(params: {\n }\n \n export const __testing = {\n+  clearBundledRuntimeMirrorMaterializeCache,\n   formatRuntimeDepsLockTimeoutMessage,\n   shouldRemoveRuntimeDepsLock,\n };"
+    }
+  ]
+}

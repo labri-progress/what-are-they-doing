@@ -1,0 +1,120 @@
+{
+  "message": "stage 1 phase D.6: router primitives \u2014 matmul_bf16_out_f32 + topk\n\nRouter runs in fp32 upstream; exposing an f32-output matmul keeps\nthe precision intact across the router projection. topk_partial_f32\ndoes per-row top-k via a fixed-size incremental insertion sort (k=4,\nn=128 \u2192 512 compares per row, beats a heap for small k).\n\nBench fixtures cover both ends:\n- matmul_bf16_out_f32: maxRel 3.89e-5 (tol 1e-3). Same matrix as the\n  bf16 test; only the final bf16 round is skipped.\n- topk_partial_f32: bit-exact indices + values across 32 rows \u00d7 4 top\n  entries vs torch.topk.\n\nTS-level router composition (matmul \u2192 topk \u2192 softmax \u2192 /k) lands with\nthe block forward wiring.",
+  "files": [
+    {
+      "sha": "ba2e175a6ae0a1a5a7a72095b3383896db1f57af",
+      "filename": "scripts/gen-kernel-fixtures.py",
+      "status": "modified",
+      "additions": 24,
+      "deletions": 0,
+      "changes": 24,
+      "blob_url": "https://github.com/teamchong/textsift/blob/2e9e693a4781d5b4bd4fac0a141f17df08db98e9/scripts%2Fgen-kernel-fixtures.py",
+      "raw_url": "https://github.com/teamchong/textsift/raw/2e9e693a4781d5b4bd4fac0a141f17df08db98e9/scripts%2Fgen-kernel-fixtures.py",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/scripts%2Fgen-kernel-fixtures.py?ref=2e9e693a4781d5b4bd4fac0a141f17df08db98e9",
+      "patch": "@@ -134,6 +134,30 @@ def main() -> int:\n     write(FIXTURES_DIR / \"embed_ids.i32\", ids.numpy().tobytes())\n     write(FIXTURES_DIR / \"embed_out.bf16\", bf16_bytes(y_embed))\n \n+    # ----- matmul_bf16_out_f32 fixture (router projection path) -----\n+    # Same x / W / bias as the bf16 test, different expected dtype.\n+    # Upstream router runs in fp32: this kernel skips the bf16 round.\n+    x_router = x_mm.clone()\n+    w_router = w_bf.clone()\n+    b_router = b_bf.clone()\n+    y_router = F.linear(x_router.to(torch.float32), w_router.to(torch.float32), b_router.to(torch.float32))\n+    write(FIXTURES_DIR / \"matmul_out_f32_x.bf16\", bf16_bytes(x_router))\n+    write(FIXTURES_DIR / \"matmul_out_f32_y.f32\", y_router.contiguous().numpy().tobytes())\n+\n+    # ----- topk_partial_f32 fixture (router top-4) -----\n+    # 128 scores per row, top-4 extraction. Spread the values so ties\n+    # are unlikely and we actually exercise the selection logic.\n+    torch.manual_seed(SEED + 8)\n+    topk_rows = 32\n+    topk_cols = 128\n+    topk_x = torch.randn(topk_rows, topk_cols, dtype=torch.float32) * 2.0\n+    topk_vals, topk_idx = torch.topk(topk_x, k=4, dim=-1)\n+    # Confirm descending \u2014 our kernel emits \"largest first\" too.\n+    assert (topk_vals[..., 0] >= topk_vals[..., -1]).all()\n+    write(FIXTURES_DIR / \"topk_x.f32\", topk_x.contiguous().numpy().tobytes())\n+    write(FIXTURES_DIR / \"topk_idx.i32\", topk_idx.to(torch.int32).contiguous().numpy().tobytes())\n+    write(FIXTURES_DIR / \"topk_val.f32\", topk_vals.contiguous().numpy().tobytes())\n+\n     # ----- SwiGLU-with-clamp fixture -----\n     # Matches OpenAIPrivacyFilterExperts._apply_gate. Inputs spread in a\n     # range that exercises both clamp branches (some values > 7 and < -7)."
+    },
+    {
+      "sha": "1e0ae1c3bc76394e1705e5b468bcf453b88050f0",
+      "filename": "scripts/verify-kernels.mjs",
+      "status": "modified",
+      "additions": 79,
+      "deletions": 0,
+      "changes": 79,
+      "blob_url": "https://github.com/teamchong/textsift/blob/2e9e693a4781d5b4bd4fac0a141f17df08db98e9/scripts%2Fverify-kernels.mjs",
+      "raw_url": "https://github.com/teamchong/textsift/raw/2e9e693a4781d5b4bd4fac0a141f17df08db98e9/scripts%2Fverify-kernels.mjs",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/scripts%2Fverify-kernels.mjs?ref=2e9e693a4781d5b4bd4fac0a141f17df08db98e9",
+      "patch": "@@ -188,6 +188,83 @@ async function runEmbed(ex, weights, spec) {\n   return compareU16(ex, outPtr, expected);\n }\n \n+async function runMatmulOutF32(ex, weights, spec) {\n+  const x = await loadFixture(spec.x);\n+  const w = weights.get(spec.weight_tensor);\n+  const b = weights.get(spec.bias_tensor);\n+  if (!w || !b) throw new Error(`missing tensor ${spec.weight_tensor}/${spec.bias_tensor}`);\n+  const expected = await loadFixture(spec.expected);\n+  const xPtr = allocAndCopy(ex, x);\n+  const outPtr = ex.alloc(expected.byteLength);\n+  ex.matmul_bf16_out_f32(xPtr, w.ptr, b.ptr, outPtr, spec.T, spec.N, spec.D);\n+  const got = new Float32Array(ex.memory.buffer, outPtr, expected.byteLength >>> 2);\n+  const want = new Float32Array(\n+    expected.buffer, expected.byteOffset, expected.byteLength >>> 2,\n+  );\n+  let maxAbs = 0, maxRel = 0, sumSq = 0, fails = 0, firstFail = -1;\n+  for (let i = 0; i < want.length; i++) {\n+    const abs = Math.abs(got[i] - want[i]);\n+    const rel = Math.abs(want[i]) > 0 ? abs / Math.abs(want[i]) : abs;\n+    if (abs > maxAbs) maxAbs = abs;\n+    if (rel > maxRel) maxRel = rel;\n+    sumSq += abs * abs;\n+    const tol = Math.max(spec.abs_tol ?? 0, spec.rel_tol * Math.abs(want[i]));\n+    if (abs > tol) {\n+      fails++;\n+      if (firstFail === -1) firstFail = i;\n+    }\n+  }\n+  return {\n+    tolerance: { relTol: spec.rel_tol, absTol: spec.abs_tol ?? 0 },\n+    total: want.length, fails, firstFail, maxAbs, maxRel,\n+    rms: Math.sqrt(sumSq / want.length),\n+    got: new Uint16Array(0), want: new Uint16Array(0),\n+  };\n+}\n+\n+async function runTopk(ex, _weights, spec) {\n+  const x = await loadFixture(spec.x);\n+  const expectedIdx = await loadFixture(spec.expected_idx);\n+  const expectedVal = await loadFixture(spec.expected_val);\n+  const xPtr = allocAndCopy(ex, x);\n+  const idxBytes = spec.rows * spec.k * 4;\n+  const valBytes = spec.rows * spec.k * 4;\n+  const idxPtr = ex.alloc(idxBytes);\n+  const valPtr = ex.alloc(valBytes);\n+  ex.topk_partial_f32(xPtr, idxPtr, valPtr, spec.rows, spec.cols, spec.k);\n+  const gotIdx = new Int32Array(ex.memory.buffer, idxPtr, idxBytes >>> 2);\n+  const wantIdx = new Int32Array(\n+    expectedIdx.buffer, expectedIdx.byteOffset, expectedIdx.byteLength >>> 2,\n+  );\n+  const gotVal = new Float32Array(ex.memory.buffer, valPtr, valBytes >>> 2);\n+  const wantVal = new Float32Array(\n+    expectedVal.buffer, expectedVal.byteOffset, expectedVal.byteLength >>> 2,\n+  );\n+  let idxFails = 0, valFails = 0, firstFail = -1;\n+  let maxAbs = 0;\n+  for (let i = 0; i < wantIdx.length; i++) {\n+    if (gotIdx[i] !== wantIdx[i]) {\n+      idxFails++;\n+      if (firstFail === -1) firstFail = i;\n+    }\n+    const abs = Math.abs(gotVal[i] - wantVal[i]);\n+    if (abs > maxAbs) maxAbs = abs;\n+    if (abs > (spec.val_abs_tol ?? 0)) valFails++;\n+  }\n+  // Synthesize a tolerance-shaped result for the shared printer.\n+  return {\n+    tolerance: { relTol: spec.val_abs_tol ?? 0, absTol: spec.val_abs_tol ?? 0 },\n+    total: wantIdx.length,\n+    fails: idxFails + valFails,\n+    firstFail,\n+    maxAbs,\n+    maxRel: 0,\n+    rms: 0,\n+    got: new Uint16Array(0),\n+    want: new Uint16Array(0),\n+  };\n+}\n+\n async function runSwigluF32(ex, _weights, spec) {\n   const x = await loadFixture(spec.x);\n   const expected = await loadFixture(spec.expected);\n@@ -309,6 +386,8 @@ const RUNNERS = {\n   rope_apply: runRopeApply,\n   softmax_f32: runSoftmaxF32,\n   swiglu_clamp_f32: runSwigluF32,\n+  matmul_bf16_out_f32: runMatmulOutF32,\n+  topk_partial_f32: runTopk,\n };\n \n async function main() {"
+    },
+    {
+      "sha": "bc12fd529d4f2e70411a7407033de59dd68a6dfe",
+      "filename": "src/js/backends/wasm.ts",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/teamchong/textsift/blob/2e9e693a4781d5b4bd4fac0a141f17df08db98e9/src%2Fjs%2Fbackends%2Fwasm.ts",
+      "raw_url": "https://github.com/teamchong/textsift/raw/2e9e693a4781d5b4bd4fac0a141f17df08db98e9/src%2Fjs%2Fbackends%2Fwasm.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/src%2Fjs%2Fbackends%2Fwasm.ts?ref=2e9e693a4781d5b4bd4fac0a141f17df08db98e9",
+      "patch": "@@ -39,7 +39,9 @@ interface PiiWasmExports {\n   weights_name(idx: number, out: number): number;\n   rms_norm(x: number, gamma: number, out: number, T: number, D: number, eps: number): void;\n   matmul_bf16(x: number, w: number, bias: number, out: number, T: number, N: number, D: number): void;\n+  matmul_bf16_out_f32(x: number, w: number, bias: number, out: number, T: number, N: number, D: number): void;\n   matmul_bf16_x_int4block(x: number, w: number, bias: number, out: number, T: number, N: number, D: number): void;\n+  topk_partial_f32(x: number, out_idx: number, out_val: number, rows: number, cols: number, k: number): void;\n   rope_apply(qk: number, cos: number, sin: number, T: number, H: number, head_dim: number): void;\n   softmax_f32(x: number, out: number, rows: number, cols: number): void;\n   swiglu_clamp_f32(gate_up: number, out: number, T: number, D: number): void;\n@@ -108,7 +110,9 @@ export async function loadPiiWasm(url: string | URL): Promise<PiiWasmExports> {\n     \"weights_name\",\n     \"rms_norm\",\n     \"matmul_bf16\",\n+    \"matmul_bf16_out_f32\",\n     \"matmul_bf16_x_int4block\",\n+    \"topk_partial_f32\",\n     \"rope_apply\",\n     \"softmax_f32\",\n     \"swiglu_clamp_f32\","
+    },
+    {
+      "sha": "b71010d979ced979cdd32d3efe1903719cbcb3dc",
+      "filename": "src/zig/wasm_exports.zig",
+      "status": "modified",
+      "additions": 139,
+      "deletions": 0,
+      "changes": 139,
+      "blob_url": "https://github.com/teamchong/textsift/blob/2e9e693a4781d5b4bd4fac0a141f17df08db98e9/src%2Fzig%2Fwasm_exports.zig",
+      "raw_url": "https://github.com/teamchong/textsift/raw/2e9e693a4781d5b4bd4fac0a141f17df08db98e9/src%2Fzig%2Fwasm_exports.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/src%2Fzig%2Fwasm_exports.zig?ref=2e9e693a4781d5b4bd4fac0a141f17df08db98e9",
+      "patch": "@@ -454,6 +454,145 @@ export fn matmul_bf16(\n     }\n }\n \n+/// F32-output variant of `matmul_bf16`. Same arithmetic; stores the\n+/// accumulator + bias as f32 instead of rounding to bf16. Used when\n+/// the consumer runs in fp32 (router, expert chain).\n+export fn matmul_bf16_out_f32(\n+    x_ptr: [*]const u16,\n+    w_ptr: [*]const u16,\n+    bias_ptr: [*]const u16,\n+    out_ptr: [*]f32,\n+    T: u32,\n+    N: u32,\n+    D: u32,\n+) void {\n+    const Tz: usize = T;\n+    const Nz: usize = N;\n+    const Dz: usize = D;\n+    const LANES: usize = 4;\n+    const UNROLL: usize = 4;\n+\n+    var t: usize = 0;\n+    while (t < Tz) : (t += 1) {\n+        const x_base = t * Dz;\n+        const out_base = t * Nz;\n+\n+        var n: usize = 0;\n+        while (n < Nz) : (n += 1) {\n+            const w_base = n * Dz;\n+\n+            var a0: @Vector(4, f32) = @splat(0);\n+            var a1: @Vector(4, f32) = @splat(0);\n+            var a2: @Vector(4, f32) = @splat(0);\n+            var a3: @Vector(4, f32) = @splat(0);\n+\n+            const step: usize = LANES * UNROLL;\n+            var d: usize = 0;\n+            while (d + step <= Dz) : (d += step) {\n+                const x0: @Vector(4, u16) = x_ptr[x_base + d ..][0..LANES].*;\n+                const x1: @Vector(4, u16) = x_ptr[x_base + d + 4 ..][0..LANES].*;\n+                const x2: @Vector(4, u16) = x_ptr[x_base + d + 8 ..][0..LANES].*;\n+                const x3: @Vector(4, u16) = x_ptr[x_base + d + 12 ..][0..LANES].*;\n+                const w0: @Vector(4, u16) = w_ptr[w_base + d ..][0..LANES].*;\n+                const w1: @Vector(4, u16) = w_ptr[w_base + d + 4 ..][0..LANES].*;\n+                const w2: @Vector(4, u16) = w_ptr[w_base + d + 8 ..][0..LANES].*;\n+                const w3: @Vector(4, u16) = w_ptr[w_base + d + 12 ..][0..LANES].*;\n+                a0 += bf16x4ToF32x4(x0) * bf16x4ToF32x4(w0);\n+                a1 += bf16x4ToF32x4(x1) * bf16x4ToF32x4(w1);\n+                a2 += bf16x4ToF32x4(x2) * bf16x4ToF32x4(w2);\n+                a3 += bf16x4ToF32x4(x3) * bf16x4ToF32x4(w3);\n+            }\n+            while (d + LANES <= Dz) : (d += LANES) {\n+                const xu: @Vector(4, u16) = x_ptr[x_base + d ..][0..LANES].*;\n+                const wu: @Vector(4, u16) = w_ptr[w_base + d ..][0..LANES].*;\n+                a0 += bf16x4ToF32x4(xu) * bf16x4ToF32x4(wu);\n+            }\n+            const combined: @Vector(4, f32) = (a0 + a1) + (a2 + a3);\n+            var acc: f32 = combined[0] + combined[1] + combined[2] + combined[3];\n+            while (d < Dz) : (d += 1) {\n+                acc += bf16ToF32(x_ptr[x_base + d]) * bf16ToF32(w_ptr[w_base + d]);\n+            }\n+\n+            out_ptr[out_base + n] = acc + bf16ToF32(bias_ptr[n]);\n+        }\n+    }\n+}\n+\n+// --------------------------------------------------------------\n+// Kernel: row-wise top-k (partial selection)\n+// --------------------------------------------------------------\n+//\n+// For each row of `x: [rows, cols]`, produce the indices and values of\n+// the `k` largest entries, written into `out_idx` and `out_val`.\n+// Ordering within the k outputs is \"largest first\" \u2014 convenient for\n+// softmax-then-divide in the router where order doesn't matter but\n+// determinism does.\n+//\n+// Uses a fixed-size incremental insertion sort of k elements. For\n+// k=4 and n=128 (router), this is O(n*k) = 512 compares per row,\n+// which is faster than a heap for small k.\n+\n+export fn topk_partial_f32(\n+    x_ptr: [*]const f32,\n+    out_idx: [*]i32,\n+    out_val: [*]f32,\n+    rows: u32,\n+    cols: u32,\n+    k: u32,\n+) void {\n+    const Rz: usize = rows;\n+    const Cz: usize = cols;\n+    const Kz: usize = k;\n+\n+    var r: usize = 0;\n+    while (r < Rz) : (r += 1) {\n+        const row_base = r * Cz;\n+        const out_base = r * Kz;\n+\n+        // Seed with the first k entries in input order, then sort\n+        // descending.\n+        var i: usize = 0;\n+        while (i < Kz) : (i += 1) {\n+            out_idx[out_base + i] = @intCast(i);\n+            out_val[out_base + i] = x_ptr[row_base + i];\n+        }\n+        // Descending insertion sort on the seed k elements.\n+        var s: usize = 1;\n+        while (s < Kz) : (s += 1) {\n+            var j: usize = s;\n+            while (j > 0 and out_val[out_base + j] > out_val[out_base + j - 1]) : (j -= 1) {\n+                const tv = out_val[out_base + j];\n+                out_val[out_base + j] = out_val[out_base + j - 1];\n+                out_val[out_base + j - 1] = tv;\n+                const ti = out_idx[out_base + j];\n+                out_idx[out_base + j] = out_idx[out_base + j - 1];\n+                out_idx[out_base + j - 1] = ti;\n+            }\n+        }\n+\n+        // Scan the rest. If new value beats the smallest (last) slot,\n+        // insert and bubble up.\n+        var c: usize = Kz;\n+        while (c < Cz) : (c += 1) {\n+            const v = x_ptr[row_base + c];\n+            if (v > out_val[out_base + Kz - 1]) {\n+                // Replace last, bubble up.\n+                out_val[out_base + Kz - 1] = v;\n+                out_idx[out_base + Kz - 1] = @intCast(c);\n+                var j: usize = Kz - 1;\n+                while (j > 0 and out_val[out_base + j] > out_val[out_base + j - 1]) : (j -= 1) {\n+                    const tv = out_val[out_base + j];\n+                    out_val[out_base + j] = out_val[out_base + j - 1];\n+                    out_val[out_base + j - 1] = tv;\n+                    const ti = out_idx[out_base + j];\n+                    out_idx[out_base + j] = out_idx[out_base + j - 1];\n+                    out_idx[out_base + j - 1] = ti;\n+                }\n+            }\n+        }\n+    }\n+}\n+\n // --------------------------------------------------------------\n // Kernel: bf16 \u00d7 int4-blockwise matmul with bias\n // --------------------------------------------------------------"
+    },
+    {
+      "sha": "27d9fca8b4e07ef97754c31b5ac42b4c23145bf9",
+      "filename": "tests/fixtures/manifest.json",
+      "status": "modified",
+      "additions": 23,
+      "deletions": 0,
+      "changes": 23,
+      "blob_url": "https://github.com/teamchong/textsift/blob/2e9e693a4781d5b4bd4fac0a141f17df08db98e9/tests%2Ffixtures%2Fmanifest.json",
+      "raw_url": "https://github.com/teamchong/textsift/raw/2e9e693a4781d5b4bd4fac0a141f17df08db98e9/tests%2Ffixtures%2Fmanifest.json",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Ffixtures%2Fmanifest.json?ref=2e9e693a4781d5b4bd4fac0a141f17df08db98e9",
+      "patch": "@@ -50,6 +50,29 @@\n       \"abs_tol\": 1e-4,\n       \"note\": \"bf16 output of an fp32 matmul over dequantized int4 (block 32, sym, fp16 scale). Expected bounded by bf16 ULP (~4e-3 rel for unit-ish values) plus int4 quant error; 1e-3 rel is tight for this combo.\"\n     },\n+    {\n+      \"name\": \"matmul_bf16_out_f32\",\n+      \"x\": \"matmul_out_f32_x.bf16\",\n+      \"weight_tensor\": \"score.weight\",\n+      \"bias_tensor\": \"score.bias\",\n+      \"expected\": \"matmul_out_f32_y.f32\",\n+      \"T\": 8,\n+      \"N\": 33,\n+      \"D\": 640,\n+      \"rel_tol\": 1e-3,\n+      \"abs_tol\": 1e-5,\n+      \"note\": \"F.linear with fp32 accumulation; rel_tol matches ~1/256 (bf16 input precision at typical magnitudes).\"\n+    },\n+    {\n+      \"name\": \"topk_partial_f32\",\n+      \"x\": \"topk_x.f32\",\n+      \"expected_idx\": \"topk_idx.i32\",\n+      \"expected_val\": \"topk_val.f32\",\n+      \"rows\": 32,\n+      \"cols\": 128,\n+      \"k\": 4,\n+      \"val_abs_tol\": 0\n+    },\n     {\n       \"name\": \"swiglu_clamp_f32\",\n       \"x\": \"swiglu_x.f32\","
+    },
+    {
+      "sha": "a2da124cc0128b590c8c1b92e596a7e8d6458f50",
+      "filename": "tests/fixtures/matmul_out_f32_x.bf16",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/teamchong/textsift/blob/2e9e693a4781d5b4bd4fac0a141f17df08db98e9/tests%2Ffixtures%2Fmatmul_out_f32_x.bf16",
+      "raw_url": "https://github.com/teamchong/textsift/raw/2e9e693a4781d5b4bd4fac0a141f17df08db98e9/tests%2Ffixtures%2Fmatmul_out_f32_x.bf16",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Ffixtures%2Fmatmul_out_f32_x.bf16?ref=2e9e693a4781d5b4bd4fac0a141f17df08db98e9"
+    },
+    {
+      "sha": "6268c2ab5db942c4fc6869373f87eab5739519c8",
+      "filename": "tests/fixtures/matmul_out_f32_y.f32",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/teamchong/textsift/blob/2e9e693a4781d5b4bd4fac0a141f17df08db98e9/tests%2Ffixtures%2Fmatmul_out_f32_y.f32",
+      "raw_url": "https://github.com/teamchong/textsift/raw/2e9e693a4781d5b4bd4fac0a141f17df08db98e9/tests%2Ffixtures%2Fmatmul_out_f32_y.f32",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Ffixtures%2Fmatmul_out_f32_y.f32?ref=2e9e693a4781d5b4bd4fac0a141f17df08db98e9"
+    },
+    {
+      "sha": "0379b6eb68b0e05b2d29927f8d26aaf54cac473e",
+      "filename": "tests/fixtures/topk_idx.i32",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/teamchong/textsift/blob/2e9e693a4781d5b4bd4fac0a141f17df08db98e9/tests%2Ffixtures%2Ftopk_idx.i32",
+      "raw_url": "https://github.com/teamchong/textsift/raw/2e9e693a4781d5b4bd4fac0a141f17df08db98e9/tests%2Ffixtures%2Ftopk_idx.i32",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Ffixtures%2Ftopk_idx.i32?ref=2e9e693a4781d5b4bd4fac0a141f17df08db98e9"
+    },
+    {
+      "sha": "615d15b9ed5a8f4b52437d2c80943ea2a6247166",
+      "filename": "tests/fixtures/topk_val.f32",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/teamchong/textsift/blob/2e9e693a4781d5b4bd4fac0a141f17df08db98e9/tests%2Ffixtures%2Ftopk_val.f32",
+      "raw_url": "https://github.com/teamchong/textsift/raw/2e9e693a4781d5b4bd4fac0a141f17df08db98e9/tests%2Ffixtures%2Ftopk_val.f32",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Ffixtures%2Ftopk_val.f32?ref=2e9e693a4781d5b4bd4fac0a141f17df08db98e9"
+    },
+    {
+      "sha": "ed4470a45f595ef30bb475bdcbd9da824ba55cc9",
+      "filename": "tests/fixtures/topk_x.f32",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/teamchong/textsift/blob/2e9e693a4781d5b4bd4fac0a141f17df08db98e9/tests%2Ffixtures%2Ftopk_x.f32",
+      "raw_url": "https://github.com/teamchong/textsift/raw/2e9e693a4781d5b4bd4fac0a141f17df08db98e9/tests%2Ffixtures%2Ftopk_x.f32",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Ffixtures%2Ftopk_x.f32?ref=2e9e693a4781d5b4bd4fac0a141f17df08db98e9"
+    }
+  ]
+}

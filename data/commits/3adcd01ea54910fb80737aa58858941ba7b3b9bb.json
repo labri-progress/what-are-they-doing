@@ -1,0 +1,77 @@
+{
+  "message": "fix: synchronize project activity writes",
+  "files": [
+    {
+      "sha": "9e2ff9d001c44094b2bbf10b371e9b29b43ac52a",
+      "filename": "src/genome/genome.ts",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 9,
+      "changes": 19,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/3adcd01ea54910fb80737aa58858941ba7b3b9bb/src%2Fgenome%2Fgenome.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/3adcd01ea54910fb80737aa58858941ba7b3b9bb/src%2Fgenome%2Fgenome.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/src%2Fgenome%2Fgenome.ts?ref=3adcd01ea54910fb80737aa58858941ba7b3b9bb",
+      "patch": "@@ -510,18 +510,19 @@ export class Genome {\n \n \tasync recordProjectActivity(project: DetectedProject, date = new Date()): Promise<boolean> {\n \t\tconst record = this.projects.recordActiveDay(project, date);\n-\t\tif (!record) return false;\n-\t\tawait this.projects.save();\n-\t\treturn true;\n+\t\treturn record !== undefined;\n \t}\n \n \tasync saveProjectActivityMutation(commitMessage: string): Promise<void> {\n-\t\tconst projectsPath = join(this.rootPath, \"memories\", \"projects.jsonl\");\n-\t\tawait this.projects.save();\n-\t\tawait git(this.rootPath, \"add\", projectsPath);\n-\t\tconst status = await git(this.rootPath, \"status\", \"--porcelain\", \"--\", projectsPath);\n-\t\tif (!status.trim()) return;\n-\t\tawait git(this.rootPath, \"commit\", \"-m\", commitMessage);\n+\t\tawait this.withMemoryWriteLock(async () => {\n+\t\t\tawait this.projects.mergeLatestFromDisk();\n+\t\t\tconst projectsPath = join(this.rootPath, \"memories\", \"projects.jsonl\");\n+\t\t\tawait this.projects.save();\n+\t\t\tawait git(this.rootPath, \"add\", projectsPath);\n+\t\t\tconst status = await git(this.rootPath, \"status\", \"--porcelain\", \"--\", projectsPath);\n+\t\t\tif (!status.trim()) return;\n+\t\t\tawait git(this.rootPath, \"commit\", \"-m\", commitMessage);\n+\t\t});\n \t}\n \n \tasync recomputeMemoryScores(options: { now?: number; minImportance?: number } = {}): Promise<{"
+    },
+    {
+      "sha": "51d097da626315ebebf0c6f7cc4d7f1df376f19c",
+      "filename": "src/genome/projects.ts",
+      "status": "modified",
+      "additions": 90,
+      "deletions": 2,
+      "changes": 92,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/3adcd01ea54910fb80737aa58858941ba7b3b9bb/src%2Fgenome%2Fprojects.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/3adcd01ea54910fb80737aa58858941ba7b3b9bb/src%2Fgenome%2Fprojects.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/src%2Fgenome%2Fprojects.ts?ref=3adcd01ea54910fb80737aa58858941ba7b3b9bb",
+      "patch": "@@ -64,6 +64,7 @@ const GENERIC_PROJECT_NAMES = new Set([\n \n export class ProjectActivityStore {\n \tprivate entries: ProjectActivityRecord[] = [];\n+\tprivate loadedFingerprints = new Map<string, string>();\n \tprivate readonly jsonl: JsonlStore<unknown>;\n \tprivate readonly timeZone: string | undefined;\n \n@@ -74,6 +75,7 @@ export class ProjectActivityStore {\n \n \tasync load(): Promise<void> {\n \t\tthis.entries = (await this.jsonl.load()).map(normalizeProjectActivityRecord);\n+\t\tthis.refreshLoadedFingerprints();\n \t}\n \n \tall(): ProjectActivityRecord[] {\n@@ -153,7 +155,94 @@ export class ProjectActivityStore {\n \n \tasync save(): Promise<void> {\n \t\tawait this.jsonl.rewrite(this.entries);\n+\t\tthis.refreshLoadedFingerprints();\n \t}\n+\n+\tasync mergeLatestFromDisk(): Promise<void> {\n+\t\tconst latest = new ProjectActivityStore(this.jsonl.path, { timeZone: this.timeZone });\n+\t\tawait latest.load();\n+\t\tconst latestEntries = latest.all();\n+\t\tconst merged = [...latestEntries];\n+\t\tconst mergedIndexById = new Map(merged.map((record, index) => [record.id, index]));\n+\n+\t\tfor (const record of this.changedSinceLoad()) {\n+\t\t\tconst existingIndex = mergedIndexById.get(record.id);\n+\t\t\tif (existingIndex === undefined) {\n+\t\t\t\tmergedIndexById.set(record.id, merged.length);\n+\t\t\t\tmerged.push(record);\n+\t\t\t} else {\n+\t\t\t\tmerged[existingIndex] = mergeProjectActivityRecords(merged[existingIndex]!, record);\n+\t\t\t}\n+\t\t}\n+\n+\t\tthis.entries = merged.map(normalizeProjectActivityRecord);\n+\t}\n+\n+\tprivate changedSinceLoad(): ProjectActivityRecord[] {\n+\t\treturn this.entries.filter((record) => {\n+\t\t\tconst loaded = this.loadedFingerprints.get(record.id);\n+\t\t\treturn loaded === undefined || loaded !== projectActivityFingerprint(record);\n+\t\t});\n+\t}\n+\n+\tprivate refreshLoadedFingerprints(): void {\n+\t\tthis.loadedFingerprints = new Map(\n+\t\t\tthis.entries.map((record) => [record.id, projectActivityFingerprint(record)]),\n+\t\t);\n+\t}\n+}\n+\n+function mergeProjectActivityRecords(\n+\tlatest: ProjectActivityRecord,\n+\tpending: ProjectActivityRecord,\n+): ProjectActivityRecord {\n+\tconst activeDates = sortedUnique([\n+\t\t...(latest.active_dates ?? []),\n+\t\t...(pending.active_dates ?? []),\n+\t\t...(latest.last_active_date ? [latest.last_active_date] : []),\n+\t\t...(pending.last_active_date ? [pending.last_active_date] : []),\n+\t]);\n+\tconst cumulativeActiveDays = Math.max(\n+\t\tlatest.cumulative_active_days,\n+\t\tpending.cumulative_active_days,\n+\t\tactiveDates.length,\n+\t);\n+\tconst lastActiveDate = activeDates.at(-1) ?? latest.last_active_date ?? pending.last_active_date;\n+\treturn {\n+\t\tid: latest.id,\n+\t\tname: pending.name,\n+\t\tcumulative_active_days: cumulativeActiveDays,\n+\t\t...(lastActiveDate ? { last_active_date: lastActiveDate } : {}),\n+\t\t...(activeDates.length > 0 ? { active_dates: activeDates } : {}),\n+\t\t...maxOptionalField(\n+\t\t\t\"last_consolidated_active_day\",\n+\t\t\tlatest.last_consolidated_active_day,\n+\t\t\tpending.last_consolidated_active_day,\n+\t\t),\n+\t\t...maxOptionalField(\n+\t\t\t\"last_entity_gc_active_day\",\n+\t\t\tlatest.last_entity_gc_active_day,\n+\t\t\tpending.last_entity_gc_active_day,\n+\t\t),\n+\t};\n+}\n+\n+function maxOptionalField<K extends string>(\n+\tkey: K,\n+\tleft: number | undefined,\n+\tright: number | undefined,\n+): Record<K, number> | object {\n+\tconst values = [left, right].filter((value): value is number => value !== undefined);\n+\tif (values.length === 0) return {};\n+\treturn { [key]: Math.max(...values) } as Record<K, number>;\n+}\n+\n+function sortedUnique(values: readonly string[]): string[] {\n+\treturn [...new Set(values)].sort();\n+}\n+\n+function projectActivityFingerprint(record: ProjectActivityRecord): string {\n+\treturn JSON.stringify(record);\n }\n \n export function projectActivityDateKey(date: Date, timeZone?: string): string {\n@@ -317,8 +406,7 @@ function normalizeProjectActivityRecord(raw: unknown): ProjectActivityRecord {\n \treturn {\n \t\tid,\n \t\tname,\n-\t\tcumulative_active_days:\n-\t\t\tactiveDates.length > 0 ? activeDates.length : Math.max(0, Math.floor(days)),\n+\t\tcumulative_active_days: Math.max(activeDates.length, Math.max(0, Math.floor(days))),\n \t\t...(lastActiveDate ? { last_active_date: lastActiveDate } : {}),\n \t\t...(activeDates.length > 0 ? { active_dates: activeDates } : {}),\n \t\t...numberField(raw, \"last_consolidated_active_day\"),"
+    },
+    {
+      "sha": "d8c2eec7d37c194366738e87805a257b614176ba",
+      "filename": "src/genome/read-only-genome.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 1,
+      "changes": 4,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/3adcd01ea54910fb80737aa58858941ba7b3b9bb/src%2Fgenome%2Fread-only-genome.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/3adcd01ea54910fb80737aa58858941ba7b3b9bb/src%2Fgenome%2Fread-only-genome.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/src%2Fgenome%2Fread-only-genome.ts?ref=3adcd01ea54910fb80737aa58858941ba7b3b9bb",
+      "patch": "@@ -39,14 +39,16 @@ const MUTATING_MEMORY_METHODS = new Set([\n \t\"markUsed\",\n \t\"markMentioned\",\n \t\"save\",\n+\t\"mergeLatestFromDisk\",\n \t\"pruneByConfidence\",\n ]);\n-const MUTATING_SEGMENT_METHODS = new Set([\"add\", \"save\"]);\n+const MUTATING_SEGMENT_METHODS = new Set([\"add\", \"stage\", \"save\"]);\n const MUTATING_PROJECT_METHODS = new Set([\n \t\"recordActiveDay\",\n \t\"markConsolidated\",\n \t\"markEntityGc\",\n \t\"upsertMaintenanceRecord\",\n+\t\"mergeLatestFromDisk\",\n \t\"save\",\n ]);\n "
+    },
+    {
+      "sha": "855c6cb5e795bc5b25093b1c38f479409b6edde0",
+      "filename": "test/genome/genome.test.ts",
+      "status": "modified",
+      "additions": 61,
+      "deletions": 0,
+      "changes": 61,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/3adcd01ea54910fb80737aa58858941ba7b3b9bb/test%2Fgenome%2Fgenome.test.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/3adcd01ea54910fb80737aa58858941ba7b3b9bb/test%2Fgenome%2Fgenome.test.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/test%2Fgenome%2Fgenome.test.ts?ref=3adcd01ea54910fb80737aa58858941ba7b3b9bb",
+      "patch": "@@ -659,6 +659,67 @@ describe(\"Genome\", () => {\n \t\t\texpect(log).toContain(\"genome: record project activity 'sprout'\");\n \t\t});\n \n+\t\ttest(\"project activity commit preserves records from another loaded genome\", async () => {\n+\t\t\tconst root = join(tempDir, \"project-activity-merge\");\n+\t\t\tconst writer = await createInitializedGenome(root);\n+\t\t\tconst staleGenome = new Genome(root);\n+\t\t\tawait staleGenome.loadFromDisk();\n+\t\t\tawait writer.recordProjectActivity({\n+\t\t\t\tid: \"sprout\",\n+\t\t\t\tname: \"Sprout\",\n+\t\t\t\tconfidence: 1,\n+\t\t\t\tsource: \"explicit\",\n+\t\t\t});\n+\t\t\tawait writer.saveProjectActivityMutation(\"genome: record project activity 'sprout'\");\n+\n+\t\t\tawait staleGenome.recordProjectActivity({\n+\t\t\t\tid: \"docs\",\n+\t\t\t\tname: \"Docs\",\n+\t\t\t\tconfidence: 1,\n+\t\t\t\tsource: \"explicit\",\n+\t\t\t});\n+\t\t\tawait staleGenome.saveProjectActivityMutation(\"genome: record project activity 'docs'\");\n+\n+\t\t\tconst reloaded = new Genome(root);\n+\t\t\tawait reloaded.loadFromDisk();\n+\t\t\texpect(reloaded.projects.getById(\"sprout\")?.cumulative_active_days).toBe(1);\n+\t\t\texpect(reloaded.projects.getById(\"docs\")?.cumulative_active_days).toBe(1);\n+\t\t});\n+\n+\t\ttest(\"project activity commit merges maintenance cadence with newer activity\", async () => {\n+\t\t\tconst root = join(tempDir, \"project-activity-maintenance-merge\");\n+\t\t\tconst writer = await createInitializedGenome(root);\n+\t\t\tconst staleGenome = new Genome(root);\n+\t\t\tawait staleGenome.loadFromDisk();\n+\t\t\tawait writer.recordProjectActivity(\n+\t\t\t\t{\n+\t\t\t\t\tid: \"sprout\",\n+\t\t\t\t\tname: \"Sprout\",\n+\t\t\t\t\tconfidence: 1,\n+\t\t\t\t\tsource: \"explicit\",\n+\t\t\t\t},\n+\t\t\t\tnew Date(\"2026-04-26T10:00:00Z\"),\n+\t\t\t);\n+\t\t\tawait writer.saveProjectActivityMutation(\"genome: record project activity 'sprout'\");\n+\n+\t\t\tstaleGenome.projects.upsertMaintenanceRecord({\n+\t\t\t\tid: \"sprout\",\n+\t\t\t\tname: \"Sprout\",\n+\t\t\t\tcumulative_active_days: 1,\n+\t\t\t});\n+\t\t\tstaleGenome.projects.markConsolidated(\"sprout\");\n+\t\t\tawait staleGenome.saveProjectActivityMutation(\"genome: update maintenance cadence\");\n+\n+\t\t\tconst reloaded = new Genome(root);\n+\t\t\tawait reloaded.loadFromDisk();\n+\t\t\texpect(reloaded.projects.getById(\"sprout\")).toMatchObject({\n+\t\t\t\tcumulative_active_days: 1,\n+\t\t\t\tlast_active_date: \"2026-04-26\",\n+\t\t\t\tactive_dates: [\"2026-04-26\"],\n+\t\t\t\tlast_consolidated_active_day: 1,\n+\t\t\t});\n+\t\t});\n+\n \t\ttest(\"addSegmentWithMemories restores JSONL files when save fails\", async () => {\n \t\t\tconst root = join(tempDir, \"segment-memory-save-fails\");\n \t\t\tconst genome = await createInitializedGenome(root);"
+    },
+    {
+      "sha": "a562e599ffeac25304251a448cc02124fa37f986",
+      "filename": "test/genome/projects.test.ts",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/3adcd01ea54910fb80737aa58858941ba7b3b9bb/test%2Fgenome%2Fprojects.test.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/3adcd01ea54910fb80737aa58858941ba7b3b9bb/test%2Fgenome%2Fprojects.test.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/test%2Fgenome%2Fprojects.test.ts?ref=3adcd01ea54910fb80737aa58858941ba7b3b9bb",
+      "patch": "@@ -190,6 +190,11 @@ describe(\"project detection\", () => {\n \t\t\tlast_active_date: \"2026-04-26\",\n \t\t\tactive_dates: [\"2026-04-26\"],\n \t\t});\n+\n+\t\tawait store.save();\n+\t\tconst reloaded = new ProjectActivityStore(join(tempDir, \"projects-legacy-count.jsonl\"));\n+\t\tawait reloaded.load();\n+\t\texpect(reloaded.getById(\"sprout\")?.cumulative_active_days).toBe(11);\n \t});\n \n \ttest(\"unknown project does not advance a project-specific decay clock\", async () => {"
+    },
+    {
+      "sha": "71fbeec90d01e8ea4d0221a84772c63a9a907d32",
+      "filename": "test/genome/read-only-genome.test.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/3adcd01ea54910fb80737aa58858941ba7b3b9bb/test%2Fgenome%2Fread-only-genome.test.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/3adcd01ea54910fb80737aa58858941ba7b3b9bb/test%2Fgenome%2Fread-only-genome.test.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/test%2Fgenome%2Fread-only-genome.test.ts?ref=3adcd01ea54910fb80737aa58858941ba7b3b9bb",
+      "patch": "@@ -102,7 +102,9 @@ describe(\"createReadOnlyGenome\", () => {\n \t\t\t\"read-only genome\",\n \t\t);\n \t\texpect(() => readOnlyGenome.memories.stage(memory)).toThrow(\"read-only genome\");\n+\t\texpect(() => readOnlyGenome.memories.mergeLatestFromDisk()).toThrow(\"read-only genome\");\n \t\texpect(() => readOnlyGenome.segments.add(segment)).toThrow(\"read-only genome\");\n+\t\texpect(() => readOnlyGenome.segments.stage(segment)).toThrow(\"read-only genome\");\n \t});\n \n \ttest(\"rejects project and operational memory mutations\", async () => {\n@@ -122,6 +124,7 @@ describe(\"createReadOnlyGenome\", () => {\n \t\t);\n \t\texpect(() => readOnlyGenome.projects.markConsolidated(\"sprout\")).toThrow(\"read-only genome\");\n \t\texpect(() => readOnlyGenome.projects.markEntityGc(\"sprout\")).toThrow(\"read-only genome\");\n+\t\texpect(() => readOnlyGenome.projects.mergeLatestFromDisk()).toThrow(\"read-only genome\");\n \t\texpect(() =>\n \t\t\treadOnlyGenome.projects.upsertMaintenanceRecord({\n \t\t\t\tid: \"sprout\","
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "message": "fix: boolean column append uses int64 in local-executor (64x storage waste) + wrong rowCount when rows%8!=0\n\nlocal-executor stored booleans as BigInt64Array (int64 dtype, 8 bytes/value)\nwhile master-do used packed bits (bool dtype, 1 bit/value). Data round-tripped\nas 0/1 integers in local mode but true/false in edge mode.\n\nAlso fixed a rowCount bug in both paths: when rows.length is not a multiple\nof 8, Math.ceil(rows.length/8)*8 overestimates the row count. The WASM\nfragmentAddBoolColumn received the inflated count, creating phantom rows.\nBoth callers now pass explicit rowCount.",
+  "files": [
+    {
+      "sha": "ba84746e98e97dad834d63aa55b0f8b07cdba420",
+      "filename": "src/local-executor.ts",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 4,
+      "changes": 11,
+      "blob_url": "https://github.com/teamchong/querymode/blob/0044894fc0680ff8a460810bdb80f3473f8bfe12/src%2Flocal-executor.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/0044894fc0680ff8a460810bdb80f3473f8bfe12/src%2Flocal-executor.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Flocal-executor.ts?ref=0044894fc0680ff8a460810bdb80f3473f8bfe12",
+      "patch": "@@ -110,7 +110,7 @@ export class LocalExecutor implements QueryExecutor {\n \n     // Convert rows to column arrays\n     const columnNames = Object.keys(rows[0]);\n-    const columnArrays: { name: string; dtype: string; values: ArrayBufferLike }[] = [];\n+    const columnArrays: { name: string; dtype: string; values: ArrayBufferLike; rowCount?: number }[] = [];\n \n     for (const colName of columnNames) {\n       const sample = rows.find(r => r[colName] != null)?.[colName];\n@@ -131,9 +131,12 @@ export class LocalExecutor implements QueryExecutor {\n         for (let i = 0; i < rows.length; i++) { const v = rows[i][colName]; arr[i] = v != null ? v as bigint : 0n; }\n         columnArrays.push({ name: colName, dtype: \"int64\", values: arr.buffer });\n       } else if (typeof sample === \"boolean\") {\n-        const arr = new BigInt64Array(rows.length);\n-        for (let i = 0; i < rows.length; i++) { const v = rows[i][colName]; arr[i] = v === null || v === undefined ? 0n : v ? 1n : 0n; }\n-        columnArrays.push({ name: colName, dtype: \"int64\", values: arr.buffer });\n+        const byteCount = Math.ceil(rows.length / 8);\n+        const boolBuf = new Uint8Array(byteCount);\n+        for (let i = 0; i < rows.length; i++) {\n+          if (rows[i][colName]) boolBuf[i >> 3] |= 1 << (i & 7);\n+        }\n+        columnArrays.push({ name: colName, dtype: \"bool\", values: boolBuf.buffer, rowCount: rows.length });\n       } else if (typeof sample === \"string\") {\n         const enc = textEncoder;\n         const parts: Uint8Array[] = [];"
+    },
+    {
+      "sha": "c30478c3466052ff1817dd74dbd21d7558d7fbc2",
+      "filename": "src/master-do.ts",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/teamchong/querymode/blob/0044894fc0680ff8a460810bdb80f3473f8bfe12/src%2Fmaster-do.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/0044894fc0680ff8a460810bdb80f3473f8bfe12/src%2Fmaster-do.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fmaster-do.ts?ref=0044894fc0680ff8a460810bdb80f3473f8bfe12",
+      "patch": "@@ -148,7 +148,7 @@ export class MasterDO extends DurableObject<Env> {\n \n     // Convert row-major to column-major\n     const columnNames = Object.keys(rows[0]);\n-    const columnArrays: { name: string; dtype: string; values: ArrayBufferLike }[] = [];\n+    const columnArrays: { name: string; dtype: string; values: ArrayBufferLike; rowCount?: number }[] = [];\n \n     for (const colName of columnNames) {\n       const sampleValue = rows.find(r => r[colName] != null)?.[colName];\n@@ -190,7 +190,7 @@ export class MasterDO extends DurableObject<Env> {\n         for (let i = 0; i < rows.length; i++) {\n           if (rows[i][colName]) boolBuf[i >> 3] |= 1 << (i & 7);\n         }\n-        columnArrays.push({ name: colName, dtype: \"bool\", values: boolBuf.buffer });\n+        columnArrays.push({ name: colName, dtype: \"bool\", values: boolBuf.buffer, rowCount: rows.length });\n       }\n     }\n "
+    },
+    {
+      "sha": "1ac47aa536dec049f660b3acdb5542463d389d63",
+      "filename": "src/wasm-engine.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 3,
+      "changes": 6,
+      "blob_url": "https://github.com/teamchong/querymode/blob/0044894fc0680ff8a460810bdb80f3473f8bfe12/src%2Fwasm-engine.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/0044894fc0680ff8a460810bdb80f3473f8bfe12/src%2Fwasm-engine.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fwasm-engine.ts?ref=0044894fc0680ff8a460810bdb80f3473f8bfe12",
+      "patch": "@@ -810,7 +810,7 @@ export class WasmEngine {\n    * Build a Lance fragment file from column data.\n    * Returns the raw Lance binary bytes ready to write to R2/disk.\n    */\n-  buildFragment(columns: { name: string; dtype: string; values: ArrayBufferLike }[]): Uint8Array {\n+  buildFragment(columns: { name: string; dtype: string; values: ArrayBufferLike; rowCount?: number }[]): Uint8Array {\n     // Estimate capacity: sum of all values plus overhead\n     let totalBytes = 0;\n     for (const col of columns) totalBytes += col.values.byteLength;\n@@ -908,8 +908,8 @@ export class WasmEngine {\n           new Uint8Array(this.exports.memory.buffer, dataPtr, col.values.byteLength)\n             .set(new Uint8Array(col.values instanceof ArrayBuffer ? col.values : col.values.slice(0)));\n           const byteCount = col.values.byteLength;\n-          // rowCount must be provided externally for exact count; default to byteLength * 8\n-          const rowCount = (col as { rowCount?: number }).rowCount ?? byteCount * 8;\n+          // rowCount must be provided for exact count; byteCount * 8 overestimates when rows % 8 != 0\n+          const rowCount = col.rowCount ?? byteCount * 8;\n           result = this.exports.fragmentAddBoolColumn(namePtr, nameLen, dataPtr, byteCount, rowCount, 0);\n           break;\n         }"
+    }
+  ]
+}

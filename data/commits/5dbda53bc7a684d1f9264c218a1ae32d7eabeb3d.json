@@ -1,0 +1,41 @@
+{
+  "message": "fix(func,core,vdbe): fix printf NULL handling + ALTER TABLE row padding\n\nTwo fixes bringing conformance from 932\u2192934 pass:\n\n1. printf('%q', NULL) now returns '(NULL)' (was empty string)\n   printf('%s', NULL) now returns '' (was '(null)')\n   Both match SQLite's documented behavior.\n\n2. ALTER TABLE ADD COLUMN now pads existing MemDB rows with the new\n   column's DEFAULT value via MemTable::pad_rows_to_column_count().\n   Previously, pre-existing rows had fewer columns than the updated\n   schema expected, causing out-of-range column accesses to return NULL.\n\n   Note: The ALTER TABLE tests still fail due to a deeper column-ordering\n   bug where the MemDB reload after ALTER TABLE assigns columns to wrong\n   positions. This padding fix is necessary but not sufficient.\n\nConformance: 932\u2192934 pass, 6\u21924 fail.\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "0637cbf94de19637c6ac9f455ac29a8b42aae59a",
+      "filename": "crates/fsqlite-core/src/connection.rs",
+      "status": "modified",
+      "additions": 35,
+      "deletions": 1,
+      "changes": 36,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/5dbda53bc7a684d1f9264c218a1ae32d7eabeb3d/crates%2Ffsqlite-core%2Fsrc%2Fconnection.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/5dbda53bc7a684d1f9264c218a1ae32d7eabeb3d/crates%2Ffsqlite-core%2Fsrc%2Fconnection.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-core%2Fsrc%2Fconnection.rs?ref=5dbda53bc7a684d1f9264c218a1ae32d7eabeb3d",
+      "patch": "@@ -21111,7 +21111,41 @@ impl Connection {\n                         on_update,\n                     });\n                 }\n-                table.clone()\n+                // FIX: Pad existing MemDB rows with the default value for the\n+                // new column. Without this, SELECT * returns NULL instead of the\n+                // DEFAULT value for pre-existing rows (column_index >= values.len()).\n+                let default_val = table.columns[new_column_index]\n+                    .default_value\n+                    .as_ref()\n+                    .map_or(SqliteValue::Null, |dv| {\n+                        // Parse constant default: integer, float, string, or NULL\n+                        if dv.eq_ignore_ascii_case(\"NULL\") {\n+                            SqliteValue::Null\n+                        } else if let Ok(i) = dv.parse::<i64>() {\n+                            SqliteValue::Integer(i)\n+                        } else if let Ok(f) = dv.parse::<f64>() {\n+                            SqliteValue::Float(f)\n+                        } else if dv.starts_with('\\'') && dv.ends_with('\\'') {\n+                            SqliteValue::Text(fsqlite_types::SmallText::from_string(\n+                                &dv[1..dv.len() - 1].replace(\"''\", \"'\"),\n+                            ))\n+                        } else {\n+                            SqliteValue::Text(fsqlite_types::SmallText::from_string(dv.as_str()))\n+                        }\n+                    });\n+                let root_page = table.root_page;\n+                let table_clone = table.clone();\n+                drop(schema);\n+                {\n+                    let mut db = self.db.borrow_mut();\n+                    if let Some(mem_table) = db.get_table_mut(root_page) {\n+                        mem_table.pad_rows_to_column_count(\n+                            table_clone.columns.len(),\n+                            &default_val,\n+                        );\n+                    }\n+                }\n+                table_clone\n             }\n             AlterTableAction::DropColumn(col_name) => {\n                 let mut schema = self.schema.borrow_mut();"
+    },
+    {
+      "sha": "ff8647fdfea117e2ad32fe0237c372cee5f783f7",
+      "filename": "crates/fsqlite-func/src/builtins.rs",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 2,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/5dbda53bc7a684d1f9264c218a1ae32d7eabeb3d/crates%2Ffsqlite-func%2Fsrc%2Fbuiltins.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/5dbda53bc7a684d1f9264c218a1ae32d7eabeb3d/crates%2Ffsqlite-func%2Fsrc%2Fbuiltins.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-func%2Fsrc%2Fbuiltins.rs?ref=5dbda53bc7a684d1f9264c218a1ae32d7eabeb3d",
+      "patch": "@@ -2075,7 +2075,8 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {\n                 let param = params.get(param_idx);\n                 param_idx += 1;\n                 let val = match param {\n-                    Some(SqliteValue::Null) | None => \"(null)\".to_string(),\n+                    // SQLite: printf('%s', NULL) returns empty string\n+                    Some(SqliteValue::Null) | None => String::new(),\n                     Some(v) => v.to_text(),\n                 };\n                 let truncated = if let Some(prec) = precision {\n@@ -2090,7 +2091,9 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {\n                 let param = params.get(param_idx);\n                 param_idx += 1;\n                 match param {\n-                    Some(SqliteValue::Null) | None => { /* C SQLite emits nothing for %q with NULL */\n+                    // SQLite: printf('%q', NULL) returns literal \"(NULL)\"\n+                    Some(SqliteValue::Null) | None => {\n+                        result.push_str(\"(NULL)\");\n                     }\n                     Some(v) => {\n                         let val = v.to_text();"
+    },
+    {
+      "sha": "993aa6008d06ddc69f73e7358d5615be3debb479",
+      "filename": "crates/fsqlite-vdbe/src/engine.rs",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 0,
+      "changes": 13,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/5dbda53bc7a684d1f9264c218a1ae32d7eabeb3d/crates%2Ffsqlite-vdbe%2Fsrc%2Fengine.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/5dbda53bc7a684d1f9264c218a1ae32d7eabeb3d/crates%2Ffsqlite-vdbe%2Fsrc%2Fengine.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-vdbe%2Fsrc%2Fengine.rs?ref=5dbda53bc7a684d1f9264c218a1ae32d7eabeb3d",
+      "patch": "@@ -530,6 +530,19 @@ impl MemTable {\n         self.rows.clear();\n     }\n \n+    /// Pad all existing rows to have at least `target_cols` columns,\n+    /// appending `default_val` for any missing trailing columns.\n+    /// Used after ALTER TABLE ADD COLUMN to make pre-existing rows\n+    /// visible with the new column's default value.\n+    pub fn pad_rows_to_column_count(&mut self, target_cols: usize, default_val: &SqliteValue) {\n+        self.num_columns = target_cols;\n+        for row in &mut self.rows {\n+            while row.values.len() < target_cols {\n+                row.values.push(default_val.clone());\n+            }\n+        }\n+    }\n+\n     /// Find a row by rowid. Returns the index.\n     pub fn find_by_rowid(&self, rowid: i64) -> Option<usize> {\n         self.rows.binary_search_by_key(&rowid, |r| r.rowid).ok()"
+    }
+  ]
+}

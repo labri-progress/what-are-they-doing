@@ -1,0 +1,65 @@
+{
+  "message": "fix(search): keep FTS checks responsive",
+  "files": [
+    {
+      "sha": "2133bff2ca30bfb058f7fc5162da32010974c7dd",
+      "filename": "README.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/discrawl/blob/5698de3d58a333b0c51550a508b49ea0c307540d/README.md",
+      "raw_url": "https://github.com/openclaw/discrawl/raw/5698de3d58a333b0c51550a508b49ea0c307540d/README.md",
+      "contents_url": "https://api.github.com/repos/openclaw/discrawl/contents/README.md?ref=5698de3d58a333b0c51550a508b49ea0c307540d",
+      "patch": "@@ -195,6 +195,7 @@ discrawl --json search \"websocket closed\"\n ```\n \n By default, `search` skips rows with no searchable content. Attachment text, attachment filenames, embeds, and replies still count as content. Use `--include-empty` to opt back in.\n+Search returns the newest matching messages first so large local archives stay responsive.\n \n ### `messages`\n "
+    },
+    {
+      "sha": "a5e48870c3b54bc4a0f30c638d943bf4c95cc9f9",
+      "filename": "internal/cli/admin_commands.go",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/openclaw/discrawl/blob/5698de3d58a333b0c51550a508b49ea0c307540d/internal%2Fcli%2Fadmin_commands.go",
+      "raw_url": "https://github.com/openclaw/discrawl/raw/5698de3d58a333b0c51550a508b49ea0c307540d/internal%2Fcli%2Fadmin_commands.go",
+      "contents_url": "https://api.github.com/repos/openclaw/discrawl/contents/internal%2Fcli%2Fadmin_commands.go?ref=5698de3d58a333b0c51550a508b49ea0c307540d",
+      "patch": "@@ -213,7 +213,7 @@ func (r *runtime) runDoctor(args []string) error {\n \t\t\treport[\"database\"] = dbErr.Error()\n \t\t} else {\n \t\t\treport[\"database\"] = \"ok\"\n-\t\t\t_, _, ftsErr := db.ReadOnlyQuery(r.ctx, `select count(*) from message_fts`)\n+\t\t\tftsErr := db.CheckMessageFTS(r.ctx)\n \t\t\tif ftsErr != nil {\n \t\t\t\treport[\"fts\"] = ftsErr.Error()\n \t\t\t} else {"
+    },
+    {
+      "sha": "b923eeec421d5301a97ff9de50b4e730ea2d57a4",
+      "filename": "internal/store/query.go",
+      "status": "modified",
+      "additions": 71,
+      "deletions": 14,
+      "changes": 85,
+      "blob_url": "https://github.com/openclaw/discrawl/blob/5698de3d58a333b0c51550a508b49ea0c307540d/internal%2Fstore%2Fquery.go",
+      "raw_url": "https://github.com/openclaw/discrawl/raw/5698de3d58a333b0c51550a508b49ea0c307540d/internal%2Fstore%2Fquery.go",
+      "contents_url": "https://api.github.com/repos/openclaw/discrawl/contents/internal%2Fstore%2Fquery.go?ref=5698de3d58a333b0c51550a508b49ea0c307540d",
+      "patch": "@@ -3,15 +3,20 @@ package store\n import (\n \t\"context\"\n \t\"database/sql\"\n+\t\"errors\"\n \t\"fmt\"\n \t\"os\"\n \t\"strings\"\n \t\"time\"\n )\n \n const (\n-\tqueryTimeout  = 15 * time.Second\n-\tqueryRowLimit = 50000\n+\tqueryTimeout            = 15 * time.Second\n+\tqueryRowLimit           = 50000\n+\tsearchCandidateFloor    = 200\n+\tsearchCandidateCap      = 5000\n+\tsearchCandidateMultiple = 20\n+\tmessageFTSHealthProbe   = \"__discrawl_probe__\"\n )\n \n func (s *Store) GetSyncState(ctx context.Context, scope string) (string, error) {\n@@ -62,29 +67,44 @@ func (s *Store) SearchMessages(ctx context.Context, opts SearchOptions) ([]Searc\n \t\tclauses = append(clauses, \"(message_fts.author_id = ? or message_fts.author_name like ?)\")\n \t\targs = append(args, opts.Author, \"%\"+opts.Author+\"%\")\n \t}\n-\tif !opts.IncludeEmpty {\n-\t\tclauses = append(clauses, \"trim(coalesce(m.normalized_content, '')) <> ''\")\n-\t}\n-\targs = append(args, opts.Limit)\n+\targs = append(args, searchCandidateLimit(opts.Limit), opts.Limit)\n \tquery := `\n+\t\twith recent_matches as (\n+\t\t\tselect\n+\t\t\t\trowid,\n+\t\t\t\tmessage_id,\n+\t\t\t\tguild_id,\n+\t\t\t\tchannel_id,\n+\t\t\t\tauthor_id,\n+\t\t\t\tcoalesce(author_name, '') as author_name,\n+\t\t\t\tcoalesce(channel_name, '') as channel_name\n+\t\t\tfrom message_fts\n+\t\t\twhere ` + strings.Join(clauses, \" and \") + `\n+\t\t\torder by rowid desc\n+\t\t\tlimit ?\n+\t\t)\n \t\tselect\n-\t\t\tm.id, m.guild_id, m.channel_id, coalesce(c.name, ''),\n-\t\t\tcoalesce(m.author_id, ''), coalesce(message_fts.author_name, ''),\n+\t\t\tm.id, m.guild_id, m.channel_id, coalesce(c.name, recent_matches.channel_name),\n+\t\t\tcoalesce(m.author_id, ''), recent_matches.author_name,\n \t\t\tcase\n \t\t\t\twhen trim(coalesce(m.content, '')) <> '' then m.content\n \t\t\t\telse m.normalized_content\n \t\t\tend,\n \t\t\tm.created_at\n-\t\tfrom message_fts\n-\t\tjoin messages m on m.id = message_fts.message_id\n+\t\tfrom recent_matches\n+\t\tjoin messages m on m.id = recent_matches.message_id\n \t\tleft join channels c on c.id = m.channel_id\n-\t\twhere ` + strings.Join(clauses, \" and \") + `\n-\t\torder by bm25(message_fts), m.created_at desc\n+\t\twhere (? or trim(coalesce(m.normalized_content, '')) <> '')\n+\t\torder by recent_matches.rowid desc\n \t\tlimit ?\n \t`\n-\trows, err := s.db.QueryContext(ctx, query, args...)\n+\tqueryCtx, cancel := withQueryTimeout(ctx)\n+\tdefer cancel()\n+\trows, err := s.db.QueryContext(queryCtx, query, append(args[:len(args)-1], opts.IncludeEmpty, args[len(args)-1])...)\n \tif err != nil {\n-\t\treturn s.searchFallback(ctx, opts)\n+\t\tfallbackCtx, fallbackCancel := withQueryTimeout(ctx)\n+\t\tdefer fallbackCancel()\n+\t\treturn s.searchFallback(fallbackCtx, opts)\n \t}\n \tdefer func() { _ = rows.Close() }()\n \tvar out []SearchResult\n@@ -100,6 +120,29 @@ func (s *Store) SearchMessages(ctx context.Context, opts SearchOptions) ([]Searc\n \treturn out, rows.Err()\n }\n \n+func (s *Store) CheckMessageFTS(ctx context.Context) error {\n+\tdb, cleanup, err := s.openReadOnlyDB()\n+\tif err != nil {\n+\t\treturn err\n+\t}\n+\tif cleanup != nil {\n+\t\tdefer cleanup()\n+\t}\n+\tqueryCtx, cancel := withQueryTimeout(ctx)\n+\tdefer cancel()\n+\n+\tvar rowID sql.NullInt64\n+\terr = db.QueryRowContext(\n+\t\tqueryCtx,\n+\t\t`select rowid from message_fts where message_fts match ? limit 1`,\n+\t\tmessageFTSHealthProbe,\n+\t).Scan(&rowID)\n+\tif errors.Is(err, sql.ErrNoRows) {\n+\t\treturn nil\n+\t}\n+\treturn err\n+}\n+\n func (s *Store) searchFallback(ctx context.Context, opts SearchOptions) ([]SearchResult, error) {\n \targs := []any{\"%\" + opts.Query + \"%\"}\n \tclauses := []string{\"m.normalized_content like ?\"}\n@@ -458,6 +501,20 @@ func withQueryTimeout(ctx context.Context) (context.Context, context.CancelFunc)\n \treturn context.WithTimeout(ctx, queryTimeout)\n }\n \n+func searchCandidateLimit(limit int) int {\n+\tif limit <= 0 {\n+\t\tlimit = 20\n+\t}\n+\tcandidates := limit * searchCandidateMultiple\n+\tif candidates < searchCandidateFloor {\n+\t\treturn searchCandidateFloor\n+\t}\n+\tif candidates > searchCandidateCap {\n+\t\treturn searchCandidateCap\n+\t}\n+\treturn candidates\n+}\n+\n func IsReadOnlySQL(query string) bool {\n \tswitch leadingSQLKeyword(query) {\n \tcase \"select\", \"explain\", \"pragma\":"
+    },
+    {
+      "sha": "70607a7ae6fd4f33e57451afe0e248be6043d1d4",
+      "filename": "internal/store/store_test.go",
+      "status": "modified",
+      "additions": 76,
+      "deletions": 0,
+      "changes": 76,
+      "blob_url": "https://github.com/openclaw/discrawl/blob/5698de3d58a333b0c51550a508b49ea0c307540d/internal%2Fstore%2Fstore_test.go",
+      "raw_url": "https://github.com/openclaw/discrawl/raw/5698de3d58a333b0c51550a508b49ea0c307540d/internal%2Fstore%2Fstore_test.go",
+      "contents_url": "https://api.github.com/repos/openclaw/discrawl/contents/internal%2Fstore%2Fstore_test.go?ref=5698de3d58a333b0c51550a508b49ea0c307540d",
+      "patch": "@@ -138,6 +138,82 @@ func TestStoreReadWriteAndSearch(t *testing.T) {\n \trequire.Equal(t, \"Peter\", messageRows[0].AuthorName)\n }\n \n+func TestSearchMessagesPrefersRecentMessageIDs(t *testing.T) {\n+\tt.Parallel()\n+\n+\tctx := context.Background()\n+\tdbPath := filepath.Join(t.TempDir(), \"discrawl.db\")\n+\ts, err := Open(ctx, dbPath)\n+\trequire.NoError(t, err)\n+\tdefer func() { _ = s.Close() }()\n+\n+\trequire.NoError(t, s.UpsertGuild(ctx, GuildRecord{ID: \"g1\", Name: \"Guild\", RawJSON: `{}`}))\n+\trequire.NoError(t, s.UpsertChannel(ctx, ChannelRecord{ID: \"c1\", GuildID: \"g1\", Kind: \"text\", Name: \"general\", RawJSON: `{}`}))\n+\n+\tbase := time.Date(2026, 4, 4, 0, 0, 0, 0, time.UTC)\n+\trequire.NoError(t, s.UpsertMessage(ctx, MessageRecord{\n+\t\tID:                \"1458939673664684210\",\n+\t\tGuildID:           \"g1\",\n+\t\tChannelID:         \"c1\",\n+\t\tChannelName:       \"general\",\n+\t\tAuthorID:          \"u1\",\n+\t\tAuthorName:        \"Peter\",\n+\t\tMessageType:       0,\n+\t\tCreatedAt:         base.Format(time.RFC3339Nano),\n+\t\tContent:           \"OpenClaw first hit\",\n+\t\tNormalizedContent: \"openclaw first hit\",\n+\t\tRawJSON:           `{}`,\n+\t}))\n+\trequire.NoError(t, s.UpsertMessage(ctx, MessageRecord{\n+\t\tID:                \"1489845247147118682\",\n+\t\tGuildID:           \"g1\",\n+\t\tChannelID:         \"c1\",\n+\t\tChannelName:       \"general\",\n+\t\tAuthorID:          \"u1\",\n+\t\tAuthorName:        \"Peter\",\n+\t\tMessageType:       0,\n+\t\tCreatedAt:         base.Add(time.Minute).Format(time.RFC3339Nano),\n+\t\tContent:           \"OpenClaw newest hit\",\n+\t\tNormalizedContent: \"openclaw newest hit\",\n+\t\tRawJSON:           `{}`,\n+\t}))\n+\n+\tresults, err := s.SearchMessages(ctx, SearchOptions{Query: \"OpenClaw\", Limit: 1})\n+\trequire.NoError(t, err)\n+\trequire.Len(t, results, 1)\n+\trequire.Equal(t, \"1489845247147118682\", results[0].MessageID)\n+\trequire.Contains(t, results[0].Content, \"newest\")\n+}\n+\n+func TestCheckMessageFTSProbe(t *testing.T) {\n+\tt.Parallel()\n+\n+\tctx := context.Background()\n+\tdbPath := filepath.Join(t.TempDir(), \"discrawl.db\")\n+\ts, err := Open(ctx, dbPath)\n+\trequire.NoError(t, err)\n+\tdefer func() { _ = s.Close() }()\n+\n+\trequire.NoError(t, s.CheckMessageFTS(ctx))\n+\n+\trequire.NoError(t, s.UpsertGuild(ctx, GuildRecord{ID: \"g1\", Name: \"Guild\", RawJSON: `{}`}))\n+\trequire.NoError(t, s.UpsertChannel(ctx, ChannelRecord{ID: \"c1\", GuildID: \"g1\", Kind: \"text\", Name: \"general\", RawJSON: `{}`}))\n+\trequire.NoError(t, s.UpsertMessage(ctx, MessageRecord{\n+\t\tID:                \"1458939673664684210\",\n+\t\tGuildID:           \"g1\",\n+\t\tChannelID:         \"c1\",\n+\t\tChannelName:       \"general\",\n+\t\tAuthorID:          \"u1\",\n+\t\tAuthorName:        \"Peter\",\n+\t\tMessageType:       0,\n+\t\tCreatedAt:         time.Now().UTC().Format(time.RFC3339Nano),\n+\t\tContent:           \"searchable text\",\n+\t\tNormalizedContent: \"searchable text\",\n+\t\tRawJSON:           `{}`,\n+\t}))\n+\trequire.NoError(t, s.CheckMessageFTS(ctx))\n+}\n+\n func TestOpenSetsSchemaVersion(t *testing.T) {\n \tt.Parallel()\n "
+    },
+    {
+      "sha": "54564388f5faa54f30c6177d06e5b401810dfa61",
+      "filename": "internal/syncer/message_sync.go",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/openclaw/discrawl/blob/5698de3d58a333b0c51550a508b49ea0c307540d/internal%2Fsyncer%2Fmessage_sync.go",
+      "raw_url": "https://github.com/openclaw/discrawl/raw/5698de3d58a333b0c51550a508b49ea0c307540d/internal%2Fsyncer%2Fmessage_sync.go",
+      "contents_url": "https://api.github.com/repos/openclaw/discrawl/contents/internal%2Fsyncer%2Fmessage_sync.go?ref=5698de3d58a333b0c51550a508b49ea0c307540d",
+      "patch": "@@ -809,7 +809,7 @@ func syncErrorOutcome(err error) string {\n \tcase \"unknown_channel\":\n \t\treturn \"skipped_unknown_channel\"\n \t}\n-\tif isRetryableSyncError(nil, err) {\n+\tif isRetryableSyncError(context.TODO(), err) {\n \t\treturn \"deferred_retryable\"\n \t}\n \treturn \"skipped\""
+    }
+  ]
+}

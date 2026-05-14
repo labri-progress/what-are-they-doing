@@ -1,0 +1,41 @@
+{
+  "message": "fix(telegram): retry invalid native quotes",
+  "files": [
+    {
+      "sha": "c41bf96e8193d55ead5612b412ed65c7c478d034",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/426107d2f864ae7ef91ad11fa51ae094851eeebc/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/426107d2f864ae7ef91ad11fa51ae094851eeebc/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=426107d2f864ae7ef91ad11fa51ae094851eeebc",
+      "patch": "@@ -81,6 +81,7 @@ Docs: https://docs.openclaw.ai\n - Channels/Telegram: honor `ALL_PROXY` / `all_proxy` and service-level `OPENCLAW_PROXY_URL` when constructing the HTTP/1-only Telegram Bot API transport, so Windows and service installs that rely on those proxy settings no longer fall back to direct egress. Fixes #74014; refs #74086. Thanks @SymbolStar.\n - Channels/Telegram: keep raw host/network-unreachable Bot API connect failures non-fatal and route tagged polling uncaught exceptions through the Telegram restart path, so transient reachability failures no longer kill the Gateway or leave long polling stuck. Fixes #60515; refs #74540. Thanks @HemantSudarshan, @thacid22, and @ewimsatt.\n - Channels/Telegram: continue polling when `deleteWebhook` hits a transient network failure but `getWebhookInfo` confirms no webhook is configured, so startup does not retry cleanup forever after the webhook was already removed. Refs #74086; carries forward #47384. Thanks @clovericbot.\n+- Channels/Telegram: retry native quote replies without `reply_parameters.quote` when Telegram returns `QUOTE_TEXT_INVALID`, so stale or truncated quote excerpts no longer drop the whole reply. Fixes #74581. Thanks @moeedahmed.\n - Channels/Telegram: apply strict safe-send retry to inbound final replies when grammY wraps a pre-connect failure, while leaving ambiguous plain network envelopes single-shot to avoid duplicate visible messages. Fixes #74203. Thanks @nanli2000cn.\n - Channels/Telegram: surface polling liveness warnings in channel status and doctor when a running long-poller has not completed `getUpdates` after startup grace or its transport activity is stale, so silent polling failures no longer look clean. Refs #74299. Thanks @lolaopenclaw.\n - Channels/Telegram: publish webhook runtime state and warn when `setWebhook` has not completed after startup grace, so webhook-mode accounts no longer look healthy while registration is still failing or retrying. Refs #74299. Thanks @lolaopenclaw and @martingarramon."
+    },
+    {
+      "sha": "34deb6e66413867d7d7a166e9012a2b556790f57",
+      "filename": "extensions/telegram/src/bot/delivery.send.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/426107d2f864ae7ef91ad11fa51ae094851eeebc/extensions%2Ftelegram%2Fsrc%2Fbot%2Fdelivery.send.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/426107d2f864ae7ef91ad11fa51ae094851eeebc/extensions%2Ftelegram%2Fsrc%2Fbot%2Fdelivery.send.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Ftelegram%2Fsrc%2Fbot%2Fdelivery.send.ts?ref=426107d2f864ae7ef91ad11fa51ae094851eeebc",
+      "patch": "@@ -18,7 +18,7 @@ export { buildTelegramSendParams } from \"../reply-parameters.js\";\n const PARSE_ERR_RE = /can't parse entities|parse entities|find end of the entity/i;\n const EMPTY_TEXT_ERR_RE = /message text is empty/i;\n const THREAD_NOT_FOUND_RE = /message thread not found/i;\n-const QUOTE_PARAM_RE = /\\bquote not found\\b/i;\n+const QUOTE_PARAM_RE = /\\bquote not found\\b|\\bQUOTE_TEXT_INVALID\\b|\\bquote text invalid\\b/i;\n const GrammyErrorCtor: typeof GrammyError | undefined =\n   typeof GrammyError === \"function\" ? GrammyError : undefined;\n "
+    },
+    {
+      "sha": "b24ad47788ead15e30a81ef4a189643eb523514b",
+      "filename": "extensions/telegram/src/bot/delivery.test.ts",
+      "status": "modified",
+      "additions": 51,
+      "deletions": 33,
+      "changes": 84,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/426107d2f864ae7ef91ad11fa51ae094851eeebc/extensions%2Ftelegram%2Fsrc%2Fbot%2Fdelivery.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/426107d2f864ae7ef91ad11fa51ae094851eeebc/extensions%2Ftelegram%2Fsrc%2Fbot%2Fdelivery.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Ftelegram%2Fsrc%2Fbot%2Fdelivery.test.ts?ref=426107d2f864ae7ef91ad11fa51ae094851eeebc",
+      "patch": "@@ -130,6 +130,18 @@ function createQuoteNotFoundError(operation = \"sendMessage\") {\n   );\n }\n \n+function createQuoteTextInvalidError(operation = \"sendMessage\") {\n+  return new Error(\n+    `GrammyError: Call to '${operation}' failed! (400: Bad Request: QUOTE_TEXT_INVALID)`,\n+  );\n+}\n+\n+function createNormalizedQuoteTextInvalidError(operation = \"sendMessage\") {\n+  return new Error(\n+    `GrammyError: Call to '${operation}' failed! (400: Bad Request: quote text invalid)`,\n+  );\n+}\n+\n function createWrappedPreConnectHttpError(operation = \"sendMessage\") {\n   const root = Object.assign(new Error(\"getaddrinfo ENOTFOUND api.telegram.org\"), {\n     code: \"ENOTFOUND\",\n@@ -919,42 +931,48 @@ describe(\"deliverReplies\", () => {\n   });\n \n   it(\"retries with legacy reply id when native quote parameters are rejected\", async () => {\n-    const runtime = createRuntime();\n-    const sendMessage = vi\n-      .fn()\n-      .mockRejectedValueOnce(createQuoteNotFoundError())\n-      .mockResolvedValueOnce({\n-        message_id: 11,\n-        chat: { id: \"123\" },\n+    for (const createError of [\n+      createQuoteNotFoundError,\n+      createQuoteTextInvalidError,\n+      createNormalizedQuoteTextInvalidError,\n+    ]) {\n+      const runtime = createRuntime();\n+      const sendMessage = vi\n+        .fn()\n+        .mockRejectedValueOnce(createError())\n+        .mockResolvedValueOnce({\n+          message_id: 11,\n+          chat: { id: \"123\" },\n+        });\n+      const bot = createBot({ sendMessage });\n+\n+      await deliverWith({\n+        replies: [{ text: \"Hello there\", replyToId: \"500\" }],\n+        runtime,\n+        bot,\n+        replyToMode: \"all\",\n+        replyQuoteMessageId: 500,\n+        replyQuoteText: \" quoted text\\n\",\n       });\n-    const bot = createBot({ sendMessage });\n \n-    await deliverWith({\n-      replies: [{ text: \"Hello there\", replyToId: \"500\" }],\n-      runtime,\n-      bot,\n-      replyToMode: \"all\",\n-      replyQuoteMessageId: 500,\n-      replyQuoteText: \" quoted text\\n\",\n-    });\n-\n-    expect(sendMessage).toHaveBeenCalledTimes(2);\n-    expect(sendMessage.mock.calls[0][2]).toEqual(\n-      expect.objectContaining({\n-        reply_parameters: {\n-          message_id: 500,\n-          quote: \" quoted text\\n\",\n+      expect(sendMessage).toHaveBeenCalledTimes(2);\n+      expect(sendMessage.mock.calls[0][2]).toEqual(\n+        expect.objectContaining({\n+          reply_parameters: {\n+            message_id: 500,\n+            quote: \" quoted text\\n\",\n+            allow_sending_without_reply: true,\n+          },\n+        }),\n+      );\n+      expect(sendMessage.mock.calls[1][2]).toEqual(\n+        expect.objectContaining({\n+          reply_to_message_id: 500,\n           allow_sending_without_reply: true,\n-        },\n-      }),\n-    );\n-    expect(sendMessage.mock.calls[1][2]).toEqual(\n-      expect.objectContaining({\n-        reply_to_message_id: 500,\n-        allow_sending_without_reply: true,\n-      }),\n-    );\n-    expect(sendMessage.mock.calls[1][2]).not.toHaveProperty(\"reply_parameters\");\n+        }),\n+      );\n+      expect(sendMessage.mock.calls[1][2]).not.toHaveProperty(\"reply_parameters\");\n+    }\n   });\n \n   it(\"uses legacy reply id when selected reply target differs from quote source\", async () => {"
+    }
+  ]
+}

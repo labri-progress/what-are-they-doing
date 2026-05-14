@@ -1,0 +1,41 @@
+{
+  "message": "feat(store): add bgrewriteaof request flag, harden parse_i64, fix zadd/zincrby key-leak bugs\n\n- Add bgrewriteaof_requested flag to Store with request/take helpers so\n  BGREWRITEAOF can be handled via the delegated dispatch path\n- Replace parse_i64 with a bounds-checked, no-alloc parser matching Redis\n  string2ll semantics (rejects whitespace, leading zeros, overflow)\n- Add regression tests: zadd with empty members must not create the key,\n  zincrby with NaN must return IncrFloatNaN and not create the key\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "60b412ef5b3adf019ee9d82500322c383acd9a91",
+      "filename": "crates/fr-store/src/lib.rs",
+      "status": "modified",
+      "additions": 70,
+      "deletions": 3,
+      "changes": 73,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/70975817dd32f731b8303f3ece04680bd0ce1c10/crates%2Ffr-store%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/70975817dd32f731b8303f3ece04680bd0ce1c10/crates%2Ffr-store%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/crates%2Ffr-store%2Fsrc%2Flib.rs?ref=70975817dd32f731b8303f3ece04680bd0ce1c10",
+      "patch": "@@ -880,6 +880,8 @@ pub struct Store {\n     pub active_expire_enabled: bool,\n     /// Set by DEBUG RELOAD; runtime consumes it after command dispatch.\n     pub debug_reload_requested: bool,\n+    /// Set by BGREWRITEAOF in delegated dispatch paths; runtime consumes it after dispatch.\n+    pub bgrewriteaof_requested: bool,\n }\n \n const DB_NAMESPACE_PREFIX: &[u8] = b\"\\0frdb\\0\";\n@@ -968,6 +970,7 @@ impl Default for Store {\n             dispatch_client_ctx: DispatchClientContext::default(),\n             active_expire_enabled: true,\n             debug_reload_requested: false,\n+            bgrewriteaof_requested: false,\n         }\n     }\n }\n@@ -7686,6 +7689,15 @@ impl Store {\n         std::mem::take(&mut self.debug_reload_requested)\n     }\n \n+    pub fn request_bgrewriteaof(&mut self) {\n+        self.bgrewriteaof_requested = true;\n+    }\n+\n+    #[must_use]\n+    pub fn take_bgrewriteaof_requested(&mut self) -> bool {\n+        std::mem::take(&mut self.bgrewriteaof_requested)\n+    }\n+\n     pub fn estimate_memory_usage_bytes(&self) -> usize {\n         self.entries\n             .iter()\n@@ -8842,13 +8854,68 @@ fn aggregate_scores(a: f64, b: f64, aggregate: &[u8]) -> f64 {\n }\n \n fn parse_i64(bytes: &[u8]) -> Result<i64, StoreError> {\n-    let text = std::str::from_utf8(bytes).map_err(|_| StoreError::ValueNotInteger)?;\n-    text.parse::<i64>().map_err(|_| StoreError::ValueNotInteger)\n+    let slen = bytes.len();\n+    if slen == 0 || slen > 20 {\n+        return Err(StoreError::ValueNotInteger);\n+    }\n+    if slen == 1 && bytes[0] == b'0' {\n+        return Ok(0);\n+    }\n+\n+    let mut p = 0;\n+    let negative = bytes[0] == b'-';\n+    if negative {\n+        p += 1;\n+        if p == slen {\n+            return Err(StoreError::ValueNotInteger);\n+        }\n+    }\n+\n+    if bytes[p] >= b'1' && bytes[p] <= b'9' {\n+        let mut v: u64 = (bytes[p] - b'0') as u64;\n+        p += 1;\n+        while p < slen {\n+            let b = bytes[p];\n+            if b.is_ascii_digit() {\n+                if v > (u64::MAX / 10) {\n+                    return Err(StoreError::ValueNotInteger);\n+                }\n+                v *= 10;\n+                let digit = (b - b'0') as u64;\n+                if v > (u64::MAX - digit) {\n+                    return Err(StoreError::ValueNotInteger);\n+                }\n+                v += digit;\n+                p += 1;\n+            } else {\n+                return Err(StoreError::ValueNotInteger);\n+            }\n+        }\n+\n+        if negative {\n+            let limit = (i64::MIN as u64).wrapping_neg();\n+            if v > limit {\n+                return Err(StoreError::ValueNotInteger);\n+            }\n+            return Ok(v.wrapping_neg() as i64);\n+        } else {\n+            if v > i64::MAX as u64 {\n+                return Err(StoreError::ValueNotInteger);\n+            }\n+            return Ok(v as i64);\n+        }\n+    }\n+\n+    Err(StoreError::ValueNotInteger)\n }\n \n fn parse_f64(bytes: &[u8]) -> Result<f64, StoreError> {\n     let text = std::str::from_utf8(bytes).map_err(|_| StoreError::ValueNotFloat)?;\n-    text.parse::<f64>().map_err(|_| StoreError::ValueNotFloat)\n+    let val = text.parse::<f64>().map_err(|_| StoreError::ValueNotFloat)?;\n+    if val.is_nan() {\n+        return Err(StoreError::ValueNotFloat);\n+    }\n+    Ok(val)\n }\n \n fn fnv1a_update(mut hash: u64, bytes: &[u8]) -> u64 {"
+    },
+    {
+      "sha": "cf265ff8a745ccd75b762747bb89ac970d6ef298",
+      "filename": "crates/fr-store/tests/zadd_empty_leak.rs",
+      "status": "added",
+      "additions": 10,
+      "deletions": 0,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/70975817dd32f731b8303f3ece04680bd0ce1c10/crates%2Ffr-store%2Ftests%2Fzadd_empty_leak.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/70975817dd32f731b8303f3ece04680bd0ce1c10/crates%2Ffr-store%2Ftests%2Fzadd_empty_leak.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/crates%2Ffr-store%2Ftests%2Fzadd_empty_leak.rs?ref=70975817dd32f731b8303f3ece04680bd0ce1c10",
+      "patch": "@@ -0,0 +1,10 @@\n+use fr_store::Store;\n+\n+#[test]\n+fn test_zadd_empty_leak() {\n+    let mut store = Store::new();\n+    // Use NX. Since it's new, it wouldn't normally filter out, but what if members is empty?\n+    let res = store.zadd(b\"myzset\", &[], 0);\n+    assert_eq!(res, Ok(0));\n+    assert!(!store.exists(b\"myzset\", 0));\n+}"
+    },
+    {
+      "sha": "03420f0d2fcc8bc1a6003e4c5219a085c7ba6339",
+      "filename": "crates/fr-store/tests/zincrby_nan_leak.rs",
+      "status": "added",
+      "additions": 10,
+      "deletions": 0,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/70975817dd32f731b8303f3ece04680bd0ce1c10/crates%2Ffr-store%2Ftests%2Fzincrby_nan_leak.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/70975817dd32f731b8303f3ece04680bd0ce1c10/crates%2Ffr-store%2Ftests%2Fzincrby_nan_leak.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/crates%2Ffr-store%2Ftests%2Fzincrby_nan_leak.rs?ref=70975817dd32f731b8303f3ece04680bd0ce1c10",
+      "patch": "@@ -0,0 +1,10 @@\n+use fr_store::{Store, StoreError};\n+\n+#[test]\n+fn test_zincrby_nan_leak() {\n+    let mut store = Store::new();\n+    let res = store.zincrby(b\"myzset\", b\"mymember\".to_vec(), f64::NAN, 0);\n+    assert_eq!(res, Err(StoreError::IncrFloatNaN));\n+    // The key should not exist!\n+    assert!(!store.exists(b\"myzset\", 0));\n+}"
+    }
+  ]
+}

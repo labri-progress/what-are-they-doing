@@ -1,0 +1,65 @@
+{
+  "message": "fix(agents): keep media generation tasks fresh",
+  "files": [
+    {
+      "sha": "e805e2b52c4ac82bc0eb2cfeec81115abd2f2e2b",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/1fcf0a422f9b53c42dffc8defe46852b799391f3/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/1fcf0a422f9b53c42dffc8defe46852b799391f3/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=1fcf0a422f9b53c42dffc8defe46852b799391f3",
+      "patch": "@@ -14,6 +14,7 @@ Docs: https://docs.openclaw.ai\n ### Fixes\n \n - Tasks/media: infer agent ownership for session-scoped task records so `/tasks` agent-local fallback includes session-backed `video_generate` and other async media jobs even when the current chat session has no linked rows. Thanks @vincentkoc.\n+- Agents/media: keep long-running `video_generate` and `music_generate` tasks fresh while provider jobs are still pending, so task maintenance does not mark active Discord media renders lost before completion. Thanks @vincentkoc.\n - Plugins/inspector: keep bundled plugin runtime capture quiet and config-tolerant for Codex, memory-lancedb, Feishu, Mattermost, QQBot, and Tlon so plugin-inspector JSON checks can validate the full bundled set. Thanks @vincentkoc.\n - Slack/auto-reply: keep fully consumed text reset triggers such as `new session` out of `BodyForAgent` after directive cleanup, so configured Slack reset phrases do not leak into the fresh model turn. Fixes #73137. Thanks @neeravmakwana.\n - Plugins/runtime deps: prune stale retained bundled runtime deps and keep doctor/secret channel contract scans on lightweight artifacts, so disabled bundled channels stop preserving old dependency trees or importing heavy plugin surfaces. Thanks @SymbolStar and @vincentkoc."
+    },
+    {
+      "sha": "5b279024a0c27c04bb245b6601b8a1ebb477083f",
+      "filename": "src/agents/tools/media-generate-background-shared.ts",
+      "status": "modified",
+      "additions": 25,
+      "deletions": 0,
+      "changes": 25,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/1fcf0a422f9b53c42dffc8defe46852b799391f3/src%2Fagents%2Ftools%2Fmedia-generate-background-shared.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/1fcf0a422f9b53c42dffc8defe46852b799391f3/src%2Fagents%2Ftools%2Fmedia-generate-background-shared.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fagents%2Ftools%2Fmedia-generate-background-shared.ts?ref=1fcf0a422f9b53c42dffc8defe46852b799391f3",
+      "patch": "@@ -18,6 +18,7 @@ import { formatAgentInternalEventsForPrompt, type AgentInternalEvent } from \"../\n import { deliverSubagentAnnouncement } from \"../subagent-announce-delivery.js\";\n \n const log = createSubsystemLogger(\"agents/tools/media-generate-background-shared\");\n+const MEDIA_GENERATION_TASK_KEEPALIVE_INTERVAL_MS = 60_000;\n \n export type MediaGenerationTaskHandle = {\n   taskId: string;\n@@ -133,6 +134,30 @@ export function recordMediaGenerationTaskProgress(params: {\n   });\n }\n \n+export async function withMediaGenerationTaskKeepalive<T>(params: {\n+  handle: MediaGenerationTaskHandle | null;\n+  progressSummary: string;\n+  eventSummary?: string;\n+  run: () => Promise<T>;\n+}): Promise<T> {\n+  if (!params.handle) {\n+    return await params.run();\n+  }\n+  const interval = setInterval(() => {\n+    recordMediaGenerationTaskProgress({\n+      handle: params.handle,\n+      progressSummary: params.progressSummary,\n+      eventSummary: params.eventSummary,\n+    });\n+  }, MEDIA_GENERATION_TASK_KEEPALIVE_INTERVAL_MS);\n+  interval.unref?.();\n+  try {\n+    return await params.run();\n+  } finally {\n+    clearInterval(interval);\n+  }\n+}\n+\n export function completeMediaGenerationTaskRun(params: {\n   handle: MediaGenerationTaskHandle | null;\n   provider: string;"
+    },
+    {
+      "sha": "f2052ab2b19b8cc17f3e97c3614d444da544e362",
+      "filename": "src/agents/tools/music-generate-tool.ts",
+      "status": "modified",
+      "additions": 19,
+      "deletions": 13,
+      "changes": 32,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/1fcf0a422f9b53c42dffc8defe46852b799391f3/src%2Fagents%2Ftools%2Fmusic-generate-tool.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/1fcf0a422f9b53c42dffc8defe46852b799391f3/src%2Fagents%2Ftools%2Fmusic-generate-tool.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fagents%2Ftools%2Fmusic-generate-tool.ts?ref=1fcf0a422f9b53c42dffc8defe46852b799391f3",
+      "patch": "@@ -28,6 +28,7 @@ import type { DeliveryContext } from \"../../utils/delivery-context.js\";\n import { buildTimeoutAbortSignal } from \"../../utils/fetch-timeout.js\";\n import { ToolInputError, readNumberParam, readStringParam } from \"./common.js\";\n import { decodeDataUrl } from \"./image-tool.helpers.js\";\n+import { withMediaGenerationTaskKeepalive } from \"./media-generate-background-shared.js\";\n import {\n   applyMusicGenerationModelConfigDefaults,\n   buildMediaReferenceDetails,\n@@ -586,19 +587,24 @@ export function createMusicGenerateTool(options?: {\n       if (shouldDetach) {\n         scheduleBackgroundWork(async () => {\n           try {\n-            const executed = await executeMusicGenerationJob({\n-              effectiveCfg,\n-              prompt,\n-              agentDir: options?.agentDir,\n-              model,\n-              lyrics,\n-              instrumental,\n-              durationSeconds,\n-              format,\n-              filename,\n-              loadedReferenceImages,\n-              taskHandle,\n-              timeoutMs,\n+            const executed = await withMediaGenerationTaskKeepalive({\n+              handle: taskHandle,\n+              progressSummary: \"Generating music\",\n+              run: () =>\n+                executeMusicGenerationJob({\n+                  effectiveCfg,\n+                  prompt,\n+                  agentDir: options?.agentDir,\n+                  model,\n+                  lyrics,\n+                  instrumental,\n+                  durationSeconds,\n+                  format,\n+                  filename,\n+                  loadedReferenceImages,\n+                  taskHandle,\n+                  timeoutMs,\n+                }),\n             });\n             completeMusicGenerationTaskRun({\n               handle: taskHandle,"
+    },
+    {
+      "sha": "60912274731cda80371acf337ad36ba006e41143",
+      "filename": "src/agents/tools/video-generate-background.test.ts",
+      "status": "modified",
+      "additions": 42,
+      "deletions": 1,
+      "changes": 43,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/1fcf0a422f9b53c42dffc8defe46852b799391f3/src%2Fagents%2Ftools%2Fvideo-generate-background.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/1fcf0a422f9b53c42dffc8defe46852b799391f3/src%2Fagents%2Ftools%2Fvideo-generate-background.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fagents%2Ftools%2Fvideo-generate-background.test.ts?ref=1fcf0a422f9b53c42dffc8defe46852b799391f3",
+      "patch": "@@ -1,4 +1,4 @@\n-import { beforeEach, describe, expect, it, vi } from \"vitest\";\n+import { afterEach, beforeEach, describe, expect, it, vi } from \"vitest\";\n import { VIDEO_GENERATION_TASK_KIND } from \"../video-generation-task-status.js\";\n import {\n   announceDeliveryMocks,\n@@ -21,6 +21,7 @@ const {\n   recordVideoGenerationTaskProgress,\n   wakeVideoGenerationTaskCompletion,\n } = await import(\"./video-generate-background.js\");\n+const { withMediaGenerationTaskKeepalive } = await import(\"./media-generate-background-shared.js\");\n \n describe(\"video generate background helpers\", () => {\n   beforeEach(() => {\n@@ -31,6 +32,10 @@ describe(\"video generate background helpers\", () => {\n     });\n   });\n \n+  afterEach(() => {\n+    vi.useRealTimers();\n+  });\n+\n   it(\"creates a running task with queued progress text\", () => {\n     taskExecutorMocks.createRunningTaskRun.mockReturnValue({\n       taskId: \"task-123\",\n@@ -77,6 +82,42 @@ describe(\"video generate background helpers\", () => {\n     });\n   });\n \n+  it(\"keeps long-running media tasks fresh while provider work is pending\", async () => {\n+    vi.useFakeTimers();\n+    let resolveRun!: (value: string) => void;\n+    const runPromise = new Promise<string>((resolve) => {\n+      resolveRun = resolve;\n+    });\n+    const task = withMediaGenerationTaskKeepalive({\n+      handle: {\n+        taskId: \"task-123\",\n+        runId: \"tool:video_generate:abc\",\n+        requesterSessionKey: \"agent:main:discord:direct:123\",\n+        taskLabel: \"friendly lobster surfing\",\n+      },\n+      progressSummary: \"Generating video\",\n+      run: () => runPromise,\n+    });\n+\n+    await vi.advanceTimersByTimeAsync(60_000);\n+\n+    expectRecordedTaskProgress({\n+      taskExecutorMocks,\n+      runId: \"tool:video_generate:abc\",\n+      progressSummary: \"Generating video\",\n+    });\n+\n+    resolveRun(\"done\");\n+    await expect(task).resolves.toBe(\"done\");\n+    const callsAfterCompletion = taskExecutorMocks.recordTaskRunProgressByRunId.mock.calls.length;\n+\n+    await vi.advanceTimersByTimeAsync(60_000);\n+\n+    expect(taskExecutorMocks.recordTaskRunProgressByRunId).toHaveBeenCalledTimes(\n+      callsAfterCompletion,\n+    );\n+  });\n+\n   it(\"queues a completion event by default when direct send is disabled\", async () => {\n     announceDeliveryMocks.deliverSubagentAnnouncement.mockResolvedValue({\n       delivered: true,"
+    },
+    {
+      "sha": "e18c85ebddf92637337d7d5f58986370de108b97",
+      "filename": "src/agents/tools/video-generate-tool.ts",
+      "status": "modified",
+      "additions": 24,
+      "deletions": 18,
+      "changes": 42,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/1fcf0a422f9b53c42dffc8defe46852b799391f3/src%2Fagents%2Ftools%2Fvideo-generate-tool.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/1fcf0a422f9b53c42dffc8defe46852b799391f3/src%2Fagents%2Ftools%2Fvideo-generate-tool.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fagents%2Ftools%2Fvideo-generate-tool.ts?ref=1fcf0a422f9b53c42dffc8defe46852b799391f3",
+      "patch": "@@ -31,6 +31,7 @@ import type {\n } from \"../../video-generation/types.js\";\n import { ToolInputError, readNumberParam, readStringParam } from \"./common.js\";\n import { decodeDataUrl } from \"./image-tool.helpers.js\";\n+import { withMediaGenerationTaskKeepalive } from \"./media-generate-background-shared.js\";\n import {\n   applyVideoGenerationModelConfigDefaults,\n   buildMediaReferenceDetails,\n@@ -982,24 +983,29 @@ export function createVideoGenerateTool(options?: {\n       if (shouldDetach) {\n         scheduleBackgroundWork(async () => {\n           try {\n-            const executed = await executeVideoGenerationJob({\n-              effectiveCfg,\n-              prompt,\n-              agentDir: options?.agentDir,\n-              model,\n-              size,\n-              aspectRatio,\n-              resolution,\n-              durationSeconds,\n-              audio,\n-              watermark,\n-              filename,\n-              loadedReferenceImages,\n-              loadedReferenceVideos,\n-              loadedReferenceAudios,\n-              taskHandle,\n-              providerOptions,\n-              timeoutMs,\n+            const executed = await withMediaGenerationTaskKeepalive({\n+              handle: taskHandle,\n+              progressSummary: \"Generating video\",\n+              run: () =>\n+                executeVideoGenerationJob({\n+                  effectiveCfg,\n+                  prompt,\n+                  agentDir: options?.agentDir,\n+                  model,\n+                  size,\n+                  aspectRatio,\n+                  resolution,\n+                  durationSeconds,\n+                  audio,\n+                  watermark,\n+                  filename,\n+                  loadedReferenceImages,\n+                  loadedReferenceVideos,\n+                  loadedReferenceAudios,\n+                  taskHandle,\n+                  providerOptions,\n+                  timeoutMs,\n+                }),\n             });\n             completeVideoGenerationTaskRun({\n               handle: taskHandle,"
+    }
+  ]
+}

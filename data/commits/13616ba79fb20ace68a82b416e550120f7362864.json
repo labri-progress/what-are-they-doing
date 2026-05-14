@@ -1,0 +1,64 @@
+{
+  "message": "perf: pre-convert attn + classifier x to f32 once per matmul\n\nSame trick that paid off for experts: widen x from fp16 to f32 once\nbefore every attention Q/K/V/O projection (and the classifier head)\nand call a new matmul_f32_x_int4block kernel (f32 in, fp16 out). The\nper-load fp16 widening in the inner MAC loop is gone \u2014 it runs once\nper activation buffer instead of once per (N, block, T tile).\n\nNode forward (T=61): 459 \u2192 331 ms (-28%).\nBrowser bench:\n  short  92 \u2192 72 ms    (0.32\u00d7 \u2192 0.42\u00d7 vs tjs)\n  medium 237 \u2192 176 ms  (0.16\u00d7 \u2192 0.22\u00d7)\n  long   530 \u2192 383 ms  (0.11\u00d7 \u2192 0.15\u00d7)\n\nCumulative since the ONNX pivot: 211/579/1341 \u2192 72/176/383 ms\n(2.9\u20133.5\u00d7 faster across the board). 8/8 parity holds.",
+  "files": [
+    {
+      "sha": "d2c73ec813941e72916de3d734bb41f4d4320e14",
+      "filename": "src/js/backends/pii-wasm-inline.ts",
+      "status": "modified",
+      "additions": 3079,
+      "deletions": 2724,
+      "changes": 5803,
+      "blob_url": "https://github.com/teamchong/textsift/blob/13616ba79fb20ace68a82b416e550120f7362864/src%2Fjs%2Fbackends%2Fpii-wasm-inline.ts",
+      "raw_url": "https://github.com/teamchong/textsift/raw/13616ba79fb20ace68a82b416e550120f7362864/src%2Fjs%2Fbackends%2Fpii-wasm-inline.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/src%2Fjs%2Fbackends%2Fpii-wasm-inline.ts?ref=13616ba79fb20ace68a82b416e550120f7362864"
+    },
+    {
+      "sha": "3bbead74e0dc7f9022d3ba1721ab9a39f28a8446",
+      "filename": "src/js/backends/wasm.ts",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/teamchong/textsift/blob/13616ba79fb20ace68a82b416e550120f7362864/src%2Fjs%2Fbackends%2Fwasm.ts",
+      "raw_url": "https://github.com/teamchong/textsift/raw/13616ba79fb20ace68a82b416e550120f7362864/src%2Fjs%2Fbackends%2Fwasm.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/src%2Fjs%2Fbackends%2Fwasm.ts?ref=13616ba79fb20ace68a82b416e550120f7362864",
+      "patch": "@@ -38,6 +38,7 @@ export interface PiiWasmExports {\n   // or a pointer into WASM memory for asymmetric (ONNX MatMulNBits semantics).\n   matmul_fp16_x_int4block(x: number, w_int4: number, w_scales: number, w_zp: number, bias: number, out: number, T: number, N: number, D: number): void;\n   matmul_fp16_x_int4block_out_f32(x: number, w_int4: number, w_scales: number, w_zp: number, bias: number, out: number, T: number, N: number, D: number): void;\n+  matmul_f32_x_int4block(x: number, w_int4: number, w_scales: number, w_zp: number, bias: number, out: number, T: number, N: number, D: number): void;\n   matmul_f32_x_int4block_out_f32(x: number, w_int4: number, w_scales: number, w_zp: number, bias: number, out: number, T: number, N: number, D: number): void;\n   topk_partial_f32(x: number, out_idx: number, out_val: number, rows: number, cols: number, k: number): void;\n   rope_apply(qk: number, cos: number, sin: number, T: number, H: number, head_dim: number): void;\n@@ -134,6 +135,7 @@ export async function loadPiiWasm(url?: string | URL | null): Promise<PiiWasmExp\n     \"rms_norm\",\n     \"matmul_fp16_x_int4block\",\n     \"matmul_fp16_x_int4block_out_f32\",\n+    \"matmul_f32_x_int4block\",\n     \"matmul_f32_x_int4block_out_f32\",\n     \"topk_partial_f32\",\n     \"rope_apply\","
+    },
+    {
+      "sha": "26ba6083a3c6576e168c7e5d149039902c4337b7",
+      "filename": "src/js/inference/attention.ts",
+      "status": "modified",
+      "additions": 18,
+      "deletions": 11,
+      "changes": 29,
+      "blob_url": "https://github.com/teamchong/textsift/blob/13616ba79fb20ace68a82b416e550120f7362864/src%2Fjs%2Finference%2Fattention.ts",
+      "raw_url": "https://github.com/teamchong/textsift/raw/13616ba79fb20ace68a82b416e550120f7362864/src%2Fjs%2Finference%2Fattention.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/src%2Fjs%2Finference%2Fattention.ts?ref=13616ba79fb20ace68a82b416e550120f7362864",
+      "patch": "@@ -67,23 +67,29 @@ export function attentionForward(\n   const kPtr = wasm.alloc(T * Hkv * hd * 2);\n   const vPtr = wasm.alloc(T * Hkv * hd * 2);\n   const attnOutPtr = wasm.alloc(T * Hq * hd * 2);\n-  if (qPtr === 0 || kPtr === 0 || vPtr === 0 || attnOutPtr === 0) {\n+  // Pre-convert hidden (fp16) \u2192 f32 once so the Q/K/V int4 matmuls can\n+  // use the f32-input kernel and skip the per-load fp16 widening.\n+  const hiddenF32Ptr = wasm.alloc(T * D * 4);\n+  const attnF32Ptr = wasm.alloc(T * Hq * hd * 4);\n+  if (qPtr === 0 || kPtr === 0 || vPtr === 0 || attnOutPtr === 0\n+      || hiddenF32Ptr === 0 || attnF32Ptr === 0) {\n     throw new Error(\"attentionForward: scratch alloc OOM\");\n   }\n+  wasm.convert_fp16_to_f32(hiddenPtr, hiddenF32Ptr, T * D);\n \n-  // Q/K/V projections (fp16 x \u00d7 int4 W \u2192 fp16 out, asymmetric uint4 with per-block ZP).\n-  wasm.matmul_fp16_x_int4block(\n-    hiddenPtr,\n+  // Q/K/V projections (f32 x \u00d7 int4 W \u2192 fp16 out, asymmetric uint4 with per-block ZP).\n+  wasm.matmul_f32_x_int4block(\n+    hiddenF32Ptr,\n     weights.qProj.int4.dataOffset, weights.qProj.scales.dataOffset, weights.qProj.zp.dataOffset,\n     weights.qProj.bias.dataOffset, qPtr, T, Hq * hd, D,\n   );\n-  wasm.matmul_fp16_x_int4block(\n-    hiddenPtr,\n+  wasm.matmul_f32_x_int4block(\n+    hiddenF32Ptr,\n     weights.kProj.int4.dataOffset, weights.kProj.scales.dataOffset, weights.kProj.zp.dataOffset,\n     weights.kProj.bias.dataOffset, kPtr, T, Hkv * hd, D,\n   );\n-  wasm.matmul_fp16_x_int4block(\n-    hiddenPtr,\n+  wasm.matmul_f32_x_int4block(\n+    hiddenF32Ptr,\n     weights.vProj.int4.dataOffset, weights.vProj.scales.dataOffset, weights.vProj.zp.dataOffset,\n     weights.vProj.bias.dataOffset, vPtr, T, Hkv * hd, D,\n   );\n@@ -102,9 +108,10 @@ export function attentionForward(\n     T, Hq, Hkv, hd, config.slidingWindow,\n   );\n \n-  // O projection: [T, Hq*hd] @ [D, Hq*hd]^T + [D] \u2192 [T, D]  (int4 W, asymmetric).\n-  wasm.matmul_fp16_x_int4block(\n-    attnOutPtr,\n+  // O projection: pre-widen attn_out, then f32-input int4 matmul.\n+  wasm.convert_fp16_to_f32(attnOutPtr, attnF32Ptr, T * Hq * hd);\n+  wasm.matmul_f32_x_int4block(\n+    attnF32Ptr,\n     weights.oProj.int4.dataOffset, weights.oProj.scales.dataOffset, weights.oProj.zp.dataOffset,\n     weights.oProj.bias.dataOffset, outputPtr, T, D, Hq * hd,\n   );"
+    },
+    {
+      "sha": "a54ef9083d60a2fab26b4d117fcf71e55c291cbf",
+      "filename": "src/js/inference/model.ts",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 2,
+      "changes": 7,
+      "blob_url": "https://github.com/teamchong/textsift/blob/13616ba79fb20ace68a82b416e550120f7362864/src%2Fjs%2Finference%2Fmodel.ts",
+      "raw_url": "https://github.com/teamchong/textsift/raw/13616ba79fb20ace68a82b416e550120f7362864/src%2Fjs%2Finference%2Fmodel.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/src%2Fjs%2Finference%2Fmodel.ts?ref=13616ba79fb20ace68a82b416e550120f7362864",
+      "patch": "@@ -89,8 +89,11 @@ export function modelForward(\n   wasm.rms_norm(srcPtr, weights.finalLayernorm.dataOffset, dstPtr, T, D, config.rmsNormEps);\n \n   // Classifier head: [T, D] \u00d7 [num_classes, D]^T + [num_classes] \u2192 [T, num_classes].\n-  wasm.matmul_fp16_x_int4block(\n-    dstPtr,\n+  // Pre-widen the final-norm output so the int4 matmul runs against f32.\n+  const classifierXPtr = wasm.alloc(T * D * 4);\n+  wasm.convert_fp16_to_f32(dstPtr, classifierXPtr, T * D);\n+  wasm.matmul_f32_x_int4block(\n+    classifierXPtr,\n     weights.classifier.int4.dataOffset,\n     weights.classifier.scales.dataOffset,\n     weights.classifier.zp.dataOffset,"
+    },
+    {
+      "sha": "4c97e1a78e04b24b844af9ceda56bc5001b3e4db",
+      "filename": "src/zig/wasm_exports.zig",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 0,
+      "changes": 15,
+      "blob_url": "https://github.com/teamchong/textsift/blob/13616ba79fb20ace68a82b416e550120f7362864/src%2Fzig%2Fwasm_exports.zig",
+      "raw_url": "https://github.com/teamchong/textsift/raw/13616ba79fb20ace68a82b416e550120f7362864/src%2Fzig%2Fwasm_exports.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/src%2Fzig%2Fwasm_exports.zig?ref=13616ba79fb20ace68a82b416e550120f7362864",
+      "patch": "@@ -615,6 +615,21 @@ export fn matmul_f32_x_int4block_out_f32(\n     matmulInt4BlockImpl(f32, f32, x_ptr, w_int4_ptr, w_scales_ptr, w_zp_ptr, bias_ptr, out_ptr, T, N, D);\n }\n \n+/// f32 x \u00d7 int4-blockwise W + bias \u2192 fp16 out. Used by attention Q/K/V/O\n+/// and the classifier head, where callers pre-widen x once and use this\n+/// kernel to skip the per-load fp16 \u2192 f32 conversion in the inner loop.\n+export fn matmul_f32_x_int4block(\n+    x_ptr: [*]const f32,\n+    w_int4_ptr: [*]const u8,\n+    w_scales_ptr: [*]const u16,\n+    w_zp_ptr: ?[*]const u8,\n+    bias_ptr: [*]const u16,\n+    out_ptr: [*]u16,\n+    T: u32, N: u32, D: u32,\n+) void {\n+    matmulInt4BlockImpl(f32, u16, x_ptr, w_int4_ptr, w_scales_ptr, w_zp_ptr, bias_ptr, out_ptr, T, N, D);\n+}\n+\n // --------------------------------------------------------------\n // Kernel: SwiGLU with clamp (privacy-filter / ORT QMoE variant)\n // --------------------------------------------------------------"
+    }
+  ]
+}

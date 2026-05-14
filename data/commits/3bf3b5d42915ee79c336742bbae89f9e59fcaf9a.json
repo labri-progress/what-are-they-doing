@@ -1,0 +1,41 @@
+{
+  "message": "feat(ast,core): AST and connection improvements with WAL staging verification updates\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "d2bf48fdfb417e9fab13ed22c38ac51f452a76e3",
+      "filename": "crates/fsqlite-ast/src/lib.rs",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 4,
+      "changes": 24,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/3bf3b5d42915ee79c336742bbae89f9e59fcaf9a/crates%2Ffsqlite-ast%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/3bf3b5d42915ee79c336742bbae89f9e59fcaf9a/crates%2Ffsqlite-ast%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-ast%2Fsrc%2Flib.rs?ref=3bf3b5d42915ee79c336742bbae89f9e59fcaf9a",
+      "patch": "@@ -506,12 +506,21 @@ impl Expr {\n     }\n }\n \n-/// Span-ignoring structural equality for expressions.\n+/// Span-ignoring, SQL-semantics-aware structural equality for expressions.\n ///\n /// Two expressions are equal if they have the same structure and all semantic\n-/// fields match, regardless of their source-location [`Span`] values. This is\n+/// fields match, regardless of their source-location [`Span`] values.  This is\n /// essential for partial-index predicate matching and expression-index lookup,\n /// where the same logical expression is parsed from different source texts.\n+///\n+/// SQL identifiers and function names are case-insensitive, so comparisons of\n+/// [`FunctionCall::name`] and [`Collate::collation`] use\n+/// `eq_ignore_ascii_case` rather than byte-exact equality.  Column and table\n+/// names in [`ColumnRef`] are compared via the derived `PartialEq` on that\n+/// struct, which is currently case-sensitive \u2014 this is a known limitation but\n+/// a safe default because mixed-case column references are rare in practice\n+/// and would only cause a missed optimisation (silent scan fallback), never a\n+/// wrong result.\n impl PartialEq for Expr {\n     #[allow(clippy::too_many_lines)]\n     fn eq(&self, other: &Self) -> bool {\n@@ -646,7 +655,14 @@ impl PartialEq for Expr {\n                     over: ov2,\n                     ..\n                 },\n-            ) => n1 == n2 && a1 == a2 && d1 == d2 && ob1 == ob2 && f1 == f2 && ov1 == ov2,\n+            ) => {\n+                n1.eq_ignore_ascii_case(n2)\n+                    && a1 == a2\n+                    && d1 == d2\n+                    && ob1 == ob2\n+                    && f1 == f2\n+                    && ov1 == ov2\n+            }\n             (\n                 Self::Collate {\n                     expr: e1,\n@@ -658,7 +674,7 @@ impl PartialEq for Expr {\n                     collation: c2,\n                     ..\n                 },\n-            ) => e1 == e2 && c1 == c2,\n+            ) => e1 == e2 && c1.eq_ignore_ascii_case(c2),\n             (\n                 Self::IsNull {\n                     expr: e1, not: n1, .."
+    },
+    {
+      "sha": "45ef4142b4e06e6b64cbed45d2e77e2fc87c7843",
+      "filename": "crates/fsqlite-core/src/connection.rs",
+      "status": "modified",
+      "additions": 66,
+      "deletions": 0,
+      "changes": 66,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/3bf3b5d42915ee79c336742bbae89f9e59fcaf9a/crates%2Ffsqlite-core%2Fsrc%2Fconnection.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/3bf3b5d42915ee79c336742bbae89f9e59fcaf9a/crates%2Ffsqlite-core%2Fsrc%2Fconnection.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-core%2Fsrc%2Fconnection.rs?ref=3bf3b5d42915ee79c336742bbae89f9e59fcaf9a",
+      "patch": "@@ -88802,6 +88802,9 @@ mod pager_routing_tests {\n     use super::*;\n     use fsqlite_ast::{ColumnRef, Expr, OrderingTerm, ResultColumn, Span};\n     use fsqlite_func::collation::CollationFunction;\n+    use std::collections::BTreeMap;\n+    use tracing::field::{Field, Visit};\n+    use tracing_subscriber::prelude::*;\n \n     #[derive(Debug)]\n     struct LengthFirstCollation;\n@@ -88851,6 +88854,69 @@ mod pager_routing_tests {\n         });\n     }\n \n+    #[derive(Debug, Clone, PartialEq, Eq)]\n+    struct CapturedTraceSpan {\n+        name: String,\n+        target: String,\n+        fields: BTreeMap<String, String>,\n+    }\n+\n+    #[derive(Default)]\n+    struct CapturedTraceFields {\n+        fields: BTreeMap<String, String>,\n+    }\n+\n+    impl Visit for CapturedTraceFields {\n+        fn record_i64(&mut self, field: &Field, value: i64) {\n+            self.fields.insert(field.name().to_owned(), value.to_string());\n+        }\n+\n+        fn record_u64(&mut self, field: &Field, value: u64) {\n+            self.fields.insert(field.name().to_owned(), value.to_string());\n+        }\n+\n+        fn record_bool(&mut self, field: &Field, value: bool) {\n+            self.fields.insert(field.name().to_owned(), value.to_string());\n+        }\n+\n+        fn record_str(&mut self, field: &Field, value: &str) {\n+            self.fields.insert(field.name().to_owned(), value.to_owned());\n+        }\n+\n+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {\n+            self.fields\n+                .insert(field.name().to_owned(), format!(\"{value:?}\"));\n+        }\n+    }\n+\n+    #[derive(Clone, Default)]\n+    struct TraceSpanCaptureLayer {\n+        spans: Arc<std::sync::Mutex<Vec<CapturedTraceSpan>>>,\n+    }\n+\n+    impl<S> tracing_subscriber::Layer<S> for TraceSpanCaptureLayer\n+    where\n+        S: tracing::Subscriber,\n+    {\n+        fn on_new_span(\n+            &self,\n+            attrs: &tracing::span::Attributes<'_>,\n+            _id: &tracing::span::Id,\n+            _ctx: tracing_subscriber::layer::Context<'_, S>,\n+        ) {\n+            let mut fields = CapturedTraceFields::default();\n+            attrs.record(&mut fields);\n+            self.spans\n+                .lock()\n+                .expect(\"trace span capture mutex poisoned\")\n+                .push(CapturedTraceSpan {\n+                    name: attrs.metadata().name().to_owned(),\n+                    target: attrs.metadata().target().to_owned(),\n+                    fields: fields.fields,\n+                });\n+        }\n+    }\n+\n     // bd-zjisk.1: Parity-cert mode defaults to ON.\n     #[test]\n     fn test_reject_mem_fallback_default_on() {"
+    },
+    {
+      "sha": "d17375572b96fc6b4677759f6f6f5d984899c7c6",
+      "filename": "scripts/verify_d1_parallel_wal_staging.sh",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/3bf3b5d42915ee79c336742bbae89f9e59fcaf9a/scripts%2Fverify_d1_parallel_wal_staging.sh",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/3bf3b5d42915ee79c336742bbae89f9e59fcaf9a/scripts%2Fverify_d1_parallel_wal_staging.sh",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/scripts%2Fverify_d1_parallel_wal_staging.sh?ref=3bf3b5d42915ee79c336742bbae89f9e59fcaf9a",
+      "patch": "@@ -107,6 +107,11 @@ echo \"artifact_dir=${ARTIFACT_DIR}\"\n \n emit_event \"bootstrap\" \"running\" \"verification started\"\n \n+run_compile_step \\\n+    \"wal_unit\" \\\n+    \"running bead-scoped WAL lane-stager unit coverage\" \\\n+    cargo test -p fsqlite-wal lane_stager -- --nocapture\n+\n run_compile_step \\\n     \"pager_unit\" \\\n     \"running bead-scoped pager unit coverage\" \\"
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "message": "ratelimit: harden token bucket refill accounting",
+  "files": [
+    {
+      "sha": "1a4bf2d4808871c16c19c0a182fc80df4cab5c3c",
+      "filename": "crates/fcp-ratelimit/src/fcp.rs",
+      "status": "modified",
+      "additions": 28,
+      "deletions": 1,
+      "changes": 29,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/50f9e9d8012e5ae6165b520c24c223ba971776cc/crates%2Ffcp-ratelimit%2Fsrc%2Ffcp.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/50f9e9d8012e5ae6165b520c24c223ba971776cc/crates%2Ffcp-ratelimit%2Fsrc%2Ffcp.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-ratelimit%2Fsrc%2Ffcp.rs?ref=50f9e9d8012e5ae6165b520c24c223ba971776cc",
+      "patch": "@@ -313,7 +313,7 @@ fn backpressure_from_state(\n \n     let retry_after_ms = match level {\n         fcp_core::BackpressureLevel::SoftLimit | fcp_core::BackpressureLevel::HardLimit => {\n-            Some(u64::try_from(state.reset_after.as_millis()).unwrap_or(u64::MAX))\n+            Some(duration_to_retry_after_ms(state.reset_after))\n         }\n         fcp_core::BackpressureLevel::Normal | fcp_core::BackpressureLevel::Warning => None,\n     };\n@@ -325,6 +325,19 @@ fn backpressure_from_state(\n     }\n }\n \n+fn duration_to_retry_after_ms(duration: Duration) -> u64 {\n+    if duration.is_zero() {\n+        return 0;\n+    }\n+\n+    let millis = duration.as_millis();\n+    if millis > 0 {\n+        return u64::try_from(millis).unwrap_or(u64::MAX);\n+    }\n+\n+    1\n+}\n+\n fn utilization_bps(limit: u32, remaining: u32) -> u16 {\n     if limit == 0 {\n         return 0;\n@@ -583,6 +596,20 @@ mod tests {\n         assert!(signal.retry_after_ms.is_some());\n     }\n \n+    #[test]\n+    fn backpressure_rounds_submillisecond_retry_after_up() {\n+        let state = RateLimitState {\n+            limit: 100,\n+            remaining: 0,\n+            reset_after: Duration::from_nanos(1),\n+            is_limited: true,\n+        };\n+\n+        let signal = backpressure_from_state(&state, BackpressureThresholds::standard());\n+        assert_eq!(signal.level, fcp_core::BackpressureLevel::HardLimit);\n+        assert_eq!(signal.retry_after_ms, Some(1));\n+    }\n+\n     #[fcp_async_core::runtime::test]\n     async fn enforce_quota_violation_includes_retry_after() {\n         let limiter = TokenBucket::new(1, Duration::from_millis(50));"
+    },
+    {
+      "sha": "c2c80b82daedb82ed3d9cfdbb61f371edbcfd778",
+      "filename": "crates/fcp-ratelimit/src/token_bucket.rs",
+      "status": "modified",
+      "additions": 37,
+      "deletions": 6,
+      "changes": 43,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/50f9e9d8012e5ae6165b520c24c223ba971776cc/crates%2Ffcp-ratelimit%2Fsrc%2Ftoken_bucket.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/50f9e9d8012e5ae6165b520c24c223ba971776cc/crates%2Ffcp-ratelimit%2Fsrc%2Ftoken_bucket.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-ratelimit%2Fsrc%2Ftoken_bucket.rs?ref=50f9e9d8012e5ae6165b520c24c223ba971776cc",
+      "patch": "@@ -121,16 +121,18 @@ impl TokenBucket {\n \n     /// Refill tokens based on elapsed time.\n     ///\n-    /// Fast path: if tokens are already at capacity, skip the Mutex lock entirely.\n-    /// The lock is only needed to update `last_refill` when actually adding tokens.\n+    /// When the bucket is already full, refresh the refill anchor so idle time does not\n+    /// accrue extra burst credit past capacity.\n     fn refill(&self) {\n-        // Fast path: if already at capacity, no refill needed.\n-        if self.tokens.load(Ordering::Acquire) >= self.capacity {\n+        let current = self.tokens.load(Ordering::Acquire);\n+        let mut last_refill = self.last_refill.lock();\n+        let now = Instant::now();\n+\n+        if current >= self.capacity {\n+            *last_refill = now;\n             return;\n         }\n \n-        let mut last_refill = self.last_refill.lock();\n-        let now = Instant::now();\n         let elapsed = now.saturating_duration_since(*last_refill);\n \n         if elapsed >= self.refill_interval {\n@@ -249,6 +251,7 @@ impl RateLimiter for TokenBucket {\n     }\n \n     fn remaining(&self) -> u32 {\n+        self.refill();\n         self.tokens.load(Ordering::Acquire)\n     }\n \n@@ -651,6 +654,34 @@ mod tests {\n         assert!(limiter.try_acquire().await);\n     }\n \n+    #[fcp_async_core::runtime::test]\n+    async fn full_bucket_does_not_bank_extra_burst_after_idle() {\n+        let limiter = TokenBucket::new(1, Duration::from_millis(50));\n+\n+        // Let the bucket sit full longer than its refill interval.\n+        sleep(Duration::from_millis(120)).await;\n+\n+        assert!(limiter.try_acquire().await);\n+        assert!(\n+            !limiter.try_acquire().await,\n+            \"idle time while full must not mint an extra token\"\n+        );\n+    }\n+\n+    #[fcp_async_core::runtime::test]\n+    async fn remaining_refreshes_after_elapsed_refill() {\n+        let config = RateLimitConfig::new(2, Duration::from_millis(100));\n+        let limiter = TokenBucket::from_config(&config);\n+\n+        assert!(limiter.try_acquire().await);\n+        assert!(limiter.try_acquire().await);\n+        assert_eq!(limiter.remaining(), 0);\n+\n+        sleep(Duration::from_millis(60)).await;\n+\n+        assert_eq!(limiter.remaining(), 1);\n+    }\n+\n     // \u2500\u2500 try_acquire_n additional \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n \n     #[fcp_async_core::runtime::test]"
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "message": "perf(wal): avoid consolidation snapshot in group commit scheduler",
+  "files": [
+    {
+      "sha": "5e317ccfdc5ab5d968116319e3796e7360cb6e6a",
+      "filename": "crates/fsqlite-pager/src/pager.rs",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 4,
+      "changes": 12,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/13ec846c41e4bef5d004a0a3671cd6bfd0a600d0/crates%2Ffsqlite-pager%2Fsrc%2Fpager.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/13ec846c41e4bef5d004a0a3671cd6bfd0a600d0/crates%2Ffsqlite-pager%2Fsrc%2Fpager.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-pager%2Fsrc%2Fpager.rs?ref=13ec846c41e4bef5d004a0a3671cd6bfd0a600d0",
+      "patch": "@@ -223,13 +223,17 @@ fn commit_service_fairness_budget(\n }\n \n fn recent_queue_age_p95(fill_age: Duration) -> Duration {\n-    let recent_arrival_wait_p95 = Duration::from_micros(\n+    // This runs in the group-commit flusher's scheduling loop. Do not call\n+    // `GLOBAL_CONSOLIDATION_METRICS.snapshot()` here: the report path copies\n+    // and sorts the histogram ring to compute exact percentiles. A decaying\n+    // tail estimate preserves the starvation-pressure signal without turning\n+    // every flush decision into a telemetry aggregation.\n+    let recent_arrival_wait_tail = Duration::from_micros(\n         GLOBAL_CONSOLIDATION_METRICS\n-            .snapshot()\n             .hist_arrival_wait\n-            .p95,\n+            .recent_tail_us(),\n     );\n-    std::cmp::max(fill_age, recent_arrival_wait_p95)\n+    std::cmp::max(fill_age, recent_arrival_wait_tail)\n }\n \n #[derive(Debug, Clone, Copy, PartialEq, Eq)]"
+    },
+    {
+      "sha": "09cf2e2f3f45a9f56b740f7626fb35e7bcf3c404",
+      "filename": "crates/fsqlite-wal/src/group_commit.rs",
+      "status": "modified",
+      "additions": 53,
+      "deletions": 0,
+      "changes": 53,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/13ec846c41e4bef5d004a0a3671cd6bfd0a600d0/crates%2Ffsqlite-wal%2Fsrc%2Fgroup_commit.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/13ec846c41e4bef5d004a0a3671cd6bfd0a600d0/crates%2Ffsqlite-wal%2Fsrc%2Fgroup_commit.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-wal%2Fsrc%2Fgroup_commit.rs?ref=13ec846c41e4bef5d004a0a3671cd6bfd0a600d0",
+      "patch": "@@ -248,6 +248,8 @@ pub struct PhaseHistogram {\n     count: AtomicU64,\n     /// Running sum for mean computation.\n     sum_us: AtomicU64,\n+    /// Cheap decaying tail estimate for hot-path policy decisions.\n+    recent_tail_us: AtomicU64,\n }\n \n impl PhaseHistogram {\n@@ -262,6 +264,7 @@ impl PhaseHistogram {\n             max_us: AtomicU64::new(0),\n             count: AtomicU64::new(0),\n             sum_us: AtomicU64::new(0),\n+            recent_tail_us: AtomicU64::new(0),\n         }\n     }\n \n@@ -285,6 +288,31 @@ impl PhaseHistogram {\n                 Err(actual) => prev = actual,\n             }\n         }\n+\n+        // Hot-path consumers need a cheap tail-pressure signal but must not\n+        // call `percentiles()`, which copies and sorts the whole ring. Maintain\n+        // a conservative decaying maximum: spikes influence a few subsequent\n+        // decisions, then fade without requiring a telemetry snapshot.\n+        let mut prev_tail = self.recent_tail_us.load(Ordering::Relaxed);\n+        loop {\n+            let decayed = prev_tail.saturating_mul(15) / 16;\n+            let next_tail = value_us.max(decayed);\n+            match self.recent_tail_us.compare_exchange_weak(\n+                prev_tail,\n+                next_tail,\n+                Ordering::Relaxed,\n+                Ordering::Relaxed,\n+            ) {\n+                Ok(_) => break,\n+                Err(actual) => prev_tail = actual,\n+            }\n+        }\n+    }\n+\n+    /// Return a constant-time recent tail estimate for scheduler hot paths.\n+    #[must_use]\n+    pub fn recent_tail_us(&self) -> u64 {\n+        self.recent_tail_us.load(Ordering::Relaxed)\n     }\n \n     /// Snapshot percentiles: returns (p50, p95, p99, max, count, mean_us).\n@@ -340,6 +368,7 @@ impl PhaseHistogram {\n         self.max_us.store(0, Ordering::Relaxed);\n         self.count.store(0, Ordering::Relaxed);\n         self.sum_us.store(0, Ordering::Relaxed);\n+        self.recent_tail_us.store(0, Ordering::Relaxed);\n     }\n }\n \n@@ -2060,6 +2089,30 @@ mod tests {\n         );\n     }\n \n+    #[test]\n+    fn test_phase_histogram_recent_tail_decays_without_snapshot() {\n+        let h = PhaseHistogram::new();\n+        h.record(1_600);\n+        assert_eq!(h.recent_tail_us(), 1_600);\n+\n+        h.record(0);\n+        assert_eq!(\n+            h.recent_tail_us(),\n+            1_500,\n+            \"recent tail should decay by one sixteenth per sample\"\n+        );\n+\n+        h.record(2_000);\n+        assert_eq!(\n+            h.recent_tail_us(),\n+            2_000,\n+            \"new spikes should replace the decayed tail immediately\"\n+        );\n+\n+        h.reset();\n+        assert_eq!(h.recent_tail_us(), 0);\n+    }\n+\n     /// Deterministic proof that consolidation achieves fsync reduction.\n     ///\n     /// Without consolidation: N transactions \u00d7 1 fsync each = N fsyncs."
+    }
+  ]
+}

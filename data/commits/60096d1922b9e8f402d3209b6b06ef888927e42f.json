@@ -1,0 +1,29 @@
+{
+  "message": "fix(repair,dir): drop lossy UTF-8 rewrite & reject zero dot inodes\n\nevidence: parse_evidence_ledger split on raw 0x0A and skip non-UTF-8 lines\nindividually instead of running String::from_utf8_lossy across the entire\nledger, which previously corrupted otherwise-valid neighboring lines into\nunparseable JSON when one line had stray bytes.\n\ndir: init_dir_block now rejects self_ino==0 and parent_ino==0 up front\nwithout mutating the buffer, matching the rest of the validation contract\n(invalid input must not touch the block). The proptest is constrained to\nthe new 1..=u32::MAX domain to keep fuzz coverage on the live path.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "c7b0b9110326f9dd0b213fd3fc96690018259acc",
+      "filename": "crates/ffs-dir/src/lib.rs",
+      "status": "modified",
+      "additions": 26,
+      "deletions": 2,
+      "changes": 28,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/60096d1922b9e8f402d3209b6b06ef888927e42f/crates%2Fffs-dir%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/60096d1922b9e8f402d3209b6b06ef888927e42f/crates%2Fffs-dir%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/crates%2Fffs-dir%2Fsrc%2Flib.rs?ref=60096d1922b9e8f402d3209b6b06ef888927e42f",
+      "patch": "@@ -431,6 +431,17 @@ pub fn init_dir_block(\n     parent_ino: u32,\n     reserved_tail: usize,\n ) -> Result<()> {\n+    if self_ino == 0 {\n+        return Err(FfsError::Format(\n+            \"directory self inode cannot be zero\".to_owned(),\n+        ));\n+    }\n+    if parent_ino == 0 {\n+        return Err(FfsError::Format(\n+            \"directory parent inode cannot be zero\".to_owned(),\n+        ));\n+    }\n+\n     let usable_len = validate_reserved_tail(block.len(), reserved_tail)?;\n     let min_entries = required_rec_len(1)\n         .checked_add(required_rec_len(2))\n@@ -757,8 +768,8 @@ mod tests {\n         #[test]\n         fn proptest_init_dir_block_roundtrip_preserves_inode_numbers(\n             geometry in dir_block_geometry_strategy(),\n-            self_ino in any::<u32>(),\n-            parent_ino in any::<u32>(),\n+            self_ino in 1_u32..=u32::MAX,\n+            parent_ino in 1_u32..=u32::MAX,\n         ) {\n             let (block_len, reserved_tail) = geometry;\n             let mut block = vec![0u8; block_len];\n@@ -1068,6 +1079,19 @@ mod tests {\n         assert!(matches!(err, FfsError::Format(_)));\n     }\n \n+    #[test]\n+    fn init_dir_block_rejects_zero_dot_inodes_without_mutation() {\n+        for (self_ino, parent_ino) in [(0, 2), (2, 0)] {\n+            let mut block = vec![0xA5; 1024];\n+            let before = block.clone();\n+\n+            let err = init_dir_block(&mut block, self_ino, parent_ino, 0).unwrap_err();\n+\n+            assert!(matches!(err, FfsError::Format(_)));\n+            assert_eq!(block, before);\n+        }\n+    }\n+\n     #[test]\n     fn init_dir_block_rejects_invalid_reserved_tail_geometry_without_mutation() {\n         for reserved_tail in [1_usize, 8, 13, 128] {"
+    },
+    {
+      "sha": "bef9ad805b1b17a22a9fe864a63e45bfa7392323",
+      "filename": "crates/ffs-repair/src/evidence.rs",
+      "status": "modified",
+      "additions": 29,
+      "deletions": 4,
+      "changes": 33,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/60096d1922b9e8f402d3209b6b06ef888927e42f/crates%2Fffs-repair%2Fsrc%2Fevidence.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/60096d1922b9e8f402d3209b6b06ef888927e42f/crates%2Fffs-repair%2Fsrc%2Fevidence.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/crates%2Fffs-repair%2Fsrc%2Fevidence.rs?ref=60096d1922b9e8f402d3209b6b06ef888927e42f",
+      "patch": "@@ -870,10 +870,15 @@ impl<W: Write> EvidenceLedger<W> {\n /// Returns successfully parsed records in order.\n #[must_use]\n pub fn parse_evidence_ledger(data: &[u8]) -> Vec<EvidenceRecord> {\n-    let text = String::from_utf8_lossy(data);\n-    text.lines()\n-        .filter(|line| !line.trim().is_empty())\n-        .filter_map(|line| serde_json::from_str(line).ok())\n+    data.split(|byte| *byte == b'\\n')\n+        .filter_map(|raw_line| {\n+            let raw_line = raw_line.strip_suffix(b\"\\r\").unwrap_or(raw_line);\n+            if raw_line.iter().all(u8::is_ascii_whitespace) {\n+                return None;\n+            }\n+            let line = std::str::from_utf8(raw_line).ok()?;\n+            serde_json::from_str(line).ok()\n+        })\n         .collect()\n }\n \n@@ -1602,6 +1607,26 @@ mod tests {\n         assert!(records.is_empty());\n     }\n \n+    #[test]\n+    fn parse_evidence_ledger_skips_invalid_utf8_lines_without_lossy_rewrite() {\n+        let invalid =\n+            EvidenceRecord::corruption_detected(0, sample_corruption_detail()).with_timestamp(100);\n+        let mut invalid_json = invalid.to_json().expect(\"serialize\").into_bytes();\n+        let detail_pos = invalid_json\n+            .windows(b\"checksum_mismatch\".len())\n+            .position(|window| window == b\"checksum_mismatch\")\n+            .expect(\"detail string present\");\n+        invalid_json[detail_pos] = 0xff;\n+\n+        let valid = EvidenceRecord::repair_succeeded(0, sample_repair_detail()).with_timestamp(200);\n+        let mut data = invalid_json;\n+        data.push(b'\\n');\n+        data.extend_from_slice(valid.to_json().expect(\"serialize\").as_bytes());\n+\n+        let records = parse_evidence_ledger(&data);\n+        assert_eq!(records, vec![valid]);\n+    }\n+\n     #[test]\n     fn from_recovery_evidence_partial_maps_to_repair_failed() {\n         let ev = RecoveryEvidence {"
+    }
+  ]
+}

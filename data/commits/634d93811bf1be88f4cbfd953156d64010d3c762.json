@@ -1,0 +1,172 @@
+{
+  "message": "Port `yara` to the new executor and remove `blockwise` (#6035)\n\n## \ud83d\udd0d Problem\n\n- `yara` was still only wired up for the old executor.\n- The port carried forward a `blockwise` mode that exposed chunk\nboundaries instead of treating the input as one logical byte stream.\n- The TQL2 form only accepted rule paths as a list literal.\n\n## \ud83d\udee0\ufe0f Solution\n\n- Port `yara` to the new executor.\n- Remove the `blockwise` flag from both executor paths.\n- Keep one execution model: buffer the full byte stream in memory and\nscan once at end of input.\n- Accept both `yara \"rule.yar\"` and `yara [\"rule-a.yar\", \"rule-b.yar\"]`.\n- Drop the obsolete `blockwise` integration test and add coverage for\nboth rule argument spellings.\n\n## \ud83d\udcac Review\n\n- Focus on the new executor implementation in\n`plugins/yara/src/plugin.cpp`.\n- The intended semantics are now strictly whole-stream and finite-input\nonly.\n- The new argument helper is shared between validation and operator\nconstruction.\n\n## Documentation PR\n\n- https://github.com/tenzir/docs/pull/261\n\n<sub>resolves TNZ-150</sub>",
+  "files": [
+    {
+      "sha": "a25cd57330c4f8136cab4790a7f1d38095674501",
+      "filename": "plugins/yara/src/plugin.cpp",
+      "status": "modified",
+      "additions": 234,
+      "deletions": 183,
+      "changes": 417,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/634d93811bf1be88f4cbfd953156d64010d3c762/plugins%2Fyara%2Fsrc%2Fplugin.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/634d93811bf1be88f4cbfd953156d64010d3c762/plugins%2Fyara%2Fsrc%2Fplugin.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/plugins%2Fyara%2Fsrc%2Fplugin.cpp?ref=634d93811bf1be88f4cbfd953156d64010d3c762",
+      "patch": "@@ -9,16 +9,19 @@\n #include \"tenzir/detail/assert.hpp\"\n \n #include <tenzir/argument_parser.hpp>\n+#include <tenzir/as_bytes.hpp>\n+#include <tenzir/chunk.hpp>\n #include <tenzir/logger.hpp>\n+#include <tenzir/operator_plugin.hpp>\n #include <tenzir/plugin.hpp>\n #include <tenzir/series_builder.hpp>\n #include <tenzir/tql2/plugin.hpp>\n+#include <tenzir/try.hpp>\n #include <tenzir/view.hpp>\n \n #include <yara/libyara.h>\n #include <yara/types.h>\n \n-#include <deque>\n #include <string_view>\n #include <yara.h>\n \n@@ -28,16 +31,14 @@ namespace {\n \n /// Arguments to the operator.\n struct operator_args {\n-  bool blockwise;\n   bool compiled_rules;\n   bool fast_scan;\n   std::vector<std::string> rules;\n \n   friend auto inspect(auto& f, operator_args& x) -> bool {\n     return f.object(x)\n       .pretty_name(\"operator_args\")\n-      .fields(f.field(\"blockwise\", x.blockwise),\n-              f.field(\"compiled_rules\", x.compiled_rules),\n+      .fields(f.field(\"compiled_rules\", x.compiled_rules),\n               f.field(\"fast_scan\", x.fast_scan), f.field(\"rules\", x.rules));\n   }\n };\n@@ -78,113 +79,52 @@ auto to_error(int status) -> caf::error {\n       return caf::make_error(ec::unspecified, \"callback error\");\n     case ERROR_TOO_MANY_MATCHES:\n       return caf::make_error(ec::unspecified, \"too many matches\");\n-    case ERROR_BLOCK_NOT_READY:\n-      return caf::make_error(ec::incomplete);\n   }\n   return {};\n }\n \n-/// Constructs a sequence of memory blocks that work with the incremental\n-/// scanning functions that YARA provides.\n-class memory_block_vector {\n-public:\n-  memory_block_vector() noexcept\n-    : iterator_{\n-        .context = this,\n-        .first = first,\n-        .next = next,\n-        .file_size = nullptr,\n-        .last_error = ERROR_SUCCESS,\n-      } {\n-  }\n-\n-  ~memory_block_vector() noexcept = default;\n-\n-  memory_block_vector(const memory_block_vector&) = delete;\n-  auto operator=(const memory_block_vector&) -> memory_block_vector& = delete;\n-  memory_block_vector(memory_block_vector&&) = delete;\n-  auto operator=(memory_block_vector&&) -> memory_block_vector& = delete;\n-\n-  /// Adds a new block at the end.\n-  auto push_back(chunk_ptr chunk) {\n-    // The *base* of a chunk is its byte offset in the sequence of all chunks\n-    // seen. This is similar to what YARA does for scanning process memory. See\n-    // https://github.com/VirusTotal/yara/issues/1356 for a more detailed\n-    // discussion.\n-    auto base = uint64_t{0};\n-    if (not blocks_.empty()) {\n-      auto& last = blocks_.back().first;\n-      base = last->base + last->size;\n-    }\n-    auto block = std::make_unique<YR_MEMORY_BLOCK>(YR_MEMORY_BLOCK{\n-      .size = chunk->size(),\n-      .base = base,\n-      // The const_cast is needed by the C API and safe because it is only\n-      // passed through as user context and later casted back to a const\n-      // uint8_t* in fetch().\n-      .context = const_cast<std::byte*>(chunk->data()),\n-      .fetch_data = fetch,\n-    });\n-    blocks_.emplace_back(std::move(block), std::move(chunk));\n-  }\n-\n-  /// Relinquishes a block of memory from the beginning.\n-  auto pop_front() -> bool {\n-    if (blocks_.empty()) {\n-      return false;\n+template <class DiagnosticHandler>\n+auto extract_rules(located<data> const& input, bool compiled_rules,\n+                   DiagnosticHandler& dh) -> Option<std::vector<std::string>> {\n+  auto result = std::vector<std::string>{};\n+  auto add_list = [&](list const& values) -> bool {\n+    result.reserve(values.size());\n+    for (auto const& rule : values) {\n+      if (not is<std::string>(rule)) {\n+        diagnostic::error(\"expected type string for rule\")\n+          .primary(input)\n+          .emit(dh);\n+        return false;\n+      }\n+      result.push_back(as<std::string>(rule));\n     }\n-    blocks_.pop_front();\n-    --offset_;\n     return true;\n+  };\n+  if (is<std::string>(input.inner)) {\n+    result.push_back(as<std::string>(input.inner));\n+  } else if (is<list>(input.inner)) {\n+    if (not add_list(as<list>(input.inner))) {\n+      return {};\n+    }\n+  } else {\n+    diagnostic::error(\"expected type `string|list<string>` for rules\")\n+      .primary(input)\n+      .emit(dh);\n+    return {};\n   }\n-\n-  /// Signal that no further blocks are being added. This results in the block\n-  /// iterator returning `ERROR_SUCCESS` instead of `ERROR_BLOCK_NOT_READY`, and\n-  /// thereby triggering a scan.\n-  auto done() -> void {\n-    done_ = true;\n+  if (result.empty()) {\n+    diagnostic::error(\"no rules provided\").emit(dh);\n+    return {};\n   }\n-\n-  /// Retrieve the underlying block iterator for the YARA API.\n-  auto iterator() -> YR_MEMORY_BLOCK_ITERATOR* {\n-    return &iterator_;\n+  if (compiled_rules and result.size() > 1) {\n+    diagnostic::error(\"can't accept multiple rules in compiled form\")\n+      .primary(input)\n+      .hint(\"provide exactly one rule argument\")\n+      .emit(dh);\n+    return {};\n   }\n-\n-private:\n-  static auto fetch(YR_MEMORY_BLOCK* self) -> const uint8_t* {\n-    return reinterpret_cast<const uint8_t*>(self->context);\n-  }\n-\n-  static auto first(YR_MEMORY_BLOCK_ITERATOR* iterator) -> YR_MEMORY_BLOCK* {\n-    auto* self = reinterpret_cast<memory_block_vector*>(iterator->context);\n-    TENZIR_DEBUG(\"setting iterator to first block\");\n-    self->offset_ = 0;\n-    return next(iterator);\n-  }\n-\n-  static auto next(YR_MEMORY_BLOCK_ITERATOR* iterator) -> YR_MEMORY_BLOCK* {\n-    auto* self = reinterpret_cast<memory_block_vector*>(iterator->context);\n-    TENZIR_ASSERT(self->offset_ <= self->blocks_.size());\n-    if (self->offset_ == self->blocks_.size()) {\n-      // If we have returned all buffered blocks, we must decide whether we are\n-      // truly done or whether more blocks are expected.\n-      TENZIR_DEBUG(\"reached last block {} (done = {})\", self->offset_,\n-                   self->done_);\n-      self->iterator_.last_error\n-        = self->done_ ? ERROR_SUCCESS : ERROR_BLOCK_NOT_READY;\n-      return nullptr;\n-    }\n-    TENZIR_DEBUG(\"returning next block {} (done = {})\", self->offset_,\n-                 self->done_);\n-    self->iterator_.last_error = ERROR_SUCCESS;\n-    return self->blocks_[self->offset_++].first.get();\n-  }\n-\n-  YR_MEMORY_BLOCK_ITERATOR iterator_;\n-  std::deque<std::pair<std::unique_ptr<YR_MEMORY_BLOCK>, chunk_ptr>> blocks_;\n-  size_t offset_ = 0;\n-  bool done_ = false;\n-};\n+  return result;\n+}\n \n /// A set of YARA rules.\n class rules {\n@@ -282,18 +222,6 @@ class scanner {\n     return builder.finish_as_table_slice(\"yara.match\");\n   }\n \n-  /// Checks a sequence of memory blocks for rule matches.\n-  auto scan(memory_block_vector& blocks)\n-    -> caf::expected<std::vector<table_slice>> {\n-    auto builder = series_builder{};\n-    yr_scanner_set_callback(scanner_, callback, &builder);\n-    auto status = yr_scanner_scan_mem_blocks(scanner_, blocks.iterator());\n-    if (auto err = to_error(status); err.valid()) {\n-      return err;\n-    }\n-    return builder.finish_as_table_slice(\"yara.match\");\n-  }\n-\n private:\n   static auto callback(YR_SCAN_CONTEXT* context, int message,\n                        void* message_data, void* user_data) -> int {\n@@ -542,55 +470,36 @@ class yara_operator final : public crtp_operator<yara_operator> {\n         .emit(ctrl.diagnostics());\n       co_return;\n     }\n-    if (args_.blockwise) {\n-      for (auto&& chunk : input) {\n-        if (not chunk) {\n-          co_yield {};\n-          continue;\n-        }\n-        if (auto slices = scanner->scan(as_bytes(chunk))) {\n-          for (auto&& slice : *slices) {\n-            co_yield slice;\n-          }\n-        } else {\n-          diagnostic::warning(\"failed to scan block with YARA rules\")\n-            .hint(\"{}\", slices.error())\n-            .emit(ctrl.diagnostics());\n-          co_yield {};\n-        }\n-      }\n-    } else {\n-      // Small optimization: in case the entire input consists of a single\n-      // chunk, we don't want to copy it at all. This actually may happen\n-      // frequently when memory-mapping files, so it's worthwhile addressing.\n-      auto first = chunk_ptr{};\n-      std::vector<std::byte> buffer;\n-      for (auto&& chunk : input) {\n-        if (not chunk) {\n-          co_yield {};\n-          continue;\n-        }\n-        if (not buffer.empty()) {\n-          buffer.insert(buffer.end(), chunk->begin(), chunk->end());\n-        } else if (not first) {\n-          first = chunk;\n-        } else {\n-          buffer.reserve(first->size() + chunk->size());\n-          buffer.insert(buffer.end(), first->begin(), first->end());\n-          buffer.insert(buffer.end(), chunk->begin(), chunk->end());\n-        }\n+    // Small optimization: in case the entire input consists of a single\n+    // chunk, we don't want to copy it at all. This actually may happen\n+    // frequently when memory-mapping files, so it's worthwhile addressing.\n+    auto first = chunk_ptr{};\n+    std::vector<std::byte> buffer;\n+    for (auto&& chunk : input) {\n+      if (not chunk) {\n+        co_yield {};\n+        continue;\n       }\n-      auto bytes = buffer.empty() ? as_bytes(first) : as_bytes(buffer);\n-      if (auto slices = scanner->scan(bytes)) {\n-        for (auto&& slice : *slices) {\n-          co_yield slice;\n-        }\n+      if (not buffer.empty()) {\n+        buffer.insert(buffer.end(), chunk->begin(), chunk->end());\n+      } else if (not first) {\n+        first = chunk;\n       } else {\n-        diagnostic::error(\"failed to scan blocks with YARA rules\")\n-          .hint(\"{}\", slices.error())\n-          .emit(ctrl.diagnostics());\n+        buffer.reserve(first->size() + chunk->size());\n+        buffer.insert(buffer.end(), first->begin(), first->end());\n+        buffer.insert(buffer.end(), chunk->begin(), chunk->end());\n       }\n     }\n+    auto bytes = buffer.empty() ? as_bytes(first) : as_bytes(buffer);\n+    if (auto slices = scanner->scan(bytes)) {\n+      for (auto&& slice : *slices) {\n+        co_yield slice;\n+      }\n+    } else {\n+      diagnostic::error(\"failed to scan input with YARA rules\")\n+        .hint(\"{}\", slices.error())\n+        .emit(ctrl.diagnostics());\n+    }\n   }\n \n   auto name() const -> std::string override {\n@@ -614,9 +523,152 @@ class yara_operator final : public crtp_operator<yara_operator> {\n   operator_args args_ = {};\n };\n \n+struct YaraArgs {\n+  located<data> rules = {};\n+  bool compiled_rules = false;\n+  bool fast_scan = false;\n+};\n+\n+class Yara final : public Operator<chunk_ptr, table_slice> {\n+public:\n+  explicit Yara(YaraArgs args) : args_{std::move(args)} {\n+  }\n+\n+  auto start(OpCtx& ctx) -> Task<void> override {\n+    if (failed_) {\n+      co_return;\n+    }\n+    failed_ = not initialize(ctx.dh());\n+    co_return;\n+  }\n+\n+  auto process(chunk_ptr input, Push<table_slice>& push, OpCtx& ctx)\n+    -> Task<void> override {\n+    TENZIR_UNUSED(push, ctx);\n+    if (failed_ or not scanner_ or not input or input->size() == 0) {\n+      co_return;\n+    }\n+    if (not buffer_.empty()) {\n+      buffer_.insert(buffer_.end(), input->begin(), input->end());\n+    } else if (not first_chunk_) {\n+      first_chunk_ = std::move(input);\n+    } else {\n+      buffer_.reserve(first_chunk_->size() + input->size());\n+      buffer_.insert(buffer_.end(), first_chunk_->begin(), first_chunk_->end());\n+      buffer_.insert(buffer_.end(), input->begin(), input->end());\n+      first_chunk_ = {};\n+    }\n+    co_return;\n+  }\n+\n+  auto finalize(Push<table_slice>& push, OpCtx& ctx)\n+    -> Task<FinalizeBehavior> override {\n+    if (failed_ or not scanner_) {\n+      co_return FinalizeBehavior::done;\n+    }\n+    auto first_chunk = std::exchange(first_chunk_, {});\n+    auto buffer = std::exchange(buffer_, std::vector<std::byte>{});\n+    auto bytes = std::span<const std::byte>{};\n+    if (not buffer.empty()) {\n+      bytes = as_bytes(buffer);\n+    } else if (first_chunk) {\n+      bytes = as_bytes(first_chunk);\n+    }\n+    auto slices = scanner_->scan(bytes);\n+    if (not slices) {\n+      diagnostic::error(\"failed to scan input with YARA rules\")\n+        .hint(\"{}\", slices.error())\n+        .emit(ctx);\n+      co_return FinalizeBehavior::done;\n+    }\n+    for (auto& slice : *slices) {\n+      co_await push(std::move(slice));\n+    }\n+    co_return FinalizeBehavior::done;\n+  }\n+\n+  auto snapshot(Serde& serde) -> void override {\n+    // We intentionally serialize buffered input because the operator must see\n+    // the entire byte stream before emitting matches.\n+    serde(\"failed\", failed_);\n+    serde(\"first_chunk\", first_chunk_);\n+    serde(\"buffer\", buffer_);\n+  }\n+\n+  auto state() -> OperatorState override {\n+    return failed_ ? OperatorState::done : OperatorState::unspecified;\n+  }\n+\n+private:\n+  auto materialize_rules(diagnostic_handler& dh) const\n+    -> Option<std::vector<std::string>> {\n+    return extract_rules(args_.rules, args_.compiled_rules, dh);\n+  }\n+\n+  auto initialize(diagnostic_handler& dh) -> bool {\n+    auto rule_strings = materialize_rules(dh);\n+    if (not rule_strings) {\n+      return false;\n+    }\n+    auto compiler = compiler::make();\n+    if (not compiler) {\n+      diagnostic::error(\"insufficient memory to create YARA compiler\").emit(dh);\n+      return false;\n+    }\n+    if (args_.compiled_rules) {\n+      TENZIR_ASSERT(rule_strings->size() == 1);\n+      auto loaded = rules::load((*rule_strings)[0]);\n+      if (not loaded) {\n+        diagnostic::error(\"failed to load compiled YARA rules\")\n+          .note(\"{}\", loaded.error())\n+          .emit(dh);\n+        return false;\n+      }\n+      rules_ = std::move(*loaded);\n+    } else {\n+      for (auto const& rule : *rule_strings) {\n+        if (auto err = compiler->add(std::filesystem::path{rule});\n+            err.valid()) {\n+          diagnostic::error(\"failed to add YARA rule to compiler\")\n+            .note(\"rule: {}\", rule)\n+            .note(\"error: {}\", err)\n+            .emit(dh);\n+          return false;\n+        }\n+      }\n+      auto compiled = compiler->compile();\n+      if (not compiled) {\n+        diagnostic::error(\"failed to compile YARA rules\")\n+          .note(\"error: {}\", compiled.error())\n+          .emit(dh);\n+        return false;\n+      }\n+      rules_ = std::move(*compiled);\n+    }\n+    auto opts = scan_options{\n+      .fast_scan = args_.fast_scan,\n+    };\n+    auto scanner_instance = scanner::make(*rules_, opts);\n+    if (not scanner_instance) {\n+      diagnostic::warning(\"failed to construct YARA scanner\").emit(dh);\n+      return false;\n+    }\n+    scanner_ = std::move(*scanner_instance);\n+    return true;\n+  }\n+\n+  YaraArgs args_;\n+  bool failed_ = false;\n+  chunk_ptr first_chunk_;\n+  std::vector<std::byte> buffer_;\n+  Option<rules> rules_;\n+  Option<scanner> scanner_;\n+};\n+\n /// The `yara` plugin.\n class plugin final : public virtual operator_plugin<yara_operator>,\n-                     public virtual operator_factory_plugin {\n+                     public virtual operator_factory_plugin,\n+                     public virtual OperatorPlugin {\n public:\n   plugin() {\n     const auto ok = yr_initialize();\n@@ -631,37 +683,38 @@ class plugin final : public virtual operator_plugin<yara_operator>,\n     return {.transformation = true};\n   }\n \n+  auto describe() const -> Description override {\n+    auto d = Describer<YaraArgs, Yara>{};\n+    auto rules = d.positional(\"rules\", &YaraArgs::rules, \"string|list<string>\");\n+    auto compiled_rules = d.named(\"compiled_rules\", &YaraArgs::compiled_rules);\n+    d.named(\"fast_scan\", &YaraArgs::fast_scan);\n+    d.validate([rules, compiled_rules](DescribeCtx& ctx) -> Empty {\n+      TRY(auto value, ctx.get(rules));\n+      auto rule_strings\n+        = extract_rules(value, ctx.get(compiled_rules).value_or(false), ctx);\n+      if (not rule_strings) {\n+        return {};\n+      }\n+      return {};\n+    });\n+    return d.without_optimize();\n+  }\n+\n   auto make(operator_factory_invocation inv, session ctx) const\n     -> failure_or<operator_ptr> override {\n     auto args = operator_args{};\n-    auto rules = located<list>{};\n+    auto rules = located<data>{};\n     argument_parser2::operator_(\"yara\")\n-      .positional(\"rules\", rules, \"list<string>\")\n+      .positional(\"rules\", rules, \"string|list<string>\")\n       .named(\"compiled_rules\", args.compiled_rules)\n       .named(\"fast_scan\", args.fast_scan)\n-      .named(\"blockwise\", args.blockwise)\n       .parse(inv, ctx)\n       .ignore();\n-    for (const auto& rule : rules.inner) {\n-      if (not is<std::string>(rule)) {\n-        diagnostic::error(\"expected type string for rule\")\n-          .primary(rules)\n-          .emit(ctx);\n-        return failure::promise();\n-      }\n-      args.rules.push_back(std::move(as<std::string>(rule)));\n-    }\n-    if (args.rules.empty()) {\n-      diagnostic::error(\"no rules provided\").emit(ctx);\n-      return failure::promise();\n-    }\n-    if (args.compiled_rules and args.rules.size() > 1) {\n-      diagnostic::error(\"can't accept multiple rules in compiled form\")\n-        .primary(rules)\n-        .hint(\"provide exactly one rule argument\")\n-        .emit(ctx);\n+    auto rule_strings = extract_rules(rules, args.compiled_rules, ctx);\n+    if (not rule_strings) {\n       return failure::promise();\n     }\n+    args.rules = std::move(*rule_strings);\n     return std::make_unique<yara_operator>(std::move(args));\n   }\n \n@@ -673,8 +726,6 @@ class plugin final : public virtual operator_plugin<yara_operator>,\n           args.compiled_rules = true;\n         } else if (arg->inner == \"-f\" or arg->inner == \"--fast-scan\") {\n           args.fast_scan = true;\n-        } else if (arg->inner == \"-B\" or arg->inner == \"--blockwise\") {\n-          args.blockwise = true;\n         } else {\n           args.rules.push_back(std::move(arg->inner));\n         }"
+    },
+    {
+      "sha": "18bf339bf2b56a1b02df337c8e4f0c4be2bf2ff9",
+      "filename": "test/inputs/yara/basic.yar",
+      "status": "added",
+      "additions": 7,
+      "deletions": 0,
+      "changes": 7,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/634d93811bf1be88f4cbfd953156d64010d3c762/test%2Finputs%2Fyara%2Fbasic.yar",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/634d93811bf1be88f4cbfd953156d64010d3c762/test%2Finputs%2Fyara%2Fbasic.yar",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Finputs%2Fyara%2Fbasic.yar?ref=634d93811bf1be88f4cbfd953156d64010d3c762",
+      "patch": "@@ -0,0 +1,7 @@\n+rule contains_malware {\n+  strings:\n+    $a = \"MALWARE\"\n+\n+  condition:\n+    $a\n+}"
+    },
+    {
+      "sha": "7c6a6cc4fc500dc958af6764204d74edbf2d3527",
+      "filename": "test/inputs/yara/empty.yar",
+      "status": "added",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/634d93811bf1be88f4cbfd953156d64010d3c762/test%2Finputs%2Fyara%2Fempty.yar",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/634d93811bf1be88f4cbfd953156d64010d3c762/test%2Finputs%2Fyara%2Fempty.yar",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Finputs%2Fyara%2Fempty.yar?ref=634d93811bf1be88f4cbfd953156d64010d3c762",
+      "patch": "@@ -0,0 +1,4 @@\n+rule empty_file {\n+  condition:\n+    filesize == 0\n+}"
+    },
+    {
+      "sha": "4f88656ce384114b5e85808e9521a4f6d0c7f9a1",
+      "filename": "test/tests/operators/yara/basic.stdin",
+      "status": "added",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/634d93811bf1be88f4cbfd953156d64010d3c762/test%2Ftests%2Foperators%2Fyara%2Fbasic.stdin",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/634d93811bf1be88f4cbfd953156d64010d3c762/test%2Ftests%2Foperators%2Fyara%2Fbasic.stdin",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fyara%2Fbasic.stdin?ref=634d93811bf1be88f4cbfd953156d64010d3c762",
+      "patch": "@@ -0,0 +1 @@\n+MALWARE\n\\ No newline at end of file"
+    },
+    {
+      "sha": "6b4e548fa82c14c91d673cc602bee8998aac7d95",
+      "filename": "test/tests/operators/yara/basic.tql",
+      "status": "added",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/634d93811bf1be88f4cbfd953156d64010d3c762/test%2Ftests%2Foperators%2Fyara%2Fbasic.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/634d93811bf1be88f4cbfd953156d64010d3c762/test%2Ftests%2Foperators%2Fyara%2Fbasic.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fyara%2Fbasic.tql?ref=634d93811bf1be88f4cbfd953156d64010d3c762",
+      "patch": "@@ -0,0 +1,4 @@\n+from_stdin {\n+  split_bytes 4\n+  yara \"inputs/yara/basic.yar\"\n+}"
+    },
+    {
+      "sha": "0a25b37c92e2368dc079f3e39877ee6675c8721d",
+      "filename": "test/tests/operators/yara/basic.txt",
+      "status": "added",
+      "additions": 21,
+      "deletions": 0,
+      "changes": 21,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/634d93811bf1be88f4cbfd953156d64010d3c762/test%2Ftests%2Foperators%2Fyara%2Fbasic.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/634d93811bf1be88f4cbfd953156d64010d3c762/test%2Ftests%2Foperators%2Fyara%2Fbasic.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fyara%2Fbasic.txt?ref=634d93811bf1be88f4cbfd953156d64010d3c762",
+      "patch": "@@ -0,0 +1,21 @@\n+{\n+  rule: {\n+    identifier: \"contains_malware\",\n+    namespace: \"default\",\n+    tags: [],\n+    meta: {},\n+    strings: {\n+      \"$a\": \"MALWARE\",\n+    },\n+  },\n+  matches: {\n+    \"$a\": [\n+      {\n+        data: b\"MALWARE\",\n+        base: 0,\n+        offset: 0,\n+        match_length: 7,\n+      },\n+    ],\n+  },\n+}"
+    },
+    {
+      "sha": "4f88656ce384114b5e85808e9521a4f6d0c7f9a1",
+      "filename": "test/tests/operators/yara/basic_list.stdin",
+      "status": "added",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/634d93811bf1be88f4cbfd953156d64010d3c762/test%2Ftests%2Foperators%2Fyara%2Fbasic_list.stdin",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/634d93811bf1be88f4cbfd953156d64010d3c762/test%2Ftests%2Foperators%2Fyara%2Fbasic_list.stdin",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fyara%2Fbasic_list.stdin?ref=634d93811bf1be88f4cbfd953156d64010d3c762",
+      "patch": "@@ -0,0 +1 @@\n+MALWARE\n\\ No newline at end of file"
+    },
+    {
+      "sha": "9e98a462444ba86166904b5e834f0968f6165038",
+      "filename": "test/tests/operators/yara/basic_list.tql",
+      "status": "added",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/634d93811bf1be88f4cbfd953156d64010d3c762/test%2Ftests%2Foperators%2Fyara%2Fbasic_list.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/634d93811bf1be88f4cbfd953156d64010d3c762/test%2Ftests%2Foperators%2Fyara%2Fbasic_list.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fyara%2Fbasic_list.tql?ref=634d93811bf1be88f4cbfd953156d64010d3c762",
+      "patch": "@@ -0,0 +1,4 @@\n+from_stdin {\n+  split_bytes 4\n+  yara [\"inputs/yara/basic.yar\"]\n+}"
+    },
+    {
+      "sha": "0a25b37c92e2368dc079f3e39877ee6675c8721d",
+      "filename": "test/tests/operators/yara/basic_list.txt",
+      "status": "added",
+      "additions": 21,
+      "deletions": 0,
+      "changes": 21,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/634d93811bf1be88f4cbfd953156d64010d3c762/test%2Ftests%2Foperators%2Fyara%2Fbasic_list.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/634d93811bf1be88f4cbfd953156d64010d3c762/test%2Ftests%2Foperators%2Fyara%2Fbasic_list.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fyara%2Fbasic_list.txt?ref=634d93811bf1be88f4cbfd953156d64010d3c762",
+      "patch": "@@ -0,0 +1,21 @@\n+{\n+  rule: {\n+    identifier: \"contains_malware\",\n+    namespace: \"default\",\n+    tags: [],\n+    meta: {},\n+    strings: {\n+      \"$a\": \"MALWARE\",\n+    },\n+  },\n+  matches: {\n+    \"$a\": [\n+      {\n+        data: b\"MALWARE\",\n+        base: 0,\n+        offset: 0,\n+        match_length: 7,\n+      },\n+    ],\n+  },\n+}"
+    },
+    {
+      "sha": "8224fbb752935ca5f7d2f1c385c48183104d7ff0",
+      "filename": "test/tests/operators/yara/compiled_rules_multiple.tql",
+      "status": "added",
+      "additions": 7,
+      "deletions": 0,
+      "changes": 7,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/634d93811bf1be88f4cbfd953156d64010d3c762/test%2Ftests%2Foperators%2Fyara%2Fcompiled_rules_multiple.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/634d93811bf1be88f4cbfd953156d64010d3c762/test%2Ftests%2Foperators%2Fyara%2Fcompiled_rules_multiple.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fyara%2Fcompiled_rules_multiple.tql?ref=634d93811bf1be88f4cbfd953156d64010d3c762",
+      "patch": "@@ -0,0 +1,7 @@\n+---\n+error: true\n+---\n+\n+from_stdin {\n+  yara [\"a\", \"b\"], compiled_rules=true\n+}"
+    },
+    {
+      "sha": "91417fb9853a2a5e71fe26d9f401455aadbf84bd",
+      "filename": "test/tests/operators/yara/compiled_rules_multiple.txt",
+      "status": "added",
+      "additions": 14,
+      "deletions": 0,
+      "changes": 14,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/634d93811bf1be88f4cbfd953156d64010d3c762/test%2Ftests%2Foperators%2Fyara%2Fcompiled_rules_multiple.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/634d93811bf1be88f4cbfd953156d64010d3c762/test%2Ftests%2Foperators%2Fyara%2Fcompiled_rules_multiple.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fyara%2Fcompiled_rules_multiple.txt?ref=634d93811bf1be88f4cbfd953156d64010d3c762",
+      "patch": "@@ -0,0 +1,14 @@\n+error: can't accept multiple rules in compiled form\n+ --> tests/operators/yara/compiled_rules_multiple.tql:6:8\n+  |\n+6 |   yara [\"a\", \"b\"], compiled_rules=true\n+  |        ^^^^^^^^^^ \n+  |\n+  = hint: provide exactly one rule argument\n+\n+error: failed to substitute pipeline\n+ --> tests/operators/yara/compiled_rules_multiple.tql:5:12\n+  |\n+5 | from_stdin {\n+  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ \n+  |"
+    },
+    {
+      "sha": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "filename": "test/tests/operators/yara/empty.stdin",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/634d93811bf1be88f4cbfd953156d64010d3c762/test%2Ftests%2Foperators%2Fyara%2Fempty.stdin",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/634d93811bf1be88f4cbfd953156d64010d3c762/test%2Ftests%2Foperators%2Fyara%2Fempty.stdin",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fyara%2Fempty.stdin?ref=634d93811bf1be88f4cbfd953156d64010d3c762"
+    },
+    {
+      "sha": "3978388cd2b01b791bcc593b968439af09c0c478",
+      "filename": "test/tests/operators/yara/empty.tql",
+      "status": "added",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/634d93811bf1be88f4cbfd953156d64010d3c762/test%2Ftests%2Foperators%2Fyara%2Fempty.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/634d93811bf1be88f4cbfd953156d64010d3c762/test%2Ftests%2Foperators%2Fyara%2Fempty.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fyara%2Fempty.tql?ref=634d93811bf1be88f4cbfd953156d64010d3c762",
+      "patch": "@@ -0,0 +1,3 @@\n+from_stdin {\n+  yara \"inputs/yara/empty.yar\"\n+}"
+    },
+    {
+      "sha": "9e97ab57a3d943384678d711c22f1c3743f011d0",
+      "filename": "test/tests/operators/yara/empty.txt",
+      "status": "added",
+      "additions": 10,
+      "deletions": 0,
+      "changes": 10,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/634d93811bf1be88f4cbfd953156d64010d3c762/test%2Ftests%2Foperators%2Fyara%2Fempty.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/634d93811bf1be88f4cbfd953156d64010d3c762/test%2Ftests%2Foperators%2Fyara%2Fempty.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fyara%2Fempty.txt?ref=634d93811bf1be88f4cbfd953156d64010d3c762",
+      "patch": "@@ -0,0 +1,10 @@\n+{\n+  rule: {\n+    identifier: \"empty_file\",\n+    namespace: \"default\",\n+    tags: [],\n+    meta: {},\n+    strings: {},\n+  },\n+  matches: {},\n+}"
+    }
+  ]
+}

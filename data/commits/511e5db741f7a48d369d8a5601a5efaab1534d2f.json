@@ -1,0 +1,100 @@
+{
+  "message": "native: chain-dispatch bench shows honest GPU compute comparison\n\nAdds CHAIN env var to both browser and native bench runners \u2014 when\nset, encodes N dispatches per submit instead of one. This is much\ncloser to a real forward pass which issues ~133 dispatches per\nsubmit + readback.\n\nHonest result at chain=100:\n  native is 1.25\u00d7 SLOWER than browser per chunk (geomean across 15)\n\nWhy the regression vs chain=1's 1.20\u00d7 faster:\n  - chain=1 measured per-call overhead (encode+submit+map per dispatch)\n    and native won by skipping wgpuDevicePoll(wait=true)\n  - chain=100 amortizes that overhead, leaving Naga vs Tint MSL\n    codegen as the dominant factor \u2014 Naga produces ~1.5\u00d7 slower\n    MSL for some simple kernels (rms_norm worst at 1.66\u00d7) while\n    matching or beating Tint on the heavy ones (qmoe pair 0.97\u00d7)\n\nEnd-to-end forward projection updated honestly in STATUS.md:\n  native \u2248 browser end-to-end \u2192 both ~2-3\u00d7 faster than transformers.js\n  (was previously projected at ~3\u00d7 from misleading chain=1 number)",
+  "files": [
+    {
+      "sha": "9850a970ab6cc17855332d585872963b3d5e5966",
+      "filename": "packages/textsift/src/native/STATUS.md",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 7,
+      "changes": 23,
+      "blob_url": "https://github.com/teamchong/textsift/blob/511e5db741f7a48d369d8a5601a5efaab1534d2f/packages%2Ftextsift%2Fsrc%2Fnative%2FSTATUS.md",
+      "raw_url": "https://github.com/teamchong/textsift/raw/511e5db741f7a48d369d8a5601a5efaab1534d2f/packages%2Ftextsift%2Fsrc%2Fnative%2FSTATUS.md",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/packages%2Ftextsift%2Fsrc%2Fnative%2FSTATUS.md?ref=511e5db741f7a48d369d8a5601a5efaab1534d2f",
+      "patch": "@@ -45,16 +45,25 @@ qmoe_down_scatter         within 8e-7 relative drift   (atomicCAS commit order)\n Reproduce: `npx playwright test conformance/dump-fixtures.spec.ts && node tests/native/conformance/all.test.js`\n \n ### Per-dispatch microbench\n-Native vs browser, same WGSL, same fixture, same warmup+iters protocol:\n \n-```\n-geomean native/browser across 15 shaders: 0.84x\n-\u2192 native is 1.20\u00d7 faster than browser per dispatch\n-```\n+Two regimes \u2014 per-call latency (`chain=1`) and per-100-dispatch chunk (`chain=100`, closer to a real forward pass that issues ~133 dispatches per submit):\n+\n+| Regime | Geomean native / browser | Interpretation |\n+|---|---|---|\n+| `chain=1` | 0.84\u00d7 | native is **1.20\u00d7 faster** per dispatch (low overhead wins) |\n+| `chain=100` | 1.25\u00d7 | native is **1.25\u00d7 slower** per 100-dispatch chunk |\n \n-Win came from skipping `wgpuDevicePoll(wait=true)` between submit and `mapAsync` (added ~1.27 ms unconditional latency). The mapAsync callback already implies GPU completion; `processEvents` just dispatches it.\n+Why the divergence: at `chain=1`, native wins by skipping `wgpuDevicePoll(wait=true)` (which adds ~1.27 ms unconditional latency). At `chain=100`, the per-call overhead amortizes and Naga's MSL codegen vs Tint's MSL codegen starts to matter \u2014 Naga produces slower MSL for some simple kernels (rms_norm 1.66\u00d7, basic casts ~1.5\u00d7) while matching or beating Tint on the heavy ones (qmoe pair 0.97\u00d7, embed_lookup 0.87\u00d7).\n \n-Reproduce: `npx playwright test conformance/bench-shaders.spec.ts && node tests/native/bench/shaders-bench.js`\n+**End-to-end projection:** real forward has ~133 dispatches per submit but with *different* shaders (each `setPipeline` may add cost). Realistic estimate: native is **roughly even** with browser end-to-end. Combined with browser textsift WebGPU being 2.6\u20133.7\u00d7 faster than transformers.js, native projects to **~2\u20133\u00d7 faster than tjs end-to-end** (down from my earlier 3\u00d7 extrapolation that was based on the misleading `chain=1` win).\n+\n+Reproduce:\n+```sh\n+npx playwright test conformance/bench-shaders.spec.ts                              # chain=1\n+node tests/native/bench/shaders-bench.js                                            # chain=1\n+CHAIN=100 npx playwright test conformance/bench-shaders.spec.ts && \\\n+  CHAIN=100 node tests/native/bench/shaders-bench.js                                # chain=100\n+```\n \n ## Architecture\n "
+    },
+    {
+      "sha": "3157b1e94c204ef1cbe5c70e4ad3a5d82e3f7be5",
+      "filename": "packages/textsift/src/native/napi.zig",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 1,
+      "changes": 15,
+      "blob_url": "https://github.com/teamchong/textsift/blob/511e5db741f7a48d369d8a5601a5efaab1534d2f/packages%2Ftextsift%2Fsrc%2Fnative%2Fnapi.zig",
+      "raw_url": "https://github.com/teamchong/textsift/raw/511e5db741f7a48d369d8a5601a5efaab1534d2f/packages%2Ftextsift%2Fsrc%2Fnative%2Fnapi.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/packages%2Ftextsift%2Fsrc%2Fnative%2Fnapi.zig?ref=511e5db741f7a48d369d8a5601a5efaab1534d2f",
+      "patch": "@@ -741,6 +741,19 @@ fn napiBenchDispatch(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c\n         }\n     }\n \n+    // Optional output.chainLen (defaults to 1).\n+    var chain_len: u32 = 1;\n+    {\n+        var v: c.napi_value = undefined;\n+        if (c.napi_get_named_property(env, out_obj, \"chainLen\", &v) == c.napi_ok) {\n+            var t: c.napi_valuetype = undefined;\n+            if (c.napi_typeof(env, v, &t) == c.napi_ok and t == c.napi_number) {\n+                chain_len = napiGetU32(env, v, \"output.chainLen must be u32\") orelse return null;\n+                if (chain_len == 0) chain_len = 1;\n+            }\n+        }\n+    }\n+\n     const dx = napiGetU32(env, napiArrayGet(env, argv[6], 0) orelse return napiThrow(env, \"dispatch[0]\"), \"dispatch[0]\") orelse return null;\n     const dy = napiGetU32(env, napiArrayGet(env, argv[6], 1) orelse return napiThrow(env, \"dispatch[1]\"), \"dispatch[1]\") orelse return null;\n     const dz = napiGetU32(env, napiArrayGet(env, argv[6], 2) orelse return napiThrow(env, \"dispatch[2]\"), \"dispatch[2]\") orelse return null;\n@@ -774,7 +787,7 @@ fn napiBenchDispatch(env: c.napi_env, info: c.napi_callback_info) callconv(.c) c\n         uniform_bytes,\n         0,\n         in_storage[0..in_n],\n-        .{ .binding = out_binding, .bytes = out_dummy },\n+        .{ .binding = out_binding, .bytes = out_dummy, .chain_len = chain_len },\n         out_initial,\n         extra_storage[0..extra_n],\n         .{ dx, dy, dz },"
+    },
+    {
+      "sha": "55a541018b102b2c2105bd018a64555305ca287f",
+      "filename": "packages/textsift/src/native/wgpu_init.zig",
+      "status": "modified",
+      "additions": 17,
+      "deletions": 5,
+      "changes": 22,
+      "blob_url": "https://github.com/teamchong/textsift/blob/511e5db741f7a48d369d8a5601a5efaab1534d2f/packages%2Ftextsift%2Fsrc%2Fnative%2Fwgpu_init.zig",
+      "raw_url": "https://github.com/teamchong/textsift/raw/511e5db741f7a48d369d8a5601a5efaab1534d2f/packages%2Ftextsift%2Fsrc%2Fnative%2Fwgpu_init.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/packages%2Ftextsift%2Fsrc%2Fnative%2Fwgpu_init.zig?ref=511e5db741f7a48d369d8a5601a5efaab1534d2f",
+      "patch": "@@ -719,7 +719,15 @@ pub fn dispatchMatmulF32(\n }\n \n pub const StorageInput = struct { binding: u32, bytes: []const u8 };\n-pub const KernelOutput = struct { binding: u32, bytes: []u8 };\n+pub const KernelOutput = struct {\n+    binding: u32,\n+    bytes: []u8,\n+    /// How many dispatches to encode per submit/readback in\n+    /// `benchDispatch`. `1` (default) is per-call latency; larger\n+    /// values approximate a forward pass that amortizes encode +\n+    /// submit + map cost across many kernel invocations.\n+    chain_len: u32 = 1,\n+};\n \n /// Generic kernel dispatcher. Every shader port becomes a thin\n /// wrapper over this \u2014 pass the WGSL source, the uniform buffer\n@@ -1300,11 +1308,12 @@ pub fn benchDispatch(\n     defer c.wgpuBindGroupRelease(bg);\n \n     // \u2500\u2500 TIMED LOOP \u2500\u2500\n+    // chain_len controls how many dispatches per submit. chain_len=1\n+    // is the per-call latency case; chain_len=N approximates a forward\n+    // pass (one submit + one readback amortized over N kernel calls).\n     var i: usize = 0;\n+    const chain_len = output.chain_len;\n     while (i < samples.len) : (i += 1) {\n-        // Reset output buffer when the kernel needs an initial value\n-        // (e.g. qmoe_down_scatter atomic acc) \u2014 otherwise it accumulates\n-        // across iters.\n         if (output_initial) |init_bytes| {\n             c.wgpuQueueWriteBuffer(queue, y_buf, 0, init_bytes.ptr, init_bytes.len);\n         }\n@@ -1313,7 +1322,10 @@ pub fn benchDispatch(\n         const pass = c.wgpuCommandEncoderBeginComputePass(encoder, null);\n         c.wgpuComputePassEncoderSetPipeline(pass, pipeline);\n         c.wgpuComputePassEncoderSetBindGroup(pass, 0, bg, 0, null);\n-        c.wgpuComputePassEncoderDispatchWorkgroups(pass, dispatch[0], dispatch[1], dispatch[2]);\n+        var ci: u32 = 0;\n+        while (ci < chain_len) : (ci += 1) {\n+            c.wgpuComputePassEncoderDispatchWorkgroups(pass, dispatch[0], dispatch[1], dispatch[2]);\n+        }\n         c.wgpuComputePassEncoderEnd(pass);\n         c.wgpuComputePassEncoderRelease(pass);\n         c.wgpuCommandEncoderCopyBufferToBuffer(encoder, y_buf, 0, readback, 0, output.bytes.len);"
+    },
+    {
+      "sha": "7b1fef5d1958e88231dacd199e6fffd6a1599f2e",
+      "filename": "tests/conformance/bench-shaders.html",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 1,
+      "changes": 8,
+      "blob_url": "https://github.com/teamchong/textsift/blob/511e5db741f7a48d369d8a5601a5efaab1534d2f/tests%2Fconformance%2Fbench-shaders.html",
+      "raw_url": "https://github.com/teamchong/textsift/raw/511e5db741f7a48d369d8a5601a5efaab1534d2f/tests%2Fconformance%2Fbench-shaders.html",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Fconformance%2Fbench-shaders.html?ref=511e5db741f7a48d369d8a5601a5efaab1534d2f",
+      "patch": "@@ -56,6 +56,10 @@\n \n       const WARMUP = 5;\n       const ITERS = 50;\n+      // chain_len approximates a real forward pass: encode N\n+      // dispatches per submit, single readback. Forward pass does\n+      // ~133 dispatches per submit; we pick 100 as representative.\n+      const CHAIN_LEN = parseInt(new URL(location.href).searchParams.get(\"chain\") || \"1\", 10);\n \n       try {\n         if (!navigator.gpu) throw new Error(\"no navigator.gpu\");\n@@ -107,7 +111,9 @@\n             const pass = enc.beginComputePass();\n             pass.setPipeline(pipeline);\n             pass.setBindGroup(0, bg);\n-            pass.dispatchWorkgroups(...f.meta.dispatch);\n+            for (let c = 0; c < CHAIN_LEN; c++) {\n+              pass.dispatchWorkgroups(...f.meta.dispatch);\n+            }\n             pass.end();\n             enc.copyBufferToBuffer(outBuf, 0, readback, 0, outBytes);\n             device.queue.submit([enc.finish()]);"
+    },
+    {
+      "sha": "5a0c728a05f7d85515be62492ff4b903aaa98ec6",
+      "filename": "tests/conformance/bench-shaders.spec.ts",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 2,
+      "changes": 6,
+      "blob_url": "https://github.com/teamchong/textsift/blob/511e5db741f7a48d369d8a5601a5efaab1534d2f/tests%2Fconformance%2Fbench-shaders.spec.ts",
+      "raw_url": "https://github.com/teamchong/textsift/raw/511e5db741f7a48d369d8a5601a5efaab1534d2f/tests%2Fconformance%2Fbench-shaders.spec.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Fconformance%2Fbench-shaders.spec.ts?ref=511e5db741f7a48d369d8a5601a5efaab1534d2f",
+      "patch": "@@ -12,12 +12,14 @@ import { fileURLToPath } from \"node:url\";\n const HERE = dirname(fileURLToPath(import.meta.url));\n const OUT = resolve(HERE, \"../native/conformance/fixtures/_browser-bench.json\");\n \n-test(\"browser shader microbench\", async ({ page }) => {\n+const CHAIN_LEN = process.env.CHAIN ?? \"1\";\n+\n+test(`browser shader microbench (chain=${CHAIN_LEN})`, async ({ page }) => {\n   test.setTimeout(2 * 60_000);\n \n   page.on(\"pageerror\", (err) => console.error(\"page error:\", err.message));\n \n-  await page.goto(\"/tests/conformance/bench-shaders.html\");\n+  await page.goto(`/tests/conformance/bench-shaders.html?chain=${CHAIN_LEN}`);\n   await page.waitForFunction(() => (window as any).__bench !== undefined, null, {\n     timeout: 90_000,\n   });"
+    },
+    {
+      "sha": "1eb6c47ebc64285e880dcebec1ccda546eccfbbb",
+      "filename": "tests/native/bench/shaders-bench.js",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/teamchong/textsift/blob/511e5db741f7a48d369d8a5601a5efaab1534d2f/tests%2Fnative%2Fbench%2Fshaders-bench.js",
+      "raw_url": "https://github.com/teamchong/textsift/raw/511e5db741f7a48d369d8a5601a5efaab1534d2f/tests%2Fnative%2Fbench%2Fshaders-bench.js",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Fnative%2Fbench%2Fshaders-bench.js?ref=511e5db741f7a48d369d8a5601a5efaab1534d2f",
+      "patch": "@@ -51,10 +51,13 @@ function loadFixture(name) {\n   };\n }\n \n+const CHAIN_LEN = parseInt(process.env.CHAIN ?? \"1\", 10);\n+\n function bench(name, backend, f) {\n   const out = {\n     binding: f.meta.output.binding,\n     byteLength: f.meta.output.byteLength,\n+    chainLen: CHAIN_LEN,\n   };\n   if (f.outputInitial) out.initial = f.outputInitial;\n   const dispatch = f.meta.dispatch;"
+    },
+    {
+      "sha": "2dde35a5e4ae82ddd3cc8bc5726818d42ba62e5b",
+      "filename": "tests/native/conformance/fixtures/_browser-bench.json",
+      "status": "modified",
+      "additions": 30,
+      "deletions": 30,
+      "changes": 60,
+      "blob_url": "https://github.com/teamchong/textsift/blob/511e5db741f7a48d369d8a5601a5efaab1534d2f/tests%2Fnative%2Fconformance%2Ffixtures%2F_browser-bench.json",
+      "raw_url": "https://github.com/teamchong/textsift/raw/511e5db741f7a48d369d8a5601a5efaab1534d2f/tests%2Fnative%2Fconformance%2Ffixtures%2F_browser-bench.json",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Fnative%2Fconformance%2Ffixtures%2F_browser-bench.json?ref=511e5db741f7a48d369d8a5601a5efaab1534d2f",
+      "patch": "@@ -1,77 +1,77 @@\n {\n   \"rms_norm\": {\n-    \"median\": 0.26999998092651367,\n-    \"min\": 0.22999978065490723,\n+    \"median\": 0.6550002098083496,\n+    \"min\": 0.5299999713897705,\n     \"samples\": 50\n   },\n   \"zero_f32\": {\n-    \"median\": 0.21499991416931152,\n-    \"min\": 0.18999981880187988,\n+    \"median\": 0.3400001525878906,\n+    \"min\": 0.3149998188018799,\n     \"samples\": 50\n   },\n   \"cast_fp16_to_f32\": {\n-    \"median\": 0.2199997901916504,\n-    \"min\": 0.19000005722045898,\n+    \"median\": 0.36999988555908203,\n+    \"min\": 0.3400001525878906,\n     \"samples\": 50\n   },\n   \"cast_f32_to_fp16_scaled\": {\n-    \"median\": 0.23000001907348633,\n-    \"min\": 0.21499991416931152,\n+    \"median\": 0.40000009536743164,\n+    \"min\": 0.33500003814697266,\n     \"samples\": 50\n   },\n   \"add_fp16\": {\n-    \"median\": 0.23000001907348633,\n-    \"min\": 0.18499994277954102,\n+    \"median\": 0.4049999713897705,\n+    \"min\": 0.3400001525878906,\n     \"samples\": 50\n   },\n   \"swiglu_clamp\": {\n-    \"median\": 0.21499991416931152,\n-    \"min\": 0.18999981880187988,\n+    \"median\": 0.4200000762939453,\n+    \"min\": 0.34999990463256836,\n     \"samples\": 50\n   },\n   \"rope_apply\": {\n-    \"median\": 0.2350001335144043,\n-    \"min\": 0.20000004768371582,\n+    \"median\": 0.4399998188018799,\n+    \"min\": 0.39499998092651367,\n     \"samples\": 50\n   },\n   \"matmul_int4_fp16_f16\": {\n-    \"median\": 0.23000001907348633,\n-    \"min\": 0.21000003814697266,\n+    \"median\": 1.125,\n+    \"min\": 1.0199999809265137,\n     \"samples\": 50\n   },\n   \"matmul_int4_f32_f32\": {\n-    \"median\": 0.22500014305114746,\n-    \"min\": 0.2049999237060547,\n+    \"median\": 0.8399999141693115,\n+    \"min\": 0.7799999713897705,\n     \"samples\": 50\n   },\n   \"embed_lookup_int4\": {\n-    \"median\": 0.24499988555908203,\n-    \"min\": 0.2200000286102295,\n+    \"median\": 0.4549999237060547,\n+    \"min\": 0.38499999046325684,\n     \"samples\": 50\n   },\n   \"add_rmsnorm_fp16_to_f32\": {\n-    \"median\": 0.25,\n-    \"min\": 0.2200000286102295,\n+    \"median\": 0.5999999046325684,\n+    \"min\": 0.5249998569488525,\n     \"samples\": 50\n   },\n   \"router_topk\": {\n-    \"median\": 0.25500011444091797,\n-    \"min\": 0.2050001621246338,\n+    \"median\": 0.8849999904632568,\n+    \"min\": 0.7850000858306885,\n     \"samples\": 50\n   },\n   \"banded_attention\": {\n-    \"median\": 0.23000001907348633,\n-    \"min\": 0.16000008583068848,\n+    \"median\": 1.1700000762939453,\n+    \"min\": 1.1099998950958252,\n     \"samples\": 50\n   },\n   \"qmoe_gate_up\": {\n-    \"median\": 0.25499987602233887,\n-    \"min\": 0.2200000286102295,\n+    \"median\": 0.809999942779541,\n+    \"min\": 0.7549998760223389,\n     \"samples\": 50\n   },\n   \"qmoe_down_scatter\": {\n-    \"median\": 0.23000001907348633,\n-    \"min\": 0.21000003814697266,\n+    \"median\": 0.8499999046325684,\n+    \"min\": 0.7949998378753662,\n     \"samples\": 50\n   }\n }\n\\ No newline at end of file"
+    },
+    {
+      "sha": "bb3dc4e22e8da03cbe5f0db71172ee6650619cee",
+      "filename": "tests/native/conformance/fixtures/qmoe_down_scatter/expected.bin",
+      "status": "modified",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/teamchong/textsift/blob/511e5db741f7a48d369d8a5601a5efaab1534d2f/tests%2Fnative%2Fconformance%2Ffixtures%2Fqmoe_down_scatter%2Fexpected.bin",
+      "raw_url": "https://github.com/teamchong/textsift/raw/511e5db741f7a48d369d8a5601a5efaab1534d2f/tests%2Fnative%2Fconformance%2Ffixtures%2Fqmoe_down_scatter%2Fexpected.bin",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Fnative%2Fconformance%2Ffixtures%2Fqmoe_down_scatter%2Fexpected.bin?ref=511e5db741f7a48d369d8a5601a5efaab1534d2f"
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "message": "fix(vdbe): propagate column collation to MIN/MAX aggregate comparisons (bd-ox2mg)\n\nVDBE codegen only resolved collation for DISTINCT aggregates, so\nMIN(col)/MAX(col) on COLLATE NOCASE columns used binary comparison.\nFix: (1) codegen emits P4::FuncNameCollated for MIN/MAX when the\nargument column has a non-BINARY collation, (2) engine intercepts\nAggStep for collated MIN/MAX and uses collation-aware comparison\ninstead of the default binary PartialOrd.\n\nUn-ignores test_conformance_collate_nocase_min_max_s69cj2.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "99733c9d7bc6377226a0c6d507ef049765ae3890",
+      "filename": "crates/fsqlite-core/tests/conformance_oracle_s55.rs",
+      "status": "modified",
+      "additions": 0,
+      "deletions": 1,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/1c8664f4926a7a36bfd1e53e0e1f7c5f8362fdc9/crates%2Ffsqlite-core%2Ftests%2Fconformance_oracle_s55.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/1c8664f4926a7a36bfd1e53e0e1f7c5f8362fdc9/crates%2Ffsqlite-core%2Ftests%2Fconformance_oracle_s55.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-core%2Ftests%2Fconformance_oracle_s55.rs?ref=1c8664f4926a7a36bfd1e53e0e1f7c5f8362fdc9",
+      "patch": "@@ -14237,7 +14237,6 @@ fn test_conformance_collate_nocase_ops_s69cj() {\n // \u2500\u2500 s69cj2: COLLATE NOCASE MIN/MAX aggregates \u2500\u2500\n \n #[test]\n-#[ignore = \"VDBE aggregate path does not propagate column collation to MIN/MAX comparison opcodes\"]\n fn test_conformance_collate_nocase_min_max_s69cj2() {\n     let fconn = Connection::open(\":memory:\").unwrap();\n     let rconn = rusqlite::Connection::open_in_memory().unwrap();"
+    },
+    {
+      "sha": "53c2340844363c1721fcb882314b9959cd5f8439",
+      "filename": "crates/fsqlite-vdbe/src/codegen.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 1,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/1c8664f4926a7a36bfd1e53e0e1f7c5f8362fdc9/crates%2Ffsqlite-vdbe%2Fsrc%2Fcodegen.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/1c8664f4926a7a36bfd1e53e0e1f7c5f8362fdc9/crates%2Ffsqlite-vdbe%2Fsrc%2Fcodegen.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-vdbe%2Fsrc%2Fcodegen.rs?ref=1c8664f4926a7a36bfd1e53e0e1f7c5f8362fdc9",
+      "patch": "@@ -8254,7 +8254,9 @@ fn parse_aggregate_columns(\n                             // Resolve collation for the aggregate argument column.\n                             // Explicit COLLATE in the expression takes priority,\n                             // otherwise inherit from the column's schema definition.\n-                            let agg_coll = if *distinct {\n+                            let needs_collation =\n+                                *distinct || canon_name == \"MIN\" || canon_name == \"MAX\";\n+                            let agg_coll = if needs_collation {\n                                 expr_collation_for_agg(&exprs[0], col_idx, table)\n                             } else {\n                                 None"
+    },
+    {
+      "sha": "fe3a470a2e8164666b7b4e4496e1f9a14df0be03",
+      "filename": "crates/fsqlite-vdbe/src/engine.rs",
+      "status": "modified",
+      "additions": 43,
+      "deletions": 1,
+      "changes": 44,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/1c8664f4926a7a36bfd1e53e0e1f7c5f8362fdc9/crates%2Ffsqlite-vdbe%2Fsrc%2Fengine.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/1c8664f4926a7a36bfd1e53e0e1f7c5f8362fdc9/crates%2Ffsqlite-vdbe%2Fsrc%2Fengine.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-vdbe%2Fsrc%2Fengine.rs?ref=1c8664f4926a7a36bfd1e53e0e1f7c5f8362fdc9",
+      "patch": "@@ -10688,7 +10688,21 @@ impl VdbeEngine {\n \n                     observe_execution_cancellation(&execution_cx)?;\n                     if should_step {\n-                        ctx.func.step(&mut ctx.state, &args)?;\n+                        let fn_lower = func_name.to_ascii_lowercase();\n+                        if agg_collation.is_some()\n+                            && (fn_lower == \"min\" || fn_lower == \"max\")\n+                            && !args.is_empty()\n+                            && !args[0].is_null()\n+                        {\n+                            agg_step_min_max_collated(\n+                                &mut ctx.state,\n+                                &args[0],\n+                                fn_lower == \"max\",\n+                                agg_collation.unwrap_or(\"BINARY\"),\n+                            );\n+                        } else {\n+                            ctx.func.step(&mut ctx.state, &args)?;\n+                        }\n                     }\n                     observe_execution_cancellation(&execution_cx)?;\n                     pc += 1;\n@@ -13883,6 +13897,34 @@ fn builtin_collation_compare_text(left: &str, right: &str, coll_name: &str) -> O\n     None\n }\n \n+fn cmp_sqlite_values_collated(a: &SqliteValue, b: &SqliteValue, coll: &str) -> Ordering {\n+    match (a, b) {\n+        (SqliteValue::Text(l), SqliteValue::Text(r)) => builtin_collation_compare_text(l, r, coll)\n+            .unwrap_or_else(|| l.as_bytes().cmp(r.as_bytes())),\n+        _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),\n+    }\n+}\n+\n+fn agg_step_min_max_collated(\n+    state: &mut Box<dyn Any + Send>,\n+    candidate: &SqliteValue,\n+    is_max: bool,\n+    coll: &str,\n+) {\n+    let current: &mut Option<SqliteValue> = state\n+        .downcast_mut()\n+        .expect(\"MIN/MAX aggregate state must be Option<SqliteValue>\");\n+    match current {\n+        None => *current = Some(candidate.clone()),\n+        &mut Some(ref cur) => {\n+            let ord = cmp_sqlite_values_collated(candidate, cur, coll);\n+            if (is_max && ord == Ordering::Greater) || (!is_max && ord == Ordering::Less) {\n+                *current = Some(candidate.clone());\n+            }\n+        }\n+    }\n+}\n+\n fn compare_ascii_nocase_bytes(left: &[u8], right: &[u8]) -> Ordering {\n     let shared_len = left.len().min(right.len());\n     for idx in 0..shared_len {"
+    }
+  ]
+}

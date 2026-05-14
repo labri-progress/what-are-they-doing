@@ -1,0 +1,53 @@
+{
+  "message": "fix: installer false Python detection and remove phantom threads table\n\nTwo bugs fixed:\n\n1. (#87) Installer falsely detects own Rust binary as legacy Python.\n   Added is_likely_python_binary() that checks file magic bytes (ELF,\n   Mach-O, PE, shebang) before offering migration. If the installed\n   binary is already a native executable, migration markers are cleared.\n\n2. (#88) Readiness check expects non-existent \"threads\" table, causing\n   serve-http to degrade to 503 after doctor reconstruct. Removed\n   \"threads\" from required tables list in readiness check, doctor\n   check, and identity health check \u2014 it was never part of the schema.\n\nCloses #87, closes #88\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "1e4c5517aefde73b282a0eca4cc60873081a7469",
+      "filename": "crates/mcp-agent-mail-cli/src/legacy.rs",
+      "status": "modified",
+      "additions": 99,
+      "deletions": 1,
+      "changes": 100,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/0261dd68d97f43577da08fef75d49115ba35fb62/crates%2Fmcp-agent-mail-cli%2Fsrc%2Flegacy.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/0261dd68d97f43577da08fef75d49115ba35fb62/crates%2Fmcp-agent-mail-cli%2Fsrc%2Flegacy.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-cli%2Fsrc%2Flegacy.rs?ref=0261dd68d97f43577da08fef75d49115ba35fb62",
+      "patch": "@@ -20,7 +20,7 @@ use mcp_agent_mail_db::schema;\n use serde::{Deserialize, Serialize};\n use std::collections::BTreeMap;\n use std::fs;\n-use std::io::Write;\n+use std::io::{Read, Write};\n use std::path::{Component, Path, PathBuf};\n \n #[derive(Args, Debug)]\n@@ -1105,6 +1105,19 @@ fn build_detect_report(\n         }\n     }\n \n+    // Bug #87: If the installed `am` binary is a compiled native executable\n+    // (ELF, Mach-O, PE) rather than a Python script, the markers we collected\n+    // are artefacts of the *Rust* installation, not a legacy Python one.\n+    // Clear the markers so we don't falsely offer a migration prompt.\n+    if !markers.is_empty() {\n+        let has_python_binary = find_installed_am_binary()\n+            .map(|p| is_likely_python_binary(&p))\n+            .unwrap_or(false);\n+        if !has_python_binary {\n+            markers.clear();\n+        }\n+    }\n+\n     let score: u32 = markers\n         .iter()\n         .map(|m| match m.severity {\n@@ -1160,6 +1173,91 @@ fn build_detect_report(\n     })\n }\n \n+/// Check whether a binary at `path` is likely a Python script (shebang with\n+/// \"python\") rather than a compiled native binary (ELF, Mach-O, PE).\n+///\n+/// Returns `true` only when positive evidence of Python is found.  For native\n+/// executables or any unreadable/missing file the function returns `false`.\n+fn is_likely_python_binary(path: &Path) -> bool {\n+    let mut file = match fs::File::open(path) {\n+        Ok(f) => f,\n+        Err(_) => return false,\n+    };\n+    let mut header = [0u8; 64];\n+    let n = match file.read(&mut header) {\n+        Ok(n) => n,\n+        Err(_) => return false,\n+    };\n+    if n < 2 {\n+        return false;\n+    }\n+\n+    // Shebang \u2014 check if the interpreter line references Python.\n+    if header[0] == b'#' && header[1] == b'!' {\n+        let line = std::str::from_utf8(&header[..n]).unwrap_or(\"\");\n+        return line.to_ascii_lowercase().contains(\"python\");\n+    }\n+\n+    // ELF magic: 0x7f 'E' 'L' 'F'\n+    if n >= 4 && header[..4] == [0x7f, b'E', b'L', b'F'] {\n+        return false;\n+    }\n+\n+    // PE (Windows) magic: 'M' 'Z'\n+    if header[0] == b'M' && header[1] == b'Z' {\n+        return false;\n+    }\n+\n+    // Mach-O magic (32-bit and 64-bit, both endiannesses)\n+    if n >= 4 {\n+        let magic = &header[..4];\n+        if magic == [0xcf, 0xfa, 0xed, 0xfe]   // MH_MAGIC_64 (little-endian)\n+            || magic == [0xfe, 0xed, 0xfa, 0xcf] // MH_MAGIC_64 (big-endian)\n+            || magic == [0xce, 0xfa, 0xed, 0xfe] // MH_MAGIC (little-endian)\n+            || magic == [0xfe, 0xed, 0xfa, 0xce] // MH_MAGIC (big-endian)\n+        {\n+            return false;\n+        }\n+    }\n+\n+    // Unknown format \u2014 assume not Python.\n+    false\n+}\n+\n+/// Find the installed `am` binary.\n+///\n+/// We first check whether the currently-running process IS the `am` CLI\n+/// (by looking at the executable's file name).  If it is, we return its\n+/// path directly.  Otherwise we fall back to a PATH lookup via `which`.\n+fn find_installed_am_binary() -> Option<PathBuf> {\n+    // If the currently-running executable is `am`, use it directly.\n+    if let Ok(exe) = std::env::current_exe() {\n+        if exe\n+            .file_name()\n+            .and_then(|n| n.to_str())\n+            .is_some_and(|name| name == \"am\")\n+        {\n+            return Some(exe);\n+        }\n+    }\n+    // Fallback: look up `am` in PATH via `which`.\n+    if let Ok(output) = std::process::Command::new(\"which\")\n+        .arg(\"am\")\n+        .output()\n+    {\n+        if output.status.success() {\n+            let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();\n+            if !path_str.is_empty() {\n+                let p = PathBuf::from(path_str);\n+                if p.exists() {\n+                    return Some(p);\n+                }\n+            }\n+        }\n+    }\n+    None\n+}\n+\n fn detect_pyproject_marker(search_root: &Path) -> Option<LegacyMarker> {\n     let pyproject = search_root.join(\"pyproject.toml\");\n     if !pyproject.exists() {"
+    },
+    {
+      "sha": "f5ea1e3c8a965db99665a4a517338cf732210c2e",
+      "filename": "crates/mcp-agent-mail-cli/src/lib.rs",
+      "status": "modified",
+      "additions": 0,
+      "deletions": 5,
+      "changes": 5,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/0261dd68d97f43577da08fef75d49115ba35fb62/crates%2Fmcp-agent-mail-cli%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/0261dd68d97f43577da08fef75d49115ba35fb62/crates%2Fmcp-agent-mail-cli%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-cli%2Fsrc%2Flib.rs?ref=0261dd68d97f43577da08fef75d49115ba35fb62",
+      "patch": "@@ -14230,7 +14230,6 @@ fn doctor_required_tables(conn: &mcp_agent_mail_db::DbConn) -> CliResult<Vec<Str\n         \"agents\",\n         \"messages\",\n         \"message_recipients\",\n-        \"threads\",\n     ];\n     let rows = conn\n         .query_sync(\n@@ -27523,10 +27522,6 @@ startup_timeout_sec = 42\n             \"CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, kind TEXT)\",\n         )\n         .expect(\"create message_recipients\");\n-        conn.execute_raw(\n-            \"CREATE TABLE threads (id INTEGER PRIMARY KEY, project_id INTEGER, thread_key TEXT)\",\n-        )\n-        .expect(\"create threads\");\n         conn.execute_raw(\n             \"INSERT INTO projects (slug, human_key, created_at) VALUES ('proj-alpha', '/tmp/proj-alpha', 0)\",\n         )"
+    },
+    {
+      "sha": "d70f48e053ad8f236b0fc4cc02846c448e0d4733",
+      "filename": "crates/mcp-agent-mail-server/src/lib.rs",
+      "status": "modified",
+      "additions": 0,
+      "deletions": 1,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/0261dd68d97f43577da08fef75d49115ba35fb62/crates%2Fmcp-agent-mail-server%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/0261dd68d97f43577da08fef75d49115ba35fb62/crates%2Fmcp-agent-mail-server%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-server%2Fsrc%2Flib.rs?ref=0261dd68d97f43577da08fef75d49115ba35fb62",
+      "patch": "@@ -10615,7 +10615,6 @@ fn readiness_check_semantic_status(\n         \"agents\",\n         \"messages\",\n         \"message_recipients\",\n-        \"threads\",\n     ]\n     .into_iter()\n     .filter(|name| !present.contains(*name))"
+    },
+    {
+      "sha": "94840f8a57f64a3d50541af04c7b156b230c5a06",
+      "filename": "crates/mcp-agent-mail-tools/src/identity.rs",
+      "status": "modified",
+      "additions": 0,
+      "deletions": 1,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/0261dd68d97f43577da08fef75d49115ba35fb62/crates%2Fmcp-agent-mail-tools%2Fsrc%2Fidentity.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/0261dd68d97f43577da08fef75d49115ba35fb62/crates%2Fmcp-agent-mail-tools%2Fsrc%2Fidentity.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-tools%2Fsrc%2Fidentity.rs?ref=0261dd68d97f43577da08fef75d49115ba35fb62",
+      "patch": "@@ -191,7 +191,6 @@ const HEALTH_CHECK_REQUIRED_TABLES: &[&str] = &[\n     \"agents\",\n     \"messages\",\n     \"message_recipients\",\n-    \"threads\",\n ];\n \n #[derive(Debug, Clone, Serialize, Deserialize)]"
+    }
+  ]
+}

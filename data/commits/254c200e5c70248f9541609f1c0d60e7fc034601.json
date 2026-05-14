@@ -1,0 +1,29 @@
+{
+  "message": "fix: bound wide strcpy scans",
+  "files": [
+    {
+      "sha": "1a3bee45f789059179d7365e0477b9e6afdb6097",
+      "filename": "crates/frankenlibc-abi/src/wchar_abi.rs",
+      "status": "modified",
+      "additions": 28,
+      "deletions": 24,
+      "changes": 52,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/254c200e5c70248f9541609f1c0d60e7fc034601/crates%2Ffrankenlibc-abi%2Fsrc%2Fwchar_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/254c200e5c70248f9541609f1c0d60e7fc034601/crates%2Ffrankenlibc-abi%2Fsrc%2Fwchar_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Fwchar_abi.rs?ref=254c200e5c70248f9541609f1c0d60e7fc034601",
+      "patch": "@@ -251,36 +251,29 @@ pub unsafe extern \"C\" fn wcscpy(dst: *mut u32, src: *const u32) -> *mut u32 {\n         return dst;\n     }\n \n-    let (mode, decision) = runtime_policy::decide(\n+    let dst_bound = known_remaining(dst as usize).map(bytes_to_wchars);\n+    let src_bound = known_remaining(src as usize).map(bytes_to_wchars);\n+    let (_mode, decision) = runtime_policy::decide(\n         ApiFamily::StringMemory,\n         dst as usize,\n         0,\n         true,\n-        known_remaining(dst as usize).is_none() && known_remaining(src as usize).is_none(),\n+        dst_bound.is_none() && src_bound.is_none(),\n         0,\n     );\n     if matches!(decision.action, MembraneAction::Deny) {\n         runtime_policy::observe(ApiFamily::StringMemory, decision.profile, 7, true);\n         return std::ptr::null_mut();\n     }\n \n-    let repair = repair_enabled(mode.heals_enabled(), decision.action);\n-    let src_bound = if repair {\n-        known_remaining(src as usize).map(bytes_to_wchars)\n-    } else {\n-        None\n-    };\n-    let dst_bound = if repair {\n-        known_remaining(dst as usize).map(bytes_to_wchars)\n-    } else {\n-        None\n-    };\n+    let bounded = dst_bound.is_some() || src_bound.is_some();\n \n-    // SAFETY: strict mode follows libc semantics; hardened mode bounds reads/writes.\n+    // SAFETY: known allocations are read/written only within their live extent;\n+    // untracked strict-mode strings preserve raw libc copy semantics.\n     let (copied_len, adverse) = unsafe {\n-        let (src_len, src_terminated) = scan_w_string(src, src_bound);\n-        let requested = src_len.saturating_add(1);\n-        if repair {\n+        if bounded {\n+            let (src_len, src_terminated) = scan_w_string(src, src_bound);\n+            let requested = src_len.saturating_add(1);\n             match dst_bound {\n                 Some(0) => {\n                     record_truncation(requested, 0);\n@@ -300,14 +293,25 @@ pub unsafe extern \"C\" fn wcscpy(dst: *mut u32, src: *const u32) -> *mut u32 {\n                     (copy_payload.saturating_add(1), truncated)\n                 }\n                 None => {\n-                    let mut i = 0usize;\n-                    loop {\n-                        let ch = *src.add(i);\n-                        *dst.add(i) = ch;\n-                        if ch == 0 {\n-                            break (i.saturating_add(1), false);\n+                    if src_bound.is_some() {\n+                        if src_len > 0 {\n+                            std::ptr::copy_nonoverlapping(src, dst, src_len);\n+                        }\n+                        *dst.add(src_len) = 0;\n+                        if !src_terminated {\n+                            record_truncation(requested, src_len);\n+                        }\n+                        (requested, !src_terminated)\n+                    } else {\n+                        let mut i = 0usize;\n+                        loop {\n+                            let ch = *src.add(i);\n+                            *dst.add(i) = ch;\n+                            if ch == 0 {\n+                                break (i.saturating_add(1), false);\n+                            }\n+                            i += 1;\n                         }\n-                        i += 1;\n                     }\n                 }\n             }"
+    },
+    {
+      "sha": "dcf7c7f622199253778d4e3fb35017906f3ba981",
+      "filename": "crates/frankenlibc-abi/tests/wchar_abi_test.rs",
+      "status": "modified",
+      "additions": 19,
+      "deletions": 0,
+      "changes": 19,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/254c200e5c70248f9541609f1c0d60e7fc034601/crates%2Ffrankenlibc-abi%2Ftests%2Fwchar_abi_test.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/254c200e5c70248f9541609f1c0d60e7fc034601/crates%2Ffrankenlibc-abi%2Ftests%2Fwchar_abi_test.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Ftests%2Fwchar_abi_test.rs?ref=254c200e5c70248f9541609f1c0d60e7fc034601",
+      "patch": "@@ -73,6 +73,25 @@ fn wcscpy_copies_full_string() {\n     assert_eq!(dst[3], 0);\n }\n \n+#[test]\n+fn wcscpy_bounds_tracked_unterminated_source() {\n+    unsafe {\n+        let src = malloc_unterminated_wide(&[b'A' as u32, b'B' as u32, b'C' as u32]);\n+        let mut dst = [0xFFFFu32; 5];\n+\n+        let ret = wcscpy(dst.as_mut_ptr(), src);\n+\n+        assert_eq!(ret, dst.as_mut_ptr());\n+        assert_eq!(dst[0], b'A' as u32);\n+        assert_eq!(dst[1], b'B' as u32);\n+        assert_eq!(dst[2], b'C' as u32);\n+        assert_eq!(dst[3], 0);\n+        assert_eq!(dst[4], 0xFFFF);\n+\n+        free(src.cast());\n+    }\n+}\n+\n #[test]\n fn wcsncpy_pads_with_nul() {\n     let src = wstr(b\"hi\");"
+    }
+  ]
+}

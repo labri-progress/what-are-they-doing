@@ -1,0 +1,53 @@
+{
+  "message": "fix(mcp): extend DbConnGuard wrapping to tool-metrics/tools/resources probes; consolidate ATC tick-budget status helper\n\nTwo follow-up fixes.\n\nDbConnGuard coverage extended\n- `crates/mcp-agent-mail-server/src/tool_metrics.rs`:\n  `load_latest_persisted_metrics` and `persisted_metric_store_size`\n  each open a short-lived connection for a single SELECT and drop\n  it. Wrap via `guard_db_conn(conn, \"tool_metrics::<fn>\")` so\n  `close_sync()` runs at scope exit instead of emitting the\n  `drop_close` warn.\n- `crates/mcp-agent-mail-tools/src/lib.rs::tool_util::open_read_db_pool`:\n  the archive-ahead probe path opens a file-backed connection just\n  to check the archive ordering. Wrap it with a\n  `guard_db_conn(conn, \"tool_util::open_read_db_pool archive-ahead probe\")`\n  before the explicit `drop(conn)` so the probe exits via\n  `close_sync()`.\n- `crates/mcp-agent-mail-tools/src/resources.rs::open_resource_read_pool`:\n  same fix for the matching resource-side probe.\n\nATC tick-budget status consolidation\n- `crates/mcp-agent-mail-server/src/lib.rs`:\n  New `atc_operator_tick_budget_status(kernel_total_micros,\n  tick_duration_micros, tick_budget_micros)` returns the\n  `(exceeded, note)` pair that `run_atc_operator_loop` was computing\n  inline via two separate branches (one for `tick_budget_exceeded`,\n  one for the log-message `note`). Consolidating them in a single\n  helper keeps the two derived values consistent: the note observes\n  the kernel time when available, else the wall-clock time \u2014\n  matching the WARN-fire rule.\n- `run_atc_operator_loop` now takes the pair from the helper; no\n  behavioural change to the WARN cadence.\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "7a59549300b668741cf67d9ff6c1957d06c84da1",
+      "filename": "crates/mcp-agent-mail-server/src/lib.rs",
+      "status": "modified",
+      "additions": 47,
+      "deletions": 11,
+      "changes": 58,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/076992a3f772b8e82995bf2bea5fe86f094d2bf3/crates%2Fmcp-agent-mail-server%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/076992a3f772b8e82995bf2bea5fe86f094d2bf3/crates%2Fmcp-agent-mail-server%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-server%2Fsrc%2Flib.rs?ref=076992a3f772b8e82995bf2bea5fe86f094d2bf3",
+      "patch": "@@ -4090,6 +4090,26 @@ const fn atc_kernel_budget_exceeded(\n     }\n }\n \n+fn atc_operator_tick_budget_status(\n+    kernel_total_micros: Option<u64>,\n+    tick_duration_micros: u64,\n+    tick_budget_micros: u64,\n+) -> (bool, Option<String>) {\n+    let exceeded = atc_kernel_budget_exceeded(\n+        kernel_total_micros,\n+        tick_duration_micros,\n+        tick_budget_micros,\n+    );\n+    let note = exceeded.then(|| {\n+        let observed_micros = kernel_total_micros.unwrap_or(tick_duration_micros);\n+        format!(\n+            \"ATC tick exceeded budget: {}us > {}us\",\n+            observed_micros, tick_budget_micros\n+        )\n+    });\n+    (exceeded, note)\n+}\n+\n fn next_atc_rollup_refresh_micros(now_micros: i64) -> i64 {\n     now_micros.saturating_add(ATC_ROLLUP_REFRESH_INTERVAL_MICROS)\n }\n@@ -6433,12 +6453,11 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo\n             .map(|summary| summary.budget.kernel_total_micros);\n         let outer_loop_overhead_micros = kernel_total_micros\n             .map_or(0, |kernel| tick_duration_micros.saturating_sub(kernel));\n-        let note = tick_budget_exceeded.then(|| {\n-            format!(\n-                \"ATC tick exceeded budget: {}us > {}us\",\n-                tick_duration_micros, tick_budget_micros\n-            )\n-        });\n+        let (tick_budget_exceeded, note) = atc_operator_tick_budget_status(\n+            kernel_total_micros,\n+            tick_duration_micros,\n+            tick_budget_micros,\n+        );\n         let snapshot = build_atc_operator_snapshot(\n             live_summary,\n             &recent_actions,\n@@ -6464,11 +6483,7 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo\n             }\n         }\n \n-        if atc_kernel_budget_exceeded(\n-            kernel_total_micros,\n-            tick_duration_micros,\n-            tick_budget_micros,\n-        ) {\n+        if tick_budget_exceeded {\n             tracing::warn!(\n                 duration_micros = tick_duration_micros,\n                 kernel_micros = kernel_total_micros.unwrap_or(0),\n@@ -14574,6 +14589,27 @@ mod tests {\n         assert!(!atc_kernel_budget_exceeded(Some(5_000), 5_000, 5_000));\n     }\n \n+    #[test]\n+    fn atc_operator_budget_status_suppresses_false_snapshot_alerts() {\n+        let (exceeded, note) = atc_operator_tick_budget_status(Some(2_500), 50_000, 5_000);\n+        assert!(!exceeded);\n+        assert!(note.is_none());\n+    }\n+\n+    #[test]\n+    fn atc_operator_budget_status_reports_kernel_runtime_when_available() {\n+        let (exceeded, note) = atc_operator_tick_budget_status(Some(7_500), 8_000, 5_000);\n+        assert!(exceeded);\n+        assert_eq!(note.as_deref(), Some(\"ATC tick exceeded budget: 7500us > 5000us\"));\n+    }\n+\n+    #[test]\n+    fn atc_operator_budget_status_falls_back_to_wall_clock_without_summary() {\n+        let (exceeded, note) = atc_operator_tick_budget_status(None, 8_000, 5_000);\n+        assert!(exceeded);\n+        assert_eq!(note.as_deref(), Some(\"ATC tick exceeded budget: 8000us > 5000us\"));\n+    }\n+\n     #[test]\n     fn stdio_startup_probe_success_is_allowed() {\n         let report = startup_checks::StartupReport {"
+    },
+    {
+      "sha": "520cd2c74d9afb6097e9281f1e8a383314abdfd8",
+      "filename": "crates/mcp-agent-mail-server/src/tool_metrics.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/076992a3f772b8e82995bf2bea5fe86f094d2bf3/crates%2Fmcp-agent-mail-server%2Fsrc%2Ftool_metrics.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/076992a3f772b8e82995bf2bea5fe86f094d2bf3/crates%2Fmcp-agent-mail-server%2Fsrc%2Ftool_metrics.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-server%2Fsrc%2Ftool_metrics.rs?ref=076992a3f772b8e82995bf2bea5fe86f094d2bf3",
+      "patch": "@@ -13,6 +13,7 @@\n \n use mcp_agent_mail_core::{Config, kpi_record_sample};\n use mcp_agent_mail_db::DbConn;\n+use mcp_agent_mail_db::guard_db_conn;\n use mcp_agent_mail_db::pool::DbPoolConfig;\n use mcp_agent_mail_db::sqlmodel::Value;\n use mcp_agent_mail_db::timestamps::now_micros;\n@@ -419,6 +420,7 @@ pub fn load_latest_persisted_metrics(database_url: &str, limit: usize) -> Vec<Pe\n     let Some(conn) = open_metrics_connection(database_url) else {\n         return Vec::new();\n     };\n+    let conn = guard_db_conn(conn, \"tool_metrics::load_latest_persisted_metrics\");\n     let limit_i64 = i64::try_from(limit.clamp(1, 2_000)).unwrap_or(200);\n     let sql = \"SELECT s.tool_name, s.calls, s.errors, s.cluster, s.complexity, \\\n                       s.latency_avg_ms, s.latency_p50_ms, s.latency_p95_ms, s.latency_p99_ms, \\\n@@ -446,6 +448,7 @@ pub fn persisted_metric_store_size(database_url: &str) -> u64 {\n     let Some(conn) = open_metrics_connection(database_url) else {\n         return 0;\n     };\n+    let conn = guard_db_conn(conn, \"tool_metrics::persisted_metric_store_size\");\n     let sql = format!(\"SELECT COUNT(*) AS c FROM {TOOL_METRICS_SNAPSHOTS_TABLE}\");\n     let rows = match conn.query_sync(&sql, &[]) {\n         Ok(rows) => rows,"
+    },
+    {
+      "sha": "be2aad3668024ce836008bc6c25f0b2503a38f73",
+      "filename": "crates/mcp-agent-mail-tools/src/lib.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/076992a3f772b8e82995bf2bea5fe86f094d2bf3/crates%2Fmcp-agent-mail-tools%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/076992a3f772b8e82995bf2bea5fe86f094d2bf3/crates%2Fmcp-agent-mail-tools%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-tools%2Fsrc%2Flib.rs?ref=076992a3f772b8e82995bf2bea5fe86f094d2bf3",
+      "patch": "@@ -649,6 +649,10 @@ pub mod tool_util {\n         } else {\n             match mcp_agent_mail_db::DbConn::open_file(&sqlite_path) {\n                 Ok(conn) => {\n+                    let conn = mcp_agent_mail_db::guard_db_conn(\n+                        conn,\n+                        \"tool_util::open_read_db_pool archive-ahead probe\",\n+                    );\n                     let archive_ahead =\n                         read_archive_is_ahead(&config.storage_root, &resolved_path, &conn);\n                     drop(conn);"
+    },
+    {
+      "sha": "c06922c102c5d4a28b25f2fd6b3d8b7f1ef74a44",
+      "filename": "crates/mcp-agent-mail-tools/src/resources.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/076992a3f772b8e82995bf2bea5fe86f094d2bf3/crates%2Fmcp-agent-mail-tools%2Fsrc%2Fresources.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/076992a3f772b8e82995bf2bea5fe86f094d2bf3/crates%2Fmcp-agent-mail-tools%2Fsrc%2Fresources.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-tools%2Fsrc%2Fresources.rs?ref=076992a3f772b8e82995bf2bea5fe86f094d2bf3",
+      "patch": "@@ -352,6 +352,10 @@ fn open_resource_read_pool() -> Result<Option<ResourceReadPool>, String> {\n     } else {\n         match mcp_agent_mail_db::DbConn::open_file(&sqlite_path) {\n             Ok(conn) => {\n+                let conn = mcp_agent_mail_db::guard_db_conn(\n+                    conn,\n+                    \"resources::open_read_db_pool archive-ahead probe\",\n+                );\n                 let archive_ahead =\n                     resource_archive_is_ahead(&config.storage_root, &resolved_path, &conn);\n                 drop(conn);"
+    }
+  ]
+}

@@ -1,0 +1,126 @@
+{
+  "message": "Port read_grok to the neo executor (#6014)\n\n## \ud83d\udd0d Problem\n- `read_grok` still only used the legacy parser adapter path.\n- That meant the operator was not available on the neo executor.\n- Grok coverage also still lived in `test-legacy/`.\n\n## \ud83d\udee0\ufe0f Solution\n- add a neo `ReadGrok` operator for `chunk_ptr -> table_slice`\n- keep the legacy path intact and add `describe()` for the neo plugin\n- reuse the existing grok parsing logic and preserve\ndiagnostics/batching behavior\n- move the existing `parse_grok` coverage into `test/`\n- add neo `read_grok` tests for basic parsing, chunk-split input, and\ninvalid `pattern_definitions`\n\n## \ud83d\udcac Review\n- Focus on parity between the new `ReadGrok` line handling and the\nlegacy parser path.\n- I intentionally skipped a changelog entry for this PR.\n\n<sub>resolves TNZ-199</sub>",
+  "files": [
+    {
+      "sha": "26016b87ff9a44b193e52fae412261925e1b45c4",
+      "filename": "libtenzir/builtins/formats/grok.cpp",
+      "status": "modified",
+      "additions": 219,
+      "deletions": 12,
+      "changes": 231,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/1f791674f128bfb1c4dd0438ad01c9627b5fa9a3/libtenzir%2Fbuiltins%2Fformats%2Fgrok.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/1f791674f128bfb1c4dd0438ad01c9627b5fa9a3/libtenzir%2Fbuiltins%2Fformats%2Fgrok.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Fbuiltins%2Fformats%2Fgrok.cpp?ref=1f791674f128bfb1c4dd0438ad01c9627b5fa9a3",
+      "patch": "@@ -8,9 +8,11 @@\n \n #include <tenzir/argument_parser.hpp>\n #include <tenzir/arrow_table_slice.hpp>\n+#include <tenzir/async/pusher.hpp>\n #include <tenzir/concept/parseable/tenzir/data.hpp>\n #include <tenzir/multi_series_builder.hpp>\n #include <tenzir/multi_series_builder_argument_parser.hpp>\n+#include <tenzir/operator_plugin.hpp>\n #include <tenzir/plugin.hpp>\n #include <tenzir/series_builder.hpp>\n #include <tenzir/to_lines.hpp>\n@@ -35,6 +37,7 @@\n #include <algorithm>\n #include <ranges>\n #include <span>\n+#include <tuple>\n \n namespace caf {\n template <>\n@@ -59,6 +62,15 @@ constexpr std::string_view builtin_patterns_strings[] =\n #include \"./grok-patterns/patterns.inc\"\n   ;\n \n+auto has_location(diagnostic const& diag) -> bool {\n+  for (auto const& annotation : diag.annotations) {\n+    if (annotation.source != location::unknown) {\n+      return true;\n+    }\n+  }\n+  return false;\n+}\n+\n enum class capture_type {\n   // The three options below (string, int, float)\n   // are grok standard options\n@@ -699,38 +711,233 @@ class plugin final : public virtual parser_plugin<grok_parser> {\n   }\n };\n \n-auto extract_pattern_definitions(std::optional<ast::expression> expr,\n-                                 session ctx)\n+auto extract_pattern_definitions(std::optional<located<data>> expr,\n+                                 diagnostic_handler& dh)\n   -> failure_or<grok_parser::pattern_definitions_type> {\n   if (not expr) {\n     return grok_parser::pattern_definitions_type{};\n   }\n-  TRY(auto d, const_eval(*expr, ctx));\n-  auto loc = expr->get_location();\n+  auto loc = expr->source;\n   return match(\n-    d,\n-    [&](std::string& s) -> failure_or<grok_parser::pattern_definitions_type> {\n-      return located{std::move(s), loc};\n+    expr->inner,\n+    [&](std::string const& s)\n+      -> failure_or<grok_parser::pattern_definitions_type> {\n+      return located{std::string{s}, loc};\n     },\n-    [&](record& r) -> failure_or<grok_parser::pattern_definitions_type> {\n-      return located{std::move(r), loc};\n+    [&](record const& r) -> failure_or<grok_parser::pattern_definitions_type> {\n+      return located{record{r}, loc};\n     },\n-    [&](const auto& v) -> failure_or<grok_parser::pattern_definitions_type> {\n+    [&](auto const& v) -> failure_or<grok_parser::pattern_definitions_type> {\n       auto t = type::infer(v);\n       diagnostic::error(\"`pattern_definitions` must be `{}` or `{}`\",\n                         type{string_type{}}.kind(), type{record_type{}}.kind())\n         .primary(loc, \"got `{}`\", t ? t->kind() : type_kind{})\n-        .emit(ctx);\n+        .emit(dh);\n       return failure::promise();\n     });\n }\n \n-class read_grok_plugin : public operator_plugin2<parser_adapter<grok_parser>> {\n+auto extract_pattern_definitions(std::optional<ast::expression> expr,\n+                                 session ctx)\n+  -> failure_or<grok_parser::pattern_definitions_type> {\n+  if (not expr) {\n+    return grok_parser::pattern_definitions_type{};\n+  }\n+  TRY(auto d, const_eval(*expr, ctx));\n+  return extract_pattern_definitions(\n+    std::optional{located{std::move(d), expr->get_location()}}, ctx);\n+}\n+\n+auto make_grok_parser(located<std::string> pattern,\n+                      std::optional<located<data>> pattern_definitions,\n+                      bool indexed_captures, bool include_unnamed,\n+                      multi_series_builder::options opts,\n+                      diagnostic_handler& dh) -> failure_or<grok_parser> {\n+  TRY(auto pattern_defs,\n+      extract_pattern_definitions(std::move(pattern_definitions), dh));\n+  try {\n+    return grok_parser{std::move(pattern_defs), std::move(pattern),\n+                       indexed_captures, include_unnamed, std::move(opts), dh};\n+  } catch (diagnostic& diag) {\n+    std::move(diag).modify().emit(dh);\n+    return failure::promise();\n+  }\n+}\n+\n+struct ReadGrokArgs {\n+  location operator_location = location::unknown;\n+  located<std::string> pattern;\n+  Option<located<data>> pattern_definitions;\n+  bool indexed_captures = false;\n+  bool include_unnamed = false;\n+  multi_series_builder::options msb_options = {};\n+};\n+\n+class ReadGrok final : public Operator<chunk_ptr, table_slice> {\n+public:\n+  explicit ReadGrok(ReadGrokArgs args) : args_{std::move(args)} {\n+  }\n+\n+  auto start(OpCtx& ctx) -> Task<void> override {\n+    auto noop_dh = null_diagnostic_handler{};\n+    auto parser = make_grok_parser(\n+      args_.pattern,\n+      args_.pattern_definitions ? std::optional{*args_.pattern_definitions}\n+                                : std::nullopt,\n+      args_.indexed_captures,\n+      args_.include_unnamed,\n+      args_.msb_options,\n+      noop_dh);\n+    if (not parser) {\n+      co_return;\n+    }\n+    dh_.emplace(ctx.dh(), [loc = args_.operator_location](diagnostic diag) {\n+      if (not has_location(diag)) {\n+        diag.annotations.emplace_back(true, std::string{}, loc);\n+      }\n+      return diag;\n+    });\n+    parser_.emplace(std::move(*parser));\n+    builder_.emplace(args_.msb_options, *dh_);\n+  }\n+\n+  auto await_task(diagnostic_handler&) const -> Task<Any> override {\n+    co_await pusher_.wait();\n+    co_return {};\n+  }\n+\n+  auto process_task(Any, Push<table_slice>& push, OpCtx&)\n+    -> Task<void> override {\n+    TENZIR_ASSERT(builder_);\n+    co_await pusher_.push(builder_->yield_ready_as_table_slice(), push);\n+  }\n+\n+  auto process(chunk_ptr input, Push<table_slice>& push, OpCtx&)\n+    -> Task<void> override {\n+    if (not parser_ or not builder_ or not input or input->size() == 0) {\n+      co_return;\n+    }\n+    auto* begin = reinterpret_cast<char const*>(input->data());\n+    auto const* end = begin + input->size();\n+    if (ended_on_carriage_return_ and *begin == '\\n') {\n+      ++begin;\n+    }\n+    ended_on_carriage_return_ = false;\n+    auto now = multi_series_builder::clock::now();\n+    for (auto current = begin; current != end; ++current) {\n+      if (*current != '\\n' and *current != '\\r') {\n+        continue;\n+      }\n+      if (buffer_.empty()) {\n+        process_line({begin, current});\n+      } else {\n+        buffer_.append(begin, current);\n+        process_line(buffer_);\n+        buffer_.clear();\n+      }\n+      co_await pusher_.push(builder_->yield_ready_as_table_slice(now), push);\n+      if (*current == '\\r') {\n+        if (current + 1 == end) {\n+          ended_on_carriage_return_ = true;\n+        } else if (*(current + 1) == '\\n') {\n+          ++current;\n+        }\n+      }\n+      begin = current + 1;\n+    }\n+    buffer_.append(begin, end);\n+    co_await pusher_.push(builder_->yield_ready_as_table_slice(now), push);\n+  }\n+\n+  auto finalize(Push<table_slice>& push, OpCtx&)\n+    -> Task<FinalizeBehavior> override {\n+    if (not parser_ or not builder_) {\n+      co_return FinalizeBehavior::done;\n+    }\n+    if (not buffer_.empty()) {\n+      process_line(buffer_);\n+      buffer_.clear();\n+    }\n+    for (auto& slice : builder_->finalize_as_table_slice()) {\n+      co_await push(std::move(slice));\n+    }\n+    co_return FinalizeBehavior::done;\n+  }\n+\n+  auto prepare_snapshot(Push<table_slice>& push, OpCtx&)\n+    -> Task<void> override {\n+    TENZIR_ASSERT(builder_);\n+    for (auto& slice : builder_->finalize_as_table_slice()) {\n+      co_await push(std::move(slice));\n+    }\n+  }\n+\n+  auto snapshot(Serde& serde) -> void override {\n+    serde(\"buffer\", buffer_);\n+    serde(\"ended_on_carriage_return\", ended_on_carriage_return_);\n+  }\n+\n+private:\n+  auto process_line(std::string_view line) -> void {\n+    TENZIR_ASSERT(parser_);\n+    TENZIR_ASSERT(builder_);\n+    TENZIR_ASSERT(dh_);\n+    if (not parser_->parse_line(*builder_, *dh_, line)) {\n+      builder_->remove_last();\n+    }\n+  }\n+\n+  ReadGrokArgs args_;\n+  std::optional<grok_parser> parser_;\n+  std::optional<transforming_diagnostic_handler> dh_;\n+  std::optional<multi_series_builder> builder_;\n+  std::string buffer_;\n+  bool ended_on_carriage_return_ = false;\n+  SeriesPusher pusher_;\n+};\n+\n+class read_grok_plugin\n+  : public virtual operator_plugin2<parser_adapter<grok_parser>>,\n+    public virtual OperatorPlugin {\n public:\n   auto name() const -> std::string override {\n     return \"tql2.read_grok\";\n   }\n \n+  auto describe() const -> Description override {\n+    auto defaults = ReadGrokArgs{};\n+    defaults.msb_options.settings.default_schema_name = \"tenzir.grok\";\n+    auto d = Describer<ReadGrokArgs, ReadGrok>{std::move(defaults)};\n+    d.operator_location(&ReadGrokArgs::operator_location);\n+    auto pattern = d.positional(\"pattern\", &ReadGrokArgs::pattern);\n+    auto pattern_definitions = d.named(\"pattern_definitions\",\n+                                       &ReadGrokArgs::pattern_definitions,\n+                                       \"record|string\");\n+    auto indexed_captures\n+      = d.named(\"indexed_captures\", &ReadGrokArgs::indexed_captures);\n+    auto include_unnamed\n+      = d.named(\"include_unnamed\", &ReadGrokArgs::include_unnamed);\n+    auto msb = add_msb_to_describer(d, &ReadGrokArgs::msb_options);\n+    d.validate([=](DescribeCtx& ctx) -> Empty {\n+      msb(ctx);\n+      auto grok_pattern = ctx.get(pattern);\n+      if (not grok_pattern) {\n+        return {};\n+      }\n+      auto opts = multi_series_builder::options{};\n+      opts.settings.default_schema_name = \"tenzir.grok\";\n+      std::ignore = make_grok_parser(\n+        *grok_pattern,\n+        ctx.get(pattern_definitions),\n+        ctx.get(indexed_captures).value_or(false),\n+        ctx.get(include_unnamed).value_or(false),\n+        std::move(opts),\n+        ctx);\n+      return {};\n+    });\n+    return d.without_optimize();\n+  }\n+\n   auto make(operator_factory_invocation inv, session ctx) const\n     -> failure_or<operator_ptr> override {\n     auto parser = argument_parser2::operator_(name());"
+    },
+    {
+      "sha": "70507f361cbd2d177c586edaaf75f9e70b67b5dd",
+      "filename": "test/tests/functions/parse_grok/basic.tql",
+      "status": "renamed",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/1f791674f128bfb1c4dd0438ad01c9627b5fa9a3/test%2Ftests%2Ffunctions%2Fparse_grok%2Fbasic.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/1f791674f128bfb1c4dd0438ad01c9627b5fa9a3/test%2Ftests%2Ffunctions%2Fparse_grok%2Fbasic.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Ffunctions%2Fparse_grok%2Fbasic.tql?ref=1f791674f128bfb1c4dd0438ad01c9627b5fa9a3",
+      "previous_filename": "test-legacy/tests/functions/parse/parse_grok.tql"
+    },
+    {
+      "sha": "e8e8aabab92d5b5fa68afefd9c61f081c22f4072",
+      "filename": "test/tests/functions/parse_grok/basic.txt",
+      "status": "renamed",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/1f791674f128bfb1c4dd0438ad01c9627b5fa9a3/test%2Ftests%2Ffunctions%2Fparse_grok%2Fbasic.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/1f791674f128bfb1c4dd0438ad01c9627b5fa9a3/test%2Ftests%2Ffunctions%2Fparse_grok%2Fbasic.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Ffunctions%2Fparse_grok%2Fbasic.txt?ref=1f791674f128bfb1c4dd0438ad01c9627b5fa9a3",
+      "patch": "@@ -12,7 +12,7 @@\n   output: null,\n }\n warning: grok parser: pattern could not be matched\n- --> tests/functions/parse/parse_grok.tql:4:27\n+ --> tests/functions/parse_grok/basic.tql:4:27\n   |\n 4 | output = input.parse_grok($pattern, pattern_definitions=$pattern_definitions)\n   |                           ~~~~~~~~ ",
+      "previous_filename": "test-legacy/tests/functions/parse/parse_grok.txt"
+    },
+    {
+      "sha": "c63a7759596e09ef21a86637d6df8f4f9a813a58",
+      "filename": "test/tests/operators/read_grok/basic.stdin",
+      "status": "added",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/1f791674f128bfb1c4dd0438ad01c9627b5fa9a3/test%2Ftests%2Foperators%2Fread_grok%2Fbasic.stdin",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/1f791674f128bfb1c4dd0438ad01c9627b5fa9a3/test%2Ftests%2Foperators%2Fread_grok%2Fbasic.stdin",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fread_grok%2Fbasic.stdin?ref=1f791674f128bfb1c4dd0438ad01c9627b5fa9a3",
+      "patch": "@@ -0,0 +1 @@\n+55.3.244.1 GET /index.html 15824 0.043"
+    },
+    {
+      "sha": "0bded3a2712365e6eacc77437bfef17d5424f0c4",
+      "filename": "test/tests/operators/read_grok/basic.tql",
+      "status": "added",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/1f791674f128bfb1c4dd0438ad01c9627b5fa9a3/test%2Ftests%2Foperators%2Fread_grok%2Fbasic.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/1f791674f128bfb1c4dd0438ad01c9627b5fa9a3/test%2Ftests%2Foperators%2Fread_grok%2Fbasic.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fread_grok%2Fbasic.tql?ref=1f791674f128bfb1c4dd0438ad01c9627b5fa9a3",
+      "patch": "@@ -0,0 +1,3 @@\n+from_stdin {\n+  read_grok \"%{IP:client} %{MY_WORD:method} %{URIPATHPARAM:req} %{NUMBER:bytes} %{NUMBER:dur}\", pattern_definitions=\"MY_WORD .*\"\n+}"
+    },
+    {
+      "sha": "489f0d11cc999de076b66d76bbc8064334c223b6",
+      "filename": "test/tests/operators/read_grok/basic.txt",
+      "status": "added",
+      "additions": 7,
+      "deletions": 0,
+      "changes": 7,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/1f791674f128bfb1c4dd0438ad01c9627b5fa9a3/test%2Ftests%2Foperators%2Fread_grok%2Fbasic.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/1f791674f128bfb1c4dd0438ad01c9627b5fa9a3/test%2Ftests%2Foperators%2Fread_grok%2Fbasic.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fread_grok%2Fbasic.txt?ref=1f791674f128bfb1c4dd0438ad01c9627b5fa9a3",
+      "patch": "@@ -0,0 +1,7 @@\n+{\n+  client: 55.3.244.1,\n+  method: \"GET\",\n+  req: \"/index.html\",\n+  bytes: 15824,\n+  dur: 0.043,\n+}"
+    },
+    {
+      "sha": "45710b40356166edb9db935909a5a82da0888c86",
+      "filename": "test/tests/operators/read_grok/invalid_pattern_definitions.tql",
+      "status": "added",
+      "additions": 7,
+      "deletions": 0,
+      "changes": 7,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/1f791674f128bfb1c4dd0438ad01c9627b5fa9a3/test%2Ftests%2Foperators%2Fread_grok%2Finvalid_pattern_definitions.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/1f791674f128bfb1c4dd0438ad01c9627b5fa9a3/test%2Ftests%2Foperators%2Fread_grok%2Finvalid_pattern_definitions.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fread_grok%2Finvalid_pattern_definitions.tql?ref=1f791674f128bfb1c4dd0438ad01c9627b5fa9a3",
+      "patch": "@@ -0,0 +1,7 @@\n+---\n+error: true\n+---\n+\n+from_stdin {\n+  read_grok \"%{WORD:x}\", pattern_definitions=42\n+}"
+    },
+    {
+      "sha": "e979b6e0e74a60e5627a38df1f5c745b36717d97",
+      "filename": "test/tests/operators/read_grok/invalid_pattern_definitions.txt",
+      "status": "added",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/1f791674f128bfb1c4dd0438ad01c9627b5fa9a3/test%2Ftests%2Foperators%2Fread_grok%2Finvalid_pattern_definitions.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/1f791674f128bfb1c4dd0438ad01c9627b5fa9a3/test%2Ftests%2Foperators%2Fread_grok%2Finvalid_pattern_definitions.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fread_grok%2Finvalid_pattern_definitions.txt?ref=1f791674f128bfb1c4dd0438ad01c9627b5fa9a3",
+      "patch": "@@ -0,0 +1,6 @@\n+error: `pattern_definitions` must be `string` or `record`\n+ --> tests/operators/read_grok/invalid_pattern_definitions.tql:6:46\n+  |\n+6 |   read_grok \"%{WORD:x}\", pattern_definitions=42\n+  |                                              ^^ got `int64`\n+  |"
+    },
+    {
+      "sha": "f12cba541add2042ba8b12bccb277fbcde5d9c93",
+      "filename": "test/tests/operators/read_grok/split_bytes.tql",
+      "status": "added",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/1f791674f128bfb1c4dd0438ad01c9627b5fa9a3/test%2Ftests%2Foperators%2Fread_grok%2Fsplit_bytes.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/1f791674f128bfb1c4dd0438ad01c9627b5fa9a3/test%2Ftests%2Foperators%2Fread_grok%2Fsplit_bytes.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fread_grok%2Fsplit_bytes.tql?ref=1f791674f128bfb1c4dd0438ad01c9627b5fa9a3",
+      "patch": "@@ -0,0 +1,6 @@\n+from {\n+  line: \"foo 42\"\n+}\n+write_lines\n+split_bytes 1\n+read_grok \"%{WORD:word} %{NUMBER:value}\""
+    },
+    {
+      "sha": "df61373278b851c90315030f5f242de95c88ae24",
+      "filename": "test/tests/operators/read_grok/split_bytes.txt",
+      "status": "added",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/1f791674f128bfb1c4dd0438ad01c9627b5fa9a3/test%2Ftests%2Foperators%2Fread_grok%2Fsplit_bytes.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/1f791674f128bfb1c4dd0438ad01c9627b5fa9a3/test%2Ftests%2Foperators%2Fread_grok%2Fsplit_bytes.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fread_grok%2Fsplit_bytes.txt?ref=1f791674f128bfb1c4dd0438ad01c9627b5fa9a3",
+      "patch": "@@ -0,0 +1,4 @@\n+{\n+  word: \"foo\",\n+  value: 42,\n+}"
+    }
+  ]
+}

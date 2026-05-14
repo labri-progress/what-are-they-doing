@@ -1,0 +1,137 @@
+{
+  "message": "fix: linux rope_apply precision + browser shader-f16 fallback\n\nThree CI failures uncovered now that the matrix actually executes\nthe conformance tests:\n\n1) Vulkan-direct rope_apply.comp.glsl \u2014 fp16 drift > 1 ULP\n\n   maxAbs=9.77e-4 maxUlp=44.00 >1ULP=27/512 vs the browser fixture.\n   Cause: glslang\u2192SPIR-V keeps `float16_t * float16_t` strictly in\n   fp16 between the multiply and the subtract; Tint\u2192SPIR-V (which\n   produces the fixture) keeps intermediates in fp32 and narrows\n   once at the end. The pattern `a*c - b*s` cancels when the rope\n   angle is small, so two roundings vs one diverges noticeably.\n\n   Fix: explicit f32 intermediates in the GLSL, single narrowing\n   on the final store. Matches Tint's behaviour.\n\n   Verified locally: structural change only, Mac build unaffected\n   (no Vulkan path on Mac). CI on Linux runner is the actual proof.\n\n2) Browser auto-fallback didn't probe shader-f16\n\n   PrivacyFilter.create() with no `backend` option picked WebGPU\n   whenever `navigator.gpu` existed \u2014 even on adapters without\n   shader-f16. WebGpuBackend.warmup() then threw at requestDevice.\n   This is a real user-facing bug, not just a CI workaround:\n   software adapters, headless chromium, and some older Mesa\n   drivers don't expose shader-f16, and they should silently\n   fall through to WASM.\n\n   Fix: probe `adapter.features.has(\"shader-f16\")` in the auto\n   path and route to WASM when missing. Explicit `backend: \"webgpu\"`\n   skips the probe so warmup throws with the actual WebGPU error.\n\n3) Eight specs explicitly need WebGPU + shader-f16\n\n   webgpu-{coldstart,forward,matmul,profile,smoke}, bench, and\n   the two conformance specs (bench-shaders, dump-fixtures) all\n   either request `backend: \"webgpu\"` or talk to WebGPU directly.\n   Added a tests/browser/helpers/skip-without-shader-f16.ts probe\n   wired via test.beforeEach. On Mac dev (shader-f16 present)\n   they run as before; on CI's software adapter they skip cleanly\n   instead of erroring.",
+  "files": [
+    {
+      "sha": "09a9fee6f82243989a1529ce6fea9e7ce9384b13",
+      "filename": "packages/textsift/src/browser/privacy-filter.ts",
+      "status": "modified",
+      "additions": 18,
+      "deletions": 1,
+      "changes": 19,
+      "blob_url": "https://github.com/teamchong/textsift/blob/6ea6b4c0a386464f93c40d75903d2c83b4845327/packages%2Ftextsift%2Fsrc%2Fbrowser%2Fprivacy-filter.ts",
+      "raw_url": "https://github.com/teamchong/textsift/raw/6ea6b4c0a386464f93c40d75903d2c83b4845327/packages%2Ftextsift%2Fsrc%2Fbrowser%2Fprivacy-filter.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/packages%2Ftextsift%2Fsrc%2Fbrowser%2Fprivacy-filter.ts?ref=6ea6b4c0a386464f93c40d75903d2c83b4845327",
+      "patch": "@@ -424,6 +424,23 @@ export class PrivacyFilter {\n         typeof navigator !== \"undefined\" &&\n         !!(navigator as { gpu?: unknown }).gpu;\n \n+      // For auto mode, also probe shader-f16: the WebGPU backend\n+      // requires it, and we'd rather fall back to WASM than throw at\n+      // warmup on adapters that don't expose it (software adapters,\n+      // headless chromium in CI, some older Linux Mesa drivers).\n+      // Explicit `backend: \"webgpu\"` skips the probe so warmup throws\n+      // with the actual WebGPU error.\n+      let webgpuUsable = hasWebGPU;\n+      if (hasWebGPU && requested === \"auto\") {\n+        try {\n+          const gpu = (navigator as unknown as { gpu: { requestAdapter(): Promise<{ features: { has(name: string): boolean } } | null> } }).gpu;\n+          const adapter = await gpu.requestAdapter();\n+          webgpuUsable = !!adapter && adapter.features.has(\"shader-f16\");\n+        } catch {\n+          webgpuUsable = false;\n+        }\n+      }\n+\n       let backend: InferenceBackend | null = null;\n \n       if (requested === \"auto\" && this.backendResolver) {\n@@ -438,7 +455,7 @@ export class PrivacyFilter {\n         const chosen: \"webgpu\" | \"wasm\" =\n           requested === \"webgpu\" ? \"webgpu\"\n           : requested === \"wasm\" ? \"wasm\"\n-          : hasWebGPU ? \"webgpu\"\n+          : webgpuUsable ? \"webgpu\"\n           : \"wasm\";\n         progress?.({ stage: \"compile\", backend: chosen });\n         backend = await selectBackend({"
+    },
+    {
+      "sha": "7f00b46e191e15d89eca57722237309adaff6ba3",
+      "filename": "packages/textsift/src/native/vulkan/shaders/rope_apply.comp.glsl",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 7,
+      "changes": 21,
+      "blob_url": "https://github.com/teamchong/textsift/blob/6ea6b4c0a386464f93c40d75903d2c83b4845327/packages%2Ftextsift%2Fsrc%2Fnative%2Fvulkan%2Fshaders%2Frope_apply.comp.glsl",
+      "raw_url": "https://github.com/teamchong/textsift/raw/6ea6b4c0a386464f93c40d75903d2c83b4845327/packages%2Ftextsift%2Fsrc%2Fnative%2Fvulkan%2Fshaders%2Frope_apply.comp.glsl",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/packages%2Ftextsift%2Fsrc%2Fnative%2Fvulkan%2Fshaders%2Frope_apply.comp.glsl?ref=6ea6b4c0a386464f93c40d75903d2c83b4845327",
+      "patch": "@@ -40,11 +40,18 @@ void main() {\n     float16_t a = qk[head_base + 2u * p];\n     float16_t b = qk[head_base + 2u * p + 1u];\n \n-    float16_t ac = a * c;\n-    float16_t bs = b * s;\n-    float16_t bc = b * c;\n-    float16_t as_ = a * s;\n-\n-    qk[head_base + 2u * p]      = ac - bs;\n-    qk[head_base + 2u * p + 1u] = bc + as_;\n+    // Compute the rotation in f32 and narrow once at the end. The\n+    // browser fixture (Tint\u2192SPIR-V) keeps intermediates in f32 across\n+    // multiply\u2192subtract, which matters here: `a*c - b*s` cancels when\n+    // the rotation angle is small, and rounding twice at f16 (once after\n+    // each multiply, once after the subtract) drifts up to ~44 ULPs vs\n+    // the fixture. glslang\u2192SPIR-V doesn't promote on its own, so we do\n+    // it explicitly. Single narrowing rounding matches Tint's behaviour.\n+    float ac = float(a) * float(c);\n+    float bs = float(b) * float(s);\n+    float bc = float(b) * float(c);\n+    float as_ = float(a) * float(s);\n+\n+    qk[head_base + 2u * p]      = float16_t(ac - bs);\n+    qk[head_base + 2u * p + 1u] = float16_t(bc + as_);\n }"
+    },
+    {
+      "sha": "eef8fe35f79b65bd3417e080876be2fca2e3f6b1",
+      "filename": "tests/browser/bench.spec.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/teamchong/textsift/blob/6ea6b4c0a386464f93c40d75903d2c83b4845327/tests%2Fbrowser%2Fbench.spec.ts",
+      "raw_url": "https://github.com/teamchong/textsift/raw/6ea6b4c0a386464f93c40d75903d2c83b4845327/tests%2Fbrowser%2Fbench.spec.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Fbrowser%2Fbench.spec.ts?ref=6ea6b4c0a386464f93c40d75903d2c83b4845327",
+      "patch": "@@ -11,6 +11,9 @@\n  */\n \n import { test, expect } from \"@playwright/test\";\n+import { skipWithoutShaderF16 } from \"./helpers/skip-without-shader-f16\";\n+\n+test.beforeEach(skipWithoutShaderF16);\n \n test(\"e2e perf bench vs transformers.js default\", async ({ page }) => {\n   test.setTimeout(10 * 60_000); // model downloads can be slow"
+    },
+    {
+      "sha": "a785f3d91121c389a6c702dbaf1fa816f63d8861",
+      "filename": "tests/browser/helpers/skip-without-shader-f16.ts",
+      "status": "added",
+      "additions": 39,
+      "deletions": 0,
+      "changes": 39,
+      "blob_url": "https://github.com/teamchong/textsift/blob/6ea6b4c0a386464f93c40d75903d2c83b4845327/tests%2Fbrowser%2Fhelpers%2Fskip-without-shader-f16.ts",
+      "raw_url": "https://github.com/teamchong/textsift/raw/6ea6b4c0a386464f93c40d75903d2c83b4845327/tests%2Fbrowser%2Fhelpers%2Fskip-without-shader-f16.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Fbrowser%2Fhelpers%2Fskip-without-shader-f16.ts?ref=6ea6b4c0a386464f93c40d75903d2c83b4845327",
+      "patch": "@@ -0,0 +1,39 @@\n+/**\n+ * Playwright helper: skip a test when the running browser's WebGPU\n+ * adapter doesn't expose `shader-f16`. The textsift WebGPU backend\n+ * requires it; CI runners often use a software WebGPU adapter\n+ * (SwiftShader, lavapipe) that doesn't.\n+ *\n+ * Usage at the top of a webgpu spec:\n+ *   test.beforeEach(skipWithoutShaderF16);\n+ */\n+import type { Page, TestInfo } from \"@playwright/test\";\n+import { test } from \"@playwright/test\";\n+\n+export async function skipWithoutShaderF16(\n+  { page }: { page: Page },\n+  testInfo: TestInfo,\n+): Promise<void> {\n+  await page.goto(\"about:blank\");\n+  const probe = await page.evaluate(async (): Promise<\n+    { ok: true; hasF16: boolean } | { ok: false; reason: string }\n+  > => {\n+    const gpu = (navigator as unknown as { gpu?: { requestAdapter(): Promise<{ features: { has(n: string): boolean } } | null> } }).gpu;\n+    if (!gpu) return { ok: false, reason: \"no navigator.gpu\" };\n+    try {\n+      const adapter = await gpu.requestAdapter();\n+      if (!adapter) return { ok: false, reason: \"requestAdapter returned null\" };\n+      return { ok: true, hasF16: adapter.features.has(\"shader-f16\") };\n+    } catch (e) {\n+      return { ok: false, reason: (e as Error).message };\n+    }\n+  });\n+\n+  if (!probe.ok) {\n+    test.skip(true, `WebGPU unavailable: ${probe.reason}`);\n+    return;\n+  }\n+  if (!probe.hasF16) {\n+    test.skip(true, \"WebGPU adapter lacks shader-f16 (likely software adapter on CI)\");\n+  }\n+}"
+    },
+    {
+      "sha": "d846c124f598a7b0e5247fba8556362a862569c6",
+      "filename": "tests/browser/webgpu-coldstart.spec.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/teamchong/textsift/blob/6ea6b4c0a386464f93c40d75903d2c83b4845327/tests%2Fbrowser%2Fwebgpu-coldstart.spec.ts",
+      "raw_url": "https://github.com/teamchong/textsift/raw/6ea6b4c0a386464f93c40d75903d2c83b4845327/tests%2Fbrowser%2Fwebgpu-coldstart.spec.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Fbrowser%2Fwebgpu-coldstart.spec.ts?ref=6ea6b4c0a386464f93c40d75903d2c83b4845327",
+      "patch": "@@ -5,6 +5,9 @@\n  */\n \n import { test, expect } from \"@playwright/test\";\n+import { skipWithoutShaderF16 } from \"./helpers/skip-without-shader-f16\";\n+\n+test.beforeEach(skipWithoutShaderF16);\n \n test(\"webgpu cold-start timing breakdown\", async ({ page }) => {\n   test.setTimeout(5 * 60_000);"
+    },
+    {
+      "sha": "f1b54260574df387bc419a9c80ae0af5f19c6ed7",
+      "filename": "tests/browser/webgpu-forward.spec.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/teamchong/textsift/blob/6ea6b4c0a386464f93c40d75903d2c83b4845327/tests%2Fbrowser%2Fwebgpu-forward.spec.ts",
+      "raw_url": "https://github.com/teamchong/textsift/raw/6ea6b4c0a386464f93c40d75903d2c83b4845327/tests%2Fbrowser%2Fwebgpu-forward.spec.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Fbrowser%2Fwebgpu-forward.spec.ts?ref=6ea6b4c0a386464f93c40d75903d2c83b4845327",
+      "patch": "@@ -6,6 +6,9 @@\n  */\n \n import { test, expect } from \"@playwright/test\";\n+import { skipWithoutShaderF16 } from \"./helpers/skip-without-shader-f16\";\n+\n+test.beforeEach(skipWithoutShaderF16);\n \n test(\"webgpu forward parity vs wasm\", async ({ page }) => {\n   // Cold-cache run downloads ~770 MB across two backends; allow 5 min."
+    },
+    {
+      "sha": "fd8c0ceaa929e8b438993beb8673e2191bc9bada",
+      "filename": "tests/browser/webgpu-matmul.spec.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/teamchong/textsift/blob/6ea6b4c0a386464f93c40d75903d2c83b4845327/tests%2Fbrowser%2Fwebgpu-matmul.spec.ts",
+      "raw_url": "https://github.com/teamchong/textsift/raw/6ea6b4c0a386464f93c40d75903d2c83b4845327/tests%2Fbrowser%2Fwebgpu-matmul.spec.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Fbrowser%2Fwebgpu-matmul.spec.ts?ref=6ea6b4c0a386464f93c40d75903d2c83b4845327",
+      "patch": "@@ -5,6 +5,9 @@\n  */\n \n import { test, expect } from \"@playwright/test\";\n+import { skipWithoutShaderF16 } from \"./helpers/skip-without-shader-f16\";\n+\n+test.beforeEach(skipWithoutShaderF16);\n \n test(\"webgpu matmul_int4 parity vs wasm\", async ({ page }) => {\n   const consoleErrors: string[] = [];"
+    },
+    {
+      "sha": "4e12fd0468beb3d9dd4abf3ea58c25d234948161",
+      "filename": "tests/browser/webgpu-profile.spec.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/teamchong/textsift/blob/6ea6b4c0a386464f93c40d75903d2c83b4845327/tests%2Fbrowser%2Fwebgpu-profile.spec.ts",
+      "raw_url": "https://github.com/teamchong/textsift/raw/6ea6b4c0a386464f93c40d75903d2c83b4845327/tests%2Fbrowser%2Fwebgpu-profile.spec.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Fbrowser%2Fwebgpu-profile.spec.ts?ref=6ea6b4c0a386464f93c40d75903d2c83b4845327",
+      "patch": "@@ -4,6 +4,9 @@\n  */\n \n import { test, expect } from \"@playwright/test\";\n+import { skipWithoutShaderF16 } from \"./helpers/skip-without-shader-f16\";\n+\n+test.beforeEach(skipWithoutShaderF16);\n \n test(\"webgpu forward latency across T\", async ({ page }) => {\n   test.setTimeout(5 * 60_000);"
+    },
+    {
+      "sha": "87983668c70b77e381816b09b932c1a12ae84e18",
+      "filename": "tests/browser/webgpu-smoke.spec.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/teamchong/textsift/blob/6ea6b4c0a386464f93c40d75903d2c83b4845327/tests%2Fbrowser%2Fwebgpu-smoke.spec.ts",
+      "raw_url": "https://github.com/teamchong/textsift/raw/6ea6b4c0a386464f93c40d75903d2c83b4845327/tests%2Fbrowser%2Fwebgpu-smoke.spec.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Fbrowser%2Fwebgpu-smoke.spec.ts?ref=6ea6b4c0a386464f93c40d75903d2c83b4845327",
+      "patch": "@@ -6,6 +6,9 @@\n  */\n \n import { test, expect } from \"@playwright/test\";\n+import { skipWithoutShaderF16 } from \"./helpers/skip-without-shader-f16\";\n+\n+test.beforeEach(skipWithoutShaderF16);\n \n test(\"webgpu backend span parity vs transformers.js\", async ({ page }) => {\n   const consoleErrors: string[] = [];"
+    },
+    {
+      "sha": "8bddc0ec08d9ac9b8a07159fd80852238fb28815",
+      "filename": "tests/conformance/bench-shaders.spec.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/teamchong/textsift/blob/6ea6b4c0a386464f93c40d75903d2c83b4845327/tests%2Fconformance%2Fbench-shaders.spec.ts",
+      "raw_url": "https://github.com/teamchong/textsift/raw/6ea6b4c0a386464f93c40d75903d2c83b4845327/tests%2Fconformance%2Fbench-shaders.spec.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Fconformance%2Fbench-shaders.spec.ts?ref=6ea6b4c0a386464f93c40d75903d2c83b4845327",
+      "patch": "@@ -8,12 +8,15 @@ import { test, expect } from \"@playwright/test\";\n import { writeFileSync, mkdirSync } from \"node:fs\";\n import { resolve, dirname } from \"node:path\";\n import { fileURLToPath } from \"node:url\";\n+import { skipWithoutShaderF16 } from \"../browser/helpers/skip-without-shader-f16\";\n \n const HERE = dirname(fileURLToPath(import.meta.url));\n const OUT = resolve(HERE, \"../native/conformance/fixtures/_browser-bench.json\");\n \n const CHAIN_LEN = process.env.CHAIN ?? \"1\";\n \n+test.beforeEach(skipWithoutShaderF16);\n+\n test(`browser shader microbench (chain=${CHAIN_LEN})`, async ({ page }) => {\n   test.setTimeout(2 * 60_000);\n "
+    },
+    {
+      "sha": "d7f867c249f867ec886f2bb15512409108ad6b8e",
+      "filename": "tests/conformance/dump-fixtures.spec.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/teamchong/textsift/blob/6ea6b4c0a386464f93c40d75903d2c83b4845327/tests%2Fconformance%2Fdump-fixtures.spec.ts",
+      "raw_url": "https://github.com/teamchong/textsift/raw/6ea6b4c0a386464f93c40d75903d2c83b4845327/tests%2Fconformance%2Fdump-fixtures.spec.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Fconformance%2Fdump-fixtures.spec.ts?ref=6ea6b4c0a386464f93c40d75903d2c83b4845327",
+      "patch": "@@ -13,10 +13,13 @@ import { test, expect } from \"@playwright/test\";\n import { mkdirSync, writeFileSync } from \"node:fs\";\n import { resolve, dirname } from \"node:path\";\n import { fileURLToPath } from \"node:url\";\n+import { skipWithoutShaderF16 } from \"../browser/helpers/skip-without-shader-f16\";\n \n const HERE = dirname(fileURLToPath(import.meta.url));\n const FIXTURES_ROOT = resolve(HERE, \"../native/conformance/fixtures\");\n \n+test.beforeEach(skipWithoutShaderF16);\n+\n test(\"dump shader conformance fixtures from browser WebGPU\", async ({ page }) => {\n   test.setTimeout(2 * 60_000);\n "
+    }
+  ]
+}

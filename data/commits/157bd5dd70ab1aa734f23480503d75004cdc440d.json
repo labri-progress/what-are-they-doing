@@ -1,0 +1,110 @@
+{
+  "message": "stage 1 phase D.4: softmax_f32 kernel\n\nRow-wise f32 softmax with max-subtract for numerical stability. Three\npasses: max, exp+sum, normalize. Scalar exp per lane \u2014 WASM has no\nvector exp; Zig's @exp uses its freestanding software exp.\n\nTested against PyTorch F.softmax on two shapes:\n- attention: [8, 257] (8 queries \u00d7 window 128+128+1 sink)\n- topk: [16, 4] (router top-4)\n\nBoth within 1e-5 relative / 1e-7 absolute. maxRel ~5e-7 on attention\nshape, ~2e-7 on topk \u2014 well inside the tolerance.",
+  "files": [
+    {
+      "sha": "1779764c88663b828408b7149c27addb3f44f51b",
+      "filename": "scripts/gen-kernel-fixtures.py",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 0,
+      "changes": 16,
+      "blob_url": "https://github.com/teamchong/textsift/blob/157bd5dd70ab1aa734f23480503d75004cdc440d/scripts%2Fgen-kernel-fixtures.py",
+      "raw_url": "https://github.com/teamchong/textsift/raw/157bd5dd70ab1aa734f23480503d75004cdc440d/scripts%2Fgen-kernel-fixtures.py",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/scripts%2Fgen-kernel-fixtures.py?ref=157bd5dd70ab1aa734f23480503d75004cdc440d",
+      "patch": "@@ -134,6 +134,22 @@ def main() -> int:\n     write(FIXTURES_DIR / \"embed_ids.i32\", ids.numpy().tobytes())\n     write(FIXTURES_DIR / \"embed_out.bf16\", bf16_bytes(y_embed))\n \n+    # ----- Softmax fixture (attention-shape) -----\n+    #\n+    # Shape picked to exercise both the \"long\" row (attention scores +\n+    # sink = window*2 + 1 cells) and a small even one (router top-k).\n+    torch.manual_seed(SEED + 5)\n+    x_sm_att = torch.randn(8, 257, dtype=torch.float32) * 3.0  # spread logits\n+    y_sm_att = F.softmax(x_sm_att, dim=-1)\n+    write(FIXTURES_DIR / \"softmax_att_x.f32\", x_sm_att.numpy().tobytes())\n+    write(FIXTURES_DIR / \"softmax_att_y.f32\", y_sm_att.numpy().tobytes())\n+\n+    torch.manual_seed(SEED + 6)\n+    x_sm_top = torch.randn(16, 4, dtype=torch.float32)\n+    y_sm_top = F.softmax(x_sm_top, dim=-1)\n+    write(FIXTURES_DIR / \"softmax_topk_x.f32\", x_sm_top.numpy().tobytes())\n+    write(FIXTURES_DIR / \"softmax_topk_y.f32\", y_sm_top.numpy().tobytes())\n+\n     # ----- RoPE yarn apply fixture -----\n     #\n     # Runs the upstream `OpenAIPrivacyFilterRotaryEmbedding` layer once"
+    },
+    {
+      "sha": "90be7acd65a473018829adae06db8f8e41b0b199",
+      "filename": "scripts/verify-kernels.mjs",
+      "status": "modified",
+      "additions": 46,
+      "deletions": 0,
+      "changes": 46,
+      "blob_url": "https://github.com/teamchong/textsift/blob/157bd5dd70ab1aa734f23480503d75004cdc440d/scripts%2Fverify-kernels.mjs",
+      "raw_url": "https://github.com/teamchong/textsift/raw/157bd5dd70ab1aa734f23480503d75004cdc440d/scripts%2Fverify-kernels.mjs",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/scripts%2Fverify-kernels.mjs?ref=157bd5dd70ab1aa734f23480503d75004cdc440d",
+      "patch": "@@ -188,6 +188,51 @@ async function runEmbed(ex, weights, spec) {\n   return compareU16(ex, outPtr, expected);\n }\n \n+async function runSoftmaxF32(ex, _weights, spec) {\n+  const x = await loadFixture(spec.x);\n+  const expected = await loadFixture(spec.expected);\n+  const xPtr = allocAndCopy(ex, x);\n+  const outPtr = ex.alloc(expected.byteLength);\n+  ex.softmax_f32(xPtr, outPtr, spec.rows, spec.cols);\n+  // Compare as f32 with tolerance \u2014 exp has >1 ULP drift vs libm.\n+  const got = new Float32Array(ex.memory.buffer, outPtr, expected.byteLength >>> 2);\n+  const want = new Float32Array(\n+    expected.buffer,\n+    expected.byteOffset,\n+    expected.byteLength >>> 2,\n+  );\n+  let maxAbs = 0;\n+  let maxRel = 0;\n+  let sumSq = 0;\n+  let fails = 0;\n+  let firstFail = -1;\n+  for (let i = 0; i < want.length; i++) {\n+    const g = got[i];\n+    const w = want[i];\n+    const abs = Math.abs(g - w);\n+    const rel = Math.abs(w) > 0 ? abs / Math.abs(w) : abs;\n+    if (abs > maxAbs) maxAbs = abs;\n+    if (rel > maxRel) maxRel = rel;\n+    sumSq += abs * abs;\n+    const tol = Math.max(spec.abs_tol ?? 0, spec.rel_tol * Math.abs(w));\n+    if (abs > tol) {\n+      fails++;\n+      if (firstFail === -1) firstFail = i;\n+    }\n+  }\n+  return {\n+    tolerance: { relTol: spec.rel_tol, absTol: spec.abs_tol ?? 0 },\n+    total: want.length,\n+    fails,\n+    firstFail,\n+    maxAbs,\n+    maxRel,\n+    rms: Math.sqrt(sumSq / want.length),\n+    got: new Uint16Array(0),\n+    want: new Uint16Array(0),\n+  };\n+}\n+\n async function runRopeApply(ex, _weights, spec) {\n   const qkIn = await loadFixture(spec.qk_in);\n   const cos = await loadFixture(spec.cos);\n@@ -229,6 +274,7 @@ const RUNNERS = {\n   embed_lookup: runEmbed,\n   matmul_bf16_x_int4block: runMatmulInt4,\n   rope_apply: runRopeApply,\n+  softmax_f32: runSoftmaxF32,\n };\n \n async function main() {"
+    },
+    {
+      "sha": "16a578e55cfbcea4148378ebcbf85072ab55f265",
+      "filename": "src/js/backends/wasm.ts",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/teamchong/textsift/blob/157bd5dd70ab1aa734f23480503d75004cdc440d/src%2Fjs%2Fbackends%2Fwasm.ts",
+      "raw_url": "https://github.com/teamchong/textsift/raw/157bd5dd70ab1aa734f23480503d75004cdc440d/src%2Fjs%2Fbackends%2Fwasm.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/src%2Fjs%2Fbackends%2Fwasm.ts?ref=157bd5dd70ab1aa734f23480503d75004cdc440d",
+      "patch": "@@ -41,6 +41,7 @@ interface PiiWasmExports {\n   matmul_bf16(x: number, w: number, bias: number, out: number, T: number, N: number, D: number): void;\n   matmul_bf16_x_int4block(x: number, w: number, bias: number, out: number, T: number, N: number, D: number): void;\n   rope_apply(qk: number, cos: number, sin: number, T: number, H: number, head_dim: number): void;\n+  softmax_f32(x: number, out: number, rows: number, cols: number): void;\n   embed_lookup(embed: number, ids: number, out: number, T: number, V: number, D: number): void;\n }\n \n@@ -108,6 +109,7 @@ export async function loadPiiWasm(url: string | URL): Promise<PiiWasmExports> {\n     \"matmul_bf16\",\n     \"matmul_bf16_x_int4block\",\n     \"rope_apply\",\n+    \"softmax_f32\",\n     \"embed_lookup\",\n   ];\n   for (const name of required) {"
+    },
+    {
+      "sha": "0b176ce32af2aa57d5aea5a35afaec85ce169e4d",
+      "filename": "src/zig/wasm_exports.zig",
+      "status": "modified",
+      "additions": 55,
+      "deletions": 0,
+      "changes": 55,
+      "blob_url": "https://github.com/teamchong/textsift/blob/157bd5dd70ab1aa734f23480503d75004cdc440d/src%2Fzig%2Fwasm_exports.zig",
+      "raw_url": "https://github.com/teamchong/textsift/raw/157bd5dd70ab1aa734f23480503d75004cdc440d/src%2Fzig%2Fwasm_exports.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/src%2Fzig%2Fwasm_exports.zig?ref=157bd5dd70ab1aa734f23480503d75004cdc440d",
+      "patch": "@@ -676,6 +676,61 @@ export fn matmul_bf16_x_int4block(\n     }\n }\n \n+// --------------------------------------------------------------\n+// Kernel: row-wise softmax, f32 in / f32 out, numerically stable\n+// --------------------------------------------------------------\n+//\n+// out[r, c] = exp(x[r, c] - max_c(x[r, :])) / sum_c(exp(...))\n+//\n+// Used by attention (scores + sink, softmax over the last axis in f32\n+// per the upstream `dtype=torch.float32` argument) and by the router\n+// (top-4 scores).\n+//\n+// Three passes over each row: max, exp+sum, normalize. Exp is scalar\n+// per lane \u2014 WASM has no vector exp; Zig's `@exp` compiles to its\n+// freestanding software implementation.\n+\n+export fn softmax_f32(\n+    x_ptr: [*]const f32,\n+    out_ptr: [*]f32,\n+    rows: u32,\n+    cols: u32,\n+) void {\n+    const Rz: usize = rows;\n+    const Cz: usize = cols;\n+\n+    var r: usize = 0;\n+    while (r < Rz) : (r += 1) {\n+        const row_base = r * Cz;\n+\n+        // Pass 1: max over the row.\n+        var row_max: f32 = x_ptr[row_base];\n+        var c: usize = 1;\n+        while (c < Cz) : (c += 1) {\n+            const v = x_ptr[row_base + c];\n+            if (v > row_max) row_max = v;\n+        }\n+\n+        // Pass 2: exp(x - max), accumulate sum.\n+        var sum: f32 = 0.0;\n+        c = 0;\n+        while (c < Cz) : (c += 1) {\n+            const e = @exp(x_ptr[row_base + c] - row_max);\n+            out_ptr[row_base + c] = e;\n+            sum += e;\n+        }\n+\n+        // Pass 3: divide by sum. If sum is zero (shouldn't happen with\n+        // max-subtract, but defensive), emit 1/C as a uniform distribution\n+        // so downstream ops don't NaN.\n+        const inv_sum: f32 = if (sum > 0.0) 1.0 / sum else 1.0 / @as(f32, @floatFromInt(Cz));\n+        c = 0;\n+        while (c < Cz) : (c += 1) {\n+            out_ptr[row_base + c] *= inv_sum;\n+        }\n+    }\n+}\n+\n // --------------------------------------------------------------\n // Kernel: RoPE apply (interleaved layout)\n // --------------------------------------------------------------"
+    },
+    {
+      "sha": "e2adedfaf908ec6e9127945869b32f2cfcfe7b47",
+      "filename": "tests/fixtures/manifest.json",
+      "status": "modified",
+      "additions": 18,
+      "deletions": 0,
+      "changes": 18,
+      "blob_url": "https://github.com/teamchong/textsift/blob/157bd5dd70ab1aa734f23480503d75004cdc440d/tests%2Ffixtures%2Fmanifest.json",
+      "raw_url": "https://github.com/teamchong/textsift/raw/157bd5dd70ab1aa734f23480503d75004cdc440d/tests%2Ffixtures%2Fmanifest.json",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Ffixtures%2Fmanifest.json?ref=157bd5dd70ab1aa734f23480503d75004cdc440d",
+      "patch": "@@ -50,6 +50,24 @@\n       \"abs_tol\": 1e-4,\n       \"note\": \"bf16 output of an fp32 matmul over dequantized int4 (block 32, sym, fp16 scale). Expected bounded by bf16 ULP (~4e-3 rel for unit-ish values) plus int4 quant error; 1e-3 rel is tight for this combo.\"\n     },\n+    {\n+      \"name\": \"softmax_f32\",\n+      \"x\": \"softmax_att_x.f32\",\n+      \"expected\": \"softmax_att_y.f32\",\n+      \"rows\": 8,\n+      \"cols\": 257,\n+      \"rel_tol\": 1e-5,\n+      \"abs_tol\": 1e-7\n+    },\n+    {\n+      \"name\": \"softmax_f32\",\n+      \"x\": \"softmax_topk_x.f32\",\n+      \"expected\": \"softmax_topk_y.f32\",\n+      \"rows\": 16,\n+      \"cols\": 4,\n+      \"rel_tol\": 1e-5,\n+      \"abs_tol\": 1e-7\n+    },\n     {\n       \"name\": \"rope_apply\",\n       \"qk_in\": \"rope_qk_in.bf16\","
+    },
+    {
+      "sha": "f1b203ac6662d530bc2fe97739c23690b5f22001",
+      "filename": "tests/fixtures/softmax_att_x.f32",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/teamchong/textsift/blob/157bd5dd70ab1aa734f23480503d75004cdc440d/tests%2Ffixtures%2Fsoftmax_att_x.f32",
+      "raw_url": "https://github.com/teamchong/textsift/raw/157bd5dd70ab1aa734f23480503d75004cdc440d/tests%2Ffixtures%2Fsoftmax_att_x.f32",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Ffixtures%2Fsoftmax_att_x.f32?ref=157bd5dd70ab1aa734f23480503d75004cdc440d"
+    },
+    {
+      "sha": "501c6bfd854cc9d0ab2d1cb3b009541ef43b7c6c",
+      "filename": "tests/fixtures/softmax_att_y.f32",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/teamchong/textsift/blob/157bd5dd70ab1aa734f23480503d75004cdc440d/tests%2Ffixtures%2Fsoftmax_att_y.f32",
+      "raw_url": "https://github.com/teamchong/textsift/raw/157bd5dd70ab1aa734f23480503d75004cdc440d/tests%2Ffixtures%2Fsoftmax_att_y.f32",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Ffixtures%2Fsoftmax_att_y.f32?ref=157bd5dd70ab1aa734f23480503d75004cdc440d"
+    },
+    {
+      "sha": "4339fd8146d8c02248ad6bab01e3925f4876eaa5",
+      "filename": "tests/fixtures/softmax_topk_x.f32",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/teamchong/textsift/blob/157bd5dd70ab1aa734f23480503d75004cdc440d/tests%2Ffixtures%2Fsoftmax_topk_x.f32",
+      "raw_url": "https://github.com/teamchong/textsift/raw/157bd5dd70ab1aa734f23480503d75004cdc440d/tests%2Ffixtures%2Fsoftmax_topk_x.f32",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Ffixtures%2Fsoftmax_topk_x.f32?ref=157bd5dd70ab1aa734f23480503d75004cdc440d"
+    },
+    {
+      "sha": "fbb4ec2b40d1a79d1d4e1e00012001bb53c52e82",
+      "filename": "tests/fixtures/softmax_topk_y.f32",
+      "status": "added",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/teamchong/textsift/blob/157bd5dd70ab1aa734f23480503d75004cdc440d/tests%2Ffixtures%2Fsoftmax_topk_y.f32",
+      "raw_url": "https://github.com/teamchong/textsift/raw/157bd5dd70ab1aa734f23480503d75004cdc440d/tests%2Ffixtures%2Fsoftmax_topk_y.f32",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Ffixtures%2Fsoftmax_topk_y.f32?ref=157bd5dd70ab1aa734f23480503d75004cdc440d",
+      "patch": "@@ -0,0 +1,2 @@\n+.\ufffd>\ufffds\u0017>\ufffdY\ufffd>\u0018\u0018\ufffd=E=\ufffd=\ufffdC\ufffd>\ufffd\n+\ufffd=W\ufffd\ufffd><\u000b\ufffd=toA>\u054a\ufffd>\ufffd\ufffd\ufffd>&e\ufffd>\ufffd\ufffd\ufffd<}\ufffdd=!\u0017\ufffd>\ufffdh\ufffd>\ufffdg\ufffd=\u0001\u0015]=S\ufffd\u001a?\u007f\ufffd\ufffd>V`e>\ufffd\ufffd\ufffd>\ufffd}g=\ufffd\u021f=\ufffd^\u0011?A\ufffd>4y\ufffd=X\u06e0=\ufffd\u01dc>\ufffd\ufffd(>k\ufffd\ufffd>O\ufffd\ufffd>R\u001bn>s\ufffd\u001d>2\u001b\ufffd=\u000b\ufffd\u000b?=@\ufffd>V8\ufffd<\r\u0005k<\u03cc3>~\ufffd\ufffd>\u001aH\ufffd>\u0001\ufffd\ufffd=\u000f\ufffd6>\ufffd\ufffd\u0010>\ufffd5\ufffd=\ufffd\u0017\u001d?\ufffd\u03d0>G\ufffd\ufffd>H7\ufffd=[\u06d0>\ufffd\ufffd\ufffd>\ufffd\ufffde=\u0001$\ufffd>\u468f>\u0010\ufffd\u0014=_e4?\ufffd\ufffdr>a\ufffd<\ufffd\ufffdk=\ufffd\ufffd\u001b>\u0004+1>\ufffd\ufffd\u001d?\n\\ No newline at end of file"
+    }
+  ]
+}

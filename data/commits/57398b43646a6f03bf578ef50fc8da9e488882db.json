@@ -1,0 +1,101 @@
+{
+  "message": "fix: skip migrations on fresh DB init to prevent orphaned pages\n\nOn a fresh database, user_version is 0, so run_migrations() was\nunnecessarily running the v3/v4 migrations that DROP+CREATE\nidx_issues_ready \u2014 orphaning page 17 and causing doctor integrity\nwarnings.\n\nNow detect fresh DBs before DDL runs, execute SCHEMA_SQL (which\ncreates everything at the current version), and stamp user_version\nimmediately, skipping migrations entirely.\n\nAlso fixes test helpers to use shared parse_created_id() and\nfuture-proof date constants in JSONL rewrite tests.\n\nCloses #221\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "2d837effcb8046c2b51d1346adcbfa57a488f21f",
+      "filename": "src/storage/schema.rs",
+      "status": "modified",
+      "additions": 31,
+      "deletions": 14,
+      "changes": 45,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_rust/blob/57398b43646a6f03bf578ef50fc8da9e488882db/src%2Fstorage%2Fschema.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_rust/raw/57398b43646a6f03bf578ef50fc8da9e488882db/src%2Fstorage%2Fschema.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_rust/contents/src%2Fstorage%2Fschema.rs?ref=57398b43646a6f03bf578ef50fc8da9e488882db",
+      "patch": "@@ -372,6 +372,13 @@ pub(crate) fn execute_batch(conn: &Connection, sql: &str) -> Result<()> {\n ///\n /// Returns an error if the SQL execution fails or pragmas cannot be set.\n pub fn apply_schema(conn: &Connection) -> Result<()> {\n+    // Detect a truly fresh (empty) database before any DDL runs.\n+    // On a fresh DB, SCHEMA_SQL creates everything at the current version,\n+    // so running migrations is unnecessary and harmful \u2014 e.g. the v3/v4\n+    // migrations DROP+CREATE idx_issues_ready which orphans a page and\n+    // causes doctor integrity warnings.\n+    let is_fresh = !table_exists(conn, \"issues\");\n+\n     // Run pre-schema migrations first to fix any incompatible old tables\n     // This must run BEFORE execute_batch because the batch includes CREATE INDEX\n     // statements that will fail if old tables have missing columns\n@@ -382,22 +389,32 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {\n \n     execute_batch(conn, SCHEMA_SQL)?;\n \n-    // Run migrations for existing databases.\n-    // If the issues table was rebuilt from scratch, skip migration checks\n-    // that reference newly-added columns because fsqlite's in-memory schema\n-    // cache may not have been updated yet.\n-    run_migrations(conn, issues_rebuilt).map_err(|e| {\n-        eprintln!(\"run_migrations failed: {:?}\", e);\n-        e\n-    })?;\n-\n-    // Mark schema as applied so future opens can skip DDL/migration work.\n-    conn.execute(&format!(\"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}\"))\n-        .map_err(|e| {\n-            eprintln!(\"PRAGMA user_version failed: {:?}\", e);\n-            BeadsError::Database(e)\n+    if is_fresh {\n+        // Fresh database: SCHEMA_SQL already created everything at the\n+        // current version. Skip migrations and stamp user_version directly.\n+        conn.execute(&format!(\"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}\"))\n+            .map_err(|e| {\n+                eprintln!(\"PRAGMA user_version failed: {:?}\", e);\n+                BeadsError::Database(e)\n+            })?;\n+    } else {\n+        // Existing database: run migrations for schema upgrades.\n+        // If the issues table was rebuilt from scratch, skip migration checks\n+        // that reference newly-added columns because fsqlite's in-memory schema\n+        // cache may not have been updated yet.\n+        run_migrations(conn, issues_rebuilt).map_err(|e| {\n+            eprintln!(\"run_migrations failed: {:?}\", e);\n+            e\n         })?;\n \n+        // Mark schema as applied so future opens can skip DDL/migration work.\n+        conn.execute(&format!(\"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}\"))\n+            .map_err(|e| {\n+                eprintln!(\"PRAGMA user_version failed: {:?}\", e);\n+                BeadsError::Database(e)\n+            })?;\n+    }\n+\n     apply_runtime_pragmas(conn).map_err(|e| {\n         eprintln!(\"apply_runtime_pragmas failed: {:?}\", e);\n         e"
+    },
+    {
+      "sha": "f55ab6b3b0d83df312004c7531aced454fcd22a6",
+      "filename": "src/storage/sqlite.rs",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 7,
+      "changes": 18,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_rust/blob/57398b43646a6f03bf578ef50fc8da9e488882db/src%2Fstorage%2Fsqlite.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_rust/raw/57398b43646a6f03bf578ef50fc8da9e488882db/src%2Fstorage%2Fsqlite.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_rust/contents/src%2Fstorage%2Fsqlite.rs?ref=57398b43646a6f03bf578ef50fc8da9e488882db",
+      "patch": "@@ -706,17 +706,21 @@ impl SqliteStorage {\n         let deterministic = base_ms * 2u64.pow(attempt);\n         // Add +-25% jitter using a cheap PRNG seeded from the current time.\n         // No need for cryptographic randomness here.\n-        let nanos = std::time::SystemTime::now()\n-            .duration_since(std::time::UNIX_EPOCH)\n-            .unwrap_or_default()\n-            .subsec_nanos() as u64;\n+        let nanos = u64::from(\n+            std::time::SystemTime::now()\n+                .duration_since(std::time::UNIX_EPOCH)\n+                .unwrap_or_default()\n+                .subsec_nanos(),\n+        );\n         let jitter_range = deterministic / 4;\n         if jitter_range == 0 {\n             return deterministic;\n         }\n-        // Map nanos into [-jitter_range, +jitter_range) via wrapping arithmetic.\n-        let raw = (nanos % (jitter_range * 2)) as i64 - jitter_range as i64;\n-        (deterministic as i64 + raw).max(1) as u64\n+        // Map nanos into [-jitter_range, +jitter_range) using i128 to avoid\n+        // truncation on the u64\u2192i64 boundary.\n+        let raw = i128::from(nanos % (jitter_range * 2)) - i128::from(jitter_range);\n+        let result = i128::from(deterministic) + raw;\n+        u64::try_from(result.max(1)).unwrap_or(u64::MAX)\n     }\n \n     /// Set export hashes using the caller's active transaction."
+    },
+    {
+      "sha": "32b926b3942e3ee377f0a69b83c91e92ba1520e1",
+      "filename": "tests/common/cli.rs",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 0,
+      "changes": 14,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_rust/blob/57398b43646a6f03bf578ef50fc8da9e488882db/tests%2Fcommon%2Fcli.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_rust/raw/57398b43646a6f03bf578ef50fc8da9e488882db/tests%2Fcommon%2Fcli.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_rust/contents/tests%2Fcommon%2Fcli.rs?ref=57398b43646a6f03bf578ef50fc8da9e488882db",
+      "patch": "@@ -225,6 +225,20 @@ where\n     }\n }\n \n+/// Extract the issue ID from `br create` stdout.\n+///\n+/// Handles both formats: `\"Created pfx-xxx: title\"` and `\"\u2713 Created pfx-xxx: title\"`.\n+pub fn parse_created_id(stdout: &str) -> String {\n+    let line = stdout.lines().next().unwrap_or(\"\");\n+    let normalized = line.strip_prefix(\"\u2713 \").unwrap_or(line);\n+    normalized\n+        .strip_prefix(\"Created \")\n+        .and_then(|rest| rest.split(':').next())\n+        .unwrap_or(\"\")\n+        .trim()\n+        .to_string()\n+}\n+\n pub fn extract_json_payload(stdout: &str) -> String {\n     let lines: Vec<&str> = stdout.lines().collect();\n     for (idx, line) in lines.iter().enumerate() {"
+    },
+    {
+      "sha": "e7f6a7e67d9581fd507d525a3aa7e9a0a73790d3",
+      "filename": "tests/e2e_list_scenarios.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 12,
+      "changes": 13,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_rust/blob/57398b43646a6f03bf578ef50fc8da9e488882db/tests%2Fe2e_list_scenarios.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_rust/raw/57398b43646a6f03bf578ef50fc8da9e488882db/tests%2Fe2e_list_scenarios.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_rust/contents/tests%2Fe2e_list_scenarios.rs?ref=57398b43646a6f03bf578ef50fc8da9e488882db",
+      "patch": "@@ -19,18 +19,7 @@\n \n mod common;\n \n-use common::cli::{BrWorkspace, parse_list_issues, run_br};\n-\n-fn parse_created_id(stdout: &str) -> String {\n-    let line = stdout.lines().next().unwrap_or(\"\");\n-    // Handle both formats: \"Created bd-xxx: title\" and \"\u2713 Created bd-xxx: title\"\n-    let normalized = line.strip_prefix(\"\u2713 \").unwrap_or(line);\n-    let id_part = normalized\n-        .strip_prefix(\"Created \")\n-        .and_then(|rest| rest.split(':').next())\n-        .unwrap_or(\"\");\n-    id_part.trim().to_string()\n-}\n+use common::cli::{BrWorkspace, parse_created_id, parse_list_issues, run_br};\n \n /// Setup a workspace with a diverse set of issues for comprehensive testing.\n fn setup_diverse_workspace() -> (BrWorkspace, Vec<String>) {"
+    },
+    {
+      "sha": "e0bff89d7d2bb2433ed70841d210aa2230bfb37b",
+      "filename": "tests/e2e_orphans.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_rust/blob/57398b43646a6f03bf578ef50fc8da9e488882db/tests%2Fe2e_orphans.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_rust/raw/57398b43646a6f03bf578ef50fc8da9e488882db/tests%2Fe2e_orphans.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_rust/contents/tests%2Fe2e_orphans.rs?ref=57398b43646a6f03bf578ef50fc8da9e488882db",
+      "patch": "@@ -88,8 +88,8 @@ fn rewrite_jsonl_issue_as_closed(workspace: &BrWorkspace, issue_id: &str) {\n             let mut issue: Value = serde_json::from_str(line).expect(\"parse issue json\");\n             if issue[\"id\"].as_str() == Some(issue_id) {\n                 issue[\"status\"] = Value::String(\"closed\".to_string());\n-                issue[\"updated_at\"] = Value::String(\"2026-01-01T00:00:00Z\".to_string());\n-                issue[\"closed_at\"] = Value::String(\"2026-01-01T00:00:00Z\".to_string());\n+                issue[\"updated_at\"] = Value::String(\"2099-01-01T00:00:00Z\".to_string());\n+                issue[\"closed_at\"] = Value::String(\"2099-01-01T00:00:00Z\".to_string());\n                 issue[\"close_reason\"] = Value::String(\"Closed via JSONL edit\".to_string());\n             }\n             serde_json::to_string(&issue).expect(\"serialize issue json\")"
+    },
+    {
+      "sha": "8f8159c612b17bd86e89de732d3a2e8565282f32",
+      "filename": "tests/e2e_quick_capture.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_rust/blob/57398b43646a6f03bf578ef50fc8da9e488882db/tests%2Fe2e_quick_capture.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_rust/raw/57398b43646a6f03bf578ef50fc8da9e488882db/tests%2Fe2e_quick_capture.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_rust/contents/tests%2Fe2e_quick_capture.rs?ref=57398b43646a6f03bf578ef50fc8da9e488882db",
+      "patch": "@@ -34,8 +34,8 @@ fn q_creates_issue_returns_id_only() {\n     // Should be just the ID, no other output\n     assert_eq!(output.lines().count(), 1, \"q should output only one line\");\n     assert!(\n-        output.starts_with(\"bd-\") || output.contains('-'),\n-        \"output should be an ID format, got: {output}\"\n+        output.contains('-'),\n+        \"output should be an issue ID (prefix-hash format), got: {output}\"\n     );\n     // Should not contain \"Created\" or other verbose text\n     assert!("
+    },
+    {
+      "sha": "f926041e8f329d97591d030bde392346d1e936d6",
+      "filename": "tests/e2e_stale.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 22,
+      "changes": 29,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_rust/blob/57398b43646a6f03bf578ef50fc8da9e488882db/tests%2Fe2e_stale.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_rust/raw/57398b43646a6f03bf578ef50fc8da9e488882db/tests%2Fe2e_stale.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_rust/contents/tests%2Fe2e_stale.rs?ref=57398b43646a6f03bf578ef50fc8da9e488882db",
+      "patch": "@@ -2,7 +2,7 @@\n \n mod common;\n \n-use common::cli::{BrWorkspace, extract_json_payload, run_br};\n+use common::cli::{BrWorkspace, extract_json_payload, parse_created_id, run_br};\n use serde_json::Value;\n \n #[test]\n@@ -62,15 +62,10 @@ fn e2e_stale_with_status_filter() {\n     run_br(&workspace, [\"create\", \"Open Issue\"], \"create1\");\n \n     let create2 = run_br(&workspace, [\"create\", \"InProgress Issue\"], \"create2\");\n-    let id2 = create2\n-        .stdout\n-        .split_whitespace()\n-        .find(|w| w.starts_with(\"bd-\"))\n-        .unwrap()\n-        .trim_end_matches(':');\n+    let id2 = parse_created_id(&create2.stdout);\n     run_br(\n         &workspace,\n-        [\"update\", id2, \"--status\", \"in_progress\"],\n+        [\"update\", &id2, \"--status\", \"in_progress\"],\n         \"update2\",\n     );\n \n@@ -104,17 +99,12 @@ fn e2e_stale_with_deferred_status_filter() {\n         \"create deferred failed: {}\",\n         deferred.stderr\n     );\n-    let deferred_id = deferred\n-        .stdout\n-        .split_whitespace()\n-        .find(|w| w.starts_with(\"bd-\"))\n-        .unwrap()\n-        .trim_end_matches(':');\n+    let deferred_id = parse_created_id(&deferred.stdout);\n     let defer = run_br(\n         &workspace,\n         [\n             \"update\",\n-            deferred_id,\n+            &deferred_id,\n             \"--status\",\n             \"deferred\",\n             \"--defer\",\n@@ -150,16 +140,11 @@ fn e2e_stale_default_includes_custom_nonterminal_statuses() {\n \n     let create = run_br(&workspace, [\"create\", \"Review Issue\"], \"create_review\");\n     assert!(create.status.success(), \"create failed: {}\", create.stderr);\n-    let issue_id = create\n-        .stdout\n-        .split_whitespace()\n-        .find(|w| w.starts_with(\"bd-\"))\n-        .unwrap()\n-        .trim_end_matches(':');\n+    let issue_id = parse_created_id(&create.stdout);\n \n     let update = run_br(\n         &workspace,\n-        [\"update\", issue_id, \"--status\", \"review\"],\n+        [\"update\", &issue_id, \"--status\", \"review\"],\n         \"set_review_status\",\n     );\n     assert!(update.status.success(), \"update failed: {}\", update.stderr);"
+    },
+    {
+      "sha": "40d74c964ff163539b01dcf73479da36afc4929c",
+      "filename": "tests/snapshots/snapshots/snapshots__snapshots__cli_output__doctor_output.snap",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_rust/blob/57398b43646a6f03bf578ef50fc8da9e488882db/tests%2Fsnapshots%2Fsnapshots%2Fsnapshots__snapshots__cli_output__doctor_output.snap",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_rust/raw/57398b43646a6f03bf578ef50fc8da9e488882db/tests%2Fsnapshots%2Fsnapshots%2Fsnapshots__snapshots__cli_output__doctor_output.snap",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_rust/contents/tests%2Fsnapshots%2Fsnapshots%2Fsnapshots__snapshots__cli_output__doctor_output.snap?ref=57398b43646a6f03bf578ef50fc8da9e488882db",
+      "patch": "@@ -13,8 +13,8 @@ OK schema.tables\n OK schema.columns\n OK db.recoverable_anomalies\n OK db.null_defaults\n-WARN sqlite.integrity_check: database disk image is malformed: page 17 is never used\n+OK sqlite.integrity_check\n OK counts.db_vs_jsonl: Both have 0 records\n OK sync.metadata: External changes pending import\n OK db.write_probe: No issues available for ID-REDACTED write probe\n-WARN sqlite3.integrity_check: *** in database main ***; Page 17: never used\n+OK sqlite3.integrity_check"
+    }
+  ]
+}

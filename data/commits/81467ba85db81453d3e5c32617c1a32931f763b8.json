@@ -1,0 +1,65 @@
+{
+  "message": "fix(subprocess): kill_on_drop on every timeout-wrapped spawn; drain pipes concurrently\n\nEvery place RCH wraps a spawned subprocess in `tokio::time::timeout(...,\ncmd.output())` was a latent process+fd leak. When the timeout fires, the\nfuture is dropped \u2014 but without `kill_on_drop`, the underlying child\nprocess keeps running detached. For SSH/SCP/rch-wkr invocations that means\nthe local process holds the network socket open until SSH's own keepalive\neventually gives up (minutes to hours), while tmux/ps show a growing forest\nof orphaned children. On a busy hook this compounds into a slow accumulation\nthat manifests as \"daemon restart fixes the issue\" weeks later.\n\nAdds `cmd.kill_on_drop(true)` before every `spawn()` / `output()` that sits\nunderneath a `tokio::time::timeout`:\n\n  rch/src/commands/hook.rs\n    hook_test: rch in hook mode \u2014 the 30s timeout would otherwise leave\n    rch-in-hook-mode processes running detached, possibly holding their\n    own daemon slot reservations.\n\n  rch/src/fleet/ssh.rs\n    build_ssh_args / build_scp_args: every fleet-wide ssh/scp invocation\n    runs under a timeout. Adds kill_on_drop on the shared arg builder so\n    every downstream command inherits the guarantee.\n\n  rch/src/hook.rs\n    run_worker_ssh_command: replaces `cmd.output()` with an explicit\n    spawn + concurrent stdout/stderr drain + child.wait(), all under the\n    outer `tokio::time::timeout`. Two independent improvements in one\n    rewrite:\n      - kill_on_drop ensures cancellation kills the local ssh process\n      - concurrent stdout+stderr `read_to_end` via `tokio::try_join!`\n        prevents a deadlock when remote output exceeds the OS pipe\n        buffer (~64KB). The previous `cmd.output()` drained both pipes\n        after `wait()`, which deadlocked verbose remote commands.\n\n  rchd/src/benchmark_scheduler.rs\n    execute_benchmark_on_worker: defense-in-depth. The explicit\n    `child.kill().await` calls cover timeout + IO-error paths; this\n    covers the panic-unwind / task-cancellation paths where the\n    explicit cleanup never runs.\n\n  rchd/src/cancellation.rs\n    remote kill-script ssh under `remote_kill_timeout`. This is the\n    single most embarrassing place to leak an ssh process \u2014 we're\n    literally in the middle of trying to clean up a stuck build and\n    failing to clean up our own cleanup.\n\nNo API or behavior change on the happy path. The only observable\ndifference is that timed-out subprocesses now die promptly instead of\nlimping along.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "5863779aa39df1da220613e47d51b79e79953c30",
+      "filename": "rch/src/commands/hook.rs",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 1,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/remote_compilation_helper/blob/81467ba85db81453d3e5c32617c1a32931f763b8/rch%2Fsrc%2Fcommands%2Fhook.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/remote_compilation_helper/raw/81467ba85db81453d3e5c32617c1a32931f763b8/rch%2Fsrc%2Fcommands%2Fhook.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/remote_compilation_helper/contents/rch%2Fsrc%2Fcommands%2Fhook.rs?ref=81467ba85db81453d3e5c32617c1a32931f763b8",
+      "patch": "@@ -426,11 +426,19 @@ pub async fn hook_test(ctx: &OutputContext) -> Result<()> {\n     // Find the rch binary\n     let rch_path = std::env::current_exe()?;\n \n-    // Spawn rch in hook mode (no arguments = hook mode)\n+    // Spawn rch in hook mode (no arguments = hook mode).\n+    //\n+    // `kill_on_drop` is essential here because the call below wraps\n+    // `child.wait_with_output()` in `tokio::time::timeout(30s, ...)`. On\n+    // timeout, the future is dropped \u2014 without this flag the child rch\n+    // process keeps running detached, which for a hook test means leaking\n+    // a process that may also have taken its own slot reservation on the\n+    // daemon. Force a SIGKILL when the future drops.\n     let mut child = Command::new(&rch_path)\n         .stdin(Stdio::piped())\n         .stdout(Stdio::piped())\n         .stderr(Stdio::piped())\n+        .kill_on_drop(true)\n         .spawn()\n         .context(\"Failed to spawn rch in hook mode\")?;\n "
+    },
+    {
+      "sha": "2ac89285eebfe46de698ec5598bc990fb276254d",
+      "filename": "rch/src/fleet/ssh.rs",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 0,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/remote_compilation_helper/blob/81467ba85db81453d3e5c32617c1a32931f763b8/rch%2Fsrc%2Ffleet%2Fssh.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/remote_compilation_helper/raw/81467ba85db81453d3e5c32617c1a32931f763b8/rch%2Fsrc%2Ffleet%2Fssh.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/remote_compilation_helper/contents/rch%2Fsrc%2Ffleet%2Fssh.rs?ref=81467ba85db81453d3e5c32617c1a32931f763b8",
+      "patch": "@@ -260,6 +260,12 @@ impl<'a> SshExecutor<'a> {\n             .arg(format!(\"ConnectTimeout={}\", self.connect_timeout.as_secs()));\n         cmd.arg(\"-o\").arg(\"StrictHostKeyChecking=accept-new\");\n         cmd.arg(\"-i\").arg(&self.worker.identity_file);\n+        // All callers wrap `cmd.output()` in `tokio::time::timeout`. On\n+        // timeout the future is dropped; without this flag the spawned\n+        // ssh process keeps running and holding the network socket open\n+        // until SSH's own keepalive eventually gives up. Set kill_on_drop\n+        // so the local ssh process is SIGKILLed promptly on cancellation.\n+        cmd.kill_on_drop(true);\n     }\n \n     /// Build common SCP command arguments.\n@@ -269,6 +275,9 @@ impl<'a> SshExecutor<'a> {\n             .arg(format!(\"ConnectTimeout={}\", self.scp_timeout.as_secs()));\n         cmd.arg(\"-o\").arg(\"StrictHostKeyChecking=accept-new\");\n         cmd.arg(\"-i\").arg(&self.worker.identity_file);\n+        // Same rationale as `build_ssh_args`: avoid leaking scp processes\n+        // when a timeout fires.\n+        cmd.kill_on_drop(true);\n     }\n \n     // ========================================================================="
+    },
+    {
+      "sha": "aea28bcd6ebfd498f109ec1916eb5762f88d6616",
+      "filename": "rch/src/hook.rs",
+      "status": "modified",
+      "additions": 54,
+      "deletions": 5,
+      "changes": 59,
+      "blob_url": "https://github.com/Dicklesworthstone/remote_compilation_helper/blob/81467ba85db81453d3e5c32617c1a32931f763b8/rch%2Fsrc%2Fhook.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/remote_compilation_helper/raw/81467ba85db81453d3e5c32617c1a32931f763b8/rch%2Fsrc%2Fhook.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/remote_compilation_helper/contents/rch%2Fsrc%2Fhook.rs?ref=81467ba85db81453d3e5c32617c1a32931f763b8",
+      "patch": "@@ -2734,14 +2734,63 @@ async fn run_worker_ssh_command(\n         timeout_duration.as_secs().max(1)\n     ));\n     cmd.arg(\"-i\").arg(identity_file.as_ref());\n-    cmd.arg(destination);\n+    cmd.arg(&destination);\n     cmd.arg(build_remote_shell_command(remote_cmd));\n     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());\n \n-    let output = timeout(timeout_duration, cmd.output())\n-        .await\n-        .map_err(|_| anyhow::anyhow!(\"SSH command timed out after {:?}\", timeout_duration))??;\n-    Ok(output)\n+    // Spawn manually instead of `cmd.output()` so the local SSH process is\n+    // killed if our outer timeout fires. `tokio::time::timeout` only drops\n+    // the future; without `kill_on_drop`, the spawned ssh process keeps\n+    // running, holding the network socket open until SSH's own keepalive\n+    // gives up. For a busy hook this leaks fds and ssh processes \u2014 exactly\n+    // the kind of slow accumulation that turns into a daemon-restart bug\n+    // weeks later.\n+    cmd.kill_on_drop(true);\n+\n+    use anyhow::Context as _;\n+    use tokio::io::AsyncReadExt as _;\n+\n+    let mut child = cmd\n+        .spawn()\n+        .with_context(|| format!(\"Failed to spawn ssh to {}\", destination))?;\n+\n+    // Drain stdout/stderr concurrently with the wait so that even verbose\n+    // remote output never deadlocks the child on a full pipe buffer.\n+    let mut stdout_pipe = child.stdout.take();\n+    let mut stderr_pipe = child.stderr.take();\n+    let collect = async {\n+        let stdout_fut = async {\n+            let mut buf = Vec::new();\n+            if let Some(p) = stdout_pipe.as_mut() {\n+                p.read_to_end(&mut buf).await?;\n+            }\n+            Ok::<_, std::io::Error>(buf)\n+        };\n+        let stderr_fut = async {\n+            let mut buf = Vec::new();\n+            if let Some(p) = stderr_pipe.as_mut() {\n+                p.read_to_end(&mut buf).await?;\n+            }\n+            Ok::<_, std::io::Error>(buf)\n+        };\n+        let (stdout_bytes, stderr_bytes) = tokio::try_join!(stdout_fut, stderr_fut)?;\n+        let status = child.wait().await?;\n+        Ok::<_, std::io::Error>(Output {\n+            status,\n+            stdout: stdout_bytes,\n+            stderr: stderr_bytes,\n+        })\n+    };\n+\n+    match timeout(timeout_duration, collect).await {\n+        Ok(result) => result.context(\"Failed to collect ssh output\"),\n+        Err(_) => {\n+            // collect future is dropped here; with kill_on_drop=true the\n+            // local ssh process is SIGKILLed when `child` (still owned by\n+            // the dropped future) is dropped.\n+            anyhow::bail!(\"SSH command timed out after {:?}\", timeout_duration);\n+        }\n+    }\n }\n \n fn build_remote_shell_command(remote_cmd: &str) -> String {"
+    },
+    {
+      "sha": "31c1ca97db9e177dea9890ff48ce76f6ac4ccd37",
+      "filename": "rchd/src/benchmark_scheduler.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/remote_compilation_helper/blob/81467ba85db81453d3e5c32617c1a32931f763b8/rchd%2Fsrc%2Fbenchmark_scheduler.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/remote_compilation_helper/raw/81467ba85db81453d3e5c32617c1a32931f763b8/rchd%2Fsrc%2Fbenchmark_scheduler.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/remote_compilation_helper/contents/rchd%2Fsrc%2Fbenchmark_scheduler.rs?ref=81467ba85db81453d3e5c32617c1a32931f763b8",
+      "patch": "@@ -906,6 +906,12 @@ async fn execute_benchmark_on_worker(\n     cmd.arg(\"~/.local/bin/rch-wkr benchmark --json\");\n     cmd.stdout(std::process::Stdio::piped());\n     cmd.stderr(std::process::Stdio::piped());\n+    // Defense in depth: if the surrounding task is dropped mid-flight (e.g.\n+    // a panic, scheduler shutdown, or a parent select! losing the race),\n+    // the spawned ssh process should not outlive us. The explicit\n+    // `child.kill().await` calls below cover the timeout/IO error paths;\n+    // `kill_on_drop` covers the panic-unwind/cancellation paths.\n+    cmd.kill_on_drop(true);\n \n     debug!(\n         worker_id = %worker.id,"
+    },
+    {
+      "sha": "393caf952941fd46f675b921694688edb0c5e816",
+      "filename": "rchd/src/cancellation.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/remote_compilation_helper/blob/81467ba85db81453d3e5c32617c1a32931f763b8/rchd%2Fsrc%2Fcancellation.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/remote_compilation_helper/raw/81467ba85db81453d3e5c32617c1a32931f763b8/rchd%2Fsrc%2Fcancellation.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/remote_compilation_helper/contents/rchd%2Fsrc%2Fcancellation.rs?ref=81467ba85db81453d3e5c32617c1a32931f763b8",
+      "patch": "@@ -561,6 +561,11 @@ impl CancellationOrchestrator {\n \n         let remote_kill_script =\n             build_remote_kill_script(record.remote_pgid_file.as_deref(), record.build_id);\n+        // `tokio::time::timeout(..., cmd.output())` drops the spawned ssh\n+        // future when it fires. Without `kill_on_drop`, the local ssh\n+        // process stays alive holding a socket until its own keepalive\n+        // gives up \u2014 at exactly the moment we're trying to clean up after\n+        // a stuck build. Force a SIGKILL on cancellation.\n         let ssh_result = tokio::time::timeout(\n             self.config.remote_kill_timeout,\n             tokio::process::Command::new(\"ssh\")\n@@ -576,6 +581,7 @@ impl CancellationOrchestrator {\n                     &format!(\"{}@{}\", user, host),\n                     &remote_kill_script,\n                 ])\n+                .kill_on_drop(true)\n                 .output(),\n         )\n         .await;"
+    }
+  ]
+}

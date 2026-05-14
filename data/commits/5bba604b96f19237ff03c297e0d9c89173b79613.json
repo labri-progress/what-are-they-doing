@@ -1,0 +1,41 @@
+{
+  "message": "Eager cap-table cleanup on close\n\nclose() used to leave #imports, #answers, and #localCaps for the GC. Cost\nwas small, but a long-lived process that opens and tears down many\nsessions accumulated Map entries until a major GC, and the peer's export\ntable was only accurate after JS's FinalizationRegistry got around to\nfiring \u2014 could be seconds.\n\nNow:\n- Snapshot import IDs and fan out Release for each before flipping\n  #closed (since #sendRelease bails on a closed session). One #flush\n  after the loop so the Releases land on the wire alongside the queued\n  Finishes.\n- Clear #imports, #answers, #localCaps so the application-supplied cap\n  targets and answer-record snapshots are eligible for collection\n  immediately on close().\n\nNew test asserts that close() fans out at least one Release frame after\na call that returned two caps. 123 tests pass.",
+  "files": [
+    {
+      "sha": "d16b20e893b11177d8ebe3a42b36440e4913a7e0",
+      "filename": "docs/follow-ups.md",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 9,
+      "changes": 23,
+      "blob_url": "https://github.com/teamchong/capnwasm/blob/5bba604b96f19237ff03c297e0d9c89173b79613/docs%2Ffollow-ups.md",
+      "raw_url": "https://github.com/teamchong/capnwasm/raw/5bba604b96f19237ff03c297e0d9c89173b79613/docs%2Ffollow-ups.md",
+      "contents_url": "https://api.github.com/repos/teamchong/capnwasm/contents/docs%2Ffollow-ups.md?ref=5bba604b96f19237ff03c297e0d9c89173b79613",
+      "patch": "@@ -111,15 +111,20 @@ events, and `createMemoryTransportPair` propagates close across the pair.\n both `#questions` (existing) and `#streamQuestions` (added in #5). Pending\n calls and stream iterators reject with `session closed` instead of hanging.\n \n-What's still on the list:\n-\n-- **Explicit `#imports` / `#answers` / `#localCaps` cleanup on close.**\n-  Today these are left for GC. Memory cost is small but a long-lived\n-  process that opens and tears down many sessions accumulates the\n-  per-session FinalizationRegistry registrations until the next major GC.\n-- **Session-teardown sweep that explicitly fires Release for every still-\n-  imported cap.** Currently relies on JS GC eventually firing the\n-  FinalizationRegistry; immediate close-time release would be cleaner.\n+**Update (2026-04-30, second pass):** the cleanup parts also done.\n+`RpcSession.close()` now:\n+\n+- Fans out `Release` for every still-imported cap *before* the transport\n+  tears down, so the peer's export table is accurate immediately rather\n+  than waiting on the next major GC.\n+- Clears `#imports`, `#answers`, and `#localCaps` so a long-lived process\n+  that churns through many sessions doesn't accumulate Map entries.\n+\n+`test/rpc.test.mjs` now asserts that close fans out at least one Release\n+frame after a call that returned multiple caps.\n+\n+Still on the list:\n+\n - **Half-close detection on a slow peer.** `wsTransport` reacts to the\n   WebSocket's close/error events; it does not detect a peer that's stopped\n   reading our sends but isn't yet closed. A heartbeat / write-stalled"
+    },
+    {
+      "sha": "b8b5dbb7d2973e7d02cc5f8693096d81a1942b6a",
+      "filename": "js/rpc.mjs",
+      "status": "modified",
+      "additions": 19,
+      "deletions": 0,
+      "changes": 19,
+      "blob_url": "https://github.com/teamchong/capnwasm/blob/5bba604b96f19237ff03c297e0d9c89173b79613/js%2Frpc.mjs",
+      "raw_url": "https://github.com/teamchong/capnwasm/raw/5bba604b96f19237ff03c297e0d9c89173b79613/js%2Frpc.mjs",
+      "contents_url": "https://api.github.com/repos/teamchong/capnwasm/contents/js%2Frpc.mjs?ref=5bba604b96f19237ff03c297e0d9c89173b79613",
+      "patch": "@@ -435,6 +435,17 @@ export class RpcSession {\n     // Drain queued sends before tearing down \u2014 otherwise a call right\n     // before close() could be dropped.\n     this.#flush();\n+    // Eager Release fan-out, BEFORE flipping #closed: #sendRelease bails out\n+    // on a closed session, and we want these to land while the transport\n+    // is still up. After this loop the peer's export entries are accurate\n+    // without waiting for our FinalizationRegistry callbacks to fire on the\n+    // next major GC, which can be seconds or longer.\n+    if (this.#imports.size && !this.#closed) {\n+      // Snapshot keys \u2014 #sendRelease mutates #imports as we iterate.\n+      const ids = Array.from(this.#imports.keys());\n+      for (const id of ids) this.#sendRelease(id, 1);\n+      this.#flush();\n+    }\n     this.#closed = true;\n     const closeErr = new Error(\"session closed\");\n     for (const q of this.#questions.values()) {\n@@ -450,6 +461,14 @@ export class RpcSession {\n     // unwind instead of hanging on a chunk that will never arrive.\n     for (const stream of this.#streamQuestions.values()) stream.end(closeErr);\n     this.#streamQuestions.clear();\n+    // The remaining tables hold no awaitable state \u2014 clear them now so a\n+    // long-lived process churning sessions doesn't accumulate Map entries\n+    // until the next major GC. The application-supplied cap targets in\n+    // #localCaps and the answer-record snapshots in #answers become eligible\n+    // for collection immediately after this.\n+    this.#answers.clear();\n+    this.#localCaps.clear();\n+    this.#imports.clear();\n     this.#transport.close?.();\n   }\n "
+    },
+    {
+      "sha": "5aef308dcb28225d73c968f0c0e08ec5b2d94230",
+      "filename": "test/rpc.test.mjs",
+      "status": "modified",
+      "additions": 35,
+      "deletions": 0,
+      "changes": 35,
+      "blob_url": "https://github.com/teamchong/capnwasm/blob/5bba604b96f19237ff03c297e0d9c89173b79613/test%2Frpc.test.mjs",
+      "raw_url": "https://github.com/teamchong/capnwasm/raw/5bba604b96f19237ff03c297e0d9c89173b79613/test%2Frpc.test.mjs",
+      "contents_url": "https://api.github.com/repos/teamchong/capnwasm/contents/test%2Frpc.test.mjs?ref=5bba604b96f19237ff03c297e0d9c89173b79613",
+      "patch": "@@ -651,3 +651,38 @@ test(\"abort: signal that never fires doesn't change normal completion\", async ()\n   assert.ok(r);  // resolved, not rejected\n   client.close();\n });\n+\n+test(\"close: eagerly fans out Release for live imports\", async () => {\n+  // The auto-release path waits for FinalizationRegistry, which can take\n+  // a major GC cycle to fire. close() should issue Release synchronously\n+  // for every still-imported cap so the peer's export table is empty\n+  // before the transport tears down.\n+  const RELEASE = 6;\n+  const IFC = 0xc1c1c1c1c1c1c1c1n;\n+  const registry = new InterfaceRegistry();\n+  registry.register(IFC, 0, async () => ({ caps: [{ kind: \"x\" }, { kind: \"y\" }] }));\n+  const cppA = await loadWasm();\n+  const cppB = await loadWasm();\n+  const { a, b } = createMemoryTransportPair();\n+  const aTap = tap(a);\n+  new RpcSession(cppB, b, registry, { bootstrap: {} });\n+  const client = new RpcSession(cppA, a);\n+\n+  const root = client.bootstrap();\n+  // Hold imported caps to keep the FinalizationRegistry from racing us.\n+  const result = await root.call(IFC, 0, emptyMessage()).promise;\n+  assert.equal(result.caps.length, 2);\n+\n+  const releasesBefore = aTap.sentKinds.filter(k => k === RELEASE).length;\n+  client.close();\n+  // Drain microtasks so the close-flush runs.\n+  await new Promise(r => setImmediate(r));\n+  const releasesAfter = aTap.sentKinds.filter(k => k === RELEASE).length;\n+  // Bootstrap (id 0) + 2 returned caps = 3 imports the client knows about.\n+  // Eager fan-out on close should send one Release per \u2014 at minimum more\n+  // than zero, regardless of whether GC has fired in this tick.\n+  assert.ok(\n+    releasesAfter > releasesBefore,\n+    `expected close() to fan out Release frames; before=${releasesBefore} after=${releasesAfter}`,\n+  );\n+});"
+    }
+  ]
+}

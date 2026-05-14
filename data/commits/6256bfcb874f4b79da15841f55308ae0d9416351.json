@@ -1,0 +1,29 @@
+{
+  "message": "fix(claudeconfig): prevent WriteModel panic on JSON null settings\n\nFourth-pass review caught an actual crash-severity bug: if\nsettings.json contains literal JSON \\`null\\` (valid JSON that Go\nunmarshals by setting the destination map to nil, not an error),\nthen WriteModel's subsequent \\`parsed[ModelKey] = model\\` assignment\nhits the classic Go panic \"assignment to entry in nil map\" and\ncrashes whatever process is doing the write.\n\nThe trigger path:\n  1. User (or something) writes literal \\`null\\` into settings.json.\n  2. WriteModel reads it, existed=true, len(raw)>0, unmarshal into\n     the pre-initialized parsed map succeeds but replaces parsed\n     with nil.\n  3. \\`parsed[ModelKey] = model\\` \u2192 PANIC.\n\nFix: after a successful unmarshal, reset parsed to an empty\nnon-nil map if it came back nil. JSON \\`null\\` now behaves\nsemantically like \"no pre-existing object to merge with\" \u2014 the\nsubsequent write replaces the \\`null\\` content with either \\`{}\\`\n(clear-model path) or \\`{\"model\": \"...\"}\\` (set-model path),\nmatching what the user would expect had the file been empty.\n\nTestWriteModelHandlesJSONNullSettings exercises both sides:\n  - Setting a model on null-content file succeeds and produces\n    a normal {\"model\": \"X\"} file.\n  - Clearing the model on null-content file produces \"{}\".\n  - Neither panics.\n\nReads were already safe (Go map reads on nil return zero+false,\nno panic). The \\`removeIfEmptyObject\\` helper added in the third\npass also guards against nil maps explicitly. WriteModel was the\nlast remaining assignment-into-parsed-map site without the guard.\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "7758ff20bddce7ed25ccf4bbe29b6ce7a041281d",
+      "filename": "internal/claudeconfig/claudeconfig.go",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 0,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/6256bfcb874f4b79da15841f55308ae0d9416351/internal%2Fclaudeconfig%2Fclaudeconfig.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/6256bfcb874f4b79da15841f55308ae0d9416351/internal%2Fclaudeconfig%2Fclaudeconfig.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fclaudeconfig%2Fclaudeconfig.go?ref=6256bfcb874f4b79da15841f55308ae0d9416351",
+      "patch": "@@ -122,6 +122,16 @@ func WriteModel(settingsPath, model string) error {\n \t\tif err := json.Unmarshal(raw, &parsed); err != nil {\n \t\t\treturn fmt.Errorf(\"parse %s: %w\", settingsPath, err)\n \t\t}\n+\t\t// JSON `null` unmarshals into a map[string]any by setting the map\n+\t\t// to nil (not an error). A later `parsed[key] = value` on a nil\n+\t\t// map panics with \"assignment to entry in nil map\", so reset to\n+\t\t// an empty non-nil map and treat `null` as \"no pre-existing\n+\t\t// object to merge with\" \u2014 the subsequent write will replace the\n+\t\t// `null` content with either `{}` (for model == \"\") or\n+\t\t// `{\"model\": \"...\"}`.\n+\t\tif parsed == nil {\n+\t\t\tparsed = map[string]any{}\n+\t\t}\n \t}\n \n \tif model == \"\" {"
+    },
+    {
+      "sha": "2256920b3176ded823f8417b9261578bccf5a008",
+      "filename": "internal/claudeconfig/claudeconfig_test.go",
+      "status": "modified",
+      "additions": 43,
+      "deletions": 0,
+      "changes": 43,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/6256bfcb874f4b79da15841f55308ae0d9416351/internal%2Fclaudeconfig%2Fclaudeconfig_test.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/6256bfcb874f4b79da15841f55308ae0d9416351/internal%2Fclaudeconfig%2Fclaudeconfig_test.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fclaudeconfig%2Fclaudeconfig_test.go?ref=6256bfcb874f4b79da15841f55308ae0d9416351",
+      "patch": "@@ -428,6 +428,49 @@ func TestRemoveIfEmptyObjectNoOpsOnJSONNull(t *testing.T) {\n \t}\n }\n \n+// Regression: if the user's settings.json contains literal `null` (valid\n+// JSON that Go unmarshals into a map as nil, NOT into an empty map), a\n+// subsequent `parsed[ModelKey] = model` assignment would panic with\n+// \"assignment to entry in nil map\". Fixed in WriteModel by resetting a\n+// nil parsed map to an empty one before assignment.\n+func TestWriteModelHandlesJSONNullSettings(t *testing.T) {\n+\tdir := t.TempDir()\n+\tpath := filepath.Join(dir, \"settings.json\")\n+\tif err := os.WriteFile(path, []byte(`null`), 0o600); err != nil {\n+\t\tt.Fatal(err)\n+\t}\n+\n+\t// Both paths \u2014 writing a model, and clearing the model \u2014 must not\n+\t// panic on null content.\n+\tif err := WriteModel(path, \"sonnet-4.6\"); err != nil {\n+\t\tt.Fatalf(\"WriteModel with null settings: %v\", err)\n+\t}\n+\tmodel, hasModel, err := ReadModel(path)\n+\tif err != nil {\n+\t\tt.Fatalf(\"ReadModel: %v\", err)\n+\t}\n+\tif !hasModel || model != \"sonnet-4.6\" {\n+\t\tt.Errorf(\"post-write-on-null got (%q, %t); want (\\\"sonnet-4.6\\\", true)\", model, hasModel)\n+\t}\n+\n+\t// Reset to `null` and exercise the clear-model path too.\n+\tif err := os.WriteFile(path, []byte(`null`), 0o600); err != nil {\n+\t\tt.Fatal(err)\n+\t}\n+\tif err := WriteModel(path, \"\"); err != nil {\n+\t\tt.Fatalf(\"WriteModel(empty) with null settings: %v\", err)\n+\t}\n+\t// Clearing a field from a null-content file ends up writing `{}`.\n+\t// Not ideal but safer than panicking.\n+\traw, err := os.ReadFile(path)\n+\tif err != nil {\n+\t\tt.Fatal(err)\n+\t}\n+\tif string(raw) != \"{}\" {\n+\t\tt.Errorf(\"clear-on-null produced %q; expected \\\"{}\\\"\", raw)\n+\t}\n+}\n+\n func TestRemoveIfEmptyObjectNoOpsOnJSONArray(t *testing.T) {\n \tdir := t.TempDir()\n \tpath := filepath.Join(dir, \"settings.json\")"
+    }
+  ]
+}

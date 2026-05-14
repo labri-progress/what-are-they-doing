@@ -1,0 +1,65 @@
+{
+  "message": "fix: avoid startup gateway reload loop (#58678) (thanks @yelog)",
+  "files": [
+    {
+      "sha": "740938e74466e627bd557ccf983ccdbb9b6610a4",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/7cf8ccf9b3f3974a2ea926ef9482575181ef30f3/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/7cf8ccf9b3f3974a2ea926ef9482575181ef30f3/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=7cf8ccf9b3f3974a2ea926ef9482575181ef30f3",
+      "patch": "@@ -13,6 +13,7 @@ Docs: https://docs.openclaw.ai\n \n ### Fixes\n \n+- Gateway/reload: ignore startup config writes by persisted hash in the config reloader so generated auth tokens and seeded Control UI origins do not trigger a restart loop, while real `gateway.auth.*` edits still require restart. (#58678) Thanks @yelog\n - Discord/inbound media: pass Discord attachment and sticker downloads through the shared idle-timeout and worker-abort path so slow or stuck inbound media fetches stop hanging message processing. (#58593) Thanks @aquaright1\n - Telegram/local Bot API: preserve media MIME types for absolute-path downloads so local audio files still trigger transcription and other MIME-based handling. (#54603) Thanks @jzakirov\n - Tasks/gateway: re-check the current task record before maintenance marks runs lost or prunes them, so a task heartbeat or cleanup update that lands during a sweep no longer gets overwritten by stale snapshot state."
+    },
+    {
+      "sha": "12a1756772899379319166a57c649c6078d84459",
+      "filename": "src/gateway/config-reload.test.ts",
+      "status": "modified",
+      "additions": 61,
+      "deletions": 1,
+      "changes": 62,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/7cf8ccf9b3f3974a2ea926ef9482575181ef30f3/src%2Fgateway%2Fconfig-reload.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/7cf8ccf9b3f3974a2ea926ef9482575181ef30f3/src%2Fgateway%2Fconfig-reload.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fconfig-reload.test.ts?ref=7cf8ccf9b3f3974a2ea926ef9482575181ef30f3",
+      "patch": "@@ -199,6 +199,18 @@ describe(\"buildGatewayReloadPlan\", () => {\n     expect(plan.noopPaths).toContain(\"diagnostics.stuckSessionWarnMs\");\n   });\n \n+  it(\"restarts for gateway.auth.token changes\", () => {\n+    const plan = buildGatewayReloadPlan([\"gateway.auth.token\"]);\n+    expect(plan.restartGateway).toBe(true);\n+    expect(plan.restartReasons).toContain(\"gateway.auth.token\");\n+  });\n+\n+  it(\"restarts for gateway.auth.mode changes\", () => {\n+    const plan = buildGatewayReloadPlan([\"gateway.auth.mode\"]);\n+    expect(plan.restartGateway).toBe(true);\n+    expect(plan.restartReasons).toContain(\"gateway.auth.mode\");\n+  });\n+\n   it(\"defaults unknown paths to restart\", () => {\n     const plan = buildGatewayReloadPlan([\"unknownField\"]);\n     expect(plan.restartGateway).toBe(true);\n@@ -228,6 +240,11 @@ describe(\"buildGatewayReloadPlan\", () => {\n       expectRestartGateway: false,\n       expectNoopPath: \"gateway.remote.url\",\n     },\n+    {\n+      path: \"gateway.auth.token\",\n+      expectRestartGateway: true,\n+      expectRestartReason: \"gateway.auth.token\",\n+    },\n     {\n       path: \"unknownField\",\n       expectRestartGateway: true,\n@@ -304,7 +321,10 @@ function makeSnapshot(partial: Partial<ConfigFileSnapshot> = {}): ConfigFileSnap\n   };\n }\n \n-function createReloaderHarness(readSnapshot: () => Promise<ConfigFileSnapshot>) {\n+function createReloaderHarness(\n+  readSnapshot: () => Promise<ConfigFileSnapshot>,\n+  options: { initialInternalWriteHash?: string | null } = {},\n+) {\n   const watcher = createWatcherMock();\n   vi.spyOn(chokidar, \"watch\").mockReturnValue(watcher as unknown as never);\n   const onHotReload = vi.fn(async () => {});\n@@ -325,6 +345,7 @@ function createReloaderHarness(readSnapshot: () => Promise<ConfigFileSnapshot>)\n   };\n   const reloader = startGatewayConfigReloader({\n     initialConfig: { gateway: { reload: { debounceMs: 0 } } },\n+    initialInternalWriteHash: options.initialInternalWriteHash,\n     readSnapshot,\n     subscribeToWrites,\n     onHotReload,\n@@ -515,4 +536,43 @@ describe(\"startGatewayConfigReloader\", () => {\n \n     await harness.reloader.stop();\n   });\n+\n+  it(\"dedupes the first watcher reread for startup internal writes\", async () => {\n+    const readSnapshot = vi\n+      .fn<() => Promise<ConfigFileSnapshot>>()\n+      .mockResolvedValueOnce(\n+        makeSnapshot({\n+          config: {\n+            gateway: { reload: { debounceMs: 0 }, auth: { mode: \"token\", token: \"startup\" } },\n+          },\n+          hash: \"startup-internal-1\",\n+        }),\n+      )\n+      .mockResolvedValueOnce(\n+        makeSnapshot({\n+          config: {\n+            gateway: { reload: { debounceMs: 0 }, port: 19001 },\n+          },\n+          hash: \"external-after-startup-1\",\n+        }),\n+      );\n+    const harness = createReloaderHarness(readSnapshot, {\n+      initialInternalWriteHash: \"startup-internal-1\",\n+    });\n+\n+    harness.watcher.emit(\"change\");\n+    await vi.runOnlyPendingTimersAsync();\n+\n+    expect(readSnapshot).toHaveBeenCalledTimes(1);\n+    expect(harness.onHotReload).not.toHaveBeenCalled();\n+    expect(harness.onRestart).not.toHaveBeenCalled();\n+\n+    harness.watcher.emit(\"change\");\n+    await vi.runOnlyPendingTimersAsync();\n+\n+    expect(readSnapshot).toHaveBeenCalledTimes(2);\n+    expect(harness.onRestart).toHaveBeenCalledTimes(1);\n+\n+    await harness.reloader.stop();\n+  });\n });"
+    },
+    {
+      "sha": "6ca2742e017fa1d7f0bf141404a767beb9dde7d9",
+      "filename": "src/gateway/config-reload.ts",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/7cf8ccf9b3f3974a2ea926ef9482575181ef30f3/src%2Fgateway%2Fconfig-reload.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/7cf8ccf9b3f3974a2ea926ef9482575181ef30f3/src%2Fgateway%2Fconfig-reload.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fconfig-reload.ts?ref=7cf8ccf9b3f3974a2ea926ef9482575181ef30f3",
+      "patch": "@@ -76,6 +76,7 @@ export type GatewayConfigReloader = {\n \n export function startGatewayConfigReloader(opts: {\n   initialConfig: OpenClawConfig;\n+  initialInternalWriteHash?: string | null;\n   readSnapshot: () => Promise<ConfigFileSnapshot>;\n   onHotReload: (plan: GatewayReloadPlan, nextConfig: OpenClawConfig) => Promise<void>;\n   onRestart: (plan: GatewayReloadPlan, nextConfig: OpenClawConfig) => void | Promise<void>;\n@@ -96,7 +97,7 @@ export function startGatewayConfigReloader(opts: {\n   let restartQueued = false;\n   let missingConfigRetries = 0;\n   let pendingInProcessConfig: OpenClawConfig | null = null;\n-  let lastAppliedWriteHash: string | null = null;\n+  let lastAppliedWriteHash = opts.initialInternalWriteHash ?? null;\n \n   const scheduleAfter = (wait: number) => {\n     if (stopped) {"
+    },
+    {
+      "sha": "a4092dbc9df8070d146969cd2ca00d0e9a1f9b22",
+      "filename": "src/gateway/server.impl.ts",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 1,
+      "changes": 9,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/7cf8ccf9b3f3974a2ea926ef9482575181ef30f3/src%2Fgateway%2Fserver.impl.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/7cf8ccf9b3f3974a2ea926ef9482575181ef30f3/src%2Fgateway%2Fserver.impl.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fserver.impl.ts?ref=7cf8ccf9b3f3974a2ea926ef9482575181ef30f3",
+      "patch": "@@ -505,6 +505,7 @@ export async function startGatewayServer(\n     });\n \n   let cfgAtStart: OpenClawConfig;\n+  let startupInternalWriteHash: string | null = null;\n   const startupRuntimeConfig = applyConfigOverrides(configSnapshot.config);\n   const authBootstrap = await prepareGatewayStartupConfig({\n     configSnapshot,\n@@ -539,11 +540,16 @@ export async function startGatewayServer(\n   );\n   // Unconditional startup migration: seed gateway.controlUi.allowedOrigins for existing\n   // non-loopback installs that upgraded to v2026.2.26+ without required origins.\n-  cfgAtStart = await maybeSeedControlUiAllowedOriginsAtStartup({\n+  const controlUiSeed = await maybeSeedControlUiAllowedOriginsAtStartup({\n     config: cfgAtStart,\n     writeConfig: writeConfigFile,\n     log,\n   });\n+  cfgAtStart = controlUiSeed.config;\n+  if (authBootstrap.persistedGeneratedToken || controlUiSeed.persistedAllowedOriginsSeed) {\n+    const startupSnapshot = await readConfigFileSnapshot();\n+    startupInternalWriteHash = startupSnapshot.hash ?? null;\n+  }\n   await runStartupMatrixMigration({\n     cfg: cfgAtStart,\n     env: process.env,\n@@ -1436,6 +1442,7 @@ export async function startGatewayServer(\n \n           return startGatewayConfigReloader({\n             initialConfig: cfgAtStart,\n+            initialInternalWriteHash: startupInternalWriteHash,\n             readSnapshot: readConfigFileSnapshot,\n             subscribeToWrites: registerConfigWriteListener,\n             onHotReload: async (plan, nextConfig) => {"
+    },
+    {
+      "sha": "abbe9774978b676d44e01c65005603a2a4a96933",
+      "filename": "src/gateway/startup-control-ui-origins.ts",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 3,
+      "changes": 7,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/7cf8ccf9b3f3974a2ea926ef9482575181ef30f3/src%2Fgateway%2Fstartup-control-ui-origins.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/7cf8ccf9b3f3974a2ea926ef9482575181ef30f3/src%2Fgateway%2Fstartup-control-ui-origins.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fstartup-control-ui-origins.ts?ref=7cf8ccf9b3f3974a2ea926ef9482575181ef30f3",
+      "patch": "@@ -8,20 +8,21 @@ export async function maybeSeedControlUiAllowedOriginsAtStartup(params: {\n   config: OpenClawConfig;\n   writeConfig: (config: OpenClawConfig) => Promise<void>;\n   log: { info: (msg: string) => void; warn: (msg: string) => void };\n-}): Promise<OpenClawConfig> {\n+}): Promise<{ config: OpenClawConfig; persistedAllowedOriginsSeed: boolean }> {\n   const seeded = ensureControlUiAllowedOriginsForNonLoopbackBind(params.config);\n   if (!seeded.seededOrigins || !seeded.bind) {\n-    return params.config;\n+    return { config: params.config, persistedAllowedOriginsSeed: false };\n   }\n   try {\n     await params.writeConfig(seeded.config);\n     params.log.info(buildSeededOriginsInfoLog(seeded.seededOrigins, seeded.bind));\n+    return { config: seeded.config, persistedAllowedOriginsSeed: true };\n   } catch (err) {\n     params.log.warn(\n       `gateway: failed to persist gateway.controlUi.allowedOrigins seed: ${String(err)}. The gateway will start with the in-memory value but config was not saved.`,\n     );\n   }\n-  return seeded.config;\n+  return { config: seeded.config, persistedAllowedOriginsSeed: false };\n }\n \n function buildSeededOriginsInfoLog(origins: string[], bind: GatewayNonLoopbackBindMode): string {"
+    }
+  ]
+}

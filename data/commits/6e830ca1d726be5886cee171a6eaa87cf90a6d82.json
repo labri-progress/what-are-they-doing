@@ -1,0 +1,29 @@
+{
+  "message": "fix: bound group name scans",
+  "files": [
+    {
+      "sha": "a1727582067c5445324d4de092aab7e9f3ded26f",
+      "filename": "crates/frankenlibc-abi/src/grp_abi.rs",
+      "status": "modified",
+      "additions": 26,
+      "deletions": 6,
+      "changes": 32,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/6e830ca1d726be5886cee171a6eaa87cf90a6d82/crates%2Ffrankenlibc-abi%2Fsrc%2Fgrp_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/6e830ca1d726be5886cee171a6eaa87cf90a6d82/crates%2Ffrankenlibc-abi%2Fsrc%2Fgrp_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Fgrp_abi.rs?ref=6e830ca1d726be5886cee171a6eaa87cf90a6d82",
+      "patch": "@@ -16,11 +16,27 @@ use frankenlibc_core::errno;\n use frankenlibc_membrane::runtime_math::{ApiFamily, MembraneAction};\n \n use crate::errno_abi::set_abi_errno;\n+use crate::malloc_abi::known_remaining;\n use crate::runtime_policy;\n+use crate::util::scan_c_string;\n \n const GROUP_PATH: &str = \"/etc/group\";\n const GROUP_PATH_ENV: &str = \"FRANKENLIBC_GROUP_PATH\";\n \n+unsafe fn bounded_cstr_bytes<'a>(ptr: *const c_char) -> Option<&'a [u8]> {\n+    if ptr.is_null() {\n+        return None;\n+    }\n+    // SAFETY: ptr is a caller-provided C string; known_remaining bounds scans\n+    // over tracked malloc-backed buffers before they can cross allocation end.\n+    let (len, terminated) = unsafe { scan_c_string(ptr, known_remaining(ptr as usize)) };\n+    if !terminated {\n+        return None;\n+    }\n+    // SAFETY: scan_c_string observed len readable bytes before the terminator.\n+    Some(unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) })\n+}\n+\n #[derive(Debug, Clone, Copy, PartialEq, Eq)]\n struct FileFingerprint {\n     len: u64,\n@@ -321,9 +337,11 @@ pub unsafe extern \"C\" fn getgrnam(name: *const c_char) -> *mut libc::group {\n         return ptr::null_mut();\n     }\n \n-    // SAFETY: name is non-null.\n-    let name_cstr = unsafe { std::ffi::CStr::from_ptr(name) };\n-    let result = do_getgrnam(name_cstr.to_bytes());\n+    let Some(name_bytes) = (unsafe { bounded_cstr_bytes(name) }) else {\n+        runtime_policy::observe(ApiFamily::Resolver, decision.profile, 15, true);\n+        return ptr::null_mut();\n+    };\n+    let result = do_getgrnam(name_bytes);\n     if result.is_null()\n         && let Some(err) = group_backend_io_error()\n     {\n@@ -429,9 +447,11 @@ pub unsafe extern \"C\" fn getgrnam_r(\n         return libc::EACCES;\n     }\n \n-    // SAFETY: name is non-null.\n-    let name_cstr = unsafe { std::ffi::CStr::from_ptr(name) };\n-    let entry = match lookup_group_by_name(name_cstr.to_bytes()) {\n+    let Some(name_bytes) = (unsafe { bounded_cstr_bytes(name) }) else {\n+        runtime_policy::observe(ApiFamily::Resolver, decision.profile, 15, true);\n+        return libc::EINVAL;\n+    };\n+    let entry = match lookup_group_by_name(name_bytes) {\n         Some(e) => e,\n         None => {\n             if let Some(err) = group_backend_io_error() {"
+    },
+    {
+      "sha": "fe4e0630b16181357eb4048007cde793a188c314",
+      "filename": "crates/frankenlibc-abi/tests/grp_abi_test.rs",
+      "status": "modified",
+      "additions": 36,
+      "deletions": 0,
+      "changes": 36,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/6e830ca1d726be5886cee171a6eaa87cf90a6d82/crates%2Ffrankenlibc-abi%2Ftests%2Fgrp_abi_test.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/6e830ca1d726be5886cee171a6eaa87cf90a6d82/crates%2Ffrankenlibc-abi%2Ftests%2Fgrp_abi_test.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Ftests%2Fgrp_abi_test.rs?ref=6e830ca1d726be5886cee171a6eaa87cf90a6d82",
+      "patch": "@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};\n \n use frankenlibc_abi::errno_abi::__errno_location;\n use frankenlibc_abi::grp_abi::*;\n+use frankenlibc_abi::malloc_abi::{free, malloc};\n use frankenlibc_core::errno;\n \n static SEQ: AtomicU64 = AtomicU64::new(0);\n@@ -95,6 +96,18 @@ fn getgrnam_null_returns_null() {\n     });\n }\n \n+#[test]\n+fn getgrnam_rejects_unterminated_name() {\n+    with_group_lock(|| unsafe {\n+        let name = malloc(4).cast::<u8>();\n+        assert!(!name.is_null());\n+        std::ptr::copy_nonoverlapping(b\"root\".as_ptr(), name, 4);\n+        let grp = getgrnam(name.cast());\n+        free(name.cast());\n+        assert!(grp.is_null(), \"unterminated getgrnam name should fail\");\n+    });\n+}\n+\n #[test]\n fn getgrnam_missing_backend_sets_errno() {\n     let missing = temp_group_path();\n@@ -387,6 +400,29 @@ fn getgrnam_r_null_name_returns_not_found() {\n     });\n }\n \n+#[test]\n+fn getgrnam_r_rejects_unterminated_name() {\n+    with_group_lock(|| unsafe {\n+        let name = malloc(4).cast::<u8>();\n+        assert!(!name.is_null());\n+        std::ptr::copy_nonoverlapping(b\"root\".as_ptr(), name, 4);\n+        let mut grp: libc::group = std::mem::zeroed();\n+        let mut buf = vec![0u8; 1024];\n+        let mut result: *mut libc::group = std::ptr::null_mut();\n+\n+        let rc = getgrnam_r(\n+            name.cast(),\n+            &mut grp,\n+            buf.as_mut_ptr().cast(),\n+            buf.len(),\n+            &mut result,\n+        );\n+        free(name.cast());\n+        assert_eq!(rc, libc::EINVAL);\n+        assert!(result.is_null());\n+    });\n+}\n+\n #[test]\n fn getgrgid_r_nonexistent() {\n     with_group_lock(|| {"
+    }
+  ]
+}

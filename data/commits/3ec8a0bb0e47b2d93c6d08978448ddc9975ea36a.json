@@ -1,0 +1,77 @@
+{
+  "message": "fix: atomize cleanup coordinator locks, auto-remove terminal jobs, deterministic scheduler ordering, and minor correctness fixes\n\nSeveral independent correctness and robustness fixes across the runtime:\n\ncancel/symbol_cancel.rs \u2014 CleanupCoordinator::cleanup() previously took\nthe handlers lock, released it, then took the pending+completed locks.\nThis created a window where a concurrent cleanup call could see the\npending set but find the handler already removed, silently losing\nsymbols. Now all three locks (handlers -> pending -> completed) are\nacquired atomically in a single scope, eliminating the interleaving\nrace.\n\nnet/worker_channel.rs \u2014 FinalizeCompleted now calls remove_job()\ninstead of transitioning to Completed state and leaving the entry in the\ntracking map. This is the counterpart to the remove_job() method added\nin a prior commit \u2014 terminal jobs are now actually cleaned up, closing\nthe memory leak.\n\nio/copy.rs \u2014 Missing `steps += 1` in the copy loop's yield-back path.\nWithout this, the step counter would not advance when the copier yields\nto avoid starving other tasks, potentially causing the progress guard\nto misreport the copy as stalled.\n\nmessaging/jetstream.rs \u2014 Replaced Box::pin(sub.next(cx)) with\nstd::pin::pin!(sub.next(cx)) in the timeout path. The Box allocation\nwas unnecessary since the future is immediately awaited and never\nstored; stack-pinning avoids the heap round-trip on every poll.\n\nruntime/scheduler (global_injector.rs, priority.rs) \u2014 Added a final\n.then_with(|| other.task.cmp(&self.task)) tiebreaker to all three Ord\nimplementations (TimedTask, SchedulerEntry, TimedEntry). Previously,\nentries with identical priority/deadline AND identical generation were\nunordered, making BinaryHeap iteration non-deterministic across runs.\nThe task ID tiebreaker ensures fully deterministic ordering, which is\nrequired for DPOR exploration reproducibility.\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "62925a73e793523f9ace169c68367a280b479aec",
+      "filename": "src/cancel/symbol_cancel.rs",
+      "status": "modified",
+      "additions": 12,
+      "deletions": 8,
+      "changes": 20,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/3ec8a0bb0e47b2d93c6d08978448ddc9975ea36a/src%2Fcancel%2Fsymbol_cancel.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/3ec8a0bb0e47b2d93c6d08978448ddc9975ea36a/src%2Fcancel%2Fsymbol_cancel.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fcancel%2Fsymbol_cancel.rs?ref=3ec8a0bb0e47b2d93c6d08978448ddc9975ea36a",
+      "patch": "@@ -995,15 +995,19 @@ impl CleanupCoordinator {\n             handler_errors: Vec::new(),\n         };\n \n-        // Remove the handler up front so callback execution never happens\n-        // while holding the handlers lock (avoids re-entrant deadlocks).\n-        let handler = self.handlers.write().remove(&object_id);\n-\n-        // Get pending symbols and mark as completed\n-        let pending_set = {\n+        // Atomically extract the handler and pending symbols while marking as completed.\n+        // The lock hierarchy (handlers -> pending -> completed) prevents deadlocks,\n+        // and holding them all prevents concurrent cleanup calls from interleaving and\n+        // losing symbols by finding a pending set without its handler.\n+        let (handler, pending_set) = {\n+            let mut handlers = self.handlers.write();\n             let mut pending = self.pending.write();\n-            self.completed.write().insert(object_id);\n-            pending.remove(&object_id)\n+            let mut completed = self.completed.write();\n+\n+            let h = handlers.remove(&object_id);\n+            completed.insert(object_id);\n+            let p = pending.remove(&object_id);\n+            (h, p)\n         };\n \n         if let Some(set) = pending_set {"
+    },
+    {
+      "sha": "22bcceb268f71e4b5d15da8b37b0f44ca10d0006",
+      "filename": "src/io/copy.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/3ec8a0bb0e47b2d93c6d08978448ddc9975ea36a/src%2Fio%2Fcopy.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/3ec8a0bb0e47b2d93c6d08978448ddc9975ea36a/src%2Fio%2Fcopy.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fio%2Fcopy.rs?ref=3ec8a0bb0e47b2d93c6d08978448ddc9975ea36a",
+      "patch": "@@ -779,6 +779,7 @@ where\n                 cx.waker().wake_by_ref();\n                 return Poll::Pending;\n             }\n+            steps += 1;\n \n             let mut made_progress = false;\n "
+    },
+    {
+      "sha": "79bd9eaf1a2b24853b45ebd8f05d132c60aad690",
+      "filename": "src/messaging/jetstream.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 2,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/3ec8a0bb0e47b2d93c6d08978448ddc9975ea36a/src%2Fmessaging%2Fjetstream.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/3ec8a0bb0e47b2d93c6d08978448ddc9975ea36a/src%2Fmessaging%2Fjetstream.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fmessaging%2Fjetstream.rs?ref=3ec8a0bb0e47b2d93c6d08978448ddc9975ea36a",
+      "patch": "@@ -984,8 +984,7 @@ impl Consumer {\n                 break;\n             }\n             let item = if let Some(deadline) = client_deadline {\n-                // Box::pin is required because timeout_at() needs Unpin\n-                let next = Box::pin(sub.next(cx));\n+                let next = std::pin::pin!(sub.next(cx));\n                 timeout_at(deadline, next).await\n             } else {\n                 Ok(sub.next(cx).await)"
+    },
+    {
+      "sha": "fcf6be2ccd3512ded96ad6c45d9cbca2c04274ac",
+      "filename": "src/net/worker_channel.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 5,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/3ec8a0bb0e47b2d93c6d08978448ddc9975ea36a/src%2Fnet%2Fworker_channel.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/3ec8a0bb0e47b2d93c6d08978448ddc9975ea36a/src%2Fnet%2Fworker_channel.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fnet%2Fworker_channel.rs?ref=3ec8a0bb0e47b2d93c6d08978448ddc9975ea36a",
+      "patch": "@@ -866,11 +866,10 @@ impl WorkerCoordinator {\n                 self.enqueue_job_message(*job_id, WorkerOp::FinalizeJob { job_id: *job_id })\n             }\n             WorkerOp::FinalizeCompleted { job_id } => {\n-                let job = self\n-                    .jobs\n-                    .get_mut(job_id)\n-                    .ok_or(WorkerChannelError::UnknownJobId(*job_id))?;\n-                job.transition_to(JobState::Completed)?;\n+                if !self.jobs.contains_key(job_id) {\n+                    return Err(WorkerChannelError::UnknownJobId(*job_id));\n+                }\n+                self.remove_job(*job_id);\n                 Ok(())\n             }\n             WorkerOp::ShutdownCompleted => {"
+    },
+    {
+      "sha": "2cac76173c775926260e23869c50a83cebb0f82d",
+      "filename": "src/runtime/scheduler/global_injector.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/3ec8a0bb0e47b2d93c6d08978448ddc9975ea36a/src%2Fruntime%2Fscheduler%2Fglobal_injector.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/3ec8a0bb0e47b2d93c6d08978448ddc9975ea36a/src%2Fruntime%2Fscheduler%2Fglobal_injector.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Fscheduler%2Fglobal_injector.rs?ref=3ec8a0bb0e47b2d93c6d08978448ddc9975ea36a",
+      "patch": "@@ -50,7 +50,7 @@ impl Ord for TimedTask {\n         other.deadline.cmp(&self.deadline).then_with(|| {\n             let diff = other.generation.wrapping_sub(self.generation).cast_signed();\n             diff.cmp(&0)\n-        })\n+        }).then_with(|| other.task.cmp(&self.task))\n     }\n }\n "
+    },
+    {
+      "sha": "6a6488f4c908cd8e53801cdb8f150cd734eacce4",
+      "filename": "src/runtime/scheduler/priority.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/3ec8a0bb0e47b2d93c6d08978448ddc9975ea36a/src%2Fruntime%2Fscheduler%2Fpriority.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/3ec8a0bb0e47b2d93c6d08978448ddc9975ea36a/src%2Fruntime%2Fscheduler%2Fpriority.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Fscheduler%2Fpriority.rs?ref=3ec8a0bb0e47b2d93c6d08978448ddc9975ea36a",
+      "patch": "@@ -33,7 +33,7 @@ impl Ord for SchedulerEntry {\n         self.priority.cmp(&other.priority).then_with(|| {\n             let diff = other.generation.wrapping_sub(self.generation).cast_signed();\n             diff.cmp(&0)\n-        })\n+        }).then_with(|| other.task.cmp(&self.task))\n     }\n }\n \n@@ -63,7 +63,7 @@ impl Ord for TimedEntry {\n         other.deadline.cmp(&self.deadline).then_with(|| {\n             let diff = other.generation.wrapping_sub(self.generation).cast_signed();\n             diff.cmp(&0)\n-        })\n+        }).then_with(|| other.task.cmp(&self.task))\n     }\n }\n "
+    }
+  ]
+}

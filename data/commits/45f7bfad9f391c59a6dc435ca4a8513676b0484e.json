@@ -1,0 +1,65 @@
+{
+  "message": "Support unsigned integer indexing in TQL (#6064)",
+  "files": [
+    {
+      "sha": "39e0fdf8836c9c0d2fc749ef0ea209f5b2005ff6",
+      "filename": "changelog/unreleased/unsigned-integer-indexing-in-tql.md",
+      "status": "added",
+      "additions": 11,
+      "deletions": 0,
+      "changes": 11,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/45f7bfad9f391c59a6dc435ca4a8513676b0484e/changelog%2Funreleased%2Funsigned-integer-indexing-in-tql.md",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/45f7bfad9f391c59a6dc435ca4a8513676b0484e/changelog%2Funreleased%2Funsigned-integer-indexing-in-tql.md",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/changelog%2Funreleased%2Funsigned-integer-indexing-in-tql.md?ref=45f7bfad9f391c59a6dc435ca4a8513676b0484e",
+      "patch": "@@ -0,0 +1,11 @@\n+---\n+title: Unsigned integer indexing in TQL\n+type: bugfix\n+authors:\n+  - mavam\n+  - codex\n+created: 2026-04-22T15:03:27.225491Z\n+---\n+\n+Both list and record indexing in TQL now work with signed and unsigned integer indices.\n+This also applies to record field-position indexing and to the `get` function for records and lists."
+    },
+    {
+      "sha": "bcbb5cd36949051039450f7abd053b1e46d917c4",
+      "filename": "libtenzir/builtins/functions/misc.cpp",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/45f7bfad9f391c59a6dc435ca4a8513676b0484e/libtenzir%2Fbuiltins%2Ffunctions%2Fmisc.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/45f7bfad9f391c59a6dc435ca4a8513676b0484e/libtenzir%2Fbuiltins%2Ffunctions%2Fmisc.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Fbuiltins%2Ffunctions%2Fmisc.cpp?ref=45f7bfad9f391c59a6dc435ca4a8513676b0484e",
+      "patch": "@@ -822,7 +822,7 @@ class get final : public function_plugin {\n     auto fallback = std::optional<ast::expression>{};\n     TRY(argument_parser2::function(name())\n           .positional(\"x\", subject, \"record|list\")\n-          .positional(\"field\", field, \"string|int\")\n+          .positional(\"field\", field, \"string|int|uint\")\n           .positional(\"fallback\", fallback, \"any\")\n           .parse(inv, ctx));\n     return function_use::make("
+    },
+    {
+      "sha": "0525b49f2cddca538ea1c511ab479031b4ee32b8",
+      "filename": "libtenzir/src/tql2/eval_impl.cpp",
+      "status": "modified",
+      "additions": 65,
+      "deletions": 19,
+      "changes": 84,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/45f7bfad9f391c59a6dc435ca4a8513676b0484e/libtenzir%2Fsrc%2Ftql2%2Feval_impl.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/45f7bfad9f391c59a6dc435ca4a8513676b0484e/libtenzir%2Fsrc%2Ftql2%2Feval_impl.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Fsrc%2Ftql2%2Feval_impl.cpp?ref=45f7bfad9f391c59a6dc435ca4a8513676b0484e",
+      "patch": "@@ -15,15 +15,19 @@\n #include \"tenzir/detail/enumerate.hpp\"\n #include \"tenzir/detail/heterogeneous_string_hash.hpp\"\n #include \"tenzir/detail/similarity.hpp\"\n+#include \"tenzir/option.hpp\"\n #include \"tenzir/series_builder.hpp\"\n #include \"tenzir/to_string.hpp\"\n #include \"tenzir/tql2/eval.hpp\"\n #include \"tenzir/tql2/plugin.hpp\"\n #include \"tenzir/tql2/registry.hpp\"\n #include \"tenzir/view3.hpp\"\n \n+#include <concepts>\n #include <limits>\n+#include <optional>\n #include <ranges>\n+#include <type_traits>\n \n namespace tenzir {\n \n@@ -111,6 +115,37 @@ auto scatter_active_rows(multi_series compressed, ActiveRows const& active,\n   return result;\n }\n \n+template <class Index>\n+auto non_negative_index(Index index) -> Option<uint64_t> {\n+  if constexpr (std::signed_integral<Index>) {\n+    if (index < 0) {\n+      return None{};\n+    }\n+    return static_cast<uint64_t>(index);\n+  } else {\n+    return index;\n+  }\n+}\n+\n+template <class Index>\n+auto resolve_list_index(Index index, int64_t length) -> Option<int64_t> {\n+  TENZIR_ASSERT_GEQ(length, 0);\n+  if constexpr (std::signed_integral<Index>) {\n+    if (index < 0) {\n+      index = length + index;\n+    }\n+    if (index < 0 or index >= length) {\n+      return None{};\n+    }\n+    return index;\n+  } else {\n+    if (index >= static_cast<uint64_t>(length)) {\n+      return None{};\n+    }\n+    return detail::narrow_cast<int64_t>(index);\n+  }\n+}\n+\n } // namespace\n \n /// Find the best matching field name from available field names.\n@@ -571,22 +606,29 @@ auto evaluator::eval(ast::index_expr const& x, ActiveRows const& active)\n         result.push_back(b.finish_assert_one_array());\n         return multi_series{result};\n       }\n-      if (auto number = index.as<int64_type>()) {\n+      auto eval_numeric_index\n+        = [&]<class NumberType>(\n+            basic_series<NumberType> const& number) -> multi_series {\n         if (auto record = value.as<record_type>()) {\n           auto result = multi_series{};\n           auto warn_null_index = false;\n           auto warn_index_out_of_bounds = false;\n-          auto last_field = std::optional<int64_t>{};\n+          using Index\n+            = std::remove_cvref_t<decltype(number.array->GetView(int64_t{}))>;\n+          auto last_field = Option<Index>{};\n           auto group_offset = int64_t{};\n-          const auto add = [&](int64_t begin, int64_t end) {\n+          auto const add = [&](int64_t begin, int64_t end) {\n             if (begin == end) {\n               return;\n             }\n             if (not last_field) {\n               result.append(series::null(null_type{}, end - begin));\n               return;\n             }\n-            if (*last_field < 0 or *last_field >= record->array->num_fields()) {\n+            auto const field = non_negative_index(*last_field);\n+            auto const num_fields\n+              = static_cast<uint64_t>(record->array->num_fields());\n+            if (not field or *field >= num_fields) {\n               if (not warn_index_out_of_bounds) {\n                 for (auto r = begin; r < end; ++r) {\n                   if (active_slice.is_active(r)) {\n@@ -598,15 +640,15 @@ auto evaluator::eval(ast::index_expr const& x, ActiveRows const& active)\n               result.append(series::null(null_type{}, end - begin));\n               return;\n             }\n-\n+            auto const field_index = detail::narrow_cast<size_t>(*field);\n             result.append(series{\n-              record->type.field(*last_field).type,\n-              check(record->array->field(detail::narrow_cast<int>(*last_field))\n+              record->type.field(field_index).type,\n+              check(record->array->field(detail::narrow_cast<int>(field_index))\n                       ->SliceSafe(begin, end - begin)),\n             });\n           };\n-          for (auto i = int64_t{}; i < number->length(); ++i) {\n-            if (number->array->IsNull(i)) {\n+          for (auto i = int64_t{}; i < number.length(); ++i) {\n+            if (number.array->IsNull(i)) {\n               if (not last_field) {\n                 continue;\n               }\n@@ -618,15 +660,15 @@ auto evaluator::eval(ast::index_expr const& x, ActiveRows const& active)\n               group_offset = i;\n               continue;\n             }\n-            const auto field = number->array->GetView(i);\n-            if (field == last_field) {\n+            auto const field = number.array->GetView(i);\n+            if (last_field == field) {\n               continue;\n             }\n             add(group_offset, i);\n             last_field = field;\n             group_offset = i;\n           }\n-          add(group_offset, number->length());\n+          add(group_offset, number.length());\n           if (warn_null_index and not x.has_question_mark) {\n             diagnostic::warning(\"cannot use `null` as index\")\n               .primary(x.index, \"is null\")\n@@ -667,27 +709,25 @@ auto evaluator::eval(ast::index_expr const& x, ActiveRows const& active)\n             check(b->AppendNull());\n             continue;\n           }\n-          if (not number->array->IsValid(i)) {\n+          if (not number.array->IsValid(i)) {\n             if (active_slice.is_active(i)) {\n               number_null = true;\n             }\n             check(b->AppendNull());\n             continue;\n           }\n-          auto target = number->array->Value(i);\n+          auto target = number.array->Value(i);\n           auto length = list->array->value_length(i);\n-          if (target < 0) {\n-            target = length + target;\n-          }\n-          if (target < 0 or target >= length) {\n+          auto list_index = resolve_list_index(target, length);\n+          if (not list_index) {\n             if (active_slice.is_active(i)) {\n               out_of_bounds = true;\n             }\n             check(b->AppendNull());\n             continue;\n           }\n           auto list_offset = list->array->value_offset(i);\n-          auto value_index = list_offset + target;\n+          auto value_index = list_offset + *list_index;\n           check(\n             append_array_slice(*b, value_type, *list_values, value_index, 1));\n         }\n@@ -710,6 +750,12 @@ auto evaluator::eval(ast::index_expr const& x, ActiveRows const& active)\n             .emit(ctx_);\n         }\n         return series{value_type, finish(*b)};\n+      };\n+      if (auto number = index.as<int64_type>()) {\n+        return eval_numeric_index(*number);\n+      }\n+      if (auto number = index.as<uint64_type>()) {\n+        return eval_numeric_index(*number);\n       }\n       diagnostic::warning(\"eval not implemented yet for: {:?}\",\n                           use_default_formatter(x))"
+    },
+    {
+      "sha": "a6d2875828f9c3fa5daf09767ebf9a9c0afdf318",
+      "filename": "test/tests/operators/select/unsigned_indexing.tql",
+      "status": "added",
+      "additions": 19,
+      "deletions": 0,
+      "changes": 19,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/45f7bfad9f391c59a6dc435ca4a8513676b0484e/test%2Ftests%2Foperators%2Fselect%2Funsigned_indexing.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/45f7bfad9f391c59a6dc435ca4a8513676b0484e/test%2Ftests%2Foperators%2Fselect%2Funsigned_indexing.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fselect%2Funsigned_indexing.tql?ref=45f7bfad9f391c59a6dc435ca4a8513676b0484e",
+      "patch": "@@ -0,0 +1,19 @@\n+let $xs = [1, 2, 3]\n+let $r = {a: \"zero\", b: \"one\"}\n+let $i = 1.uint()\n+\n+from (\n+  {case: \"zero\", i: 0.uint(), xs: [\"a\", \"b\"], rec: {a: 10, b: 20}},\n+  {case: \"one\", i: 1.uint(), xs: [\"a\", \"b\"], rec: {a: 10, b: 20}},\n+  {case: \"out-of-bounds\", i: 2.uint(), xs: [\"a\", \"b\"], rec: {a: 10, b: 20}},\n+)\n+select \\\n+  case,\n+  list_const = $xs[$i],\n+  record_const = $r[$i],\n+  list_dynamic = xs[i]?,\n+  record_dynamic = rec[i]?,\n+  list_get = xs.get(i, \"fallback\"),\n+  record_get = rec.get(i, -1),\n+  list_oob = $xs[99.uint()],\n+  record_oob = $r[99.uint()]"
+    },
+    {
+      "sha": "80289c3663e424cec393af93b715f1fbddbd1122",
+      "filename": "test/tests/operators/select/unsigned_indexing.txt",
+      "status": "added",
+      "additions": 48,
+      "deletions": 0,
+      "changes": 48,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/45f7bfad9f391c59a6dc435ca4a8513676b0484e/test%2Ftests%2Foperators%2Fselect%2Funsigned_indexing.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/45f7bfad9f391c59a6dc435ca4a8513676b0484e/test%2Ftests%2Foperators%2Fselect%2Funsigned_indexing.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fselect%2Funsigned_indexing.txt?ref=45f7bfad9f391c59a6dc435ca4a8513676b0484e",
+      "patch": "@@ -0,0 +1,48 @@\n+{\n+  case: \"zero\",\n+  list_const: 2,\n+  record_const: \"one\",\n+  list_dynamic: \"a\",\n+  record_dynamic: 10,\n+  list_get: \"a\",\n+  record_get: 10,\n+  list_oob: null,\n+  record_oob: null,\n+}\n+{\n+  case: \"one\",\n+  list_const: 2,\n+  record_const: \"one\",\n+  list_dynamic: \"b\",\n+  record_dynamic: 20,\n+  list_get: \"b\",\n+  record_get: 20,\n+  list_oob: null,\n+  record_oob: null,\n+}\n+{\n+  case: \"out-of-bounds\",\n+  list_const: 2,\n+  record_const: \"one\",\n+  list_dynamic: null,\n+  record_dynamic: null,\n+  list_get: \"fallback\",\n+  record_get: -1,\n+  list_oob: null,\n+  record_oob: null,\n+}\n+warning: list index out of bounds\n+  --> tests/operators/select/unsigned_indexing.tql:18:18\n+   |\n+18 |   list_oob = $xs[99.uint()],\n+   |                  ~~~~~~~~~ is out of bounds\n+   |\n+   = hint: use `[\u2026]?` to suppress this warning\n+\n+warning: index out of bounds\n+  --> tests/operators/select/unsigned_indexing.tql:19:19\n+   |\n+19 |   record_oob = $r[99.uint()]\n+   |                   ~~~~~~~~~ is out of bounds\n+   |\n+   = hint: use `[\u2026]?` to suppress this warning"
+    }
+  ]
+}

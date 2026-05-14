@@ -1,0 +1,89 @@
+{
+  "message": "fix(firmware): defensive node_id capture prevents runtime clobber (#390)\n\nUsers on multi-node ESP32 deployments have been reporting for months\nthat their provisioned `node_id` reverts to the Kconfig default of `1`\nin UDP frames and the `csi_collector` init log, despite boot showing:\n\n    nvs_config: NVS override: node_id=4\n    main: ESP32-S3 CSI Node (ADR-018) - Node ID: 4\n    csi_collector: CSI collection initialized (node_id=1, channel=11)\n\nSee #232, #375, #385, #386, #390. The root memory-corruption path for\nthe `g_nvs_config.node_id` byte has not been definitively isolated\n(does not reproduce on my attached ESP32-S3 running current source\nand the v0.6.0 release binary), but the UDP frame header can be made\ntamper-proof regardless:\n\n1. `csi_collector_init()` now captures `g_nvs_config.node_id` into a\n   module-local `static uint8_t s_node_id` at init time.\n2. `csi_serialize_frame()` reads `buf[4]` from `s_node_id`, not from\n   the global - so any later corruption of `g_nvs_config` cannot\n   affect outgoing CSI frames.\n3. All other consumers (`edge_processing.c` x3, `wasm_runtime.c`,\n   `display_ui.c`, `main.c swarm_bridge_init`) now go through a new\n   `csi_collector_get_node_id()` accessor instead of reading the\n   global directly.\n4. A canary at end-of-init logs `WARN` if `g_nvs_config.node_id`\n   already diverges from the captured value - this will pinpoint\n   the corruption path if it happens on a user's device.\n\nHardware validation on attached ESP32-S3 (COM8):\n  - NVS loads node_id=2\n  - Boot log: `main: ... Node ID: 2`\n  - NEW log: `csi_collector: Captured node_id=2 at init (defensive\n    copy for #232/#375/#385/#390)`\n  - Init log: `csi_collector: CSI collection initialized (node_id=2)`\n  - UDP frame byte[4] = 2 (verified via socket sniffer, 15/15 packets)\n\nThis is defense in depth - it shields the UDP frame from whatever\nupstream bug is clobbering the struct. When a user hits the original\nbug, the canary WARN will help isolate the root cause.\n\nRefs #232 #375 #385 #386 #390\n\nCo-Authored-By: claude-flow <ruv@ruv.net>",
+  "files": [
+    {
+      "sha": "ab60036031e79efecafc3150f65c539ac008f36d",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/ruvnet/RuView/blob/425f0e6aac3101b7ea7269a850d28b6a533a2b1f/CHANGELOG.md",
+      "raw_url": "https://github.com/ruvnet/RuView/raw/425f0e6aac3101b7ea7269a850d28b6a533a2b1f/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/ruvnet/RuView/contents/CHANGELOG.md?ref=425f0e6aac3101b7ea7269a850d28b6a533a2b1f",
+      "patch": "@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0\n ### Fixed\n - **`provision.py` esptool v5 compat** (#391) \u2014 Stale `write_flash` (underscore) syntax in the dry-run manual-flash hint now uses `write-flash` (hyphenated) for esptool >= 5.x. The primary flash command was already correct.\n - **`provision.py` silent NVS wipe** (#391) \u2014 The script replaces the entire `csi_cfg` NVS namespace on every run, so partial invocations were silently erasing WiFi credentials and causing `Retrying WiFi connection (10/10)` in the field. Now refuses to run without `--ssid`, `--password`, and `--target-ip` unless `--force-partial` is passed. `--force-partial` prints a warning listing which keys will be wiped.\n+- **Firmware: defensive `node_id` capture** (#232, #375, #385, #386, #390) \u2014 Users on multi-node deployments reported `node_id` reverting to the Kconfig default (`1`) in UDP frames and in the `csi_collector` init log, despite NVS loading the correct value. The root cause (memory corruption of `g_nvs_config`) has not been definitively isolated, but the UDP frame header is now tamper-proof: `csi_collector_init()` captures `g_nvs_config.node_id` into a module-local `s_node_id` once, and `csi_serialize_frame()` plus all other consumers (`edge_processing.c`, `wasm_runtime.c`, `display_ui.c`, `swarm_bridge_init`) read it via the new `csi_collector_get_node_id()` accessor. A canary logs `WARN` if `g_nvs_config.node_id` diverges from `s_node_id` at end-of-init, helping isolate the upstream corruption path. Validated on attached ESP32-S3 (COM8): NVS `node_id=2` propagates through boot log, capture log, init log, and byte[4] of every UDP frame.\n \n ### Docs\n - **CHANGELOG catch-up** (#367) \u2014 Added missing entries for v0.5.5, v0.6.0, and v0.7.0 releases."
+    },
+    {
+      "sha": "ba5745376a6701aea7ffae03f9b0ca7b656cb2ad",
+      "filename": "firmware/esp32-csi-node/main/csi_collector.c",
+      "status": "modified",
+      "additions": 36,
+      "deletions": 4,
+      "changes": 40,
+      "blob_url": "https://github.com/ruvnet/RuView/blob/425f0e6aac3101b7ea7269a850d28b6a533a2b1f/firmware%2Fesp32-csi-node%2Fmain%2Fcsi_collector.c",
+      "raw_url": "https://github.com/ruvnet/RuView/raw/425f0e6aac3101b7ea7269a850d28b6a533a2b1f/firmware%2Fesp32-csi-node%2Fmain%2Fcsi_collector.c",
+      "contents_url": "https://api.github.com/repos/ruvnet/RuView/contents/firmware%2Fesp32-csi-node%2Fmain%2Fcsi_collector.c?ref=425f0e6aac3101b7ea7269a850d28b6a533a2b1f",
+      "patch": "@@ -25,6 +25,14 @@\n /* ADR-060: Access the global NVS config for MAC filter and channel override. */\n extern nvs_config_t g_nvs_config;\n \n+/* Defensive fix (#232, #375, #385, #386, #390): capture node_id at init-time\n+ * into a module-local static. Using the global g_nvs_config.node_id directly\n+ * at every callback is vulnerable to any memory corruption that clobbers the\n+ * struct (which users have reported reverting node_id to the Kconfig default\n+ * of 1). The local copy is set once at csi_collector_init() and then used\n+ * exclusively by csi_serialize_frame(). */\n+static uint8_t s_node_id = 1;\n+\n /* ADR-057: Build-time guard \u2014 fail early if CSI is not enabled in sdkconfig.\n  * Without this, the firmware compiles but crashes at runtime with:\n  *   \"E (xxxx) wifi:CSI not enabled in menuconfig!\"\n@@ -117,8 +125,9 @@ size_t csi_serialize_frame(const wifi_csi_info_t *info, uint8_t *buf, size_t buf\n     uint32_t magic = CSI_MAGIC;\n     memcpy(&buf[0], &magic, 4);\n \n-    /* Node ID (from NVS runtime config, not compile-time Kconfig) */\n-    buf[4] = g_nvs_config.node_id;\n+    /* Node ID (captured at init into s_node_id to survive memory corruption\n+     * that could clobber g_nvs_config.node_id - see #232/#375/#385/#390). */\n+    buf[4] = s_node_id;\n \n     /* Number of antennas */\n     buf[5] = n_antennas;\n@@ -215,6 +224,13 @@ static void wifi_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type)\n \n void csi_collector_init(void)\n {\n+    /* Capture node_id into module-local static at init time. After this point\n+     * csi_serialize_frame() uses s_node_id exclusively, isolating the UDP\n+     * frame node_id field from any memory corruption of g_nvs_config. */\n+    s_node_id = g_nvs_config.node_id;\n+    ESP_LOGI(TAG, \"Captured node_id=%u at init (defensive copy for #232/#375/#385/#390)\",\n+             (unsigned)s_node_id);\n+\n     /* ADR-060: Determine the CSI channel.\n      * Priority: 1) NVS override (--channel), 2) connected AP channel, 3) Kconfig default. */\n     uint8_t csi_channel = (uint8_t)CONFIG_CSI_WIFI_CHANNEL;\n@@ -272,8 +288,24 @@ void csi_collector_init(void)\n                  g_nvs_config.filter_mac[4], g_nvs_config.filter_mac[5]);\n     }\n \n-    ESP_LOGI(TAG, \"CSI collection initialized (node_id=%d, channel=%u)\",\n-             g_nvs_config.node_id, (unsigned)csi_channel);\n+    ESP_LOGI(TAG, \"CSI collection initialized (node_id=%u, channel=%u)\",\n+             (unsigned)s_node_id, (unsigned)csi_channel);\n+\n+    /* Clobber-detection canary: if g_nvs_config.node_id no longer matches the\n+     * value we captured, something corrupted the struct between nvs_config_load\n+     * and here. This is the historic #232/#375 symptom. */\n+    if (g_nvs_config.node_id != s_node_id) {\n+        ESP_LOGW(TAG, \"node_id clobber detected: captured=%u but g_nvs_config=%u \"\n+                 \"(frames will use captured value %u). Please report to #390.\",\n+                 (unsigned)s_node_id, (unsigned)g_nvs_config.node_id,\n+                 (unsigned)s_node_id);\n+    }\n+}\n+\n+/* Accessor for other modules that need the authoritative runtime node_id. */\n+uint8_t csi_collector_get_node_id(void)\n+{\n+    return s_node_id;\n }\n \n /* ---- ADR-029: Channel hopping ---- */"
+    },
+    {
+      "sha": "3bdfd14843540c78bff90cb0541f7ac93bf31d49",
+      "filename": "firmware/esp32-csi-node/main/csi_collector.h",
+      "status": "modified",
+      "additions": 12,
+      "deletions": 0,
+      "changes": 12,
+      "blob_url": "https://github.com/ruvnet/RuView/blob/425f0e6aac3101b7ea7269a850d28b6a533a2b1f/firmware%2Fesp32-csi-node%2Fmain%2Fcsi_collector.h",
+      "raw_url": "https://github.com/ruvnet/RuView/raw/425f0e6aac3101b7ea7269a850d28b6a533a2b1f/firmware%2Fesp32-csi-node%2Fmain%2Fcsi_collector.h",
+      "contents_url": "https://api.github.com/repos/ruvnet/RuView/contents/firmware%2Fesp32-csi-node%2Fmain%2Fcsi_collector.h?ref=425f0e6aac3101b7ea7269a850d28b6a533a2b1f",
+      "patch": "@@ -29,6 +29,18 @@\n  */\n void csi_collector_init(void);\n \n+/**\n+ * Get the runtime node_id captured at csi_collector_init().\n+ *\n+ * This is a defensive copy of g_nvs_config.node_id taken at init time. Other\n+ * modules (edge_processing, wasm_runtime, display_ui) should prefer this\n+ * accessor over reading g_nvs_config.node_id directly, because the global\n+ * struct can be clobbered by memory corruption (see #232, #375, #385, #390).\n+ *\n+ * @return Node ID (0-255) as loaded from NVS or Kconfig default at boot.\n+ */\n+uint8_t csi_collector_get_node_id(void);\n+\n /**\n  * Serialize CSI data into ADR-018 binary frame format.\n  *"
+    },
+    {
+      "sha": "901867fbdede3a23e583f2f0d4f49687db50f632",
+      "filename": "firmware/esp32-csi-node/main/display_ui.c",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/ruvnet/RuView/blob/425f0e6aac3101b7ea7269a850d28b6a533a2b1f/firmware%2Fesp32-csi-node%2Fmain%2Fdisplay_ui.c",
+      "raw_url": "https://github.com/ruvnet/RuView/raw/425f0e6aac3101b7ea7269a850d28b6a533a2b1f/firmware%2Fesp32-csi-node%2Fmain%2Fdisplay_ui.c",
+      "contents_url": "https://api.github.com/repos/ruvnet/RuView/contents/firmware%2Fesp32-csi-node%2Fmain%2Fdisplay_ui.c?ref=425f0e6aac3101b7ea7269a850d28b6a533a2b1f",
+      "patch": "@@ -8,6 +8,7 @@\n \n #include \"display_ui.h\"\n #include \"nvs_config.h\"\n+#include \"csi_collector.h\"  /* csi_collector_get_node_id() - defensive #390 */\n #include \"sdkconfig.h\"\n \n extern nvs_config_t g_nvs_config;\n@@ -350,7 +351,7 @@ void display_ui_update(void)\n     {\n         char buf[48];\n \n-        snprintf(buf, sizeof(buf), \"Node: %d\", g_nvs_config.node_id);\n+        snprintf(buf, sizeof(buf), \"Node: %u\", (unsigned)csi_collector_get_node_id());\n         lv_label_set_text(s_sys_node, buf);\n \n         snprintf(buf, sizeof(buf), \"Heap: %lu KB free\","
+    },
+    {
+      "sha": "ad5c879512c1bc13799889813271f8f972a37913",
+      "filename": "firmware/esp32-csi-node/main/edge_processing.c",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 3,
+      "changes": 7,
+      "blob_url": "https://github.com/ruvnet/RuView/blob/425f0e6aac3101b7ea7269a850d28b6a533a2b1f/firmware%2Fesp32-csi-node%2Fmain%2Fedge_processing.c",
+      "raw_url": "https://github.com/ruvnet/RuView/raw/425f0e6aac3101b7ea7269a850d28b6a533a2b1f/firmware%2Fesp32-csi-node%2Fmain%2Fedge_processing.c",
+      "contents_url": "https://api.github.com/repos/ruvnet/RuView/contents/firmware%2Fesp32-csi-node%2Fmain%2Fedge_processing.c?ref=425f0e6aac3101b7ea7269a850d28b6a533a2b1f",
+      "patch": "@@ -19,6 +19,7 @@\n \n #include \"edge_processing.h\"\n #include \"nvs_config.h\"\n+#include \"csi_collector.h\"  /* csi_collector_get_node_id() - defensive #390 */\n #include \"mmwave_sensor.h\"\n \n /* Runtime config \u2014 declared in main.c, loaded from NVS at boot. */\n@@ -441,7 +442,7 @@ static void send_compressed_frame(const uint8_t *iq_data, uint16_t iq_len,\n     uint32_t magic = EDGE_COMPRESSED_MAGIC;\n     memcpy(&pkt[0], &magic, 4);\n \n-    pkt[4] = g_nvs_config.node_id;\n+    pkt[4] = csi_collector_get_node_id();  /* #390: defensive copy */\n     pkt[5] = channel;\n     memcpy(&pkt[6], &iq_len, 2);\n     memcpy(&pkt[8], &comp_len, 2);\n@@ -557,7 +558,7 @@ static void send_vitals_packet(void)\n     memset(&pkt, 0, sizeof(pkt));\n \n     pkt.magic = EDGE_VITALS_MAGIC;\n-    pkt.node_id = g_nvs_config.node_id;\n+    pkt.node_id = csi_collector_get_node_id();  /* #390: defensive copy */\n \n     pkt.flags = 0;\n     if (s_presence_detected) pkt.flags |= 0x01;\n@@ -647,7 +648,7 @@ static void send_feature_vector(void)\n     memset(&pkt, 0, sizeof(pkt));\n \n     pkt.magic = EDGE_FEATURE_MAGIC;\n-    pkt.node_id = g_nvs_config.node_id;\n+    pkt.node_id = csi_collector_get_node_id();  /* #390: defensive copy */\n     pkt.reserved = 0;\n     pkt.seq = s_feature_seq++;\n     pkt.timestamp_us = esp_timer_get_time();"
+    },
+    {
+      "sha": "631a0dbaf8cb6749f6e151b67c3d2ddaa46106fa",
+      "filename": "firmware/esp32-csi-node/main/main.c",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/ruvnet/RuView/blob/425f0e6aac3101b7ea7269a850d28b6a533a2b1f/firmware%2Fesp32-csi-node%2Fmain%2Fmain.c",
+      "raw_url": "https://github.com/ruvnet/RuView/raw/425f0e6aac3101b7ea7269a850d28b6a533a2b1f/firmware%2Fesp32-csi-node%2Fmain%2Fmain.c",
+      "contents_url": "https://api.github.com/repos/ruvnet/RuView/contents/firmware%2Fesp32-csi-node%2Fmain%2Fmain.c?ref=425f0e6aac3101b7ea7269a850d28b6a533a2b1f",
+      "patch": "@@ -267,7 +267,7 @@ void app_main(void)\n         strncpy(swarm_cfg.seed_url, g_nvs_config.seed_url, sizeof(swarm_cfg.seed_url) - 1);\n         strncpy(swarm_cfg.seed_token, g_nvs_config.seed_token, sizeof(swarm_cfg.seed_token) - 1);\n         strncpy(swarm_cfg.zone_name, g_nvs_config.zone_name, sizeof(swarm_cfg.zone_name) - 1);\n-        swarm_ret = swarm_bridge_init(&swarm_cfg, g_nvs_config.node_id);\n+        swarm_ret = swarm_bridge_init(&swarm_cfg, csi_collector_get_node_id());\n         if (swarm_ret != ESP_OK) {\n             ESP_LOGW(TAG, \"Swarm bridge init failed: %s\", esp_err_to_name(swarm_ret));\n         }"
+    },
+    {
+      "sha": "8696be9fab612640cb3975e156a392a2620cb6bc",
+      "filename": "firmware/esp32-csi-node/main/wasm_runtime.c",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/ruvnet/RuView/blob/425f0e6aac3101b7ea7269a850d28b6a533a2b1f/firmware%2Fesp32-csi-node%2Fmain%2Fwasm_runtime.c",
+      "raw_url": "https://github.com/ruvnet/RuView/raw/425f0e6aac3101b7ea7269a850d28b6a533a2b1f/firmware%2Fesp32-csi-node%2Fmain%2Fwasm_runtime.c",
+      "contents_url": "https://api.github.com/repos/ruvnet/RuView/contents/firmware%2Fesp32-csi-node%2Fmain%2Fwasm_runtime.c?ref=425f0e6aac3101b7ea7269a850d28b6a533a2b1f",
+      "patch": "@@ -13,6 +13,7 @@\n #include \"sdkconfig.h\"\n #include \"wasm_runtime.h\"\n #include \"nvs_config.h\"\n+#include \"csi_collector.h\"  /* csi_collector_get_node_id() - defensive #390 */\n \n extern nvs_config_t g_nvs_config;\n \n@@ -383,7 +384,7 @@ static void send_wasm_output(uint8_t slot_id)\n     memset(&pkt, 0, sizeof(pkt));\n \n     pkt.magic = WASM_OUTPUT_MAGIC;\n-    pkt.node_id = g_nvs_config.node_id;\n+    pkt.node_id = csi_collector_get_node_id();  /* #390: defensive copy */\n     pkt.module_id = slot_id;\n     pkt.event_count = n_filtered;\n "
+    }
+  ]
+}

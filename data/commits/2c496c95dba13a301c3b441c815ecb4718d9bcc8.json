@@ -1,0 +1,29 @@
+{
+  "message": "fix(fcp-webhook): reject duplicate record_event replays (flywheel_connectors-g65em)",
+  "files": [
+    {
+      "sha": "a5f8576daeb4b99ab8aa1bb8162c40b712e45c93",
+      "filename": "crates/fcp-webhook/src/handler.rs",
+      "status": "modified",
+      "additions": 30,
+      "deletions": 3,
+      "changes": 33,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/2c496c95dba13a301c3b441c815ecb4718d9bcc8/crates%2Ffcp-webhook%2Fsrc%2Fhandler.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/2c496c95dba13a301c3b441c815ecb4718d9bcc8/crates%2Ffcp-webhook%2Fsrc%2Fhandler.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-webhook%2Fsrc%2Fhandler.rs?ref=2c496c95dba13a301c3b441c815ecb4718d9bcc8",
+      "patch": "@@ -229,12 +229,15 @@ impl<V: SignatureVerifier> WebhookHandler<V> {\n     /// Record an event as seen.\n     ///\n     /// # Errors\n-    /// Returns [`WebhookError::ReplayCacheFull`] when the cache has reached its maximum size.\n+    /// Returns [`WebhookError::ReplayDetected`] when the event was already\n+    /// recorded within the idempotency TTL. Returns\n+    /// [`WebhookError::ReplayCacheFull`] when the cache has reached its maximum size.\n     ///\n     /// # Deprecated\n     /// The write half of the racy [`check_replay`] + `record_event` pair.\n-    /// Use [`claim_event`] instead \u2014 it performs the duplicate check and\n-    /// the insert atomically under a single write lock (br-v3wrz).\n+    /// Use [`claim_event`] instead. `record_event` now fails closed on an\n+    /// already-recorded active ID, but it still cannot protect callers that\n+    /// process the event between a prior [`check_replay`] call and this write.\n     ///\n     /// [`check_replay`]: Self::check_replay\n     /// [`claim_event`]: Self::claim_event\n@@ -244,8 +247,20 @@ impl<V: SignatureVerifier> WebhookHandler<V> {\n     )]\n     pub fn record_event(&self, event_id: &str) -> WebhookResult<()> {\n         if self.config.idempotency_enabled {\n+            self.cleanup_seen_events();\n+\n             let mut state = self.seen_events.write();\n             let now = Utc::now();\n+            if let Some(&time) = state.events.get(event_id) {\n+                let ttl = chrono::Duration::from_std(self.config.idempotency_ttl)\n+                    .unwrap_or(chrono::TimeDelta::MAX);\n+                if now - time < ttl {\n+                    return Err(WebhookError::ReplayDetected {\n+                        event_id: event_id.to_string(),\n+                    });\n+                }\n+            }\n+\n             if state.events.len() >= MAX_SEEN_EVENTS && !state.events.contains_key(event_id) {\n                 self.prune_expired_events_locked(&mut state, now);\n                 if state.events.len() >= MAX_SEEN_EVENTS {\n@@ -677,6 +692,18 @@ mod tests {\n         ));\n     }\n \n+    #[test]\n+    fn record_event_rejects_active_duplicate_id() {\n+        let verifier = HmacSha256Verifier::new(\"secret\");\n+        let handler = WebhookHandler::new(verifier, \"test\");\n+\n+        assert!(handler.record_event(\"evt_1\").is_ok());\n+        assert!(matches!(\n+            handler.record_event(\"evt_1\"),\n+            Err(WebhookError::ReplayDetected { event_id }) if event_id == \"evt_1\"\n+        ));\n+    }\n+\n     /// Regression for br-v3wrz: `claim_event` MUST behave atomically\n     /// under the concurrent delivery pattern that made the deprecated\n     /// `check_replay` + `record_event` split pair unsafe."
+    },
+    {
+      "sha": "575f2496837508d0c1cebdacb9b263b9c2af9934",
+      "filename": "crates/fcp-webhook/tests/no_mock_integration.rs",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 4,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/2c496c95dba13a301c3b441c815ecb4718d9bcc8/crates%2Ffcp-webhook%2Ftests%2Fno_mock_integration.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/2c496c95dba13a301c3b441c815ecb4718d9bcc8/crates%2Ffcp-webhook%2Ftests%2Fno_mock_integration.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-webhook%2Ftests%2Fno_mock_integration.rs?ref=2c496c95dba13a301c3b441c815ecb4718d9bcc8",
+      "patch": "@@ -1006,14 +1006,15 @@ fn known_hmac_sha1_vectors() {\n // \u2500\u2500\u2500 claim_event vs record_event semantics \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n \n #[test]\n-fn record_event_does_not_check_replay() {\n+fn record_event_rejects_active_replay() {\n     let handler = WebhookHandler::new(HmacSha256Verifier::new(\"s\"), \"test\");\n \n-    // record_event records, never errors for fresh + duplicate inserts\n     handler.record_event(\"evt_r1\").unwrap();\n-    handler.record_event(\"evt_r1\").unwrap(); // no error on duplicate\n+    assert!(matches!(\n+        handler.record_event(\"evt_r1\"),\n+        Err(WebhookError::ReplayDetected { event_id }) if event_id == \"evt_r1\"\n+    ));\n \n-    // But check_replay now detects it\n     assert!(matches!(\n         handler.check_replay(\"evt_r1\"),\n         Err(WebhookError::ReplayDetected { .. })"
+    }
+  ]
+}

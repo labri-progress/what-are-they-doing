@@ -1,0 +1,41 @@
+{
+  "message": "fix: three small audit-pass safety fixes (cargo child cleanup, poisoned lock, malformed reclaim token)\n\nThree independent one-site hardenings from the same audit sweep, too\nsmall to justify a commit each.\n\n1. rch-common/src/cargo_path_deps.rs \u2014 kill & reap child on try_wait err\n\n   `invoke_cargo_metadata` polls a spawned `cargo metadata` subprocess\n   with `child.try_wait()` in a loop. The timeout branch already\n   kills+waits the child (committed in 0c98d12). The error branch \u2014\n   when `try_wait()` itself returns `Err(_)` (rare but possible: EINTR,\n   EINVAL from the kernel on corrupted state) \u2014 dropped straight to a\n   `return Err(...)` without touching the child at all, leaking the\n   subprocess to the caller as an orphan.\n\n   Fix: best-effort `child.kill(); child.wait();` before returning the\n   error, mirroring the timeout branch's pattern. The kills are\n   ignored-on-failure because there's no sensible recovery from a\n   kill-after-try_wait-error anyway \u2014 the goal is just \"don't leak\".\n\n   Also reflows one format! call that clippy flagged in the pre-existing\n   timeout branch (three-line `.with_diagnostic(format!(\\n ...))` -> one\n   line) \u2014 unrelated to the fix but fell under the same rustfmt pass.\n\n2. rchd/src/history.rs \u2014 `queued_build` uses poisoned-lock recovery\n\n   The other readers of `self.queued` in BuildHistory use the project's\n   standard pattern `.read().unwrap_or_else(|e| e.into_inner())` so that\n   a prior panic under the write lock doesn't escalate to a panic in a\n   harmless read query. `queued_build` was the one site that still said\n   `.read().unwrap()`, which would panic-propagate on a poisoned lock.\n   Harmonized with the rest of the file.\n\n   Not a \"poison is fine\" statement \u2014 if the write side truly corrupted\n   the Vec, readers will see that corruption. But reads here are\n   `.iter().find(...).cloned()` on QueuedBuildState which is a plain\n   struct; a corrupted clone is almost always preferable to a daemon\n   crash during a query.\n\n3. rchd/src/reclaim.rs \u2014 skip malformed tokens instead of aborting the line\n\n   `parse_reclaim_metrics` splits a metrics line into\n   `key=value` tokens. It used `?` on `split_once('=')`, which means a\n   single token that doesn't contain `=` causes the whole line's metrics\n   to be dropped (returns None from the function). Real-world output has\n   shown trailing shell-produced tokens like bare `--` or a stray\n   terminator that the previous behaviour turned into a silent metrics\n   loss.\n\n   Fix: `let-else continue` on the split result, so malformed tokens are\n   skipped and the well-formed `key=value` pairs in the same line are\n   still parsed. Any genuinely critical field absence is still caught\n   later by the per-field `removed`/`dry_removed`/etc. None checks.\n\nAll three are tightenings that do not change the happy path, only the\n\"something unexpected happened\" path.",
+  "files": [
+    {
+      "sha": "a59d1d0a34cb4888b2b110c4cc2a2744665b4d4e",
+      "filename": "rch-common/src/cargo_path_deps.rs",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 4,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/remote_compilation_helper/blob/2e9966bb7ab5b91ac22a66f666389965970ae35d/rch-common%2Fsrc%2Fcargo_path_deps.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/remote_compilation_helper/raw/2e9966bb7ab5b91ac22a66f666389965970ae35d/rch-common%2Fsrc%2Fcargo_path_deps.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/remote_compilation_helper/contents/rch-common%2Fsrc%2Fcargo_path_deps.rs?ref=2e9966bb7ab5b91ac22a66f666389965970ae35d",
+      "patch": "@@ -343,10 +343,7 @@ fn invoke_cargo_metadata(manifest_path: &Path) -> Result<String, CargoPathDepend\n                         ),\n                     )\n                     .with_manifest_path(manifest_path)\n-                    .with_diagnostic(format!(\n-                        \"timeout_secs={}\",\n-                        CARGO_METADATA_TIMEOUT.as_secs()\n-                    ));\n+                    .with_diagnostic(format!(\"timeout_secs={}\", CARGO_METADATA_TIMEOUT.as_secs()));\n                     if let Some(ke) = kill_err {\n                         err = err.with_diagnostic(format!(\"kill_failed={ke}\"));\n                     }\n@@ -358,6 +355,10 @@ fn invoke_cargo_metadata(manifest_path: &Path) -> Result<String, CargoPathDepend\n                 std::thread::sleep(std::time::Duration::from_millis(50));\n             }\n             Err(error) => {\n+                // try_wait() errored (rare: EINTR, EINVAL, etc.). Best-effort\n+                // kill so the child doesn't outlive us, then propagate.\n+                let _ = child.kill();\n+                let _ = child.wait();\n                 return Err(CargoPathDependencyError::new(\n                     CargoPathDependencyErrorKind::MetadataInvocationFailure,\n                     format!(\"failed to poll cargo metadata: {error}\"),"
+    },
+    {
+      "sha": "15e4b7cbbcf38de6ede090182d76f40b05139e3c",
+      "filename": "rchd/src/history.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 1,
+      "changes": 5,
+      "blob_url": "https://github.com/Dicklesworthstone/remote_compilation_helper/blob/2e9966bb7ab5b91ac22a66f666389965970ae35d/rchd%2Fsrc%2Fhistory.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/remote_compilation_helper/raw/2e9966bb7ab5b91ac22a66f666389965970ae35d/rchd%2Fsrc%2Fhistory.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/remote_compilation_helper/contents/rchd%2Fsrc%2Fhistory.rs?ref=2e9966bb7ab5b91ac22a66f666389965970ae35d",
+      "patch": "@@ -598,9 +598,12 @@ impl BuildHistory {\n \n     /// Get a specific queued build by ID.\n     pub fn queued_build(&self, queue_id: u64) -> Option<QueuedBuildState> {\n+        // Use the same poisoned-lock recovery pattern as the rest of this\n+        // file: a prior panic under this lock shouldn't propagate a panic\n+        // into a simple read-only query.\n         self.queued\n             .read()\n-            .unwrap()\n+            .unwrap_or_else(|e| e.into_inner())\n             .iter()\n             .find(|b| b.id == queue_id)\n             .cloned()"
+    },
+    {
+      "sha": "6d513c64bfe18ba425c2b02349236b3eda11b641",
+      "filename": "rchd/src/reclaim.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 1,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/remote_compilation_helper/blob/2e9966bb7ab5b91ac22a66f666389965970ae35d/rchd%2Fsrc%2Freclaim.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/remote_compilation_helper/raw/2e9966bb7ab5b91ac22a66f666389965970ae35d/rchd%2Fsrc%2Freclaim.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/remote_compilation_helper/contents/rchd%2Fsrc%2Freclaim.rs?ref=2e9966bb7ab5b91ac22a66f666389965970ae35d",
+      "patch": "@@ -306,7 +306,12 @@ fn parse_reclaim_metrics(stdout: &str) -> Option<ReclaimMetrics> {\n     let mut protected = None;\n \n     for token in line.split_whitespace().skip(1) {\n-        let (key, value) = token.split_once('=')?;\n+        // Skip malformed tokens rather than aborting the whole line.\n+        // A single stray token (e.g. a trailing suffix from a shell\n+        // variation) shouldn't cause us to drop perfectly good metrics.\n+        let Some((key, value)) = token.split_once('=') else {\n+            continue;\n+        };\n         match key {\n             \"removed\" => removed = value.parse::<u32>().ok(),\n             \"dry_removed\" => dry_removed = value.parse::<u32>().ok(),"
+    }
+  ]
+}

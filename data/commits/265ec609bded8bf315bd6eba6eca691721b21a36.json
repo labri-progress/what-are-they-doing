@@ -1,0 +1,101 @@
+{
+  "message": "fix: harden collapse writes and locks",
+  "files": [
+    {
+      "sha": "df064ef08da2c1b5d4f94e1ce8a317b09b638fed",
+      "filename": "src/core/session-collapse.ts",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/265ec609bded8bf315bd6eba6eca691721b21a36/src%2Fcore%2Fsession-collapse.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/265ec609bded8bf315bd6eba6eca691721b21a36/src%2Fcore%2Fsession-collapse.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/src%2Fcore%2Fsession-collapse.ts?ref=265ec609bded8bf315bd6eba6eca691721b21a36",
+      "patch": "@@ -182,12 +182,12 @@ export async function collapseSessionToMemory(\n \t\t};\n \t});\n \n-\tawait input.genome.addSegmentWithMemories(segment, memories);\n+\tconst persistedMemories = await input.genome.addSegmentWithMemories(segment, memories);\n \n \treturn {\n \t\tsegment,\n \t\tproject,\n-\t\textractedMemoryCount: filtered.length,\n+\t\textractedMemoryCount: persistedMemories.length,\n \t};\n }\n "
+    },
+    {
+      "sha": "6339ff89703e6d849c2ac100281f4c28898be7c6",
+      "filename": "src/genome/dedup.ts",
+      "status": "modified",
+      "additions": 37,
+      "deletions": 0,
+      "changes": 37,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/265ec609bded8bf315bd6eba6eca691721b21a36/src%2Fgenome%2Fdedup.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/265ec609bded8bf315bd6eba6eca691721b21a36/src%2Fgenome%2Fdedup.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/src%2Fgenome%2Fdedup.ts?ref=265ec609bded8bf315bd6eba6eca691721b21a36",
+      "patch": "@@ -92,6 +92,43 @@ export async function filterDuplicateDrafts(\n \treturn accepted;\n }\n \n+export async function filterDuplicateMemories(\n+\tmemories: readonly Memory[],\n+\texisting: readonly Memory[],\n+\toptions: DedupOptions = {},\n+): Promise<Memory[]> {\n+\tconst accepted: Memory[] = [];\n+\tfor (const memory of memories) {\n+\t\tconst textDuplicate = await findDuplicateMemory(\n+\t\t\t{ text: memory.content },\n+\t\t\t[...existing, ...accepted],\n+\t\t\t{ ...options, embeddingProvider: undefined },\n+\t\t);\n+\t\tif (textDuplicate.duplicate) continue;\n+\n+\t\tconst vector = memoryVectorForDedup(memory);\n+\t\tif (vector) {\n+\t\t\tconst vectorThreshold = options.vectorThreshold ?? VECTOR_DUPLICATE_THRESHOLD;\n+\t\t\tconst existingDuplicate = findVectorDuplicate(\n+\t\t\t\tvector,\n+\t\t\t\texisting.filter(isActiveMemoryForRecall),\n+\t\t\t\tvectorThreshold,\n+\t\t\t);\n+\t\t\tif (existingDuplicate.duplicate) continue;\n+\n+\t\t\tconst batchDuplicate = findVectorDuplicate(\n+\t\t\t\tvector,\n+\t\t\t\taccepted.filter(isActiveMemoryForRecall),\n+\t\t\t\tvectorThreshold,\n+\t\t\t);\n+\t\t\tif (batchDuplicate.duplicate) continue;\n+\t\t}\n+\n+\t\taccepted.push(memory);\n+\t}\n+\treturn accepted;\n+}\n+\n export function trigramDiceSimilarity(left: string, right: string): number {\n \tconst a = trigrams(normalizeText(left));\n \tconst b = trigrams(normalizeText(right));"
+    },
+    {
+      "sha": "76a76dcbac5260a88622379faee9c4568ae614b0",
+      "filename": "src/genome/file-lock.ts",
+      "status": "modified",
+      "additions": 106,
+      "deletions": 1,
+      "changes": 107,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/265ec609bded8bf315bd6eba6eca691721b21a36/src%2Fgenome%2Ffile-lock.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/265ec609bded8bf315bd6eba6eca691721b21a36/src%2Fgenome%2Ffile-lock.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/src%2Fgenome%2Ffile-lock.ts?ref=265ec609bded8bf315bd6eba6eca691721b21a36",
+      "patch": "@@ -1,26 +1,43 @@\n-import { mkdir, rm } from \"node:fs/promises\";\n+import { mkdir, readFile, rm, stat, writeFile } from \"node:fs/promises\";\n+import { hostname } from \"node:os\";\n+import { join } from \"node:path\";\n \n export interface DirectoryLockOptions {\n \ttimeoutMs?: number;\n \tpollMs?: number;\n+\tstaleMs?: number;\n }\n \n+interface DirectoryLockOwner {\n+\tpid: number;\n+\thostname: string;\n+\tcreatedAt: number;\n+}\n+\n+const DEFAULT_STALE_MS = 5 * 60_000;\n+const OWNER_FILE = \"owner.json\";\n+\n export async function acquireDirectoryLock(\n \tlockDir: string,\n \toptions: DirectoryLockOptions = {},\n ): Promise<() => Promise<void>> {\n \tconst deadline = Date.now() + (options.timeoutMs ?? 30_000);\n \tconst pollMs = options.pollMs ?? 25;\n+\tconst staleMs = options.staleMs ?? DEFAULT_STALE_MS;\n \twhile (true) {\n \t\ttry {\n \t\t\tawait mkdir(lockDir);\n+\t\t\tawait writeLockOwner(lockDir);\n \t\t\treturn async () => {\n \t\t\t\tawait rm(lockDir, { recursive: true, force: true });\n \t\t\t};\n \t\t} catch (err) {\n \t\t\tif (!(err instanceof Error) || !(\"code\" in err) || err.code !== \"EEXIST\") {\n \t\t\t\tthrow err;\n \t\t\t}\n+\t\t\tif (await reclaimStaleLock(lockDir, staleMs)) {\n+\t\t\t\tcontinue;\n+\t\t\t}\n \t\t\tif (Date.now() >= deadline) {\n \t\t\t\tthrow new Error(`Timed out waiting for directory lock at ${lockDir}`);\n \t\t\t}\n@@ -29,6 +46,94 @@ export async function acquireDirectoryLock(\n \t}\n }\n \n+async function writeLockOwner(lockDir: string): Promise<void> {\n+\ttry {\n+\t\tconst owner: DirectoryLockOwner = {\n+\t\t\tpid: process.pid,\n+\t\t\thostname: hostname(),\n+\t\t\tcreatedAt: Date.now(),\n+\t\t};\n+\t\tawait writeFile(join(lockDir, OWNER_FILE), JSON.stringify(owner), { flag: \"wx\" });\n+\t} catch (error) {\n+\t\tawait rm(lockDir, { recursive: true, force: true });\n+\t\tthrow error;\n+\t}\n+}\n+\n+async function reclaimStaleLock(lockDir: string, staleMs: number): Promise<boolean> {\n+\tconst owner = await readLockOwner(lockDir);\n+\tif (owner) {\n+\t\tconst ageMs = Date.now() - owner.createdAt;\n+\t\tif (owner.hostname === hostname()) {\n+\t\t\tif (!processIsAlive(owner.pid)) {\n+\t\t\t\tawait rm(lockDir, { recursive: true, force: true });\n+\t\t\t\treturn true;\n+\t\t\t}\n+\t\t\treturn false;\n+\t\t}\n+\t\tif (ageMs >= staleMs) {\n+\t\t\tawait rm(lockDir, { recursive: true, force: true });\n+\t\t\treturn true;\n+\t\t}\n+\t\treturn false;\n+\t}\n+\n+\ttry {\n+\t\tconst stats = await stat(lockDir);\n+\t\tif (Date.now() - stats.mtimeMs >= staleMs) {\n+\t\t\tawait rm(lockDir, { recursive: true, force: true });\n+\t\t\treturn true;\n+\t\t}\n+\t} catch (error) {\n+\t\tif (error instanceof Error && \"code\" in error && error.code === \"ENOENT\") return true;\n+\t\tthrow error;\n+\t}\n+\treturn false;\n+}\n+\n+async function readLockOwner(lockDir: string): Promise<DirectoryLockOwner | undefined> {\n+\ttry {\n+\t\tconst parsed: unknown = JSON.parse(await readFile(join(lockDir, OWNER_FILE), \"utf-8\"));\n+\t\tif (!isRecord(parsed)) return undefined;\n+\t\tconst pid = parsed.pid;\n+\t\tconst ownerHostname = parsed.hostname;\n+\t\tconst createdAt = parsed.createdAt;\n+\t\tif (\n+\t\t\ttypeof pid !== \"number\" ||\n+\t\t\ttypeof ownerHostname !== \"string\" ||\n+\t\t\ttypeof createdAt !== \"number\"\n+\t\t) {\n+\t\t\treturn undefined;\n+\t\t}\n+\t\treturn { pid, hostname: ownerHostname, createdAt };\n+\t} catch (error) {\n+\t\tif (error instanceof Error && \"code\" in error && error.code === \"ENOENT\") return undefined;\n+\t\tif (error instanceof SyntaxError) return undefined;\n+\t\tthrow error;\n+\t}\n+}\n+\n+function processIsAlive(pid: number): boolean {\n+\ttry {\n+\t\tprocess.kill(pid, 0);\n+\t\treturn true;\n+\t} catch (error) {\n+\t\tif (\n+\t\t\terror instanceof Error &&\n+\t\t\t\"code\" in error &&\n+\t\t\t((error as NodeJS.ErrnoException).code === \"ESRCH\" ||\n+\t\t\t\t(error as NodeJS.ErrnoException).code === \"EINVAL\")\n+\t\t) {\n+\t\t\treturn false;\n+\t\t}\n+\t\treturn true;\n+\t}\n+}\n+\n+function isRecord(value: unknown): value is Record<string, unknown> {\n+\treturn typeof value === \"object\" && value !== null && !Array.isArray(value);\n+}\n+\n async function sleep(ms: number): Promise<void> {\n \tawait new Promise((resolve) => setTimeout(resolve, ms));\n }"
+    },
+    {
+      "sha": "8af0eba37f86e3ab3acba50ed64b01c10f3f8d99",
+      "filename": "src/genome/genome.ts",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 9,
+      "changes": 22,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/265ec609bded8bf315bd6eba6eca691721b21a36/src%2Fgenome%2Fgenome.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/265ec609bded8bf315bd6eba6eca691721b21a36/src%2Fgenome%2Fgenome.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/src%2Fgenome%2Fgenome.ts?ref=265ec609bded8bf315bd6eba6eca691721b21a36",
+      "patch": "@@ -11,6 +11,7 @@ import { parseAgentMarkdown, serializeAgentMarkdown } from \"../agents/markdown-l\n import type { AgentSpec, Memory, RoutingRule } from \"../kernel/types.ts\";\n import type { EmbeddingProvider } from \"../llm/embeddings.ts\";\n import { getToolDisplayName } from \"../shared/tool-display.ts\";\n+import { filterDuplicateMemories } from \"./dedup.ts\";\n import { acquireDirectoryLock } from \"./file-lock.ts\";\n import { sanitizeGitEnv } from \"./git-env.ts\";\n import {\n@@ -432,7 +433,7 @@ export class Genome {\n \t}\n \n \t/** Add a collapsed segment and extracted memories in one verified genome mutation. */\n-\tasync addSegmentWithMemories(segment: MemorySegment, memories: Memory[]): Promise<void> {\n+\tasync addSegmentWithMemories(segment: MemorySegment, memories: Memory[]): Promise<Memory[]> {\n \t\tconst provider = await this.getEmbeddingProvider();\n \t\tconst embeddedSegment = await attachReadySegmentEmbedding(segment, provider);\n \t\tconst embeddedMemories: Memory[] = [];\n@@ -443,30 +444,33 @@ export class Genome {\n \n \t\tconst segmentsPath = join(this.rootPath, \"memories\", \"segments.jsonl\");\n \t\tconst memoriesPath = join(this.rootPath, \"memories\", \"memories.jsonl\");\n-\t\tconst filesToAdd = embeddedMemories.length > 0 ? [segmentsPath, memoriesPath] : [segmentsPath];\n-\t\tawait this.withMemoryWriteLock(async () => {\n+\t\treturn this.withMemoryWriteLock(async () => {\n \t\t\tawait this.segments.load();\n \t\t\tawait this.memories.load();\n-\t\t\tthis.assertCanAddSegmentWithMemories(embeddedSegment, embeddedMemories);\n+\t\t\tconst memoriesToStage = await filterDuplicateMemories(embeddedMemories, this.memories.all());\n+\t\t\tthis.assertCanAddSegmentWithMemories(embeddedSegment, memoriesToStage);\n+\t\t\tconst filesToAdd = memoriesToStage.length > 0 ? [segmentsPath, memoriesPath] : [segmentsPath];\n \t\t\tconst snapshots = await snapshotTextFiles(filesToAdd);\n \t\t\tlet committed = false;\n \t\t\ttry {\n \t\t\t\tthis.segments.stage(embeddedSegment);\n-\t\t\t\tfor (const memory of embeddedMemories) {\n-\t\t\t\t\tthis.memories.stage(memory);\n+\t\t\t\tconst savedMemories: Memory[] = [];\n+\t\t\t\tfor (const memory of memoriesToStage) {\n+\t\t\t\t\tsavedMemories.push(this.memories.stage(memory));\n \t\t\t\t}\n-\t\t\t\tif (embeddedMemories.length > 0) await this.memories.mergeLatestFromDisk();\n+\t\t\t\tif (memoriesToStage.length > 0) await this.memories.mergeLatestFromDisk();\n \t\t\t\tawait this.segments.save();\n-\t\t\t\tif (embeddedMemories.length > 0) await this.memories.save();\n+\t\t\t\tif (memoriesToStage.length > 0) await this.memories.save();\n \t\t\t\tawait git(this.rootPath, \"add\", ...filesToAdd);\n \t\t\t\tawait rebuildMemoryIndexFromJsonl(this.rootPath, { assumeMemoryWriteLock: true });\n \t\t\t\tawait git(\n \t\t\t\t\tthis.rootPath,\n \t\t\t\t\t\"commit\",\n \t\t\t\t\t\"-m\",\n-\t\t\t\t\t`genome: add memory segment '${embeddedSegment.id}' with ${embeddedMemories.length} memories`,\n+\t\t\t\t\t`genome: add memory segment '${embeddedSegment.id}' with ${memoriesToStage.length} memories`,\n \t\t\t\t);\n \t\t\t\tcommitted = true;\n+\t\t\t\treturn savedMemories;\n \t\t\t} catch (err) {\n \t\t\t\tif (!committed) {\n \t\t\t\t\tawait restoreUncommittedMemoryMutation(this.rootPath, snapshots, filesToAdd);"
+    },
+    {
+      "sha": "8b20277d8edc39130bdb318ca3991c6e00f82b89",
+      "filename": "test/genome/file-lock.test.ts",
+      "status": "added",
+      "additions": 58,
+      "deletions": 0,
+      "changes": 58,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/265ec609bded8bf315bd6eba6eca691721b21a36/test%2Fgenome%2Ffile-lock.test.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/265ec609bded8bf315bd6eba6eca691721b21a36/test%2Fgenome%2Ffile-lock.test.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/test%2Fgenome%2Ffile-lock.test.ts?ref=265ec609bded8bf315bd6eba6eca691721b21a36",
+      "patch": "@@ -0,0 +1,58 @@\n+import { describe, expect, test } from \"bun:test\";\n+import { mkdir, rm, writeFile } from \"node:fs/promises\";\n+import { hostname, tmpdir } from \"node:os\";\n+import { join } from \"node:path\";\n+import { acquireDirectoryLock } from \"../../src/genome/file-lock.ts\";\n+\n+describe(\"acquireDirectoryLock\", () => {\n+\ttest(\"times out while an active lock is held\", async () => {\n+\t\tconst root = join(tmpdir(), `sprout-lock-active-${Date.now()}`);\n+\t\tconst lockDir = join(root, \"memory-write.lock\");\n+\t\tawait mkdir(root, { recursive: true });\n+\t\tconst release = await acquireDirectoryLock(lockDir);\n+\t\ttry {\n+\t\t\tawait expect(\n+\t\t\t\tacquireDirectoryLock(lockDir, { timeoutMs: 20, pollMs: 5, staleMs: 0 }),\n+\t\t\t).rejects.toThrow(\"Timed out\");\n+\t\t} finally {\n+\t\t\tawait release();\n+\t\t\tawait rm(root, { recursive: true, force: true });\n+\t\t}\n+\t});\n+\n+\ttest(\"reclaims a lock owned by a dead local process\", async () => {\n+\t\tconst root = join(tmpdir(), `sprout-lock-dead-${Date.now()}`);\n+\t\tconst lockDir = join(root, \"memory-write.lock\");\n+\t\tawait mkdir(lockDir, { recursive: true });\n+\t\tawait writeFile(\n+\t\t\tjoin(lockDir, \"owner.json\"),\n+\t\t\tJSON.stringify({\n+\t\t\t\tpid: 99_999_999,\n+\t\t\t\thostname: hostname(),\n+\t\t\t\tcreatedAt: Date.now(),\n+\t\t\t}),\n+\t\t);\n+\n+\t\tconst release = await acquireDirectoryLock(lockDir, {\n+\t\t\ttimeoutMs: 200,\n+\t\t\tpollMs: 5,\n+\t\t\tstaleMs: 60_000,\n+\t\t});\n+\t\tawait release();\n+\t\tawait rm(root, { recursive: true, force: true });\n+\t});\n+\n+\ttest(\"reclaims ownerless stale lock directories\", async () => {\n+\t\tconst root = join(tmpdir(), `sprout-lock-ownerless-${Date.now()}`);\n+\t\tconst lockDir = join(root, \"memory-write.lock\");\n+\t\tawait mkdir(lockDir, { recursive: true });\n+\n+\t\tconst release = await acquireDirectoryLock(lockDir, {\n+\t\t\ttimeoutMs: 200,\n+\t\t\tpollMs: 5,\n+\t\t\tstaleMs: 0,\n+\t\t});\n+\t\tawait release();\n+\t\tawait rm(root, { recursive: true, force: true });\n+\t});\n+});"
+    },
+    {
+      "sha": "5dc30a56d02be6879ac72df9c1af694d3a1cadce",
+      "filename": "test/genome/genome.test.ts",
+      "status": "modified",
+      "additions": 21,
+      "deletions": 0,
+      "changes": 21,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/265ec609bded8bf315bd6eba6eca691721b21a36/test%2Fgenome%2Fgenome.test.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/265ec609bded8bf315bd6eba6eca691721b21a36/test%2Fgenome%2Fgenome.test.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/test%2Fgenome%2Fgenome.test.ts?ref=265ec609bded8bf315bd6eba6eca691721b21a36",
+      "patch": "@@ -1006,6 +1006,27 @@ describe(\"Genome\", () => {\n \t\t\texpect(await git(root, \"status\", \"--porcelain\")).toBe(\"\");\n \t\t});\n \n+\t\ttest(\"addSegmentWithMemories deduplicates against fresh locked disk state\", async () => {\n+\t\t\tconst root = join(tempDir, \"segment-memory-fresh-dedup\");\n+\t\t\tconst writer = await createInitializedGenome(root);\n+\t\t\tconst staleGenome = createTestGenome(root);\n+\t\t\tawait staleGenome.loadFromDisk();\n+\t\t\tawait writer.addMemory(makeMemory({ id: \"fresh-duplicate\", content: \"already present\" }));\n+\n+\t\t\tconst persisted = await staleGenome.addSegmentWithMemories(\n+\t\t\t\tmakeSegment({ id: \"dedup-segment\" }),\n+\t\t\t\t[makeMemory({ id: \"stale-duplicate\", content: \"already present\" })],\n+\t\t\t);\n+\n+\t\t\texpect(persisted).toEqual([]);\n+\t\t\texpect(staleGenome.segments.getById(\"dedup-segment\")).toBeDefined();\n+\t\t\texpect(staleGenome.memories.getById(\"stale-duplicate\")).toBeUndefined();\n+\t\t\texpect(await readOptionalFile(join(root, \"memories\", \"memories.jsonl\"))).not.toContain(\n+\t\t\t\t\"stale-duplicate\",\n+\t\t\t);\n+\t\t\texpect(await git(root, \"status\", \"--porcelain\")).toBe(\"\");\n+\t\t});\n+\n \t\ttest(\"addSegmentWithMemories restores JSONL and index when commit fails after rebuild\", async () => {\n \t\t\tconst root = join(tempDir, \"segment-memory-commit-fails\");\n \t\t\tconst genome = await createInitializedGenome(root);"
+    },
+    {
+      "sha": "5060510368b97084d591bc51030fe6e311865ed9",
+      "filename": "test/genome/memory-store.test.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/265ec609bded8bf315bd6eba6eca691721b21a36/test%2Fgenome%2Fmemory-store.test.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/265ec609bded8bf315bd6eba6eca691721b21a36/test%2Fgenome%2Fmemory-store.test.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/test%2Fgenome%2Fmemory-store.test.ts?ref=265ec609bded8bf315bd6eba6eca691721b21a36",
+      "patch": "@@ -333,7 +333,7 @@ describe(\"MemoryStore\", () => {\n \t\tconst store = new MemoryStore(filePath);\n \t\tawait store.load();\n \t\tawait store.add(makeMemory({ id: \"dup-1\", content: \"first\" }));\n-\t\texpect(store.add(makeMemory({ id: \"dup-1\", content: \"second\" }))).rejects.toThrow(\n+\t\tawait expect(store.add(makeMemory({ id: \"dup-1\", content: \"second\" }))).rejects.toThrow(\n \t\t\t/already exists/,\n \t\t);\n \t});"
+    },
+    {
+      "sha": "8a17fde910618ab6e35ffa6a04ae81f342144f3e",
+      "filename": "test/host/session-collapse.test.ts",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/265ec609bded8bf315bd6eba6eca691721b21a36/test%2Fhost%2Fsession-collapse.test.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/265ec609bded8bf315bd6eba6eca691721b21a36/test%2Fhost%2Fsession-collapse.test.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/test%2Fhost%2Fsession-collapse.test.ts?ref=265ec609bded8bf315bd6eba6eca691721b21a36",
+      "patch": "@@ -326,6 +326,7 @@ abc123\n \t\t\t},\n \t\t\taddSegmentWithMemories: async (_segment: unknown, memories: readonly unknown[]) => {\n \t\t\t\tpersistedMemoryCount = memories.length;\n+\t\t\t\treturn memories;\n \t\t\t},\n \t\t} as unknown as Genome;\n \n@@ -390,7 +391,7 @@ abc123\n \t\t\tmemoryEmbeddingProvider: async () => {\n \t\t\t\tthrow new Error(\"empty extraction should not load embeddings\");\n \t\t\t},\n-\t\t\taddSegmentWithMemories: async () => {},\n+\t\t\taddSegmentWithMemories: async () => [],\n \t\t} as unknown as Genome;\n \n \t\tawait collapseSessionToMemory({"
+    }
+  ]
+}

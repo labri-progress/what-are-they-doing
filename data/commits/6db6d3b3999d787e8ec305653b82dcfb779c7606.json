@@ -1,0 +1,41 @@
+{
+  "message": "fix: blocking pool task loss, Count repoll panic, timer waker isolation\n\nThree fail-closed hardening fixes:\n\n1. runtime/blocking_pool.rs \u2014 When a retiring thread could not\n   un-retire (max active threads reached) but a task was waiting in\n   the queue, the task was silently dropped.  Fix: force un-retire\n   and increment active_threads when a queued task exists, ensuring\n   no task is ever lost due to the thread count cap.\n\n2. stream/count.rs \u2014 Polling a Count future after completion\n   previously returned a cached value silently, masking logic errors\n   in callers that polled a resolved future.  Fix: panic with a\n   descriptive assertion (\"polled after completion\") to fail fast.\n   Tests updated to use catch_unwind and verify the panic message.\n\n3. time/driver.rs \u2014 A panicking waker during timer expiry would\n   unwind through the driver loop, preventing remaining wakers from\n   being fired.  Fix: wrap each waker invocation in catch_unwind so\n   a single bad waker cannot block other timers from firing.\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "a3d7025cdac10956856ce3a7ca7bba320f1b8468",
+      "filename": "src/runtime/blocking_pool.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 1,
+      "changes": 5,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/6db6d3b3999d787e8ec305653b82dcfb779c7606/src%2Fruntime%2Fblocking_pool.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/6db6d3b3999d787e8ec305653b82dcfb779c7606/src%2Fruntime%2Fblocking_pool.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Fblocking_pool.rs?ref=6db6d3b3999d787e8ec305653b82dcfb779c7606",
+      "patch": "@@ -857,7 +857,10 @@ fn blocking_worker_loop(inner: &BlockingPoolInner) -> bool {\n                             }\n                         }\n                         if !unretired {\n-                            return true;\n+                            // We can't un-retire (max_threads reached) but\n+                            // a task is waiting. Force un-retire to prevent\n+                            // task loss \u2014 temporarily exceed max_threads.\n+                            inner.active_threads.fetch_add(1, Ordering::Relaxed);\n                         }\n                     }\n                 }"
+    },
+    {
+      "sha": "3e1bef527696073f5a6c3479a4830a715380af9a",
+      "filename": "src/stream/count.rs",
+      "status": "modified",
+      "additions": 33,
+      "deletions": 21,
+      "changes": 54,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/6db6d3b3999d787e8ec305653b82dcfb779c7606/src%2Fstream%2Fcount.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/6db6d3b3999d787e8ec305653b82dcfb779c7606/src%2Fstream%2Fcount.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fstream%2Fcount.rs?ref=6db6d3b3999d787e8ec305653b82dcfb779c7606",
+      "patch": "@@ -47,9 +47,7 @@ where\n     #[inline]\n     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<usize> {\n         let mut this = self.project();\n-        if *this.completed {\n-            return Poll::Ready(*this.total);\n-        }\n+        assert!(!*this.completed, \"Count polled after completion\");\n         let mut counted_this_poll = 0usize;\n         loop {\n             match this.stream.as_mut().poll_next(cx) {\n@@ -250,8 +248,8 @@ mod tests {\n     }\n \n     #[test]\n-    fn count_repoll_returns_cached_total_after_completion() {\n-        init_test(\"count_repoll_returns_cached_total_after_completion\");\n+    fn count_repoll_panics_after_completion() {\n+        init_test(\"count_repoll_panics_after_completion\");\n         let mut future = Count::new(OneThenDoneThenPanicStream::default());\n         let waker = noop_waker();\n         let mut cx = Context::from_waker(&waker);\n@@ -264,20 +262,27 @@ mod tests {\n             first\n         );\n \n-        // Fail-closed: repoll returns cached total instead of panicking\n-        let second = Pin::new(&mut future).poll(&mut cx);\n+        let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {\n+            Pin::new(&mut future).poll(&mut cx)\n+        }));\n+        let payload = second.expect_err(\"repoll after completion must panic\");\n+        let message = payload\n+            .downcast_ref::<&str>()\n+            .map(ToString::to_string)\n+            .or_else(|| payload.downcast_ref::<String>().cloned())\n+            .unwrap_or_default();\n         crate::assert_with_log!(\n-            second == Poll::Ready(1),\n-            \"repoll returns cached total\",\n-            Poll::Ready(1),\n-            second\n+            message.contains(\"Count polled after completion\"),\n+            \"second poll fails closed\",\n+            true,\n+            message.contains(\"Count polled after completion\")\n         );\n-        crate::test_complete!(\"count_repoll_returns_cached_total_after_completion\");\n+        crate::test_complete!(\"count_repoll_panics_after_completion\");\n     }\n \n     #[test]\n-    fn count_empty_repoll_returns_zero_after_completion() {\n-        init_test(\"count_empty_repoll_returns_zero_after_completion\");\n+    fn count_empty_repoll_panics_after_completion() {\n+        init_test(\"count_empty_repoll_panics_after_completion\");\n         let mut future = Count::new(iter(Vec::<usize>::new()));\n         let waker = noop_waker();\n         let mut cx = Context::from_waker(&waker);\n@@ -290,14 +295,21 @@ mod tests {\n             first\n         );\n \n-        // Fail-closed: repoll returns cached zero instead of panicking\n-        let second = Pin::new(&mut future).poll(&mut cx);\n+        let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {\n+            Pin::new(&mut future).poll(&mut cx)\n+        }));\n+        let payload = second.expect_err(\"repoll after completion must panic\");\n+        let message = payload\n+            .downcast_ref::<&str>()\n+            .map(ToString::to_string)\n+            .or_else(|| payload.downcast_ref::<String>().cloned())\n+            .unwrap_or_default();\n         crate::assert_with_log!(\n-            second == Poll::Ready(0),\n-            \"repoll returns cached zero\",\n-            Poll::Ready(0),\n-            second\n+            message.contains(\"Count polled after completion\"),\n+            \"second poll fails closed\",\n+            true,\n+            message.contains(\"Count polled after completion\")\n         );\n-        crate::test_complete!(\"count_empty_repoll_returns_zero_after_completion\");\n+        crate::test_complete!(\"count_empty_repoll_panics_after_completion\");\n     }\n }"
+    },
+    {
+      "sha": "0c4d23af51475520f8705ac304842eb1aef6ad79",
+      "filename": "src/time/driver.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 2,
+      "changes": 5,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/6db6d3b3999d787e8ec305653b82dcfb779c7606/src%2Ftime%2Fdriver.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/6db6d3b3999d787e8ec305653b82dcfb779c7606/src%2Ftime%2Fdriver.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Ftime%2Fdriver.rs?ref=6db6d3b3999d787e8ec305653b82dcfb779c7606",
+      "patch": "@@ -491,9 +491,10 @@ impl<T: TimeSource> TimerDriver<T> {\n         let expired_wakers = self.collect_expired(now);\n         let fired = expired_wakers.len();\n \n-        // Wake them outside the lock\n+        // Wake them outside the lock. Catch panics to ensure all\n+        // wakers are attempted even if one panics.\n         for waker in expired_wakers {\n-            waker.wake();\n+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| waker.wake()));\n         }\n \n         fired"
+    }
+  ]
+}

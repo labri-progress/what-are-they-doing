@@ -1,0 +1,205 @@
+{
+  "message": "test(fuzz): seed fuzz_rdb_decoder corpus with 16 compact-encoding seeds (br-frankenredis-aqgx fuzz follow-up)\n\nThe compact RDB type-tag decoders shipped in ec6a274 (RDB_TYPE_SET_INTSET=11,\nHASH_LISTPACK=16, ZSET_LISTPACK=17, LIST_QUICKLIST_2=18, SET_LISTPACK=20)\nlanded with full unit-test coverage but the fuzz_rdb_decoder corpus had\nZERO seeds for any of those tags. libfuzzer relies on corpus seeds to\nmutate-and-explore \u2014 without representative compact-encoding inputs the\nnew code paths were effectively un-fuzzed.\n\nThis commit:\n\n* fuzz/scripts/gen_compact_rdb_seeds.py \u2014 idempotent generator that\n  emits well-formed and adversarial RDB blobs covering each compact\n  type tag. Reproduces upstream RDB length/string/listpack/intset\n  primitives plus the CRC64-Redis bit-reflection final step (which\n  the original Python port omitted, producing trailers that decode_rdb\n  rejected with InvalidFrame). Pinned by the workspace's existing\n  CRC reference vector `crc64(\"123456789\") == 0xe9c6_d914_c4b8_d9ca`.\n* fuzz/corpus/fuzz_rdb_decoder/compact_* \u2014 16 binary seeds:\n  - 10 well-formed: intset (16/32/64-bit widths), set/hash/zset\n    listpacks, quicklist2 PACKED + PLAIN + mixed nodes\n  - 6 adversarial: truncated/invalid-encoding intset, odd-count\n    hash listpack, non-numeric zset score, unknown quicklist\n    container byte, truncated listpack body\n* fr-persist::compact_corpus_seeds_decode_or_reject_cleanly \u2014 verification\n  test that loads each corpus seed, asserts well-formed seeds decode\n  to the expected RdbValue kind/cardinality, and asserts adversarial\n  seeds are rejected with PersistError::InvalidFrame without panicking.\n  This is the safety net so a future decoder change can't silently\n  regress a previously-handled seed.\n\nValidated via rch: cargo test -p fr-persist 144/144 (was 143 + the new\ncorpus test); cargo clippy -p fr-persist --all-targets -- -D warnings\nclean.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "f73e277bfc5748bd8da36c49ed3e8dee616e8fcd",
+      "filename": "crates/fr-persist/src/lib.rs",
+      "status": "modified",
+      "additions": 89,
+      "deletions": 0,
+      "changes": 89,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/00bd2fbce3bc157e63b1936c70a3c0079354004a/crates%2Ffr-persist%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/00bd2fbce3bc157e63b1936c70a3c0079354004a/crates%2Ffr-persist%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/crates%2Ffr-persist%2Fsrc%2Flib.rs?ref=00bd2fbce3bc157e63b1936c70a3c0079354004a",
+      "patch": "@@ -3746,6 +3746,95 @@ mod tests {\n         assert!(decode_intset_members(&[0; 4]).is_none());\n     }\n \n+    /// Acceptance gate for the fuzz_rdb_decoder corpus seeds added in\n+    /// `fuzz/scripts/gen_compact_rdb_seeds.py`. Each well-formed seed\n+    /// must decode cleanly into the expected `RdbValue` shape; each\n+    /// adversarial seed must be rejected with `PersistError::InvalidFrame`\n+    /// without panicking.\n+    ///\n+    /// The corpus lives under `fuzz/corpus/fuzz_rdb_decoder/compact_*`\n+    /// \u2014 that's the directory libfuzzer reads when running\n+    /// `cargo fuzz run fuzz_rdb_decoder`. The script that emits these\n+    /// is idempotent and re-runnable; this test is the safety net so a\n+    /// future decoder change can't silently make a previously-handled\n+    /// seed regress.\n+    /// (br-frankenredis-aqgx fuzz follow-up)\n+    #[test]\n+    fn compact_corpus_seeds_decode_or_reject_cleanly() {\n+        let corpus_root = std::path::Path::new(env!(\"CARGO_MANIFEST_DIR\"))\n+            .join(\"../../fuzz/corpus/fuzz_rdb_decoder\");\n+        if !corpus_root.exists() {\n+            // Fuzz corpus not present in this checkout \u2014 skip rather\n+            // than fail. (Some clean-room build environments strip the\n+            // fuzz/ tree.)\n+            eprintln!(\n+                \"[SKIP] fuzz corpus dir {} not present\",\n+                corpus_root.display()\n+            );\n+            return;\n+        }\n+\n+        // Well-formed compact seeds: must decode cleanly to the matching\n+        // RdbValue shape.\n+        let well_formed = [\n+            (\"compact_intset_small_16bit\", \"Set\", 5usize),\n+            (\"compact_intset_32bit\", \"Set\", 3),\n+            (\"compact_intset_64bit\", \"Set\", 3),\n+            (\"compact_set_listpack\", \"Set\", 3),\n+            (\"compact_set_listpack_single\", \"Set\", 1),\n+            (\"compact_hash_listpack\", \"Hash\", 3),\n+            (\"compact_zset_listpack\", \"SortedSet\", 4),\n+            (\"compact_quicklist2_packed\", \"List\", 5),\n+            (\"compact_quicklist2_plain\", \"List\", 1),\n+            (\"compact_quicklist2_mixed\", \"List\", 3),\n+        ];\n+\n+        for (name, expected_kind, expected_len) in well_formed {\n+            let path = corpus_root.join(name);\n+            let bytes = std::fs::read(&path)\n+                .unwrap_or_else(|e| panic!(\"read corpus seed {}: {e}\", path.display()));\n+            let (entries, _aux) =\n+                decode_rdb(&bytes).unwrap_or_else(|e| panic!(\"seed {name} should decode: {e:?}\"));\n+            assert_eq!(entries.len(), 1, \"seed {name} should produce 1 entry\");\n+            let (kind, len) = match &entries[0].value {\n+                RdbValue::String(_) => (\"String\", 1),\n+                RdbValue::List(items) => (\"List\", items.len()),\n+                RdbValue::Set(members) => (\"Set\", members.len()),\n+                RdbValue::Hash(fields) => (\"Hash\", fields.len()),\n+                RdbValue::SortedSet(members) => (\"SortedSet\", members.len()),\n+                _ => (\"Other\", 0),\n+            };\n+            assert_eq!(\n+                kind, expected_kind,\n+                \"seed {name} decoded to wrong RdbValue kind: got {kind}, expected {expected_kind}\"\n+            );\n+            assert_eq!(\n+                len, expected_len,\n+                \"seed {name} decoded to wrong cardinality: got {len}, expected {expected_len}\"\n+            );\n+        }\n+\n+        // Adversarial seeds: must be rejected (Err) without panic.\n+        let adversarial = [\n+            \"compact_intset_truncated\",\n+            \"compact_intset_invalid_encoding\",\n+            \"compact_hash_listpack_odd\",\n+            \"compact_zset_listpack_non_numeric\",\n+            \"compact_quicklist2_unknown_container\",\n+            \"compact_listpack_truncated\",\n+        ];\n+\n+        for name in adversarial {\n+            let path = corpus_root.join(name);\n+            let bytes = std::fs::read(&path)\n+                .unwrap_or_else(|e| panic!(\"read corpus seed {}: {e}\", path.display()));\n+            assert!(\n+                decode_rdb(&bytes).is_err(),\n+                \"adversarial seed {name} should be rejected by decode_rdb\",\n+            );\n+        }\n+    }\n+\n     #[test]\n     fn rdb_rejects_invalid_magic() {\n         assert!(decode_rdb(b\"NOTREDIS\").is_err());"
+    },
+    {
+      "sha": "27b0a410ee21d659784b26c4eb6543140b232958",
+      "filename": "fuzz/corpus/fuzz_rdb_decoder/compact_hash_listpack",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_hash_listpack",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_hash_listpack",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_hash_listpack?ref=00bd2fbce3bc157e63b1936c70a3c0079354004a"
+    },
+    {
+      "sha": "4acf1c68c2f7fecad0ceb89a5aea0b4a70fa0846",
+      "filename": "fuzz/corpus/fuzz_rdb_decoder/compact_hash_listpack_odd",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_hash_listpack_odd",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_hash_listpack_odd",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_hash_listpack_odd?ref=00bd2fbce3bc157e63b1936c70a3c0079354004a"
+    },
+    {
+      "sha": "9d001f22804e105540f2959617eaa0c9e7d1a655",
+      "filename": "fuzz/corpus/fuzz_rdb_decoder/compact_intset_32bit",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_intset_32bit",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_intset_32bit",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_intset_32bit?ref=00bd2fbce3bc157e63b1936c70a3c0079354004a"
+    },
+    {
+      "sha": "20df62454155fc9f7dfaf5727a3d447da6ca0c91",
+      "filename": "fuzz/corpus/fuzz_rdb_decoder/compact_intset_64bit",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_intset_64bit",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_intset_64bit",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_intset_64bit?ref=00bd2fbce3bc157e63b1936c70a3c0079354004a"
+    },
+    {
+      "sha": "70dfd1c72dacca63209d9de1cfe11ea5ae6dc4ab",
+      "filename": "fuzz/corpus/fuzz_rdb_decoder/compact_intset_invalid_encoding",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_intset_invalid_encoding",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_intset_invalid_encoding",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_intset_invalid_encoding?ref=00bd2fbce3bc157e63b1936c70a3c0079354004a"
+    },
+    {
+      "sha": "5ce9654e6aaec63a0977304fecc4ec13883b9eff",
+      "filename": "fuzz/corpus/fuzz_rdb_decoder/compact_intset_small_16bit",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_intset_small_16bit",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_intset_small_16bit",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_intset_small_16bit?ref=00bd2fbce3bc157e63b1936c70a3c0079354004a"
+    },
+    {
+      "sha": "75fa27cacac0779a960a19dea26b589b49d0b8c3",
+      "filename": "fuzz/corpus/fuzz_rdb_decoder/compact_intset_truncated",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_intset_truncated",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_intset_truncated",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_intset_truncated?ref=00bd2fbce3bc157e63b1936c70a3c0079354004a"
+    },
+    {
+      "sha": "fccc9f073832e1a3e6466be812c0e14c1f2c38ea",
+      "filename": "fuzz/corpus/fuzz_rdb_decoder/compact_listpack_truncated",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_listpack_truncated",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_listpack_truncated",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_listpack_truncated?ref=00bd2fbce3bc157e63b1936c70a3c0079354004a"
+    },
+    {
+      "sha": "bbc6e7103b147e3deff94ede729241ed52fee014",
+      "filename": "fuzz/corpus/fuzz_rdb_decoder/compact_quicklist2_mixed",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_quicklist2_mixed",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_quicklist2_mixed",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_quicklist2_mixed?ref=00bd2fbce3bc157e63b1936c70a3c0079354004a"
+    },
+    {
+      "sha": "371f989b9c8b0d49d99ed6f421a769e309c0b140",
+      "filename": "fuzz/corpus/fuzz_rdb_decoder/compact_quicklist2_packed",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_quicklist2_packed",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_quicklist2_packed",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_quicklist2_packed?ref=00bd2fbce3bc157e63b1936c70a3c0079354004a"
+    },
+    {
+      "sha": "72a7fa19609add9ebdc49f6538247df9b936047e",
+      "filename": "fuzz/corpus/fuzz_rdb_decoder/compact_quicklist2_plain",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_quicklist2_plain",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_quicklist2_plain",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_quicklist2_plain?ref=00bd2fbce3bc157e63b1936c70a3c0079354004a"
+    },
+    {
+      "sha": "f66f059e0b5110910fcb65e504440a86da49ccc3",
+      "filename": "fuzz/corpus/fuzz_rdb_decoder/compact_quicklist2_unknown_container",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_quicklist2_unknown_container",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_quicklist2_unknown_container",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_quicklist2_unknown_container?ref=00bd2fbce3bc157e63b1936c70a3c0079354004a"
+    },
+    {
+      "sha": "821391af8b21647fe5bf9e9f9730b6719e3a3011",
+      "filename": "fuzz/corpus/fuzz_rdb_decoder/compact_set_listpack",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_set_listpack",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_set_listpack",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_set_listpack?ref=00bd2fbce3bc157e63b1936c70a3c0079354004a"
+    },
+    {
+      "sha": "eee35f680bb59b4112151a94b7029015ee89dfc6",
+      "filename": "fuzz/corpus/fuzz_rdb_decoder/compact_set_listpack_single",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_set_listpack_single",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_set_listpack_single",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_set_listpack_single?ref=00bd2fbce3bc157e63b1936c70a3c0079354004a"
+    },
+    {
+      "sha": "7eed2c16f0e32b24cfdaafbf368cc4c0310df01e",
+      "filename": "fuzz/corpus/fuzz_rdb_decoder/compact_zset_listpack",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_zset_listpack",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_zset_listpack",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_zset_listpack?ref=00bd2fbce3bc157e63b1936c70a3c0079354004a"
+    },
+    {
+      "sha": "ba485099fa9cd58e3612a466c40e22c36b740b8a",
+      "filename": "fuzz/corpus/fuzz_rdb_decoder/compact_zset_listpack_non_numeric",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_zset_listpack_non_numeric",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_zset_listpack_non_numeric",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_rdb_decoder%2Fcompact_zset_listpack_non_numeric?ref=00bd2fbce3bc157e63b1936c70a3c0079354004a"
+    },
+    {
+      "sha": "caa586c41915a9b4bc0133112002787a346f579e",
+      "filename": "fuzz/scripts/gen_compact_rdb_seeds.py",
+      "status": "added",
+      "additions": 388,
+      "deletions": 0,
+      "changes": 388,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fscripts%2Fgen_compact_rdb_seeds.py",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/00bd2fbce3bc157e63b1936c70a3c0079354004a/fuzz%2Fscripts%2Fgen_compact_rdb_seeds.py",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fscripts%2Fgen_compact_rdb_seeds.py?ref=00bd2fbce3bc157e63b1936c70a3c0079354004a",
+      "patch": "@@ -0,0 +1,388 @@\n+#!/usr/bin/env python3\n+\"\"\"Generate RDB corpus seeds for the compact-encoding type tags\n+(11/16/17/18/20) that `fr_persist::decode_rdb` started accepting in\n+br-frankenredis-aqgx (commit ec6a274).\n+\n+The fuzz_rdb_decoder corpus previously had 13 seeds covering the canonical\n+type tags (0/1/2/4/5/15/19/21) but ZERO coverage of the compact tags. That\n+made libfuzzer slow to discover the new code paths even though the decoder\n+machinery for those tags has shipped \u2014 the corpus was the bottleneck.\n+\n+This script writes a fresh batch of well-formed and adversarial seeds to\n+fuzz/corpus/fuzz_rdb_decoder/. It is idempotent and safe to re-run after\n+each round of decoder changes. The seeds are kept small (\u2264256 bytes each)\n+to fit libfuzzer's preference for short inputs that mutate quickly.\n+\n+Run:\n+    python3 fuzz/scripts/gen_compact_rdb_seeds.py\n+\n+Verification (run from repo root):\n+    cargo test -p fr-persist compact_corpus_seeds_decode_or_reject_cleanly\n+\"\"\"\n+\n+from __future__ import annotations\n+\n+import struct\n+import zlib\n+from pathlib import Path\n+\n+\n+# \u2500\u2500 RDB primitives (mirrors fr_persist::rdb_encode_*) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n+\n+def encode_length(length: int) -> bytes:\n+    \"\"\"Variable-length RDB length encoding (mirrors rdb_encode_length).\"\"\"\n+    if length < 64:\n+        return bytes([length])\n+    if length < 16384:\n+        return bytes([0x40 | (length >> 8), length & 0xFF])\n+    if length <= 0xFFFF_FFFF:\n+        return bytes([0x80]) + struct.pack(\">I\", length)\n+    return bytes([0x81]) + struct.pack(\">Q\", length)\n+\n+\n+def encode_string(data: bytes) -> bytes:\n+    return encode_length(len(data)) + data\n+\n+\n+def append_select_db(buf: bytearray, db: int, n_keys: int = 1, n_expires: int = 0) -> None:\n+    buf.append(0xFE)  # SELECTDB\n+    buf.extend(encode_length(db))\n+    buf.append(0xFB)  # RESIZEDB\n+    buf.extend(encode_length(n_keys))\n+    buf.extend(encode_length(n_expires))\n+\n+\n+def finalize(buf: bytearray) -> bytes:\n+    \"\"\"Append EOF + CRC64-Redis trailer (matching upstream).\"\"\"\n+    buf.append(0xFF)  # EOF\n+    crc = crc64_redis(bytes(buf))\n+    buf.extend(struct.pack(\"<Q\", crc))\n+    return bytes(buf)\n+\n+\n+# \u2500\u2500 CRC64 with Redis polynomial (0xAD93D23594C935A9) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n+\n+_POLY = 0xAD93_D235_94C9_35A9\n+\n+\n+def _reflect64(value: int) -> int:\n+    \"\"\"Bit-reflect a 64-bit value (mirrors fr_persist::crc64_redis::reflect).\n+    Upstream `_crc64` returns `crc_reflect(crc, 64)` as the final step;\n+    omitting this was the bug that made the original Python port emit\n+    seeds with bogus trailers that decode_rdb rejected with InvalidFrame.\n+    \"\"\"\n+    out = value & 1\n+    for _ in range(1, 64):\n+        value >>= 1\n+        out = (out << 1) | (value & 1)\n+    return out\n+\n+\n+def crc64_redis(data: bytes) -> int:\n+    crc = 0\n+    for byte in data:\n+        mask = 0x01\n+        while mask:\n+            bit_set = (crc & 0x8000_0000_0000_0000) != 0\n+            if byte & mask:\n+                bit_set = not bit_set\n+            crc = (crc << 1) & 0xFFFF_FFFF_FFFF_FFFF\n+            if bit_set:\n+                crc ^= _POLY\n+            mask = (mask << 1) & 0xFF\n+    return _reflect64(crc)\n+\n+\n+# \u2500\u2500 Listpack encoder (mirrors fr-store::encode_listpack_strings) \u2500\u2500\u2500\u2500\u2500\u2500\n+\n+def lp_entry(value: bytes) -> bytes:\n+    \"\"\"Encode a single listpack entry as a 6-bit-tag literal string.\n+\n+    Only supports values < 64 bytes \u2014 sufficient for fuzz corpus seeds.\n+    \"\"\"\n+    if len(value) >= 64:\n+        raise ValueError(\"seed listpack entries must be <64 bytes\")\n+    body = bytearray()\n+    body.append(0x80 | len(value))  # 6-bit tag\n+    body.extend(value)\n+    # Backlen is the length of `body` as a backwards-decoded varint.\n+    data_len = len(body)\n+    if data_len <= 127:\n+        body.append(data_len)\n+    else:\n+        body.append((data_len >> 7) & 0x7F)\n+        body.append(((data_len & 0x7F) | 0x80))\n+    return bytes(body)\n+\n+\n+def listpack(entries: list[bytes]) -> bytes:\n+    body = b\"\".join(lp_entry(e) for e in entries)\n+    total_bytes = 6 + len(body) + 1\n+    out = bytearray()\n+    out.extend(struct.pack(\"<I\", total_bytes))  # total bytes (LE u32)\n+    out.extend(struct.pack(\"<H\", min(len(entries), 0xFFFF)))  # entry count\n+    out.extend(body)\n+    out.append(0xFF)  # listpack EOF\n+    return bytes(out)\n+\n+\n+# \u2500\u2500 Intset encoder (mirrors fr-persist::decode_intset_members shape) \u2500\n+\n+def intset(values: list[int]) -> bytes:\n+    \"\"\"Build an upstream-compatible intset binary.\n+\n+    Picks the narrowest encoding that fits all values, sorts them\n+    ascending (upstream emits intsets sorted), and emits 8-byte header\n+    plus elements.\n+    \"\"\"\n+    if not values:\n+        encoding = 2\n+    elif all(-32768 <= v <= 32767 for v in values):\n+        encoding = 2\n+    elif all(-2_147_483_648 <= v <= 2_147_483_647 for v in values):\n+        encoding = 4\n+    else:\n+        encoding = 8\n+\n+    sorted_values = sorted(values)\n+    out = bytearray()\n+    out.extend(struct.pack(\"<I\", encoding))\n+    out.extend(struct.pack(\"<I\", len(sorted_values)))\n+    width_struct = {2: \"<h\", 4: \"<i\", 8: \"<q\"}[encoding]\n+    for v in sorted_values:\n+        out.extend(struct.pack(width_struct, v))\n+    return bytes(out)\n+\n+\n+# \u2500\u2500 RDB header \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n+\n+def rdb_header() -> bytearray:\n+    return bytearray(b\"REDIS0011\")\n+\n+\n+# \u2500\u2500 Compact-type seed builders \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n+\n+def build_intset_seed(values: list[int], key: bytes = b\"si\") -> bytes:\n+    \"\"\"RDB_TYPE_SET_INTSET (11) \u2014 string-wrapped intset blob.\"\"\"\n+    buf = rdb_header()\n+    append_select_db(buf, 0)\n+    buf.append(11)  # RDB_TYPE_SET_INTSET\n+    buf.extend(encode_string(key))\n+    buf.extend(encode_string(intset(values)))\n+    return finalize(buf)\n+\n+\n+def build_set_listpack_seed(members: list[bytes], key: bytes = b\"slp\") -> bytes:\n+    \"\"\"RDB_TYPE_SET_LISTPACK (20) \u2014 string-wrapped listpack of members.\"\"\"\n+    buf = rdb_header()\n+    append_select_db(buf, 0)\n+    buf.append(20)  # RDB_TYPE_SET_LISTPACK\n+    buf.extend(encode_string(key))\n+    buf.extend(encode_string(listpack(members)))\n+    return finalize(buf)\n+\n+\n+def build_hash_listpack_seed(pairs: list[tuple[bytes, bytes]], key: bytes = b\"hlp\") -> bytes:\n+    \"\"\"RDB_TYPE_HASH_LISTPACK (16) \u2014 listpack of (field, value) pairs.\"\"\"\n+    buf = rdb_header()\n+    append_select_db(buf, 0)\n+    buf.append(16)\n+    buf.extend(encode_string(key))\n+    flat: list[bytes] = []\n+    for field, value in pairs:\n+        flat.append(field)\n+        flat.append(value)\n+    buf.extend(encode_string(listpack(flat)))\n+    return finalize(buf)\n+\n+\n+def build_zset_listpack_seed(pairs: list[tuple[bytes, bytes]], key: bytes = b\"zlp\") -> bytes:\n+    \"\"\"RDB_TYPE_ZSET_LISTPACK (17) \u2014 listpack of (member, score-as-string).\"\"\"\n+    buf = rdb_header()\n+    append_select_db(buf, 0)\n+    buf.append(17)\n+    buf.extend(encode_string(key))\n+    flat: list[bytes] = []\n+    for member, score_str in pairs:\n+        flat.append(member)\n+        flat.append(score_str)\n+    buf.extend(encode_string(listpack(flat)))\n+    return finalize(buf)\n+\n+\n+def build_quicklist2_packed_seed(items: list[bytes], key: bytes = b\"lq\") -> bytes:\n+    \"\"\"RDB_TYPE_LIST_QUICKLIST_2 (18) with one PACKED node containing a\n+    listpack of all items.\"\"\"\n+    buf = rdb_header()\n+    append_select_db(buf, 0)\n+    buf.append(18)\n+    buf.extend(encode_string(key))\n+    buf.extend(encode_length(1))  # node count\n+    buf.extend(encode_length(2))  # container = PACKED\n+    buf.extend(encode_string(listpack(items)))\n+    return finalize(buf)\n+\n+\n+def build_quicklist2_plain_seed(item: bytes, key: bytes = b\"lq_plain\") -> bytes:\n+    \"\"\"RDB_TYPE_LIST_QUICKLIST_2 (18) with one PLAIN node carrying the\n+    element bytes raw (used when an element exceeds list-max-listpack-size).\"\"\"\n+    buf = rdb_header()\n+    append_select_db(buf, 0)\n+    buf.append(18)\n+    buf.extend(encode_string(key))\n+    buf.extend(encode_length(1))  # node count\n+    buf.extend(encode_length(1))  # container = PLAIN\n+    buf.extend(encode_string(item))\n+    return finalize(buf)\n+\n+\n+def build_quicklist2_mixed_seed(packed_items: list[bytes], plain_item: bytes, key: bytes = b\"lq_mix\") -> bytes:\n+    \"\"\"Two-node quicklist: one PACKED listpack node followed by one PLAIN node.\"\"\"\n+    buf = rdb_header()\n+    append_select_db(buf, 0)\n+    buf.append(18)\n+    buf.extend(encode_string(key))\n+    buf.extend(encode_length(2))  # node count\n+    buf.extend(encode_length(2))  # node 1: PACKED\n+    buf.extend(encode_string(listpack(packed_items)))\n+    buf.extend(encode_length(1))  # node 2: PLAIN\n+    buf.extend(encode_string(plain_item))\n+    return finalize(buf)\n+\n+\n+# \u2500\u2500 Adversarial seed builders (must be rejected without panic) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n+\n+def build_adversarial_truncated_intset() -> bytes:\n+    \"\"\"Header claims width=2 / len=10 but only one element follows.\"\"\"\n+    buf = rdb_header()\n+    append_select_db(buf, 0)\n+    buf.append(11)\n+    buf.extend(encode_string(b\"si_short\"))\n+    blob = bytearray()\n+    blob.extend(struct.pack(\"<I\", 2))   # width=2\n+    blob.extend(struct.pack(\"<I\", 10))  # claimed length=10\n+    blob.extend(struct.pack(\"<h\", 7))   # only 1 actual element\n+    buf.extend(encode_string(bytes(blob)))\n+    return finalize(buf)\n+\n+\n+def build_adversarial_intset_invalid_encoding() -> bytes:\n+    \"\"\"Encoding byte = 3 (must be 2/4/8).\"\"\"\n+    buf = rdb_header()\n+    append_select_db(buf, 0)\n+    buf.append(11)\n+    buf.extend(encode_string(b\"si_bad_enc\"))\n+    blob = bytearray()\n+    blob.extend(struct.pack(\"<I\", 3))   # invalid: must be 2/4/8\n+    blob.extend(struct.pack(\"<I\", 0))\n+    buf.extend(encode_string(bytes(blob)))\n+    return finalize(buf)\n+\n+\n+def build_adversarial_hash_listpack_odd_count() -> bytes:\n+    \"\"\"Hash listpack with an odd number of entries \u2014 must trip the\n+    pair-mismatch rejection in decode_rdb.\"\"\"\n+    buf = rdb_header()\n+    append_select_db(buf, 0)\n+    buf.append(16)\n+    buf.extend(encode_string(b\"hlp_odd\"))\n+    buf.extend(encode_string(listpack([b\"f1\", b\"v1\", b\"orphan\"])))\n+    return finalize(buf)\n+\n+\n+def build_adversarial_zset_listpack_non_numeric_score() -> bytes:\n+    \"\"\"Zset listpack with a non-numeric score \u2014 must trip the f64-parse\n+    rejection in decode_rdb.\"\"\"\n+    buf = rdb_header()\n+    append_select_db(buf, 0)\n+    buf.append(17)\n+    buf.extend(encode_string(b\"zlp_nan\"))\n+    buf.extend(encode_string(listpack([b\"member\", b\"not_a_number\"])))\n+    return finalize(buf)\n+\n+\n+def build_adversarial_quicklist2_unknown_container() -> bytes:\n+    \"\"\"Quicklist node with container=99 (only 1 PLAIN and 2 PACKED valid).\"\"\"\n+    buf = rdb_header()\n+    append_select_db(buf, 0)\n+    buf.append(18)\n+    buf.extend(encode_string(b\"lq_bad\"))\n+    buf.extend(encode_length(1))\n+    buf.extend(encode_length(99))  # not 1 or 2\n+    buf.extend(encode_string(listpack([b\"x\"])))\n+    return finalize(buf)\n+\n+\n+def build_adversarial_listpack_truncated() -> bytes:\n+    \"\"\"Listpack header claims 100 bytes but body is short \u2014 exercises\n+    the listpack decoder's bounds checks.\"\"\"\n+    buf = rdb_header()\n+    append_select_db(buf, 0)\n+    buf.append(20)\n+    buf.extend(encode_string(b\"slp_short\"))\n+    fake_lp = bytearray()\n+    fake_lp.extend(struct.pack(\"<I\", 100))  # claim 100 bytes\n+    fake_lp.extend(struct.pack(\"<H\", 5))    # claim 5 entries\n+    fake_lp.extend(b\"\\x80hi\\x03\")           # 4 bytes body\n+    fake_lp.append(0xFF)                    # EOF\n+    buf.extend(encode_string(bytes(fake_lp)))\n+    return finalize(buf)\n+\n+\n+# \u2500\u2500 Driver \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n+\n+def main() -> None:\n+    repo = Path(__file__).resolve().parent.parent.parent\n+    out_dir = repo / \"fuzz\" / \"corpus\" / \"fuzz_rdb_decoder\"\n+    out_dir.mkdir(parents=True, exist_ok=True)\n+\n+    seeds: list[tuple[str, bytes]] = [\n+        # Well-formed compact-encoding seeds\n+        (\"compact_intset_small_16bit\", build_intset_seed([1, 2, 3, 5, 7])),\n+        (\"compact_intset_32bit\", build_intset_seed([-100_000, 0, 100_000])),\n+        (\"compact_intset_64bit\", build_intset_seed([-(1 << 40), 0, (1 << 40)])),\n+        (\"compact_set_listpack\", build_set_listpack_seed([b\"alpha\", b\"beta\", b\"gamma\"])),\n+        (\"compact_set_listpack_single\", build_set_listpack_seed([b\"only\"])),\n+        (\n+            \"compact_hash_listpack\",\n+            build_hash_listpack_seed([(b\"f1\", b\"v1\"), (b\"f2\", b\"v2\"), (b\"f3\", b\"v3\")]),\n+        ),\n+        (\n+            \"compact_zset_listpack\",\n+            build_zset_listpack_seed(\n+                [(b\"a\", b\"1\"), (b\"b\", b\"2.5\"), (b\"c\", b\"7.25\"), (b\"d\", b\"-3.14159\")]\n+            ),\n+        ),\n+        (\n+            \"compact_quicklist2_packed\",\n+            build_quicklist2_packed_seed([b\"a\", b\"b\", b\"c\", b\"d\", b\"e\"]),\n+        ),\n+        (\"compact_quicklist2_plain\", build_quicklist2_plain_seed(b\"single_plain_element_43_bytes\")),\n+        (\n+            \"compact_quicklist2_mixed\",\n+            build_quicklist2_mixed_seed([b\"x\", b\"y\"], b\"z_plain_node_payload\"),\n+        ),\n+        # Adversarial / malformed seeds (must be rejected, not panic)\n+        (\"compact_intset_truncated\", build_adversarial_truncated_intset()),\n+        (\"compact_intset_invalid_encoding\", build_adversarial_intset_invalid_encoding()),\n+        (\"compact_hash_listpack_odd\", build_adversarial_hash_listpack_odd_count()),\n+        (\n+            \"compact_zset_listpack_non_numeric\",\n+            build_adversarial_zset_listpack_non_numeric_score(),\n+        ),\n+        (\n+            \"compact_quicklist2_unknown_container\",\n+            build_adversarial_quicklist2_unknown_container(),\n+        ),\n+        (\"compact_listpack_truncated\", build_adversarial_listpack_truncated()),\n+    ]\n+\n+    for name, payload in seeds:\n+        path = out_dir / name\n+        path.write_bytes(payload)\n+        print(f\"wrote {len(payload):4d} bytes to {path.relative_to(repo)}\")\n+    print(f\"\\ngenerated {len(seeds)} corpus seeds\")\n+\n+\n+if __name__ == \"__main__\":\n+    main()"
+    }
+  ]
+}
