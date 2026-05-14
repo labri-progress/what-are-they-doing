@@ -55,7 +55,7 @@ object HeuristicMatcher {
             val jsonBytes      = Files.readAllBytes(file)
             val heuristicsJson = readFromArray[List[AgentHeuristic]](jsonBytes)
             val agentName      = file.getFileName.toString.stripSuffix(".json")
-            heuristicsJson.foreach{heuristic =>
+            heuristicsJson.foreach { heuristic =>
               assert(heuristic.period_start == "", s"Heuristic $agentName has a non-empty period_start")
               assert(heuristic.period_end == None, s"Heuristic $agentName has a non-empty period_end")
             }
@@ -69,7 +69,7 @@ object HeuristicMatcher {
       commitAuthor: String,
       filenames: List[String],
       heuristicsByAgent: Map[String, List[AgentHeuristic]]
-  ): List[String] =
+  ): Set[String] =
       val matched = mutable.ListBuffer[String]()
       for (agentName, heuristics) <- heuristicsByAgent do
           var found = false
@@ -85,7 +85,7 @@ object HeuristicMatcher {
                           if matchPattern(pat, fn) then
                               matched += agentName
                               found = true
-      matched.toList
+      matched.toSet
 
   private def matchCommitHeuristic(
       commitMessage: String,

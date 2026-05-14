@@ -15,7 +15,7 @@ given codecCommitDetail: JsonValueCodec[CommitDetail] = JsonCodecMaker.make
 
 given codecHeuristicJson: JsonValueCodec[List[AgentHeuristic]] = JsonCodecMaker.make
 
-given codecDeveloperEntry: JsonValueCodec[List[DeveloperEntry]] = JsonCodecMaker.make
+given codecDeveloperEntry: JsonValueCodec[List[DevSummary]] = JsonCodecMaker.make
 
 case class MonthlySnapshot(
     developer: String,
@@ -107,4 +107,11 @@ case class AgentHeuristic(
     commit_message_prefix: List[String],
     period_start: String,
     period_end: Option[String]
+)
+
+
+
+case class DevSummary(
+    handle: String,
+    repos: Option[List[String]] = None
 )
