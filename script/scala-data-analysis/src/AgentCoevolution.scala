@@ -1,14 +1,24 @@
 package whataretheydoing
 
 import com.github.plokhotnyuk.jsoniter_scala.core.*
+import com.github.tototoshi.csv.CSVWriter
 
 import java.nio.file.{Files, Path}
-import java.time.{LocalDate, YearMonth}
+import java.time.{DayOfWeek, LocalDate, YearMonth}
+import java.time.format.DateTimeFormatter
 import scala.collection.parallel.immutable.{ParMap, ParVector}
 import scala.jdk.CollectionConverters.*
 import scala.util.Using
 
 object DevData {
+
+  case class PeriodCsvRow(
+      developer: String,
+      period_iso: String,
+      total_commits: Int,
+      agent: String,
+      count: Int
+  )
 
 // ── CSV output ─────────────────────────────────────────────────────────────
 
@@ -100,17 +110,81 @@ object DevData {
     )
   }
 
-  @main def run(): Unit = {
+  private def weekStart(day: LocalDate): LocalDate =
+    day.`with`(DayOfWeek.MONDAY)
 
-    println(s"Running with dataDir=${dataPath.toString} granularity=$granularity")
+  private def periodRows: Vector[PeriodCsvRow] =
+    time("build weekly period rows") {
+      val totalsByDeveloperWeek =
+        aggregateData.iterator
+          .flatMap { case (developer, _, _, snapshot) =>
+            snapshot.days.iterator.map { case (day, dayData) =>
+              ((developer, weekStart(LocalDate.parse(day))), dayData.total_count)
+            }
+          }
+          .toVector
+          .groupMapReduce(_._1)(_._2)(_ + _)
+
+      val countsByDeveloperWeekAgent =
+        aggregateData.iterator
+          .flatMap { case (developer, _, _, snapshot) =>
+            snapshot.days.iterator.flatMap { case (day, dayData) =>
+              val week = weekStart(LocalDate.parse(day))
+              dayData.commits.iterator.flatMap { commit =>
+                val agents = commitSignals.getOrElse(commit.sha, Set.empty)
+                val labels = if agents.nonEmpty then agents else Set("no agent")
+                labels.iterator.map(agent => ((developer, week, agent), 1))
+              }
+            }
+          }
+          .toVector
+          .groupMapReduce(_._1)(_._2)(_ + _)
+
+      countsByDeveloperWeekAgent.toVector
+        .sortBy { case ((developer, week, agent), _) => (developer, week, agent) }
+        .map { case ((developer, week, agent), count) =>
+          PeriodCsvRow(
+            developer = developer,
+            period_iso = week.toString,
+            total_commits = totalsByDeveloperWeek((developer, week)),
+            agent = agent,
+            count = count
+          )
+        }
+    }
+
+  private def writePeriodsCsv(rows: Seq[PeriodCsvRow], path: Path): Unit = {
+    val writer = CSVWriter.open(path.toFile)
+    try
+        writer.writeRow(List("developer", "period_iso", "total_commits", "agent", "count"))
+        rows.foreach { row =>
+          writer.writeRow(
+            List(
+              row.developer,
+              row.period_iso,
+              row.total_commits.toString,
+              row.agent,
+              row.count.toString
+            )
+          )
+        }
+    finally writer.close()
+  }
+
+  @main def makeWeeklyPlotCsv(): Unit = {
+
+    println(s"Running with dataDir=${dataPath.toString} granularity=week")
 
     Files.createDirectories(outputPath)
 
     println(s"Tracked developers: ${trackedHandles.mkString(", ")}")
-
-    // Load heuristics
     println(s"Loaded ${heuristicsByAgent.size} agent definitions")
 
+    val rows       = periodRows
+    val outputFile = outputPath.resolve("agent-coevolution-periods.csv")
+    writePeriodsCsv(rows, outputFile)
+
+    println(s"Wrote ${rows.size} weekly rows to $outputFile")
   }
 
 }
