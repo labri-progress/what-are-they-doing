@@ -32,6 +32,7 @@ object DevAgentCommitTypes {
   case class CommitTypePeriodRow(
       periodIso: String,
       totalCommits: Int,
+      sampledCommits: Int,
       countsByType: Map[CommitType, Int]
   )
 
@@ -251,6 +252,17 @@ object DevAgentCommitTypes {
         .toVector
         .groupMapReduce(_._1)(_._2)(_ + _)
 
+    val sampledByWeek =
+      aggregateData.iterator
+        .filter(_.dev == handle)
+        .flatMap { case (_, _, _, snapshot) =>
+          snapshot.days.iterator.map { case (day, dayData) =>
+            (weekStart(LocalDate.parse(day)), dayData.commits.size)
+          }
+        }
+        .toVector
+        .groupMapReduce(_._1)(_._2)(_ + _)
+
     val countsByWeekType =
       aggregateData.iterator
         .filter(_.dev == handle)
@@ -270,6 +282,7 @@ object DevAgentCommitTypes {
       CommitTypePeriodRow(
         periodIso = week.toString,
         totalCommits = totalsByWeek(week),
+        sampledCommits = sampledByWeek.getOrElse(week, 0),
         countsByType = commitTypeOrder.map(t => t -> countsByWeekType.getOrElse((week, t), 0)).toMap
       )
     }

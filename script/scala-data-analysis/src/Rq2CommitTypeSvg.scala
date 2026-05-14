@@ -58,7 +58,8 @@ object Rq2CommitTypeSvg {
   private def computeScale(rows: Vector[CommitTypePeriodRow]): ChartScale = {
     val maxStack = rows.map(_.countsByType.values.sum).maxOption.getOrElse(0)
     val maxTotal = rows.map(_.totalCommits).maxOption.getOrElse(0)
-    val yMaxRaw = math.max(maxStack, maxTotal)
+    val maxSampled = rows.map(_.sampledCommits).maxOption.getOrElse(0)
+    val yMaxRaw = math.max(maxStack, math.max(maxTotal, maxSampled))
     val yStep = niceStep(yMaxRaw, targetTickCount = 6)
     val yMax = math.max(yStep, ((yMaxRaw + yStep - 1) / yStep) * yStep)
     ChartScale(yMax = yMax, yStep = yStep)
@@ -137,24 +138,39 @@ object Rq2CommitTypeSvg {
       s"<text x='${fmt(x)}' y='${fmt(y)}' transform='rotate(45 ${fmt(x)} ${fmt(y)})' text-anchor='start' font-size='11' fill='#495057'>${svgEscape(row.periodIso)}</text>"
     }.mkString("\n")
 
-  private def renderTotalLine(layout: ChartLayout, scale: ChartScale, rows: Vector[CommitTypePeriodRow]): String = {
+  private def renderLineSeries(
+      layout: ChartLayout,
+      scale: ChartScale,
+      rows: Vector[CommitTypePeriodRow],
+      valueOf: CommitTypePeriodRow => Int,
+      stroke: String,
+      dashArray: String,
+      markerFill: String
+  ): String = {
     val points = rows.zipWithIndex.map { case (row, index) =>
       val cx = xForBar(layout, rows.size, index) + barWidth(layout, rows.size) / 2.0
-      val cy = yForValue(layout, scale, row.totalCommits.toDouble)
+      val cy = yForValue(layout, scale, valueOf(row).toDouble)
       s"${fmt(cx)},${fmt(cy)}"
     }.mkString(" ")
 
     val markers = rows.zipWithIndex.map { case (row, index) =>
       val cx = xForBar(layout, rows.size, index) + barWidth(layout, rows.size) / 2.0
-      val cy = yForValue(layout, scale, row.totalCommits.toDouble)
-      s"<rect x='${fmt(cx - 2.5)}' y='${fmt(cy - 2.5)}' width='5' height='5' fill='#343a40' transform='rotate(45 ${fmt(cx)} ${fmt(cy)})' />"
+      val cy = yForValue(layout, scale, valueOf(row).toDouble)
+      s"<rect x='${fmt(cx - 2.5)}' y='${fmt(cy - 2.5)}' width='5' height='5' fill='$markerFill' transform='rotate(45 ${fmt(cx)} ${fmt(cy)})' />"
     }.mkString("\n")
 
-    s"<polyline fill='none' stroke='#343a40' stroke-width='2' stroke-dasharray='6 4' points='$points' />\n$markers"
+    s"<polyline fill='none' stroke='$stroke' stroke-width='2' stroke-dasharray='$dashArray' points='$points' />\n$markers"
   }
 
-  private def renderLegend(layout: ChartLayout, activeTypes: Vector[CommitType]): String = {
-    val entries = Vector("total commits (snapshot)") ++ activeTypes.map(_.toString.toLowerCase)
+  private def renderOverlayLines(layout: ChartLayout, scale: ChartScale, rows: Vector[CommitTypePeriodRow]): String = {
+    val totalLine = renderLineSeries(layout, scale, rows, _.totalCommits, "#343a40", "6 4", "#343a40")
+    val sampledLine = renderLineSeries(layout, scale, rows, _.sampledCommits, "#1d4ed8", "3 3", "#1d4ed8")
+    totalLine + "\n" + sampledLine
+  }
+
+  private def renderLegend(layout: ChartLayout, activeTypes: Vector[CommitType], includeSampled: Boolean): String = {
+    val lineEntries = Vector("total commits (snapshot)") ++ (if includeSampled then Vector("sampled commits") else Vector.empty)
+    val entries = lineEntries ++ activeTypes.map(_.toString.toLowerCase)
     val boxHeight = 18 + entries.size * 20
     val box =
       s"<rect x='${fmt(layout.legendX)}' y='${fmt(layout.legendY)}' width='${fmt(layout.legendWidth)}' height='${fmt(boxHeight)}' rx='4' ry='4' fill='white' fill-opacity='0.92' stroke='#ced4da' stroke-width='1' />"
@@ -165,8 +181,12 @@ object Rq2CommitTypeSvg {
           s"<line x1='${fmt(layout.legendX + 10)}' y1='${fmt(y - 4)}' x2='${fmt(layout.legendX + 30)}' y2='${fmt(y - 4)}' stroke='#343a40' stroke-width='2' stroke-dasharray='6 4' />" +
             s"<rect x='${fmt(layout.legendX + 17)}' y='${fmt(y - 7)}' width='6' height='6' fill='#343a40' transform='rotate(45 ${fmt(layout.legendX + 20)} ${fmt(y - 4)})' />" +
             s"<text x='${fmt(layout.legendX + 38)}' y='${fmt(y)}' font-size='12' fill='#212529'>${svgEscape(label)}</text>"
+      else if includeSampled && idx == 1 then
+          s"<line x1='${fmt(layout.legendX + 10)}' y1='${fmt(y - 4)}' x2='${fmt(layout.legendX + 30)}' y2='${fmt(y - 4)}' stroke='#1d4ed8' stroke-width='2' stroke-dasharray='3 3' />" +
+            s"<rect x='${fmt(layout.legendX + 17)}' y='${fmt(y - 7)}' width='6' height='6' fill='#1d4ed8' transform='rotate(45 ${fmt(layout.legendX + 20)} ${fmt(y - 4)})' />" +
+            s"<text x='${fmt(layout.legendX + 38)}' y='${fmt(y)}' font-size='12' fill='#212529'>${svgEscape(label)}</text>"
       else
-          val commitType = activeTypes(idx - 1)
+          val commitType = activeTypes(idx - lineEntries.size)
           s"<rect x='${fmt(layout.legendX + 10)}' y='${fmt(y - 10)}' width='18' height='12' fill='${commitTypeColors(commitType)}' stroke='#ffffff' stroke-width='0.6' />" +
             s"<text x='${fmt(layout.legendX + 38)}' y='${fmt(y)}' font-size='12' fill='#212529'>${svgEscape(label)}</text>"
     }.mkString("\n")
@@ -181,10 +201,11 @@ object Rq2CommitTypeSvg {
 
   private def renderFooter(layout: ChartLayout, rows: Vector[CommitTypePeriodRow], activeTypes: Vector[CommitType]): String = {
     val totalSnapshot = rows.map(_.totalCommits).sum
+    val sampledCommits = rows.map(_.sampledCommits).sum
     val embeddedRecords = rows.map(_.countsByType.values.sum).sum
     val byTypeTotals = activeTypes.map(t => t -> rows.map(_.countsByType.getOrElse(t, 0)).sum).filter(_._2 > 0)
     val dominantType = byTypeTotals.sortBy(-_._2).headOption.map { case (t, c) => s"Top type: ${t.toString.toLowerCase} ($c)" }.getOrElse("Top type: -")
-    val footer = s"Total snapshot commits: $totalSnapshot  |  Embedded records: $embeddedRecords  |  Periods: ${rows.size}  |  $dominantType"
+    val footer = s"Total snapshot commits: $totalSnapshot  |  Sampled commits: $sampledCommits  |  Embedded records: $embeddedRecords  |  Periods: ${rows.size}  |  $dominantType"
     s"<text x='${fmt(layout.width / 2.0)}' y='${fmt(layout.height - 12.0)}' text-anchor='middle' font-size='12' fill='#212529'>${svgEscape(footer)}</text>"
   }
 
@@ -197,6 +218,7 @@ object Rq2CommitTypeSvg {
   private def renderChart(title: String, rows0: Vector[CommitTypePeriodRow]): String = {
     val rows = trimLeadingEmptyWeeks(rows0)
     val activeTypes = activeCommitTypes(rows)
+    val includeSampled = rows.exists(row => row.sampledCommits != row.totalCommits)
     val layout = ChartLayout(
       width = math.max(1200, rows.size * 48 + 240),
       height = 620,
@@ -217,9 +239,9 @@ ${renderBackground()}
 ${renderGridAndAxes(layout, scale)}
 ${renderTitles(layout, title)}
 $bars
-${renderTotalLine(layout, scale, rows)}
+${renderOverlayLines(layout, scale, rows)}
 ${renderBarLabels(layout, rows)}
-${renderLegend(layout, activeTypes)}
+${renderLegend(layout, activeTypes, includeSampled)}
 ${renderFooter(layout, rows, activeTypes)}
 </svg>
 """
@@ -255,6 +277,7 @@ ${renderFooter(layout, rows, activeTypes)}
       CommitTypePeriodRow(
         periodIso = week.toString,
         totalCommits = totalsByWeek(week),
+        sampledCommits = totalsByWeek(week),
         countsByType = commitTypeOrder.map(t => t -> countsByWeekType.getOrElse((week, t), 0)).toMap
       )
     }
