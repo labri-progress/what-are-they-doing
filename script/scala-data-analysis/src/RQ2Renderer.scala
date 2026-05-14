@@ -1,11 +1,27 @@
 package whataretheydoing
 
+import whataretheydoing.DevAgentCommitTypes.*
+import whataretheydoing.SVGGraphLib.*
+
 import java.nio.file.Files
 import java.time.LocalDate
 
 object RQ2Renderer {
-  import DevAgentCommitTypes.*
-  import SVGGraphLib.*
+
+  val commitTypeColors: Map[CommitType, String] = Map(
+    CommitType.Feat     -> "#e76f51",
+    CommitType.Fix      -> "#f4a261",
+    CommitType.Refactor -> "#2a9d8f",
+    CommitType.Docs     -> "#577590",
+    CommitType.Test     -> "#9b5de5",
+    CommitType.Perf     -> "#43aa8b",
+    CommitType.Build    -> "#4d908e",
+    CommitType.Ci       -> "#277da1",
+    CommitType.Style    -> "#90be6d",
+    CommitType.Chore    -> "#adb5bd",
+    CommitType.Revert   -> "#6c757d",
+    CommitType.Unknown  -> "#e9ecef"
+  )
 
   private val totalCommitsLine = LineSeries(
     label = "total commits (snapshot)",
@@ -108,7 +124,7 @@ object RQ2Renderer {
     println(s"Loaded ${heuristicsByAgent.size} agent definitions")
 
     val stackOrder = commitTypeOrder.map(_.toString.toLowerCase)
-    val colors = commitTypeColors.map((k, v) => k.toString.toLowerCase -> v)
+    val colors     = commitTypeColors.map((k, v) => k.toString.toLowerCase -> v)
 
     trackedHandles.toVector.sorted.foreach { handle =>
       val rows = commitTypeRowsForDeveloper(handle)
@@ -136,7 +152,7 @@ object RQ2Renderer {
     println(s"Loaded ${heuristicsByAgent.size} agent definitions")
 
     val stackOrder = commitTypeOrder.map(_.toString.toLowerCase)
-    val colors = commitTypeColors.map((k, v) => k.toString.toLowerCase -> v)
+    val colors     = commitTypeColors.map((k, v) => k.toString.toLowerCase -> v)
 
     heuristicsByAgent.keys.toVector.sorted.foreach { agent =>
       val rows = toStackedCommitTypeRows(commitTypeRowsForAgent(agent))

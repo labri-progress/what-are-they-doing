@@ -205,20 +205,7 @@ object DevAgentCommitTypes {
     CommitType.Unknown
   )
 
-  val commitTypeColors: Map[CommitType, String] = Map(
-    CommitType.Feat -> "#e76f51",
-    CommitType.Fix -> "#f4a261",
-    CommitType.Refactor -> "#2a9d8f",
-    CommitType.Docs -> "#577590",
-    CommitType.Test -> "#9b5de5",
-    CommitType.Perf -> "#43aa8b",
-    CommitType.Build -> "#4d908e",
-    CommitType.Ci -> "#277da1",
-    CommitType.Style -> "#90be6d",
-    CommitType.Chore -> "#adb5bd",
-    CommitType.Revert -> "#6c757d",
-    CommitType.Unknown -> "#e9ecef"
-  )
+
 
   def weekStart(day: LocalDate): LocalDate =
     day.`with`(DayOfWeek.MONDAY)
