@@ -1,0 +1,29 @@
+{
+  "message": "feat: partitioned writes \u2014 fan out to separate MasterDOs\n\nWhen partitionBy is set, writes are split by partition value and\nrouted to different MasterDOs (named by table+partition). Each DO\nhandles its own CAS loop independently \u2014 no contention across\npartitions. Same bio-cell model: more write pressure \u2192 more cells.\n\nWorker HTTP route also supports partitionKey for direct /write calls.",
+  "files": [
+    {
+      "sha": "d4d6036043e9311c359d9f5002e5de919270b01d",
+      "filename": "src/index.ts",
+      "status": "modified",
+      "additions": 31,
+      "deletions": 1,
+      "changes": 32,
+      "blob_url": "https://github.com/teamchong/querymode/blob/032343889fe9edddbc764f19430e1911ba93b36c/src%2Findex.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/032343889fe9edddbc764f19430e1911ba93b36c/src%2Findex.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Findex.ts?ref=032343889fe9edddbc764f19430e1911ba93b36c",
+      "patch": "@@ -195,11 +195,41 @@ class RemoteExecutor implements QueryExecutor {\n     return rpc.queryRpc(query);\n   }\n \n-  /** Append rows via RPC to Master DO. */\n+  /** Append rows via RPC to Master DO. Partitioned writes fan out to separate MasterDOs. */\n   async append(table: string, rows: Record<string, unknown>[], options?: AppendOptions): Promise<AppendResult> {\n     if (!this.masterNamespace) {\n       throw new Error(\"append() requires masterDoNamespace \u2014 pass it via QueryMode.remote(queryDO, { masterDO })\");\n     }\n+\n+    // Partitioned writes: split by partition key, route each group to a different MasterDO\n+    if (options?.partitionBy) {\n+      const partCol = options.partitionBy;\n+      const groups = new Map<string, Record<string, unknown>[]>();\n+      for (const row of rows) {\n+        const key = row[partCol] === null || row[partCol] === undefined ? \"__null__\" : String(row[partCol]);\n+        let group = groups.get(key);\n+        if (!group) { group = []; groups.set(key, group); }\n+        group.push(row);\n+      }\n+\n+      // Fan out: each partition group goes to a MasterDO named by table+partition\n+      const results = await Promise.all(\n+        [...groups.entries()].map(([partValue, groupRows]) => {\n+          const doName = `master-${table}-${partValue}`;\n+          const id = this.masterNamespace!.idFromName(doName);\n+          const rpc = this.masterNamespace!.get(id) as unknown as MasterDORpc;\n+          return rpc.appendRpc(table, groupRows, options);\n+        }),\n+      );\n+\n+      const totalWritten = results.reduce((s, r) => s + r.rowsWritten, 0);\n+      return {\n+        ...results[results.length - 1],\n+        rowsWritten: totalWritten,\n+        metadata: { ...options.metadata, partitionBy: partCol, partitions: String(groups.size) },\n+      };\n+    }\n+\n     const id = this.masterNamespace.idFromName(\"master\");\n     const masterRpc = this.masterNamespace.get(id) as unknown as MasterDORpc;\n     return masterRpc.appendRpc(table, rows, options);"
+    },
+    {
+      "sha": "add6128be1798f4acec67a09628f71694ee4b315",
+      "filename": "src/worker.ts",
+      "status": "modified",
+      "additions": 17,
+      "deletions": 5,
+      "changes": 22,
+      "blob_url": "https://github.com/teamchong/querymode/blob/032343889fe9edddbc764f19430e1911ba93b36c/src%2Fworker.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/032343889fe9edddbc764f19430e1911ba93b36c/src%2Fworker.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fworker.ts?ref=032343889fe9edddbc764f19430e1911ba93b36c",
+      "patch": "@@ -23,12 +23,23 @@ function getQueryDo(request: Request, env: Env): { rpc: QueryDORpc & { setRegion\n   return { rpc, regionName };\n }\n \n-/** Get the Master DO (typed as RPC). */\n-function getMasterDo(env: Env): MasterDORpc {\n-  const masterId = env.MASTER_DO.idFromName(\"master\");\n+/** Get the Master DO (typed as RPC). Optionally shard by partition key for write parallelism. */\n+function getMasterDo(env: Env, partitionKey?: string): MasterDORpc {\n+  const name = partitionKey ? `master-${fnv1aHash(partitionKey)}` : \"master\";\n+  const masterId = env.MASTER_DO.idFromName(name);\n   return env.MASTER_DO.get(masterId) as unknown as MasterDORpc;\n }\n \n+/** FNV-1a hash \u2192 4-character hex string for deterministic sharding. */\n+function fnv1aHash(s: string): string {\n+  let h = 0x811c9dc5;\n+  for (let i = 0; i < s.length; i++) {\n+    h ^= s.charCodeAt(i);\n+    h = Math.imul(h, 0x01000193);\n+  }\n+  return (h >>> 0).toString(16).padStart(8, \"0\").slice(0, 4);\n+}\n+\n /**\n  * Cloudflare Worker entry point \u2014 the only HTTP layer.\n  * Parses HTTP requests, calls DO RPC methods, returns HTTP responses.\n@@ -92,8 +103,9 @@ export default {\n       // \u2500\u2500 Master DO routes \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n \n       if (url.pathname === \"/write\") {\n-        const body = await request.json();\n-        const result = await getMasterDo(env).writeRpc(body);\n+        const body = await request.json() as Record<string, unknown>;\n+        const partKey = typeof body.partitionKey === \"string\" ? body.partitionKey : undefined;\n+        const result = await getMasterDo(env, partKey).writeRpc(body);\n         return json(result, 200, headers);\n       }\n "
+    }
+  ]
+}

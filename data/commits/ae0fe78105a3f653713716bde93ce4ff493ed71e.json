@@ -1,0 +1,53 @@
+{
+  "message": "fix: LimitOperator.nextColumnar early termination + extract rowComparator/groupKey shared helpers\n\n- LimitOperator.nextColumnar() returned null on empty batch instead of continuing (missing early guard + continue)\n- Extract rowComparator() in types.ts, dedup 4 identical nulls-last sort comparators\n- Reuse groupKey() in WindowOperator partition + DistinctOperator row-based key building",
+  "files": [
+    {
+      "sha": "6013bc14c5a819c2d8c70a6b49818a348cc40b29",
+      "filename": "src/decode.ts",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 8,
+      "changes": 10,
+      "blob_url": "https://github.com/teamchong/querymode/blob/ae0fe78105a3f653713716bde93ce4ff493ed71e/src%2Fdecode.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/ae0fe78105a3f653713716bde93ce4ff493ed71e/src%2Fdecode.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fdecode.ts?ref=ae0fe78105a3f653713716bde93ce4ff493ed71e",
+      "patch": "@@ -1,4 +1,5 @@\n import type { ColumnMeta, PageInfo, Row, DataType } from \"./types.js\";\n+import { rowComparator } from \"./types.js\";\n import type { QueryDescriptor } from \"./client.js\";\n import type { WasmEngine } from \"./wasm-engine.js\";\n import { decodeParquetColumnChunk, decodePlainValues } from \"./parquet-decode.js\";\n@@ -294,14 +295,7 @@ export function applySortAndLimit(rows: Row[], query: QueryDescriptor): Row[] {\n     return sorted.slice(offset);\n   }\n \n-  const dir = desc ? -1 : 1;\n-  rows.sort((a, b) => {\n-    const av = a[col], bv = b[col];\n-    if (av === null && bv === null) return 0;\n-    if (av === null) return 1;\n-    if (bv === null) return -1;\n-    return av < bv ? -dir : av > bv ? dir : 0;\n-  });\n+  rows.sort(rowComparator(col, desc));\n   const start = offset;\n   const end = limit !== undefined ? offset + limit : undefined;\n   return rows.slice(start, end);"
+    },
+    {
+      "sha": "7840de866a2e6c547c52a2552109976e83a469f8",
+      "filename": "src/operators.ts",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 37,
+      "changes": 45,
+      "blob_url": "https://github.com/teamchong/querymode/blob/ae0fe78105a3f653713716bde93ce4ff493ed71e/src%2Foperators.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/ae0fe78105a3f653713716bde93ce4ff493ed71e/src%2Foperators.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Foperators.ts?ref=ae0fe78105a3f653713716bde93ce4ff493ed71e",
+      "patch": "@@ -8,7 +8,7 @@\n  */\n \n import type { ColumnMeta, FilterOp, PageInfo, Row } from \"./types.js\";\n-import { NULL_SENTINEL } from \"./types.js\";\n+import { NULL_SENTINEL, rowComparator, groupKey } from \"./types.js\";\n import type { QueryDescriptor } from \"./client.js\";\n import type { WasmEngine } from \"./wasm-engine.js\";\n import { canSkipPage, matchesFilter, rowPassesFilters, decodePage } from \"./decode.js\";\n@@ -872,17 +872,7 @@ export class WindowOperator implements Operator {\n     // Group by partitionBy keys\n     const partitions = new Map<string, number[]>();\n     for (let i = 0; i < rows.length; i++) {\n-      let key: string;\n-      if (win.partitionBy.length > 0) {\n-        key = \"\";\n-        for (let p = 0; p < win.partitionBy.length; p++) {\n-          if (p > 0) key += \"\\x00\";\n-          const v = rows[i][win.partitionBy[p]];\n-          key += v === null || v === undefined ? NULL_SENTINEL : String(v);\n-        }\n-      } else {\n-        key = \"__all__\";\n-      }\n+      const key = win.partitionBy.length > 0 ? groupKey(rows[i], win.partitionBy) : \"__all__\";\n       const indices = partitions.get(key);\n       if (indices) indices.push(i);\n       else partitions.set(key, [i]);\n@@ -1112,13 +1102,8 @@ export class DistinctOperator implements Operator {\n \n       const unique: Row[] = [];\n       for (const row of batch) {\n-        let key = \"\";\n         const keyCols = this.columns.length > 0 ? this.columns : Object.keys(row);\n-        for (let g = 0; g < keyCols.length; g++) {\n-          if (g > 0) key += \"\\x00\";\n-          const v = row[keyCols[g]];\n-          key += v === null || v === undefined ? NULL_SENTINEL : String(v);\n-        }\n+        const key = groupKey(row, keyCols);\n         if (!this.seen.has(key)) {\n           this.seen.add(key);\n           unique.push(row);\n@@ -1404,6 +1389,8 @@ export class LimitOperator implements Operator {\n       return { columns, rowCount: rows.length };\n     }\n \n+    if (this.remaining <= 0) return null;\n+\n     while (true) {\n       const batch = await this.upstream.nextColumnar();\n       if (!batch) return null;\n@@ -1430,7 +1417,7 @@ export class LimitOperator implements Operator {\n       if (sel.length > 0) {\n         return { columns: batch.columns, rowCount: batch.rowCount, selection: sel };\n       }\n-      return null;\n+      // Empty batch \u2014 continue to next\n     }\n   }\n \n@@ -1731,15 +1718,7 @@ export class InMemorySortOperator implements Operator {\n       }\n     }\n \n-    const col = this.col;\n-    const dir = this.desc ? -1 : 1;\n-    allRows.sort((a, b) => {\n-      const av = a[col], bv = b[col];\n-      if (av === null && bv === null) return 0;\n-      if (av === null) return 1;\n-      if (bv === null) return -1;\n-      return av < bv ? -dir : av > bv ? dir : 0;\n-    });\n+    allRows.sort(rowComparator(this.col, this.desc));\n \n     return this.offset > 0 ? allRows.slice(this.offset) : allRows;\n   }\n@@ -2602,15 +2581,7 @@ export class ExternalSortOperator implements Operator {\n \n   private getCompareFn(): (a: Row, b: Row) => number {\n     if (this.mergeCompareFn) return this.mergeCompareFn;\n-    const col = this.col;\n-    const dir = this.desc ? -1 : 1;\n-    this.mergeCompareFn = (a: Row, b: Row): number => {\n-      const av = a[col], bv = b[col];\n-      if (av === null && bv === null) return 0;\n-      if (av === null) return 1;\n-      if (bv === null) return -1;\n-      return av < bv ? -dir : av > bv ? dir : 0;\n-    };\n+    this.mergeCompareFn = rowComparator(this.col, this.desc);\n     return this.mergeCompareFn;\n   }\n "
+    },
+    {
+      "sha": "8af166f2cd19607ff089b765970d45274275c511",
+      "filename": "src/types.ts",
+      "status": "modified",
+      "additions": 12,
+      "deletions": 0,
+      "changes": 12,
+      "blob_url": "https://github.com/teamchong/querymode/blob/ae0fe78105a3f653713716bde93ce4ff493ed71e/src%2Ftypes.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/ae0fe78105a3f653713716bde93ce4ff493ed71e/src%2Ftypes.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Ftypes.ts?ref=ae0fe78105a3f653713716bde93ce4ff493ed71e",
+      "patch": "@@ -12,6 +12,18 @@ export function groupKey(row: Row, cols: string[]): string {\n   return key;\n }\n \n+/** Nulls-last row comparator for a single sort column. */\n+export function rowComparator(col: string, desc: boolean): (a: Row, b: Row) => number {\n+  const dir = desc ? -1 : 1;\n+  return (a: Row, b: Row): number => {\n+    const av = a[col], bv = b[col];\n+    if (av === null && bv === null) return 0;\n+    if (av === null) return 1;\n+    if (bv === null) return -1;\n+    return av < bv ? -dir : av > bv ? dir : 0;\n+  };\n+}\n+\n /** Lance file footer metadata cached in DO memory */\n export interface Footer {\n   /** Byte offset where column metadata starts */"
+    },
+    {
+      "sha": "870ed07a7015cfc2730aa33bf4ebabe605137c12",
+      "filename": "src/worker-do.ts",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 8,
+      "changes": 10,
+      "blob_url": "https://github.com/teamchong/querymode/blob/ae0fe78105a3f653713716bde93ce4ff493ed71e/src%2Fworker-do.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/ae0fe78105a3f653713716bde93ce4ff493ed71e/src%2Fworker-do.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fworker-do.ts?ref=ae0fe78105a3f653713716bde93ce4ff493ed71e",
+      "patch": "@@ -2,6 +2,7 @@ import { DurableObject } from \"cloudflare:workers\";\n import type { R2Partition, WorkerDORpc } from \"./worker-pool.js\";\n import { decodeColumnarRun, encodeColumnarRun } from \"./r2-spill.js\";\n import type { Row } from \"./types.js\";\n+import { rowComparator } from \"./types.js\";\n \n interface WorkerEnv {\n   DATA_BUCKET: R2Bucket;\n@@ -186,14 +187,7 @@ export class WorkerDO extends DurableObject<WorkerEnv> implements WorkerDORpc {\n     const resultKey = `${resultKeyPrefix}/${crypto.randomUUID()}.bin`;\n \n     const rows = await this.readPartition(partitionKey);\n-    const dir = sortDesc ? -1 : 1;\n-    rows.sort((a, b) => {\n-      const av = a[sortColumn], bv = b[sortColumn];\n-      if (av === null && bv === null) return 0;\n-      if (av === null) return 1;\n-      if (bv === null) return -1;\n-      return av < bv ? -dir : av > bv ? dir : 0;\n-    });\n+    rows.sort(rowComparator(sortColumn, sortDesc));\n \n     return [await this.writePartition(resultKey, rows)];\n   }"
+    }
+  ]
+}

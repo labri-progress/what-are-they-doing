@@ -1,0 +1,29 @@
+{
+  "message": "fix(mux): resolve Context trait conflict and missing TryInto import\n\n1. termwiztermtab.rs: Remove conflicting termwiz::Context import that\n   shadowed anyhow::Context. In do_input_poll (which returns\n   termwiz::Result), replace .context() calls with direct\n   termwiz::error::Error construction to avoid trait ambiguity.\n\n2. domain.rs: Add explicit `use std::convert::TryInto` \u2014 the mux\n   crate uses edition 2018 where TryInto is not in the prelude,\n   causing baud.try_into() to fail.\n\nBoth bugs were only visible when compiling with specific feature\ncombinations (mcp+web+subprocess-bridge+vendored+disk-pressure).\n\nValidated: 299 mux tests pass, multi-feature lib check clean.\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "228e12cbfd0804e9c2e2f3cfcdc5cb93d65bef8e",
+      "filename": "frankenterm/mux/src/domain.rs",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 1,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/a0cdb58b8e94b31bf76842093bb488f5d83e63be/frankenterm%2Fmux%2Fsrc%2Fdomain.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/a0cdb58b8e94b31bf76842093bb488f5d83e63be/frankenterm%2Fmux%2Fsrc%2Fdomain.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/frankenterm%2Fmux%2Fsrc%2Fdomain.rs?ref=a0cdb58b8e94b31bf76842093bb488f5d83e63be",
+      "patch": "@@ -5,6 +5,7 @@\n //! container or actually remote, running on the other end\n //! of an ssh session somewhere.\n \n+use std::convert::TryInto;\n use crate::localpane::LocalPane;\n use crate::pane::{alloc_pane_id, Pane, PaneId};\n use crate::tab::{SplitRequest, Tab, TabId};\n@@ -247,7 +248,10 @@ impl LocalDomain {\n         let port = serial_domain.port.as_ref().unwrap_or(&serial_domain.name);\n         let mut serial = portable_pty::serial::SerialTty::new(&port);\n         if let Some(baud) = serial_domain.baud {\n-            serial.set_baud_rate(baud as u32);\n+            let baud_u32: u32 = baud.try_into().map_err(|_| {\n+                anyhow::anyhow!(\"baud rate {} exceeds u32::MAX\", baud)\n+            })?;\n+            serial.set_baud_rate(baud_u32);\n         }\n         let pty_system = Box::new(serial);\n         Ok(Self::with_pty_system(&serial_domain.name, pty_system))"
+    },
+    {
+      "sha": "39d931784922c4c59852f67251190ead75f9ae2b",
+      "filename": "frankenterm/mux/src/termwiztermtab.rs",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 7,
+      "changes": 20,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/a0cdb58b8e94b31bf76842093bb488f5d83e63be/frankenterm%2Fmux%2Fsrc%2Ftermwiztermtab.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/a0cdb58b8e94b31bf76842093bb488f5d83e63be/frankenterm%2Fmux%2Fsrc%2Ftermwiztermtab.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/frankenterm%2Fmux%2Fsrc%2Ftermwiztermtab.rs?ref=a0cdb58b8e94b31bf76842093bb488f5d83e63be",
+      "patch": "@@ -12,7 +12,7 @@ use crate::renderable::*;\n use crate::tab::Tab;\n use crate::window::WindowId;\n use crate::Mux;\n-use anyhow::bail;\n+use anyhow::{bail, Context};\n use async_trait::async_trait;\n use config::keyassignment::ScrollbackEraseMode;\n use crossbeam::channel::{unbounded as channel, Receiver, Sender};\n@@ -32,7 +32,6 @@ use termwiz::input::{InputEvent, KeyEvent, Modifiers, MouseEvent as TermWizMouse\n use termwiz::render::terminfo::TerminfoRenderer;\n use termwiz::surface::{Change, Line, SequenceNo};\n use termwiz::terminal::{ScreenSize, TerminalWaker};\n-use termwiz::Context;\n use std::sync::OnceLock;\n use url::Url;\n \n@@ -363,12 +362,16 @@ impl TermWizTerminal {\n                     if err.is_timeout() {\n                         Ok(None)\n                     } else {\n-                        Err(err).context(\"receive from channel\")\n+                        Err(termwiz::error::Error::from(format!(\n+                            \"receive from channel: {err}\"\n+                        )))\n                     }\n                 }\n             }\n         } else {\n-            let input = self.input_rx.recv().context(\"receive from channel\")?;\n+            let input = self.input_rx.recv().map_err(|err| {\n+                termwiz::error::Error::from(format!(\"receive from channel: {err}\"))\n+            })?;\n             Ok(Some(input))\n         }\n     }\n@@ -464,7 +467,8 @@ pub fn allocate(\n     size: TerminalSize,\n     config: Arc<dyn TerminalConfiguration + Send + Sync>,\n ) -> (TermWizTerminal, Arc<dyn Pane>) {\n-    let render_pipe = Pipe::new().expect(\"Pipe creation not to fail\");\n+    let render_pipe = Pipe::new()\n+        .expect(\"failed to create render pipe for TermWiz terminal \u2014 check file descriptor limits\");\n \n     let (input_tx, input_rx) = channel();\n \n@@ -492,7 +496,8 @@ pub fn allocate(\n     let pane: Arc<dyn Pane> = Arc::new(pane);\n \n     let mux = Mux::get();\n-    mux.add_pane(&pane).expect(\"to be able to add pane to mux\");\n+    mux.add_pane(&pane)\n+        .expect(\"failed to add TermWiz pane to mux \u2014 pane ID collision?\");\n \n     (tw_term, pane)\n }\n@@ -512,7 +517,8 @@ pub async fn run<\n     f: F,\n     term_config: Option<Arc<dyn TerminalConfiguration + Send + Sync>>,\n ) -> anyhow::Result<T> {\n-    let render_pipe = Pipe::new().expect(\"Pipe creation not to fail\");\n+    let render_pipe = Pipe::new()\n+        .context(\"failed to create render pipe for TermWiz terminal \u2014 check file descriptor limits\")?;\n     let render_rx = render_pipe.read;\n     let (input_tx, input_rx) = channel();\n     let should_close_window = window_id.is_none();"
+    }
+  ]
+}

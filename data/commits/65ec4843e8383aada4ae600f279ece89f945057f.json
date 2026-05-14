@@ -1,0 +1,41 @@
+{
+  "message": "fix: tighten outbound channel/plugin resolution",
+  "files": [
+    {
+      "sha": "9448b919312933ea173f4fa65a7e970f460aadb6",
+      "filename": "src/infra/outbound/channel-selection.test.ts",
+      "status": "modified",
+      "additions": 38,
+      "deletions": 0,
+      "changes": 38,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/65ec4843e8383aada4ae600f279ece89f945057f/src%2Finfra%2Foutbound%2Fchannel-selection.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/65ec4843e8383aada4ae600f279ece89f945057f/src%2Finfra%2Foutbound%2Fchannel-selection.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Foutbound%2Fchannel-selection.test.ts?ref=65ec4843e8383aada4ae600f279ece89f945057f",
+      "patch": "@@ -2,12 +2,17 @@ import { beforeEach, describe, expect, it, vi } from \"vitest\";\n \n const mocks = vi.hoisted(() => ({\n   listChannelPlugins: vi.fn(),\n+  resolveOutboundChannelPlugin: vi.fn(),\n }));\n \n vi.mock(\"../../channels/plugins/index.js\", () => ({\n   listChannelPlugins: mocks.listChannelPlugins,\n }));\n \n+vi.mock(\"./channel-resolution.js\", () => ({\n+  resolveOutboundChannelPlugin: mocks.resolveOutboundChannelPlugin,\n+}));\n+\n import {\n   listConfiguredMessageChannels,\n   resolveMessageChannelSelection,\n@@ -36,6 +41,10 @@ describe(\"listConfiguredMessageChannels\", () => {\n   beforeEach(() => {\n     mocks.listChannelPlugins.mockReset();\n     mocks.listChannelPlugins.mockReturnValue([]);\n+    mocks.resolveOutboundChannelPlugin.mockReset();\n+    mocks.resolveOutboundChannelPlugin.mockImplementation(({ channel }: { channel: string }) => ({\n+      id: channel,\n+    }));\n   });\n \n   it(\"skips unknown plugin ids and plugins without accounts\", async () => {\n@@ -158,6 +167,35 @@ describe(\"resolveMessageChannelSelection\", () => {\n     ).rejects.toThrow(\"Unknown channel: channel:c123\");\n   });\n \n+  it(\"falls back when the explicit known channel is unavailable in the active plugin registry\", async () => {\n+    mocks.resolveOutboundChannelPlugin.mockImplementation(({ channel }: { channel: string }) =>\n+      channel === \"slack\" ? { id: \"slack\" } : undefined,\n+    );\n+\n+    const selection = await resolveMessageChannelSelection({\n+      cfg: {} as never,\n+      channel: \"discord\",\n+      fallbackChannel: \"slack\",\n+    });\n+\n+    expect(selection).toEqual({\n+      channel: \"slack\",\n+      configured: [],\n+      source: \"tool-context-fallback\",\n+    });\n+  });\n+\n+  it(\"throws unavailable when a known channel has no active plugin\", async () => {\n+    mocks.resolveOutboundChannelPlugin.mockReturnValue(undefined);\n+\n+    await expect(\n+      resolveMessageChannelSelection({\n+        cfg: {} as never,\n+        channel: \"discord\",\n+      }),\n+    ).rejects.toThrow(\"Channel is unavailable: discord\");\n+  });\n+\n   it(\"throws when no channel is provided and nothing is configured\", async () => {\n     await expect(\n       resolveMessageChannelSelection({"
+    },
+    {
+      "sha": "024fc2273f689c56644da2f5d931df731ae8d21c",
+      "filename": "src/infra/outbound/channel-selection.ts",
+      "status": "modified",
+      "additions": 35,
+      "deletions": 5,
+      "changes": 40,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/65ec4843e8383aada4ae600f279ece89f945057f/src%2Finfra%2Foutbound%2Fchannel-selection.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/65ec4843e8383aada4ae600f279ece89f945057f/src%2Finfra%2Foutbound%2Fchannel-selection.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Foutbound%2Fchannel-selection.ts?ref=65ec4843e8383aada4ae600f279ece89f945057f",
+      "patch": "@@ -7,6 +7,7 @@ import {\n   isDeliverableMessageChannel,\n   normalizeMessageChannel,\n } from \"../../utils/message-channel.js\";\n+import { resolveOutboundChannelPlugin } from \"./channel-resolution.js\";\n \n export type MessageChannelId = DeliverableMessageChannel;\n export type MessageChannelSelectionSource =\n@@ -34,6 +35,22 @@ function resolveKnownChannel(value?: string | null): MessageChannelId | undefine\n   return normalized as MessageChannelId;\n }\n \n+function resolveAvailableKnownChannel(params: {\n+  cfg: OpenClawConfig;\n+  value?: string | null;\n+}): MessageChannelId | undefined {\n+  const normalized = resolveKnownChannel(params.value);\n+  if (!normalized) {\n+    return undefined;\n+  }\n+  return resolveOutboundChannelPlugin({\n+    channel: normalized,\n+    cfg: params.cfg,\n+  })\n+    ? normalized\n+    : undefined;\n+}\n+\n function isAccountEnabled(account: unknown): boolean {\n   if (!account || typeof account !== \"object\") {\n     return true;\n@@ -94,25 +111,38 @@ export async function resolveMessageChannelSelection(params: {\n }> {\n   const normalized = normalizeMessageChannel(params.channel);\n   if (normalized) {\n-    if (!isKnownChannel(normalized)) {\n-      const fallback = resolveKnownChannel(params.fallbackChannel);\n+    const availableExplicit = resolveAvailableKnownChannel({\n+      cfg: params.cfg,\n+      value: normalized,\n+    });\n+    if (!availableExplicit) {\n+      const fallback = resolveAvailableKnownChannel({\n+        cfg: params.cfg,\n+        value: params.fallbackChannel,\n+      });\n       if (fallback) {\n         return {\n           channel: fallback,\n           configured: await listConfiguredMessageChannels(params.cfg),\n           source: \"tool-context-fallback\",\n         };\n       }\n-      throw new Error(`Unknown channel: ${String(normalized)}`);\n+      if (!isKnownChannel(normalized)) {\n+        throw new Error(`Unknown channel: ${String(normalized)}`);\n+      }\n+      throw new Error(`Channel is unavailable: ${String(normalized)}`);\n     }\n     return {\n-      channel: normalized as MessageChannelId,\n+      channel: availableExplicit,\n       configured: await listConfiguredMessageChannels(params.cfg),\n       source: \"explicit\",\n     };\n   }\n \n-  const fallback = resolveKnownChannel(params.fallbackChannel);\n+  const fallback = resolveAvailableKnownChannel({\n+    cfg: params.cfg,\n+    value: params.fallbackChannel,\n+  });\n   if (fallback) {\n     return {\n       channel: fallback,"
+    },
+    {
+      "sha": "088baf75c2230210b82033968d06aacfb6b90f91",
+      "filename": "src/infra/outbound/message-action-runner.ts",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/65ec4843e8383aada4ae600f279ece89f945057f/src%2Finfra%2Foutbound%2Fmessage-action-runner.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/65ec4843e8383aada4ae600f279ece89f945057f/src%2Finfra%2Foutbound%2Fmessage-action-runner.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Foutbound%2Fmessage-action-runner.ts?ref=65ec4843e8383aada4ae600f279ece89f945057f",
+      "patch": "@@ -20,6 +20,7 @@ import { buildChannelAccountBindings } from \"../../routing/bindings.js\";\n import { normalizeAgentId } from \"../../routing/session-key.js\";\n import { type GatewayClientMode, type GatewayClientName } from \"../../utils/message-channel.js\";\n import { throwIfAborted } from \"./abort.js\";\n+import { resolveOutboundChannelPlugin } from \"./channel-resolution.js\";\n import {\n   listConfiguredMessageChannels,\n   resolveMessageChannelSelection,\n@@ -670,6 +671,11 @@ async function handlePluginAction(ctx: ResolvedActionContext): Promise<MessageAc\n     };\n   }\n \n+  const plugin = resolveOutboundChannelPlugin({ channel, cfg });\n+  if (!plugin?.actions?.handleAction) {\n+    throw new Error(`Channel ${channel} is unavailable for message actions (plugin not loaded).`);\n+  }\n+\n   const handled = await dispatchChannelMessageAction({\n     channel,\n     action,"
+    }
+  ]
+}

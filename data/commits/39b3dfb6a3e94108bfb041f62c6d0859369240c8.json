@@ -1,0 +1,41 @@
+{
+  "message": "fix(transport,service): mock corruption clears verified flag, sink send_all prevents iterator double-advance, load balancer drops lock before strategy callback\n\nThree transport/service layer fixes:\n\nsrc/transport/mock.rs \u2014 corrupt_symbol no longer preserves the is_verified\nflag on corrupted symbols: it always returns an unverified symbol. Previously,\na corrupted symbol could still carry a verified=true flag, which would bypass\ndownstream integrity checks that gate on verification status. Removed unused\nverified variable. Added test corrupted_symbol_is_no_longer_marked_verified.\n\nsrc/transport/sink.rs \u2014 SendAllFuture now tracks iter_exhausted separately,\npreventing double-advance of the iterator on re-poll after a Pending flush.\nPreviously, if the inner sink returned Pending during a flush, the next poll\nwould re-consume the iterator from the beginning (since the future was\nre-entered), causing duplicate sends. The flush is now only attempted after\nthe iterator has been fully consumed.\n\nsrc/service/load_balance.rs \u2014 LoadBalancer::push now explicitly drops the\nbackends lock guard before calling strategy.on_backend_inserted(index).\nThis prevents holding the backends mutex during the strategy callback, which\ncould deadlock if the strategy implementation needs to inspect the backend\nlist or acquire other locks that depend on backends.\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "019e86add43492b4776ea6dc025a19961d264e0e",
+      "filename": "src/service/load_balance.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 9,
+      "changes": 16,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/39b3dfb6a3e94108bfb041f62c6d0859369240c8/src%2Fservice%2Fload_balance.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/39b3dfb6a3e94108bfb041f62c6d0859369240c8/src%2Fservice%2Fload_balance.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fservice%2Fload_balance.rs?ref=39b3dfb6a3e94108bfb041f62c6d0859369240c8",
+      "patch": "@@ -503,15 +503,13 @@ impl<S, T: Strategy> LoadBalancer<S, T> {\n \n     /// Add a backend service.\n     pub fn push(&self, service: S) {\n-        let index = {\n-            let mut backends = self.backends.lock();\n-            let index = backends.len();\n-            backends.push(Arc::new(Backend {\n-                service: Mutex::new(service),\n-                load: Arc::new(LoadMetric::new()),\n-            }));\n-            index\n-        };\n+        let mut backends = self.backends.lock();\n+        let index = backends.len();\n+        backends.push(Arc::new(Backend {\n+            service: Mutex::new(service),\n+            load: Arc::new(LoadMetric::new()),\n+        }));\n+        drop(backends);\n         self.strategy.on_backend_inserted(index);\n     }\n     /// Get the number of backends."
+    },
+    {
+      "sha": "e0f0f8f7838f42bda29925a40c3332fe10d80ace",
+      "filename": "src/transport/mock.rs",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 6,
+      "changes": 21,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/39b3dfb6a3e94108bfb041f62c6d0859369240c8/src%2Ftransport%2Fmock.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/39b3dfb6a3e94108bfb041f62c6d0859369240c8/src%2Ftransport%2Fmock.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Ftransport%2Fmock.rs?ref=39b3dfb6a3e94108bfb041f62c6d0859369240c8",
+      "patch": "@@ -809,7 +809,6 @@ fn sample_latency(config: &SimTransportConfig, rng: &mut DetRng) -> Duration {\n \n fn corrupt_symbol(symbol: &AuthenticatedSymbol, rng: &mut DetRng) -> AuthenticatedSymbol {\n     let tag = *symbol.tag();\n-    let verified = symbol.is_verified();\n     let original = symbol.symbol().clone();\n     let mut data = original.data().to_vec();\n     if data.is_empty() {\n@@ -819,11 +818,9 @@ fn corrupt_symbol(symbol: &AuthenticatedSymbol, rng: &mut DetRng) -> Authenticat\n         data[idx] ^= 0xFF;\n     }\n     let corrupted = Symbol::new(original.id(), data, original.kind());\n-    if verified {\n-        AuthenticatedSymbol::new_verified(corrupted, tag)\n-    } else {\n-        AuthenticatedSymbol::from_parts(corrupted, tag)\n-    }\n+    // Corruption invalidates any prior verification; downstream consumers must\n+    // re-verify the mutated payload against its tag.\n+    AuthenticatedSymbol::from_parts(corrupted, tag)\n }\n \n #[cfg(test)]\n@@ -847,6 +844,18 @@ mod tests {\n         AuthenticatedSymbol::new_verified(symbol, tag)\n     }\n \n+    #[test]\n+    fn corrupted_symbol_is_no_longer_marked_verified() {\n+        let original = create_symbol(7);\n+        let mut rng = DetRng::new(123);\n+\n+        let corrupted = corrupt_symbol(&original, &mut rng);\n+\n+        assert!(!corrupted.is_verified());\n+        assert_eq!(corrupted.tag(), original.tag());\n+        assert_ne!(corrupted.symbol().data(), original.symbol().data());\n+    }\n+\n     struct NoopWake;\n \n     impl Wake for NoopWake {"
+    },
+    {
+      "sha": "567946229a298c73b6b3ac4110e7b6e036f6ddd5",
+      "filename": "src/transport/sink.rs",
+      "status": "modified",
+      "additions": 18,
+      "deletions": 12,
+      "changes": 30,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/39b3dfb6a3e94108bfb041f62c6d0859369240c8/src%2Ftransport%2Fsink.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/39b3dfb6a3e94108bfb041f62c6d0859369240c8/src%2Ftransport%2Fsink.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Ftransport%2Fsink.rs?ref=39b3dfb6a3e94108bfb041f62c6d0859369240c8",
+      "patch": "@@ -85,6 +85,7 @@ pub trait SymbolSinkExt: SymbolSink {\n             buffered: None,\n             count: 0,\n             completed: false,\n+            iter_exhausted: false,\n         }\n     }\n \n@@ -186,6 +187,7 @@ pub struct SendAllFuture<'a, S: ?Sized, I> {\n     buffered: Option<AuthenticatedSymbol>,\n     count: usize,\n     completed: bool,\n+    iter_exhausted: bool,\n }\n \n impl<S, I> Future for SendAllFuture<'_, S, I>\n@@ -235,22 +237,26 @@ where\n                 }\n             }\n \n+            if self.iter_exhausted {\n+                // Flush\n+                match Pin::new(&mut *self.sink).poll_flush(cx) {\n+                    Poll::Ready(Ok(())) => {\n+                        self.completed = true;\n+                        return Poll::Ready(Ok(self.count));\n+                    }\n+                    Poll::Ready(Err(e)) => {\n+                        self.completed = true;\n+                        return Poll::Ready(Err(e));\n+                    }\n+                    Poll::Pending => return Poll::Pending,\n+                }\n+            }\n+\n             // Get next\n             match self.iter.next() {\n                 Some(symbol) => self.buffered = Some(symbol),\n                 None => {\n-                    // Flush\n-                    match Pin::new(&mut *self.sink).poll_flush(cx) {\n-                        Poll::Ready(Ok(())) => {\n-                            self.completed = true;\n-                            return Poll::Ready(Ok(self.count));\n-                        }\n-                        Poll::Ready(Err(e)) => {\n-                            self.completed = true;\n-                            return Poll::Ready(Err(e));\n-                        }\n-                        Poll::Pending => return Poll::Pending,\n-                    }\n+                    self.iter_exhausted = true;\n                 }\n             }\n         }"
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "message": "fix: CTE inlining silently dropped un-pushable predicates\n\nCTE inlining only merged filters/filterGroups from the CTE descriptor,\ndropping the CTE's whereExpr (un-pushable predicates like UPPER(name)),\ncomputedExprs, and other extras. A query like:\n  WITH x AS (SELECT * FROM t WHERE UPPER(name) = 'JOHN')\n  SELECT * FROM x\nwould return ALL rows instead of just 'JOHN'.\n\nNow:\n- CTE's whereExpr is merged into outer whereExpr via AND\n- CTE's computedExprs are propagated to outer query\n- CTEs with sort/limit/aggregates/groupBy/having are NOT inlined\n  (these need materialization, which isn't yet supported)",
+  "files": [
+    {
+      "sha": "7f34de7e98e2bde53dc823c6da1f0835834c39e9",
+      "filename": "src/sql/compiler.test.ts",
+      "status": "modified",
+      "additions": 28,
+      "deletions": 0,
+      "changes": 28,
+      "blob_url": "https://github.com/teamchong/querymode/blob/9d9a9cefd6a64241a190b5f3982b3395c126eb9f/src%2Fsql%2Fcompiler.test.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/9d9a9cefd6a64241a190b5f3982b3395c126eb9f/src%2Fsql%2Fcompiler.test.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fsql%2Fcompiler.test.ts?ref=9d9a9cefd6a64241a190b5f3982b3395c126eb9f",
+      "patch": "@@ -271,4 +271,32 @@ describe(\"SQL Compiler - compileFull\", () => {\n     expect(result.computedExprs![0].alias).toBe(\"total\");\n     expect(result.computedExprs![0].expr.kind).toBe(\"binary\");\n   });\n+\n+  it(\"CTE inlines simple filters\", () => {\n+    const result = sqlFull(\"WITH active AS (SELECT * FROM users WHERE status = 'active') SELECT * FROM active WHERE age > 25\");\n+    expect(result.descriptor.table).toBe(\"users\");\n+    expect(result.descriptor.filters).toHaveLength(2);\n+    expect(result.descriptor.filters[0]).toMatchObject({ column: \"status\", op: \"eq\", value: \"active\" });\n+    expect(result.descriptor.filters[1]).toMatchObject({ column: \"age\", op: \"gt\", value: 25 });\n+  });\n+\n+  it(\"CTE with un-pushable WHERE propagates whereExpr\", () => {\n+    // UPPER(name) can't be pushed to FilterOp[], so CTE has a whereExpr\n+    const result = sqlFull(\"WITH x AS (SELECT * FROM t WHERE UPPER(name) = 'JOHN') SELECT * FROM x\");\n+    expect(result.descriptor.table).toBe(\"t\");\n+    // The un-pushable predicate should appear as whereExpr, not silently dropped\n+    expect(result.whereExpr).toBeDefined();\n+  });\n+\n+  it(\"CTE with aggregation is not inlined\", () => {\n+    const result = sqlFull(\"WITH counts AS (SELECT dept, COUNT(*) AS cnt FROM t GROUP BY dept) SELECT * FROM counts\");\n+    // CTE has groupBy \u2014 can't be inlined, table stays as CTE name\n+    expect(result.descriptor.table).toBe(\"counts\");\n+  });\n+\n+  it(\"CTE with LIMIT is not inlined\", () => {\n+    const result = sqlFull(\"WITH top5 AS (SELECT * FROM t ORDER BY score DESC LIMIT 5) SELECT * FROM top5\");\n+    // CTE has sort+limit \u2014 can't be inlined\n+    expect(result.descriptor.table).toBe(\"top5\");\n+  });\n });"
+    },
+    {
+      "sha": "d149f073f5f665d903d417269f6b5ede3bfd3c60",
+      "filename": "src/sql/compiler.ts",
+      "status": "modified",
+      "additions": 23,
+      "deletions": 4,
+      "changes": 27,
+      "blob_url": "https://github.com/teamchong/querymode/blob/9d9a9cefd6a64241a190b5f3982b3395c126eb9f/src%2Fsql%2Fcompiler.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/9d9a9cefd6a64241a190b5f3982b3395c126eb9f/src%2Fsql%2Fcompiler.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fsql%2Fcompiler.ts?ref=9d9a9cefd6a64241a190b5f3982b3395c126eb9f",
+      "patch": "@@ -175,15 +175,34 @@ export function compileFull(stmt: SelectStmt): SqlCompileResult {\n     windows: windows.length > 0 ? windows : undefined,\n   };\n \n-  // Inline CTE: if FROM references a CTE name, merge its filters and resolve to the real table\n+  // Inline CTE: if FROM references a CTE name, merge its filters and resolve to the real table.\n+  // Only inline simple CTEs (filter-only). CTEs with sort/limit/aggregates need materialization.\n   if (compiledCtes) {\n     const cteMap = new Map(compiledCtes.map(c => [c.name, c.result]));\n     const cte = cteMap.get(desc.table);\n     if (cte) {\n       const base = cte.descriptor;\n-      desc.table = base.table;\n-      desc.filters = [...base.filters, ...desc.filters];\n-      desc.filterGroups = [...(base.filterGroups ?? []), ...(desc.filterGroups ?? [])];\n+      // Guard: CTEs with sort/limit/aggregates/groupBy/having can't be inlined \u2014\n+      // they change the result shape and need materialization first.\n+      const canInline = !base.sortColumn && base.limit === undefined &&\n+        !base.aggregates && !base.groupBy && !cte.havingExpr && !cte.allOrderBy;\n+      if (canInline) {\n+        desc.table = base.table;\n+        desc.filters = [...base.filters, ...desc.filters];\n+        desc.filterGroups = [...(base.filterGroups ?? []), ...(desc.filterGroups ?? [])];\n+        // Merge CTE's residual whereExpr into outer whereExpr via AND\n+        if (cte.whereExpr) {\n+          whereExpr = whereExpr\n+            ? { kind: \"binary\", op: \"and\", left: cte.whereExpr, right: whereExpr } as SqlExpr\n+            : cte.whereExpr;\n+        }\n+        // Propagate CTE's computedExprs\n+        if (cte.computedExprs) {\n+          computedExprs.unshift(...cte.computedExprs);\n+        }\n+      }\n+      // If !canInline, table name stays as CTE name \u2014 will fail at execution\n+      // (CTE materialization not yet supported)\n     }\n   }\n "
+    }
+  ]
+}

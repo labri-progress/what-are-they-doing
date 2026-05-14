@@ -1,0 +1,41 @@
+{
+  "message": "Fix owner-PID lifecycle monitoring for cross-platform reliability\n\nTwo bugs caused the brainstorm server to self-terminate within 60s:\n\n1. ownerAlive() treated EPERM (permission denied) as \"process dead\".\n   When the owner PID belongs to a different user (Tailscale SSH,\n   system daemons), process.kill(pid, 0) throws EPERM \u2014 but the\n   process IS alive. Fixed: return e.code === 'EPERM'.\n\n2. On WSL, the grandparent PID resolves to a short-lived subprocess\n   that exits before the first 60s lifecycle check. The PID is\n   genuinely dead (ESRCH), so the EPERM fix alone doesn't help.\n   Fixed: validate the owner PID at server startup \u2014 if it's already\n   dead, it was a bad resolution, so disable monitoring and rely on\n   the 30-minute idle timeout.\n\nThis also removes the Windows/MSYS2-specific OWNER_PID=\"\" carve-out\nfrom start-server.sh, since the server now handles invalid PIDs\ngenerically at startup regardless of platform.\n\nTested on Linux (magic-kingdom) via Tailscale SSH:\n- Root-owned owner PID (EPERM): server survives \u2713\n- Dead owner PID at startup (WSL sim): monitoring disabled, survives \u2713\n- Valid owner that dies: server shuts down within 60s \u2713\n\nFixes #879",
+  "files": [
+    {
+      "sha": "c73a7165dab08d405323c2ae95b45afda5a9d943",
+      "filename": "RELEASE-NOTES.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/obra/superpowers/blob/9f04f0635114d09ca054778e2dd44942efd1c008/RELEASE-NOTES.md",
+      "raw_url": "https://github.com/obra/superpowers/raw/9f04f0635114d09ca054778e2dd44942efd1c008/RELEASE-NOTES.md",
+      "contents_url": "https://api.github.com/repos/obra/superpowers/contents/RELEASE-NOTES.md?ref=9f04f0635114d09ca054778e2dd44942efd1c008",
+      "patch": "@@ -17,7 +17,7 @@ The subagent review loop (dispatching a fresh agent to review plans/specs) doubl\n \n ### Bug Fixes\n \n-- **Owner-PID false positives** \u2014 the brainstorm server's `ownerAlive()` check treated EPERM (permission denied) the same as ESRCH (process not found), causing the server to self-terminate within 60 seconds whenever the owner process ran as a different user. This affected WSL (owner is a Windows process), Tailscale SSH, and any cross-user scenario. Fixed by treating EPERM as \"alive\". (#879)\n+- **Owner-PID lifecycle fixes** \u2014 the brainstorm server's owner-PID monitoring had two bugs causing false shutdowns within 60 seconds: (1) EPERM from cross-user PIDs (Tailscale SSH, etc.) was treated as \"process dead\", and (2) on WSL the grandparent PID resolves to a short-lived subprocess that exits before the first lifecycle check. Fixed by treating EPERM as \"alive\" and validating the owner PID at startup \u2014 if it's already dead, monitoring is disabled and the server relies on the 30-minute idle timeout. This also removes the Windows/MSYS2-specific carve-out from `start-server.sh` since the server now handles it generically. (#879)\n - **writing-skills** \u2014 corrected false claim that SKILL.md frontmatter supports \"only two fields\"; now says \"two required fields\" and links to the agentskills.io specification for all supported fields (PR #882 by @arittr)\n \n ### Codex App Compatibility"
+    },
+    {
+      "sha": "562c17f8933a39e1973737617bad8637529fe018",
+      "filename": "skills/brainstorming/scripts/server.cjs",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 3,
+      "changes": 19,
+      "blob_url": "https://github.com/obra/superpowers/blob/9f04f0635114d09ca054778e2dd44942efd1c008/skills%2Fbrainstorming%2Fscripts%2Fserver.cjs",
+      "raw_url": "https://github.com/obra/superpowers/raw/9f04f0635114d09ca054778e2dd44942efd1c008/skills%2Fbrainstorming%2Fscripts%2Fserver.cjs",
+      "contents_url": "https://api.github.com/repos/obra/superpowers/contents/skills%2Fbrainstorming%2Fscripts%2Fserver.cjs?ref=9f04f0635114d09ca054778e2dd44942efd1c008",
+      "patch": "@@ -79,7 +79,7 @@ const URL_HOST = process.env.BRAINSTORM_URL_HOST || (HOST === '127.0.0.1' ? 'loc\n const SESSION_DIR = process.env.BRAINSTORM_DIR || '/tmp/brainstorm';\n const CONTENT_DIR = path.join(SESSION_DIR, 'content');\n const STATE_DIR = path.join(SESSION_DIR, 'state');\n-const OWNER_PID = process.env.BRAINSTORM_OWNER_PID ? Number(process.env.BRAINSTORM_OWNER_PID) : null;\n+let ownerPid = process.env.BRAINSTORM_OWNER_PID ? Number(process.env.BRAINSTORM_OWNER_PID) : null;\n \n const MIME_TYPES = {\n   '.html': 'text/html', '.css': 'text/css', '.js': 'application/javascript',\n@@ -312,8 +312,8 @@ function startServer() {\n   }\n \n   function ownerAlive() {\n-    if (!OWNER_PID) return true;\n-    try { process.kill(OWNER_PID, 0); return true; } catch (e) { return e.code === 'EPERM'; }\n+    if (!ownerPid) return true;\n+    try { process.kill(ownerPid, 0); return true; } catch (e) { return e.code === 'EPERM'; }\n   }\n \n   // Check every 60s: exit if owner process died or idle for 30 minutes\n@@ -323,6 +323,19 @@ function startServer() {\n   }, 60 * 1000);\n   lifecycleCheck.unref();\n \n+  // Validate owner PID at startup. If it's already dead, the PID resolution\n+  // was wrong (common on WSL, Tailscale SSH, and cross-user scenarios).\n+  // Disable monitoring and rely on the idle timeout instead.\n+  if (ownerPid) {\n+    try { process.kill(ownerPid, 0); }\n+    catch (e) {\n+      if (e.code !== 'EPERM') {\n+        console.log(JSON.stringify({ type: 'owner-pid-invalid', pid: ownerPid, reason: 'dead at startup' }));\n+        ownerPid = null;\n+      }\n+    }\n+  }\n+\n   server.listen(PORT, HOST, () => {\n     const info = JSON.stringify({\n       type: 'server-started', port: Number(PORT), host: HOST,"
+    },
+    {
+      "sha": "9ef6dcb991547a28e2b555d6fd08e97b8ea27400",
+      "filename": "skills/brainstorming/scripts/start-server.sh",
+      "status": "modified",
+      "additions": 0,
+      "deletions": 6,
+      "changes": 6,
+      "blob_url": "https://github.com/obra/superpowers/blob/9f04f0635114d09ca054778e2dd44942efd1c008/skills%2Fbrainstorming%2Fscripts%2Fstart-server.sh",
+      "raw_url": "https://github.com/obra/superpowers/raw/9f04f0635114d09ca054778e2dd44942efd1c008/skills%2Fbrainstorming%2Fscripts%2Fstart-server.sh",
+      "contents_url": "https://api.github.com/repos/obra/superpowers/contents/skills%2Fbrainstorming%2Fscripts%2Fstart-server.sh?ref=9f04f0635114d09ca054778e2dd44942efd1c008",
+      "patch": "@@ -107,12 +107,6 @@ if [[ -z \"$OWNER_PID\" || \"$OWNER_PID\" == \"1\" ]]; then\n   OWNER_PID=\"$PPID\"\n fi\n \n-# On Windows/MSYS2, the MSYS2 PID namespace is invisible to Node.js.\n-# Skip owner-PID monitoring \u2014 the 30-minute idle timeout prevents orphans.\n-case \"${OSTYPE:-}\" in\n-  msys*|cygwin*|mingw*) OWNER_PID=\"\" ;;\n-esac\n-\n # Foreground mode for environments that reap detached/background processes.\n if [[ \"$FOREGROUND\" == \"true\" ]]; then\n   echo \"$$\" > \"$PID_FILE\""
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "message": "fcp-store/object_store: close put-vs-put quota TOCTOU window\n\n`MemoryObjectStore::put` previously released the `objects.write()`\nguard before bumping `used_bytes` via `fetch_add`. Between\n`drop(objects)` and `fetch_add`, a concurrent `put` could acquire\n`objects.write()`, observe `used_bytes.load()` still at the pre-commit\nvalue, pass its quota check, insert, and then both `fetch_add`s would\npush `used_bytes` past `max_bytes`.\n\nConcrete interleaving (max_bytes=200, three 100-byte puts):\n  T_A inserts (used 0\u2192100), drops objects, fetch_add pending\n  T_B acquires objects, reads used=100, 100+100<=200 \u2713, inserts\n  T_C acquires objects (after T_B drop), reads used=100 (T_B's\n       fetch_add not yet executed), 100+100<=200 \u2713, inserts,\n       fetch_add \u2192 used=200\n  T_B fetch_add \u2192 used=300 (200-byte quota silently violated)\n\nMove `fetch_add` inside the `objects.write()` critical section so the\ncommit happens atomically with the insert. `delete` already keeps its\n`fetch_update` inside the critical section; this patch makes `put`\nmatch.\n\nCloses flywheel_connectors-sfunf.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "544d621c4a105da43858d5d37c9dc08c49726911",
+      "filename": "crates/fcp-store/src/object_store.rs",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 1,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/ed6df4f21c5c36fa1a61040ce68aa8e1c9bfc323/crates%2Ffcp-store%2Fsrc%2Fobject_store.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/ed6df4f21c5c36fa1a61040ce68aa8e1c9bfc323/crates%2Ffcp-store%2Fsrc%2Fobject_store.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-store%2Fsrc%2Fobject_store.rs?ref=ed6df4f21c5c36fa1a61040ce68aa8e1c9bfc323",
+      "patch": "@@ -419,9 +419,16 @@ impl ObjectStore for MemoryObjectStore {\n         // Maintain zone index BEFORE releasing the objects lock so that\n         // a concurrent delete() cannot create orphan zone_index entries.\n         self.zone_index.write().entry(zone_id).or_default().push(id);\n-        drop(objects);\n \n+        // Commit the byte count BEFORE releasing the objects lock. If\n+        // `fetch_add` runs after `drop(objects)`, a concurrent `put` can\n+        // acquire `objects.write()`, observe the still-stale `used_bytes`\n+        // load, and pass its quota check despite the in-flight commit \u2014\n+        // both inserts then succeed and `used_bytes` exceeds `max_bytes`.\n+        // `delete` already keeps its `fetch_update` inside the critical\n+        // section; mirror that here.\n         self.used_bytes.fetch_add(size, Ordering::SeqCst);\n+        drop(objects);\n \n         Ok(())\n     }"
+    }
+  ]
+}

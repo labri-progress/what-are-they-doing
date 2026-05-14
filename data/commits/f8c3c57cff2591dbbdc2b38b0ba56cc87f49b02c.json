@@ -1,0 +1,53 @@
+{
+  "message": "fix(mvcc): add runtime warnings and documentation for concurrent mode snapshot drift (GH#65)\n\nThe MVCC concurrent mode (BEGIN CONCURRENT) has a known snapshot-drift\nbug where snapshot_high lags behind commit_seq under sustained write\nload, causing all writes to fail after ~10-20 operations. The default\nwas already flipped to false in a prior commit, but users who explicitly\nenable FSQLITE_CONCURRENT_MODE=true had no warning about the limitation.\n\nChanges:\n- Add tracing::warn at startup and LazyLock init when concurrent mode is\n  explicitly enabled (queries.rs, search_recipes.rs, server lib.rs)\n- Update config.rs doc comment to reflect the correct default (false) and\n  document the known limitation with a link to GH#65\n- Add detailed doc comment on run_with_mvcc_retry explaining the snapshot\n  refresh requirement for callers\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "6c133193d88ab25625d0f17761cb7ad8d5b52e21",
+      "filename": "crates/mcp-agent-mail-core/src/config.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 1,
+      "changes": 8,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/f8c3c57cff2591dbbdc2b38b0ba56cc87f49b02c/crates%2Fmcp-agent-mail-core%2Fsrc%2Fconfig.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/f8c3c57cff2591dbbdc2b38b0ba56cc87f49b02c/crates%2Fmcp-agent-mail-core%2Fsrc%2Fconfig.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-core%2Fsrc%2Fconfig.rs?ref=f8c3c57cff2591dbbdc2b38b0ba56cc87f49b02c",
+      "patch": "@@ -63,7 +63,13 @@ pub struct Config {\n     pub integrity_check_interval_hours: u64,\n \n     // FrankenSQLite MVCC / RaptorQ\n-    /// Auto-promote bare `BEGIN` to `BEGIN CONCURRENT` (default: true).\n+    /// Use `BEGIN CONCURRENT` for write transactions (default: **false**).\n+    ///\n+    /// Disabled by default due to known MVCC snapshot-drift bug (GH#65):\n+    /// under sustained write load, `snapshot_high` lags behind `commit_seq`\n+    /// and all writes fail with `fcw_base_drift`.  Use `BEGIN IMMEDIATE`\n+    /// (single-writer) unless you have a specific need for concurrent\n+    /// writers and have tested your workload.\n     pub fsqlite_concurrent_mode: bool,\n     /// Enable `RaptorQ` erasure-coded self-healing on WAL + DB files (default: true).\n     pub fsqlite_raptorq_enabled: bool,"
+    },
+    {
+      "sha": "5548184475519ae5d04608fa084386d66b7fab04",
+      "filename": "crates/mcp-agent-mail-db/src/queries.rs",
+      "status": "modified",
+      "additions": 26,
+      "deletions": 2,
+      "changes": 28,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/f8c3c57cff2591dbbdc2b38b0ba56cc87f49b02c/crates%2Fmcp-agent-mail-db%2Fsrc%2Fqueries.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/f8c3c57cff2591dbbdc2b38b0ba56cc87f49b02c/crates%2Fmcp-agent-mail-db%2Fsrc%2Fqueries.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-db%2Fsrc%2Fqueries.rs?ref=f8c3c57cff2591dbbdc2b38b0ba56cc87f49b02c",
+      "patch": "@@ -823,10 +823,27 @@ fn tracked(conn: &crate::DbConn) -> TrackedConnection<'_> {\n /// Read once from `FSQLITE_CONCURRENT_MODE` env var; defaults to `false`.\n /// When `false`, all transactions use `BEGIN IMMEDIATE` (single-writer).\n /// Set `FSQLITE_CONCURRENT_MODE=true` to opt in to `BEGIN CONCURRENT`.\n+///\n+/// **Warning:** Concurrent mode is known to cause snapshot drift\n+/// (`fcw_base_drift`) under sustained write load, where `snapshot_high`\n+/// lags behind `commit_seq` and all writes eventually fail.  See\n+/// <https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/65>.\n+/// The underlying frankensqlite MVCC snapshot-advance bug has not yet\n+/// been fixed.  Single-writer mode (`BEGIN IMMEDIATE`) is recommended\n+/// for all deployments.\n static CONCURRENT_MODE_ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {\n-    std::env::var(\"FSQLITE_CONCURRENT_MODE\")\n+    let enabled = std::env::var(\"FSQLITE_CONCURRENT_MODE\")\n         .ok()\n-        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), \"1\" | \"true\" | \"yes\" | \"on\"))\n+        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), \"1\" | \"true\" | \"yes\" | \"on\"));\n+    if enabled {\n+        tracing::warn!(\n+            \"FSQLITE_CONCURRENT_MODE=true: BEGIN CONCURRENT is enabled. \\\n+             This mode has a known snapshot-drift bug (GH#65) that causes \\\n+             all writes to fail after ~10-20 operations. Single-writer mode \\\n+             (FSQLITE_CONCURRENT_MODE=false) is strongly recommended.\"\n+        );\n+    }\n+    enabled\n });\n \n fn should_fallback_begin_concurrent(err_msg: &str) -> bool {\n@@ -1487,6 +1504,13 @@ fn is_plain_write_contention_error(e: &DbError) -> bool {\n /// retries plain `SQLite` busy/locked contention for the same reason: once a\n /// write transaction has failed mid-flight, retrying a single statement is not\n /// sufficient to guarantee a coherent outcome.\n+///\n+/// **IMPORTANT (GH#65):** Each retry *must* issue a fresh `BEGIN CONCURRENT`\n+/// (or `BEGIN IMMEDIATE`) so that the new transaction obtains a current\n+/// snapshot from `load_consistent_snapshot()`.  Reusing a connection's\n+/// stale snapshot across retries causes `fcw_base_drift` rejection where\n+/// `snapshot_high` permanently lags behind `commit_seq`.  Callers achieve\n+/// this by placing `begin_concurrent_tx` inside the closure passed here.\n async fn run_with_mvcc_retry<T, F, Fut>(\n     cx: &Cx,\n     operation: &'static str,"
+    },
+    {
+      "sha": "08ab51d6e460ad77c3f35fed51cd3690d744cc63",
+      "filename": "crates/mcp-agent-mail-db/src/search_recipes.rs",
+      "status": "modified",
+      "additions": 12,
+      "deletions": 2,
+      "changes": 14,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/f8c3c57cff2591dbbdc2b38b0ba56cc87f49b02c/crates%2Fmcp-agent-mail-db%2Fsrc%2Fsearch_recipes.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/f8c3c57cff2591dbbdc2b38b0ba56cc87f49b02c/crates%2Fmcp-agent-mail-db%2Fsrc%2Fsearch_recipes.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-db%2Fsrc%2Fsearch_recipes.rs?ref=f8c3c57cff2591dbbdc2b38b0ba56cc87f49b02c",
+      "patch": "@@ -298,10 +298,20 @@ use crate::sqlmodel::Value;\n ///\n /// Controlled by `FSQLITE_CONCURRENT_MODE` (default: disabled).\n /// Set `FSQLITE_CONCURRENT_MODE=true` to opt in.\n+///\n+/// See queries.rs `CONCURRENT_MODE_ENABLED` for the known snapshot-drift\n+/// limitation (GH#65).\n static SYNC_CONCURRENT_MODE_ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {\n-    std::env::var(\"FSQLITE_CONCURRENT_MODE\")\n+    let enabled = std::env::var(\"FSQLITE_CONCURRENT_MODE\")\n         .ok()\n-        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), \"1\" | \"true\" | \"yes\" | \"on\"))\n+        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), \"1\" | \"true\" | \"yes\" | \"on\"));\n+    if enabled {\n+        tracing::warn!(\n+            \"FSQLITE_CONCURRENT_MODE=true (search_recipes): BEGIN CONCURRENT enabled \\\n+             for sync write helpers. See GH#65 for known snapshot-drift limitations.\"\n+        );\n+    }\n+    enabled\n });\n \n fn begin_sync_write_tx(conn: &DbConn) -> Result<(), String> {"
+    },
+    {
+      "sha": "4f2b69fc0bf1315cd155ac771dff1740b9057d51",
+      "filename": "crates/mcp-agent-mail-server/src/lib.rs",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 0,
+      "changes": 13,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/f8c3c57cff2591dbbdc2b38b0ba56cc87f49b02c/crates%2Fmcp-agent-mail-server%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/f8c3c57cff2591dbbdc2b38b0ba56cc87f49b02c/crates%2Fmcp-agent-mail-server%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-server%2Fsrc%2Flib.rs?ref=f8c3c57cff2591dbbdc2b38b0ba56cc87f49b02c",
+      "patch": "@@ -1254,6 +1254,19 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {\n     spawn_startup_search_backfill(config);\n \n     log_active_database(config);\n+\n+    // Surface a prominent warning when MVCC concurrent mode is enabled so\n+    // operators are aware of the known snapshot-drift limitation (GH#65).\n+    if config.fsqlite_concurrent_mode {\n+        tracing::warn!(\n+            \"fsqlite_concurrent_mode=true: MVCC concurrent writes enabled. \\\n+             This mode has a known snapshot-drift issue (GH#65) that can cause \\\n+             all writes to fail after ~10-20 operations under sustained load. \\\n+             Set FSQLITE_CONCURRENT_MODE=false (the default) to use reliable \\\n+             single-writer mode.\"\n+        );\n+    }\n+\n     tracing::info!(\"MCP Agent Mail server (stdio) starting transport loop\");\n     build_server(config).run_stdio();\n "
+    }
+  ]
+}

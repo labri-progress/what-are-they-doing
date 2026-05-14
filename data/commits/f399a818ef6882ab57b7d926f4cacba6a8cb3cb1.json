@@ -1,0 +1,41 @@
+{
+  "message": "refactor: extract ios watch reply coordinator",
+  "files": [
+    {
+      "sha": "34b6876822bdf75ea9a25b43fb0668e2d3259674",
+      "filename": "apps/ios/Sources/Model/NodeAppModel.swift",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 26,
+      "changes": 36,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/f399a818ef6882ab57b7d926f4cacba6a8cb3cb1/apps%2Fios%2FSources%2FModel%2FNodeAppModel.swift",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/f399a818ef6882ab57b7d926f4cacba6a8cb3cb1/apps%2Fios%2FSources%2FModel%2FNodeAppModel.swift",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/apps%2Fios%2FSources%2FModel%2FNodeAppModel.swift?ref=f399a818ef6882ab57b7d926f4cacba6a8cb3cb1",
+      "patch": "@@ -129,8 +129,7 @@ final class NodeAppModel {\n     private var backgroundReconnectSuppressed = false\n     private var backgroundReconnectLeaseUntil: Date?\n     private var lastSignificantLocationWakeAt: Date?\n-    private var queuedWatchReplies: [WatchQuickReplyEvent] = []\n-    private var seenWatchReplyIds = Set<String>()\n+    @ObservationIgnored private let watchReplyCoordinator = WatchReplyCoordinator()\n \n     private var gatewayConnected = false\n     private var operatorConnected = false\n@@ -2199,37 +2198,22 @@ extension NodeAppModel {\n     }\n \n     private func handleWatchQuickReply(_ event: WatchQuickReplyEvent) async {\n-        let replyId = event.replyId.trimmingCharacters(in: .whitespacesAndNewlines)\n-        let actionId = event.actionId.trimmingCharacters(in: .whitespacesAndNewlines)\n-        if replyId.isEmpty || actionId.isEmpty {\n+        switch self.watchReplyCoordinator.ingest(event, isGatewayConnected: await self.isGatewayConnected()) {\n+        case .dropMissingFields:\n             self.watchReplyLogger.info(\"watch reply dropped: missing replyId/actionId\")\n-            return\n-        }\n-\n-        if self.seenWatchReplyIds.contains(replyId) {\n+        case .deduped(let replyId):\n             self.watchReplyLogger.debug(\n                 \"watch reply deduped replyId=\\(replyId, privacy: .public)\")\n-            return\n-        }\n-        self.seenWatchReplyIds.insert(replyId)\n-\n-        if await !self.isGatewayConnected() {\n-            self.queuedWatchReplies.append(event)\n+        case .queue(let replyId, let actionId):\n             self.watchReplyLogger.info(\n                 \"watch reply queued replyId=\\(replyId, privacy: .public) action=\\(actionId, privacy: .public)\")\n-            return\n+        case .forward:\n+            await self.forwardWatchReplyToAgent(event)\n         }\n-\n-        await self.forwardWatchReplyToAgent(event)\n     }\n \n     private func flushQueuedWatchRepliesIfConnected() async {\n-        guard await self.isGatewayConnected() else { return }\n-        guard !self.queuedWatchReplies.isEmpty else { return }\n-\n-        let pending = self.queuedWatchReplies\n-        self.queuedWatchReplies.removeAll()\n-        for event in pending {\n+        for event in self.watchReplyCoordinator.drainIfConnected(await self.isGatewayConnected()) {\n             await self.forwardWatchReplyToAgent(event)\n         }\n     }\n@@ -2259,7 +2243,7 @@ extension NodeAppModel {\n                 \"watch reply forwarding failed replyId=\\(event.replyId) \"\n                 + \"error=\\(error.localizedDescription)\"\n             self.watchReplyLogger.error(\"\\(failedMessage, privacy: .public)\")\n-            self.queuedWatchReplies.insert(event, at: 0)\n+            self.watchReplyCoordinator.requeueFront(event)\n         }\n     }\n \n@@ -2852,7 +2836,7 @@ extension NodeAppModel {\n     }\n \n     func _test_queuedWatchReplyCount() -> Int {\n-        self.queuedWatchReplies.count\n+        self.watchReplyCoordinator.queuedCount\n     }\n \n     func _test_setGatewayConnected(_ connected: Bool) {"
+    },
+    {
+      "sha": "bdd183d35772ce304487f1f8486b10d6596a91de",
+      "filename": "apps/ios/Sources/Model/WatchReplyCoordinator.swift",
+      "status": "added",
+      "additions": 46,
+      "deletions": 0,
+      "changes": 46,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/f399a818ef6882ab57b7d926f4cacba6a8cb3cb1/apps%2Fios%2FSources%2FModel%2FWatchReplyCoordinator.swift",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/f399a818ef6882ab57b7d926f4cacba6a8cb3cb1/apps%2Fios%2FSources%2FModel%2FWatchReplyCoordinator.swift",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/apps%2Fios%2FSources%2FModel%2FWatchReplyCoordinator.swift?ref=f399a818ef6882ab57b7d926f4cacba6a8cb3cb1",
+      "patch": "@@ -0,0 +1,46 @@\n+import Foundation\n+\n+@MainActor\n+final class WatchReplyCoordinator {\n+    enum Decision {\n+        case dropMissingFields\n+        case deduped(replyId: String)\n+        case queue(replyId: String, actionId: String)\n+        case forward\n+    }\n+\n+    private var queuedReplies: [WatchQuickReplyEvent] = []\n+    private var seenReplyIds = Set<String>()\n+\n+    func ingest(_ event: WatchQuickReplyEvent, isGatewayConnected: Bool) -> Decision {\n+        let replyId = event.replyId.trimmingCharacters(in: .whitespacesAndNewlines)\n+        let actionId = event.actionId.trimmingCharacters(in: .whitespacesAndNewlines)\n+        if replyId.isEmpty || actionId.isEmpty {\n+            return .dropMissingFields\n+        }\n+        if self.seenReplyIds.contains(replyId) {\n+            return .deduped(replyId: replyId)\n+        }\n+        self.seenReplyIds.insert(replyId)\n+        if !isGatewayConnected {\n+            self.queuedReplies.append(event)\n+            return .queue(replyId: replyId, actionId: actionId)\n+        }\n+        return .forward\n+    }\n+\n+    func drainIfConnected(_ isGatewayConnected: Bool) -> [WatchQuickReplyEvent] {\n+        guard isGatewayConnected, !self.queuedReplies.isEmpty else { return [] }\n+        let pending = self.queuedReplies\n+        self.queuedReplies.removeAll()\n+        return pending\n+    }\n+\n+    func requeueFront(_ event: WatchQuickReplyEvent) {\n+        self.queuedReplies.insert(event, at: 0)\n+    }\n+\n+    var queuedCount: Int {\n+        self.queuedReplies.count\n+    }\n+}"
+    },
+    {
+      "sha": "ad55607e9a40ccb66215b3a8fc437620c0c874c8",
+      "filename": "apps/ios/SwiftSources.input.xcfilelist",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/f399a818ef6882ab57b7d926f4cacba6a8cb3cb1/apps%2Fios%2FSwiftSources.input.xcfilelist",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/f399a818ef6882ab57b7d926f4cacba6a8cb3cb1/apps%2Fios%2FSwiftSources.input.xcfilelist",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/apps%2Fios%2FSwiftSources.input.xcfilelist?ref=f399a818ef6882ab57b7d926f4cacba6a8cb3cb1",
+      "patch": "@@ -13,6 +13,7 @@ Sources/OpenClawApp.swift\n Sources/Location/LocationService.swift\n Sources/Model/NodeAppModel.swift\n Sources/Model/NodeAppModel+Canvas.swift\n+Sources/Model/WatchReplyCoordinator.swift\n Sources/RootCanvas.swift\n Sources/RootTabs.swift\n Sources/Screen/ScreenController.swift"
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "message": "Add NATS max_payload enforcement, producer E2E test, and formatting fix\n\nnats.rs: Add MAX_READ_BUFFER constant (8 MiB) to bound memory growth\nfrom fast servers. Enforce server's max_payload limit during CONNECT\nhandshake \u2014 if the server advertises a smaller max_payload than the\nclient config, clamp to the server's value to prevent rejected publishes.\n\ne2e_messaging.rs: Add e2e_kafka_producer_delivery_ack_metadata test\nexercising deterministic delivery metadata \u2014 verifies topic, partition,\nmonotonic offset increments across sequential sends, flush completion,\nand blank topic rejection. Also imports KafkaProducer/ProducerConfig/\nKafkaError directly and simplifies the consumer lifecycle error match.\n\nsqlite.rs: Format the Debug impl's needs_rollback field to satisfy\nrustfmt line-length rules.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "f67b0639575a5f4128295877b0e30232cbcf194d",
+      "filename": "src/database/sqlite.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 1,
+      "changes": 5,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/1527fe9b6801eedc9946d88dd2c0a663f29c5e1c/src%2Fdatabase%2Fsqlite.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/1527fe9b6801eedc9946d88dd2c0a663f29c5e1c/src%2Fdatabase%2Fsqlite.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fdatabase%2Fsqlite.rs?ref=1527fe9b6801eedc9946d88dd2c0a663f29c5e1c",
+      "patch": "@@ -349,7 +349,10 @@ impl fmt::Debug for SqliteConnection {\n         f.debug_struct(\"SqliteConnection\")\n             .field(\"open\", &self.inner.lock().conn.is_some())\n             .field(\"pool\", &self.pool)\n-            .field(\"needs_rollback\", &self.needs_rollback.load(Ordering::Relaxed))\n+            .field(\n+                \"needs_rollback\",\n+                &self.needs_rollback.load(Ordering::Relaxed),\n+            )\n             .finish()\n     }\n }"
+    },
+    {
+      "sha": "8ebdcc2df3e5e127c250c05f2a17939af2fc1ba8",
+      "filename": "src/messaging/nats.rs",
+      "status": "modified",
+      "additions": 18,
+      "deletions": 1,
+      "changes": 19,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/1527fe9b6801eedc9946d88dd2c0a663f29c5e1c/src%2Fmessaging%2Fnats.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/1527fe9b6801eedc9946d88dd2c0a663f29c5e1c/src%2Fmessaging%2Fnats.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fmessaging%2Fnats.rs?ref=1527fe9b6801eedc9946d88dd2c0a663f29c5e1c",
+      "patch": "@@ -331,6 +331,10 @@ fn random_suffix(cx: &Cx) -> String {\n     format!(\"{:016x}\", hi ^ lo)\n }\n \n+/// Maximum read buffer size (8 MiB). Prevents unbounded memory growth\n+/// if the server sends data faster than the client can consume.\n+const MAX_READ_BUFFER: usize = 8 * 1024 * 1024;\n+\n /// Internal read buffer for NATS protocol parsing.\n #[derive(Debug)]\n struct NatsReadBuffer {\n@@ -350,8 +354,14 @@ impl NatsReadBuffer {\n         &self.buf[self.pos..]\n     }\n \n-    fn extend(&mut self, bytes: &[u8]) {\n+    fn extend(&mut self, bytes: &[u8]) -> Result<(), NatsError> {\n+        if self.buf.len() + bytes.len() - self.pos > MAX_READ_BUFFER {\n+            return Err(NatsError::Protocol(format!(\n+                \"read buffer exceeds maximum size ({MAX_READ_BUFFER} bytes)\"\n+            )));\n+        }\n         self.buf.extend_from_slice(bytes);\n+        Ok(())\n     }\n \n     fn consume(&mut self, n: usize) {\n@@ -460,6 +470,13 @@ impl NatsClient {\n \n         // Read initial INFO from server\n         let info = client.read_info(cx).await?;\n+\n+        // Enforce the server's max_payload if it is smaller than the client's.\n+        // This prevents the client from sending payloads that the server will reject.\n+        if info.max_payload > 0 && info.max_payload < client.config.max_payload {\n+            client.config.max_payload = info.max_payload;\n+        }\n+\n         *client.state.server_info.lock() = Some(info.clone());\n \n         // Send CONNECT command"
+    },
+    {
+      "sha": "e26d2ecddb36290383b4852e22f6623255ab7713",
+      "filename": "tests/e2e_messaging.rs",
+      "status": "modified",
+      "additions": 38,
+      "deletions": 4,
+      "changes": 42,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/1527fe9b6801eedc9946d88dd2c0a663f29c5e1c/tests%2Fe2e_messaging.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/1527fe9b6801eedc9946d88dd2c0a663f29c5e1c/tests%2Fe2e_messaging.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/tests%2Fe2e_messaging.rs?ref=1527fe9b6801eedc9946d88dd2c0a663f29c5e1c",
+      "patch": "@@ -7,7 +7,9 @@ use asupersync::channel::mpsc;\n use asupersync::channel::session::tracked_channel;\n use asupersync::cx::Cx;\n use asupersync::lab::{LabConfig, LabRuntime};\n-use asupersync::messaging::{ConsumerConfig, KafkaConsumer, TopicPartitionOffset};\n+use asupersync::messaging::{\n+    ConsumerConfig, KafkaConsumer, KafkaError, KafkaProducer, ProducerConfig, TopicPartitionOffset,\n+};\n use asupersync::types::{Budget, CancelReason};\n use parking_lot::Mutex;\n use std::sync::Arc;\n@@ -443,10 +445,42 @@ fn e2e_kafka_consumer_lifecycle() {\n             .poll(&cx, Duration::from_millis(1))\n             .await\n             .expect_err(\"poll after close should fail\");\n-        assert!(\n-            matches!(err, asupersync::messaging::KafkaError::Config(msg) if msg.contains(\"closed\"))\n-        );\n+        assert!(matches!(err, KafkaError::Config(msg) if msg.contains(\"closed\")));\n \n         test_complete!(\"e2e_kafka_consumer_lifecycle\");\n     });\n }\n+\n+#[test]\n+fn e2e_kafka_producer_delivery_ack_metadata() {\n+    common::init_test_logging();\n+    common::run_test_with_cx(|cx| async move {\n+        test_phase!(\"Kafka Producer Delivery Acks\");\n+\n+        let producer = KafkaProducer::new(ProducerConfig::default()).expect(\"producer creation\");\n+\n+        let first = producer\n+            .send(&cx, \"orders\", None, b\"one\", Some(1))\n+            .await\n+            .expect(\"first send\");\n+        let second = producer\n+            .send(&cx, \"orders\", None, b\"two\", Some(1))\n+            .await\n+            .expect(\"second send\");\n+\n+        assert_eq!(first.topic, \"orders\");\n+        assert_eq!(first.partition, 1);\n+        assert_eq!(second.partition, 1);\n+        assert_eq!(second.offset, first.offset + 1);\n+\n+        producer\n+            .flush(&cx, Duration::from_millis(5))\n+            .await\n+            .expect(\"flush\");\n+\n+        let blank_topic = producer.send(&cx, \" \", None, b\"bad\", None).await;\n+        assert!(matches!(blank_topic, Err(KafkaError::InvalidTopic(_))));\n+\n+        test_complete!(\"e2e_kafka_producer_delivery_ack_metadata\");\n+    });\n+}"
+    }
+  ]
+}

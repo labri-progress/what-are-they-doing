@@ -1,0 +1,137 @@
+{
+  "message": "Security hardening: fix cross-repo leak, remove stubs, validate inputs\n\n- PackWorkerDO: validate all R2 keys are prefixed with repoPath (prevents\n  cross-repo data exfiltration via crafted descriptors), cap batch size\n- Fan-out: fail on any rejected batch instead of silently dropping objects\n  from packfile (prevents incomplete/corrupt clone responses)\n- worker.ts: add VALID_PATH_SEGMENT + RESERVED_NAMES validation matching\n  handler.ts (prevents path traversal in owner/repo URL segments)\n- Remove unused permissions table (was a stub creating false security)\n- Remove visibility from updatable fields (stored but never enforced)\n- Sanitize DO API error messages (no longer leaks internal details)\n- Validate ref names on push via receive-pack (was unvalidated)\n- Remove globalThis.__gitmode_env__ (leaked raw R2/DO bindings to isolate)",
+  "files": [
+    {
+      "sha": "850d3165385365aeb70d699f56e0702b8cbcbbb5",
+      "filename": "docs/src/content/docs/architecture.mdx",
+      "status": "modified",
+      "additions": 0,
+      "deletions": 6,
+      "changes": 6,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/a4ad735ca0051e659948896aace660633224fbcf/docs%2Fsrc%2Fcontent%2Fdocs%2Farchitecture.mdx",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/a4ad735ca0051e659948896aace660633224fbcf/docs%2Fsrc%2Fcontent%2Fdocs%2Farchitecture.mdx",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/docs%2Fsrc%2Fcontent%2Fdocs%2Farchitecture.mdx?ref=a4ad735ca0051e659948896aace660633224fbcf",
+      "patch": "@@ -67,12 +67,6 @@ CREATE TABLE commits (\n   timestamp INTEGER NOT NULL\n );\n \n--- Access control\n-CREATE TABLE permissions (\n-  username TEXT PRIMARY KEY,\n-  role TEXT NOT NULL           -- e.g. \"admin\", \"write\", \"read\"\n-);\n-\n -- Object chunk index (maps SHA \u2192 R2 chunk for batch reads)\n CREATE TABLE object_chunks (\n   sha TEXT PRIMARY KEY,"
+    },
+    {
+      "sha": "2f1e63f97c9544df29d6a348ee8c601c6cb77bb0",
+      "filename": "src/env.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/a4ad735ca0051e659948896aace660633224fbcf/src%2Fenv.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/a4ad735ca0051e659948896aace660633224fbcf/src%2Fenv.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Fenv.ts?ref=a4ad735ca0051e659948896aace660633224fbcf",
+      "patch": "@@ -2,7 +2,7 @@\n //\n // Storage architecture (2 services):\n //   R2 (OBJECTS)      \u2014 git objects (blobs, trees, commits, tags) + worktree files\n-//   DO (REPO_STORE)   \u2014 per-repo SQLite for refs, metadata, permissions, SSH keys\n+//   DO (REPO_STORE)   \u2014 per-repo SQLite for refs, metadata\n export interface Env {\n   OBJECTS: R2Bucket;\n   REPO_STORE: DurableObjectNamespace;"
+    },
+    {
+      "sha": "215f5b8d1bfd5d7f0ddf9149043abb6acc66327a",
+      "filename": "src/git-engine.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 2,
+      "changes": 5,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/a4ad735ca0051e659948896aace660633224fbcf/src%2Fgit-engine.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/a4ad735ca0051e659948896aace660633224fbcf/src%2Fgit-engine.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Fgit-engine.ts?ref=a4ad735ca0051e659948896aace660633224fbcf",
+      "patch": "@@ -4,7 +4,7 @@\n //   R2 key:  \"{repo}/chunks/{uuid}\"                    (~2MB bundled objects, primary)\n //   R2 key:  \"{repo}/objects/{sha1[0:2]}/{sha1[2:]}\"  (loose objects, legacy fallback)\n //   R2 key:  \"{repo}/worktrees/{branch}/{filepath}\"    (materialized files)\n-//   SQLite:  refs, head, repo_meta, commits, permissions, object_chunks, file_sizes\n+//   SQLite:  refs, head, repo_meta, commits, object_chunks, file_sizes\n \n import { WasmEngine } from \"./wasm-engine\";\n import { toHex } from \"./hex\";\n@@ -437,7 +437,8 @@ export class GitEngine {\n \n   updateRepoMeta(fields: Record<string, string>): void {\n     const sql = this.requireSql();\n-    const allowed = [\"description\", \"visibility\", \"default_branch\"];\n+    // Note: visibility is stored but NOT enforced \u2014 auth is the caller's responsibility\n+    const allowed = [\"description\", \"default_branch\"];\n     const sets: string[] = [];\n     const values: string[] = [];\n     for (const [key, val] of Object.entries(fields)) {"
+    },
+    {
+      "sha": "2b6f3a57abf65b949bd341da4178cd7f2385a681",
+      "filename": "src/pack-worker.ts",
+      "status": "modified",
+      "additions": 19,
+      "deletions": 1,
+      "changes": 20,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/a4ad735ca0051e659948896aace660633224fbcf/src%2Fpack-worker.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/a4ad735ca0051e659948896aace660633224fbcf/src%2Fpack-worker.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Fpack-worker.ts?ref=a4ad735ca0051e659948896aace660633224fbcf",
+      "patch": "@@ -14,6 +14,7 @@ import { objectToPackType, writeTypeSizeHeader, typeSizeHeaderLen } from \"./pack\n import { OBJ_BLOB, OBJ_TREE, OBJ_COMMIT, OBJ_TAG } from \"./git-engine\";\n \n const decoder = new TextDecoder();\n+const MAX_OBJECTS_PER_BATCH = 1000;\n \n interface ObjectDescriptor {\n   sha: string;\n@@ -52,12 +53,29 @@ export class PackWorkerDO extends DurableObject<Env> {\n     }\n \n     const body = await request.json() as BuildRequest;\n-    const { objects } = body;\n+    const { repoPath, objects } = body;\n+    if (!repoPath || typeof repoPath !== \"string\") {\n+      return new Response(\"Missing repoPath\\n\", { status: 400 });\n+    }\n     if (!objects || objects.length === 0) {\n       return new Response(new Uint8Array(0), {\n         headers: { \"content-type\": \"application/octet-stream\", \"x-object-count\": \"0\" },\n       });\n     }\n+    if (objects.length > MAX_OBJECTS_PER_BATCH) {\n+      return new Response(\"Too many objects\\n\", { status: 400 });\n+    }\n+\n+    // Validate all R2 keys are scoped to this repo (prevent cross-repo reads)\n+    const repoPrefix = repoPath + \"/\";\n+    for (const desc of objects) {\n+      if (desc.chunkKey && !desc.chunkKey.startsWith(repoPrefix)) {\n+        return new Response(\"Invalid chunk key scope\\n\", { status: 400 });\n+      }\n+      if (desc.looseKey && !desc.looseKey.startsWith(repoPrefix)) {\n+        return new Response(\"Invalid object key scope\\n\", { status: 400 });\n+      }\n+    }\n \n     const wasm = await this.getWasm();\n     const r2 = this.env.OBJECTS;"
+    },
+    {
+      "sha": "3c40d1af6f98cc889f9239a7388b0615cf02b165",
+      "filename": "src/packfile-builder.ts",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 2,
+      "changes": 8,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/a4ad735ca0051e659948896aace660633224fbcf/src%2Fpackfile-builder.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/a4ad735ca0051e659948896aace660633224fbcf/src%2Fpackfile-builder.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Fpackfile-builder.ts?ref=a4ad735ca0051e659948896aace660633224fbcf",
+      "patch": "@@ -191,18 +191,22 @@ async function buildPackfileFanout(\n     })\n   );\n \n-  // Gather segments, log failures\n+  // Gather segments \u2014 fail if any batch was rejected (don't produce incomplete packfiles)\n   const segments: Uint8Array[] = [];\n   let objectCount = 0;\n+  const failures: string[] = [];\n   for (let i = 0; i < results.length; i++) {\n     const r = results[i];\n     if (r.status === \"fulfilled\") {\n       segments.push(r.value.segment);\n       objectCount += r.value.count;\n     } else {\n-      console.error(`PackWorkerDO batch ${i} failed: ${r.reason}`);\n+      failures.push(`batch ${i}: ${r.reason}`);\n     }\n   }\n+  if (failures.length > 0) {\n+    throw new Error(`PackWorkerDO fan-out failed: ${failures.join(\"; \")}`);\n+  }\n \n   // Assemble final packfile: header + segments + SHA-1 trailer\n   let totalSize = 12; // header"
+    },
+    {
+      "sha": "eb03732c476a236b652a215dadb9547f915e17ad",
+      "filename": "src/receive-pack.ts",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 2,
+      "changes": 13,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/a4ad735ca0051e659948896aace660633224fbcf/src%2Freceive-pack.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/a4ad735ca0051e659948896aace660633224fbcf/src%2Freceive-pack.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Freceive-pack.ts?ref=a4ad735ca0051e659948896aace660633224fbcf",
+      "patch": "@@ -13,6 +13,7 @@ import type { Env } from \"./env\";\n import { decodePktLine, encodePktLine, encodePktLineBytes, FLUSH_PKT } from \"./pkt-line\";\n import { unpackPackfile, type ObjectCache } from \"./packfile-reader\";\n import { materializeWorktree } from \"./checkout\";\n+import { validateRefName } from \"./repo-store\";\n \n const decoder = new TextDecoder();\n const ZERO_SHA = \"0\".repeat(40);\n@@ -94,10 +95,18 @@ export async function handleReceivePack(\n       if (updates.length >= 1000) {\n         return { response: errorResponse(\"Too many ref updates (max 1000)\", useSideband) };\n       }\n+      const refname = line.slice(82);\n+      // Validate ref name (strip refs/ prefix for validation)\n+      const shortRef = refname.replace(/^refs\\//, \"\");\n+      try {\n+        validateRefName(shortRef);\n+      } catch {\n+        return { response: errorResponse(`Invalid ref name: ${refname}`, useSideband) };\n+      }\n       updates.push({\n         oldSha: line.slice(0, 40),\n         newSha: line.slice(41, 81),\n-        refname: line.slice(82),\n+        refname,\n       });\n     }\n   }\n@@ -142,7 +151,7 @@ export async function handleReceivePack(\n         results.push(`ok ${update.refname}`);\n       }\n     } catch (err) {\n-      results.push(`ng ${update.refname} ${err}`);\n+      results.push(`ng ${update.refname} failed`);\n     }\n   }\n "
+    },
+    {
+      "sha": "bae8bfe20f568f42e70f174f377ce6696f21eca6",
+      "filename": "src/repo-store.ts",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 10,
+      "changes": 18,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/a4ad735ca0051e659948896aace660633224fbcf/src%2Frepo-store.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/a4ad735ca0051e659948896aace660633224fbcf/src%2Frepo-store.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Frepo-store.ts?ref=a4ad735ca0051e659948896aace660633224fbcf",
+      "patch": "@@ -2,7 +2,7 @@\n //\n // Each repository gets its own DO instance. The DO's embedded SQLite\n // database stores refs (branches, tags, HEAD) and metadata (repo info,\n-// commit index, permissions). Git objects live in R2.\n+// commit index). Git objects live in R2.\n //\n // This replaces the previous KV (refs) + D1 (metadata) + RepoLock (mutex)\n // architecture with a single strongly-consistent DO per repo.\n@@ -23,7 +23,7 @@ const MAX_DESCRIPTION_LEN = 10 * 1024; // 10KB\n const MAX_SHORT_FIELD_LEN = 1024; // 1KB (author, email, tagger)\n const INVALID_REF_CHARS = /[\\x00-\\x1f\\x7f ~^:?*\\[\\\\]/;\n \n-function validateRefName(name: string): void {\n+export function validateRefName(name: string): void {\n   if (!name || typeof name !== \"string\") throw new Error(\"Ref name is required\");\n   if (name.length > MAX_REF_NAME_LEN) throw new Error(\"Ref name too long\");\n   if (INVALID_REF_CHARS.test(name)) throw new Error(\"Ref name contains invalid characters\");\n@@ -107,12 +107,8 @@ export class RepoStore extends DurableObject<Env> {\n         timestamp INTEGER NOT NULL\n       )\n     `);\n-    this.sql.exec(`\n-      CREATE TABLE IF NOT EXISTS permissions (\n-        username TEXT PRIMARY KEY,\n-        role TEXT NOT NULL\n-      )\n-    `);\n+    // Note: authentication/authorization is the caller's responsibility.\n+    // Use createHandler() with a custom auth wrapper \u2014 see docs.\n     this.sql.exec(`\n       CREATE TABLE IF NOT EXISTS file_sizes (\n         sha TEXT PRIMARY KEY,\n@@ -238,8 +234,10 @@ export class RepoStore extends DurableObject<Env> {\n         try {\n           return await handleApiAction(porcelain, engine, apiAction, request, url);\n         } catch (err) {\n-          const message = err instanceof Error ? err.message : String(err);\n-          return Response.json({ error: message }, { status: 400 });\n+          const raw = err instanceof Error ? err.message : String(err);\n+          // Only return known user-facing errors; hide internal details\n+          const safe = /^(Missing|Invalid|Ref|Branch|Tag|Merge|No |Not |Cannot )/.test(raw) ? raw : \"Operation failed\";\n+          return Response.json({ error: safe }, { status: 400 });\n         }\n       }\n "
+    },
+    {
+      "sha": "4e1b35827aaa92c117f4bebca934e9350a111680",
+      "filename": "src/schema.sql",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 5,
+      "changes": 7,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/a4ad735ca0051e659948896aace660633224fbcf/src%2Fschema.sql",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/a4ad735ca0051e659948896aace660633224fbcf/src%2Fschema.sql",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Fschema.sql?ref=a4ad735ca0051e659948896aace660633224fbcf",
+      "patch": "@@ -37,8 +37,5 @@ CREATE TABLE IF NOT EXISTS commits (\n CREATE INDEX IF NOT EXISTS idx_commits_timestamp ON commits(timestamp DESC);\n CREATE INDEX IF NOT EXISTS idx_commits_author ON commits(author);\n \n--- Access permissions\n-CREATE TABLE IF NOT EXISTS permissions (\n-  username TEXT PRIMARY KEY,\n-  role TEXT NOT NULL CHECK (role IN ('read', 'write', 'admin'))\n-);\n+-- Note: authentication/authorization is the caller's responsibility.\n+-- Use createHandler() with a custom auth wrapper \u2014 see docs."
+    },
+    {
+      "sha": "13b3ede2ee28d7e6fdf80002296488f67457885f",
+      "filename": "src/worker.ts",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 0,
+      "changes": 14,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/a4ad735ca0051e659948896aace660633224fbcf/src%2Fworker.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/a4ad735ca0051e659948896aace660633224fbcf/src%2Fworker.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Fworker.ts?ref=a4ad735ca0051e659948896aace660633224fbcf",
+      "patch": "@@ -49,6 +49,14 @@ const GIT_ROUTE = /^\\/([^/]+)\\/([^/]+?)\\.git\\/(.+)$/;\n const API_ROUTE = /^\\/api\\/repos\\/([^/]+)\\/([^/]+)(?:\\/(.*))?$/;\n const LIST_REPOS_ROUTE = /^\\/api\\/repos(?:\\/([^/]+))?\\/?$/;\n \n+const VALID_PATH_SEGMENT = /^[a-zA-Z0-9._][a-zA-Z0-9._-]*$/;\n+const RESERVED_NAMES = /^\\.\\.?$/;\n+\n+function isValidOwnerRepo(owner: string, repo: string): boolean {\n+  return VALID_PATH_SEGMENT.test(owner) && VALID_PATH_SEGMENT.test(repo)\n+    && !RESERVED_NAMES.test(owner) && !RESERVED_NAMES.test(repo);\n+}\n+\n function getStore(env: Env, repoPath: string) {\n   const id = env.REPO_STORE.idFromName(repoPath);\n   return env.REPO_STORE.get(id);\n@@ -101,6 +109,9 @@ export default {\n     const apiMatch = path.match(API_ROUTE);\n     if (apiMatch) {\n       const [, owner, repo, rest = \"\"] = apiMatch;\n+      if (!isValidOwnerRepo(owner, repo)) {\n+        return withCors(Response.json({ error: \"Invalid repository path\" }, { status: 400 }));\n+      }\n       const repoPath = `${owner}/${repo}`;\n       const store = getStore(env, repoPath);\n \n@@ -116,6 +127,9 @@ export default {\n     const gitMatch = path.match(GIT_ROUTE);\n     if (gitMatch) {\n       const [, owner, repo, action] = gitMatch;\n+      if (!isValidOwnerRepo(owner, repo)) {\n+        return new Response(\"Invalid repository path\\n\", { status: 400 });\n+      }\n       const repoPath = `${owner}/${repo}`;\n       const store = getStore(env, repoPath);\n "
+    },
+    {
+      "sha": "8f24938f4c4b64dc22fb6a0db8a2aa94bc83d16a",
+      "filename": "test/gitmode.test.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 2,
+      "changes": 3,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/a4ad735ca0051e659948896aace660633224fbcf/test%2Fgitmode.test.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/a4ad735ca0051e659948896aace660633224fbcf/test%2Fgitmode.test.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/test%2Fgitmode.test.ts?ref=a4ad735ca0051e659948896aace660633224fbcf",
+      "patch": "@@ -1444,12 +1444,11 @@ describe(\"REST API\", () => {\n   it(\"PATCH / updates repo metadata\", async () => {\n     const resp = await apiJson(\"\", {\n       method: \"PATCH\",\n-      body: JSON.stringify({ description: \"My test repo\", visibility: \"private\" }),\n+      body: JSON.stringify({ description: \"My test repo\" }),\n     });\n     expect(resp.ok).toBe(true);\n     const meta = await apiJson(\"\");\n     expect(meta.description).toBe(\"My test repo\");\n-    expect(meta.visibility).toBe(\"private\");\n   });\n });\n "
+    },
+    {
+      "sha": "55030edb5ca9d2518e67207233b6e2d63d41fa73",
+      "filename": "worker/index.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 5,
+      "changes": 6,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/a4ad735ca0051e659948896aace660633224fbcf/worker%2Findex.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/a4ad735ca0051e659948896aace660633224fbcf/worker%2Findex.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/worker%2Findex.ts?ref=a4ad735ca0051e659948896aace660633224fbcf",
+      "patch": "@@ -19,9 +19,5 @@ const gitmode = createHandler({\n });\n \n export default {\n-  async fetch(request: Request, env: Env): Promise<Response> {\n-    // Expose env to RSC components via globalThis\n-    (globalThis as any).__gitmode_env__ = env;\n-    return gitmode(request, env);\n-  },\n+  fetch: gitmode,\n };"
+    }
+  ]
+}

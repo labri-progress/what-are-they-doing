@@ -1,0 +1,77 @@
+{
+  "message": "fix: preserve debounce and followup ordering (#52998) (thanks @osolmaz)",
+  "files": [
+    {
+      "sha": "2b4335c468013f4cf7e82be66a7f53d7ec9d536c",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/1b69d9ee1a516a9371a7c9e6e5a67dd8b5b1f0e0/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/1b69d9ee1a516a9371a7c9e6e5a67dd8b5b1f0e0/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=1b69d9ee1a516a9371a7c9e6e5a67dd8b5b1f0e0",
+      "patch": "@@ -27,6 +27,7 @@ Docs: https://docs.openclaw.ai\n - Voice-call/Plivo: stabilize Plivo v2 replay keys so webhook retries and replay protection stop colliding on valid follow-up deliveries.\n - Release/install: keep previously released bundled plugins and Control UI assets in published openclaw npm installs, and fail release checks when those shipped artifacts are missing. Thanks @vincentkoc.\n - Mistral/models: lower bundled Mistral max-token defaults to safe output budgets and teach `openclaw doctor --fix` to repair old persisted Mistral provider configs that still carry context-sized output limits, avoiding deterministic Mistral 422 rejects on fresh and existing setups. Fixes #52599. Thanks @vincentkoc.\n+- Telegram/auto-reply: preserve same-chat inbound debounce order without stranding stale busy-session followups, and keep same-key overflow turns ordered when tracked debounce keys are saturated. (#52998) Thanks @osolmaz.\n \n ## 2026.3.22\n "
+    },
+    {
+      "sha": "16076891ce3e3e61c5dc09b2905577fea16d75cb",
+      "filename": "src/auto-reply/inbound-debounce.ts",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 1,
+      "changes": 6,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/1b69d9ee1a516a9371a7c9e6e5a67dd8b5b1f0e0/src%2Fauto-reply%2Finbound-debounce.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/1b69d9ee1a516a9371a7c9e6e5a67dd8b5b1f0e0/src%2Fauto-reply%2Finbound-debounce.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fauto-reply%2Finbound-debounce.ts?ref=1b69d9ee1a516a9371a7c9e6e5a67dd8b5b1f0e0",
+      "patch": "@@ -203,7 +203,11 @@ export function createInboundDebouncer<T>(params: InboundDebounceCreateParams<T>\n       return;\n     }\n     if (!canTrackKey(key)) {\n-      await runFlush([item]);\n+      // When the debounce map is saturated, fall back to immediate keyed work\n+      // instead of buffering, but still preserve same-key ordering.\n+      await enqueueKeyTask(key, async () => {\n+        await runFlush([item]);\n+      });\n       return;\n     }\n "
+    },
+    {
+      "sha": "9563ce0d9e8b3e77aafb4913e8ff468816346723",
+      "filename": "src/auto-reply/inbound.test.ts",
+      "status": "modified",
+      "additions": 63,
+      "deletions": 0,
+      "changes": 63,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/1b69d9ee1a516a9371a7c9e6e5a67dd8b5b1f0e0/src%2Fauto-reply%2Finbound.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/1b69d9ee1a516a9371a7c9e6e5a67dd8b5b1f0e0/src%2Fauto-reply%2Finbound.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fauto-reply%2Finbound.test.ts?ref=1b69d9ee1a516a9371a7c9e6e5a67dd8b5b1f0e0",
+      "patch": "@@ -543,6 +543,69 @@ describe(\"createInboundDebouncer\", () => {\n \n     vi.useRealTimers();\n   });\n+\n+  it(\"keeps same-key overflow work ordered after falling back to immediate flushes\", async () => {\n+    const started: string[] = [];\n+    const finished: string[] = [];\n+    let releaseOverflow!: () => void;\n+    const overflowGate = new Promise<void>((resolve) => {\n+      releaseOverflow = resolve;\n+    });\n+\n+    const setTimeoutSpy = vi.spyOn(globalThis, \"setTimeout\");\n+    const debouncer = createInboundDebouncer<{ key: string; id: string }>({\n+      debounceMs: 50,\n+      maxTrackedKeys: 1,\n+      buildKey: (item) => item.key,\n+      onFlush: async (items) => {\n+        const ids = items.map((entry) => entry.id).join(\",\");\n+        started.push(ids);\n+        if (ids === \"2\") {\n+          await overflowGate;\n+        }\n+        finished.push(ids);\n+      },\n+    });\n+\n+    try {\n+      await debouncer.enqueue({ key: \"a\", id: \"1\" });\n+      const callCountBeforeOverflow = setTimeoutSpy.mock.calls.length;\n+      clearTimeout(\n+        setTimeoutSpy.mock.results[callCountBeforeOverflow - 1]?.value as ReturnType<\n+          typeof setTimeout\n+        >,\n+      );\n+\n+      const overflowEnqueue = debouncer.enqueue({ key: \"b\", id: \"2\" });\n+      await vi.waitFor(() => {\n+        expect(started).toEqual([\"2\"]);\n+      });\n+\n+      const bufferedEnqueue = debouncer.enqueue({ key: \"b\", id: \"3\" });\n+      const bufferedTimerIndex = setTimeoutSpy.mock.calls.findLastIndex(\n+        (call, index) => index >= callCountBeforeOverflow && call[1] === 50,\n+      );\n+      expect(bufferedTimerIndex).toBeGreaterThanOrEqual(callCountBeforeOverflow);\n+      clearTimeout(\n+        setTimeoutSpy.mock.results[bufferedTimerIndex]?.value as ReturnType<typeof setTimeout>,\n+      );\n+      const bufferedFlush = (\n+        setTimeoutSpy.mock.calls[bufferedTimerIndex]?.[0] as (() => Promise<void>) | undefined\n+      )?.();\n+\n+      await Promise.resolve();\n+      expect(started).toEqual([\"2\"]);\n+      expect(finished).toEqual([]);\n+\n+      releaseOverflow();\n+      await Promise.all([overflowEnqueue, bufferedEnqueue, bufferedFlush]);\n+\n+      expect(started).toEqual([\"2\", \"3\"]);\n+      expect(finished).toEqual([\"2\", \"3\"]);\n+    } finally {\n+      setTimeoutSpy.mockRestore();\n+    }\n+  });\n });\n \n describe(\"initSessionState BodyStripped\", () => {"
+    },
+    {
+      "sha": "84f85968954fff509fdc9b897bc68685adf58598",
+      "filename": "src/auto-reply/reply/agent-runner.runreplyagent.e2e.test.ts",
+      "status": "modified",
+      "additions": 19,
+      "deletions": 0,
+      "changes": 19,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/1b69d9ee1a516a9371a7c9e6e5a67dd8b5b1f0e0/src%2Fauto-reply%2Freply%2Fagent-runner.runreplyagent.e2e.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/1b69d9ee1a516a9371a7c9e6e5a67dd8b5b1f0e0/src%2Fauto-reply%2Freply%2Fagent-runner.runreplyagent.e2e.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fauto-reply%2Freply%2Fagent-runner.runreplyagent.e2e.test.ts?ref=1b69d9ee1a516a9371a7c9e6e5a67dd8b5b1f0e0",
+      "patch": "@@ -114,6 +114,7 @@ function createMinimalRun(params?: {\n   typingMode?: TypingMode;\n   blockStreamingEnabled?: boolean;\n   isActive?: boolean;\n+  isRunActive?: () => boolean;\n   shouldFollowup?: boolean;\n   resolvedQueueMode?: string;\n   runOverrides?: Partial<FollowupRun[\"run\"]>;\n@@ -169,6 +170,7 @@ function createMinimalRun(params?: {\n         shouldSteer: false,\n         shouldFollowup: params?.shouldFollowup ?? false,\n         isActive: params?.isActive ?? false,\n+        isRunActive: params?.isRunActive,\n         isStreaming: false,\n         opts,\n         typing,\n@@ -326,6 +328,23 @@ describe(\"runReplyAgent heartbeat followup guard\", () => {\n     expect(state.runEmbeddedPiAgentMock).not.toHaveBeenCalled();\n   });\n \n+  it(\"starts draining immediately when the active snapshot is already stale\", async () => {\n+    const { run } = createMinimalRun({\n+      opts: { isHeartbeat: false },\n+      isActive: true,\n+      isRunActive: () => false,\n+      shouldFollowup: true,\n+      resolvedQueueMode: \"collect\",\n+    });\n+\n+    const result = await run();\n+\n+    expect(result).toBeUndefined();\n+    expect(vi.mocked(enqueueFollowupRun)).toHaveBeenCalledTimes(1);\n+    expect(vi.mocked(scheduleFollowupDrain)).toHaveBeenCalledTimes(1);\n+    expect(state.runEmbeddedPiAgentMock).not.toHaveBeenCalled();\n+  });\n+\n   it(\"drains followup queue when an unexpected exception escapes the run path\", async () => {\n     const accounting = await import(\"./session-run-accounting.js\");\n     const persistSpy = vi"
+    },
+    {
+      "sha": "95798a52ba0d82b0b487332d688751242c1c1554",
+      "filename": "src/auto-reply/reply/agent-runner.ts",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 0,
+      "changes": 7,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/1b69d9ee1a516a9371a7c9e6e5a67dd8b5b1f0e0/src%2Fauto-reply%2Freply%2Fagent-runner.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/1b69d9ee1a516a9371a7c9e6e5a67dd8b5b1f0e0/src%2Fauto-reply%2Freply%2Fagent-runner.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fauto-reply%2Freply%2Fagent-runner.ts?ref=1b69d9ee1a516a9371a7c9e6e5a67dd8b5b1f0e0",
+      "patch": "@@ -73,6 +73,7 @@ export async function runReplyAgent(params: {\n   shouldSteer: boolean;\n   shouldFollowup: boolean;\n   isActive: boolean;\n+  isRunActive?: () => boolean;\n   isStreaming: boolean;\n   opts?: GetReplyOptions;\n   typing: TypingController;\n@@ -104,6 +105,7 @@ export async function runReplyAgent(params: {\n     shouldSteer,\n     shouldFollowup,\n     isActive,\n+    isRunActive,\n     isStreaming,\n     opts,\n     typing,\n@@ -241,6 +243,11 @@ export async function runReplyAgent(params: {\n       queuedRunFollowupTurn,\n       false,\n     );\n+    // Re-check liveness after enqueue so a stale active snapshot cannot leave\n+    // the followup queue idle if the original run already finished.\n+    if (!isRunActive?.()) {\n+      finalizeWithFollowup(undefined, queueKey, queuedRunFollowupTurn);\n+    }\n     await touchActiveSessionEntry();\n     typing.cleanup();\n     return undefined;"
+    },
+    {
+      "sha": "48bd648ea596acfe48b5c97370c42bd7192015dd",
+      "filename": "src/auto-reply/reply/get-reply-run.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/1b69d9ee1a516a9371a7c9e6e5a67dd8b5b1f0e0/src%2Fauto-reply%2Freply%2Fget-reply-run.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/1b69d9ee1a516a9371a7c9e6e5a67dd8b5b1f0e0/src%2Fauto-reply%2Freply%2Fget-reply-run.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fauto-reply%2Freply%2Fget-reply-run.ts?ref=1b69d9ee1a516a9371a7c9e6e5a67dd8b5b1f0e0",
+      "patch": "@@ -585,6 +585,7 @@ export async function runPreparedReply(\n     shouldSteer,\n     shouldFollowup,\n     isActive,\n+    isRunActive: () => isEmbeddedPiRunActive(sessionIdFinal),\n     isStreaming,\n     opts,\n     typing,"
+    }
+  ]
+}

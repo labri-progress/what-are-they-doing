@@ -1,0 +1,65 @@
+{
+  "message": "perf: Move stdlib from inlined JS to Data module\n\nstdlib-fs.ts was 4.4MB / 129K lines of inlined JS template literals.\nNow split into:\n  - stdlib-data.dat (4.6MB Data module, loaded as ArrayBuffer)\n  - stdlib-fs.ts (11 lines, thin loader that decodes + JSON.parse)\n\nThis shrinks the JS script by ~4.4MB, reducing worker bundle size and\nimproving transform time (1s \u2192 59ms in vitest). The stdlibFS export\nAPI is unchanged \u2014 all consumers see the same Record<string, string>.\n\n233/233 tests pass.",
+  "files": [
+    {
+      "sha": "5bb8e90c47ba146931685bed8378ccff8451090a",
+      "filename": ".gitignore",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/teamchong/pymode/blob/a39733668869073c07c6669e2049be9d3ae48f50/.gitignore",
+      "raw_url": "https://github.com/teamchong/pymode/raw/a39733668869073c07c6669e2049be9d3ae48f50/.gitignore",
+      "contents_url": "https://api.github.com/repos/teamchong/pymode/contents/.gitignore?ref=a39733668869073c07c6669e2049be9d3ae48f50",
+      "patch": "@@ -17,9 +17,10 @@ package-lock.json\n # Wrangler\n .wrangler/\n \n-# Generated stdlib (regenerate with scripts/generate-stdlib-fs.sh)\n+# Generated stdlib (regenerate with python3 scripts/generate-stdlib-fs.py)\n worker/src/stdlib-fs.ts\n worker/src/stdlib-fs.mjs\n+worker/src/stdlib-data.dat\n \n # WASM symlinks in worker\n worker/src/*.wasm"
+    },
+    {
+      "sha": "ad891deacea4a0b20e4625f7ae77559cbd1cf15c",
+      "filename": "scripts/generate-stdlib-fs.py",
+      "status": "modified",
+      "additions": 64,
+      "deletions": 53,
+      "changes": 117,
+      "blob_url": "https://github.com/teamchong/pymode/blob/a39733668869073c07c6669e2049be9d3ae48f50/scripts%2Fgenerate-stdlib-fs.py",
+      "raw_url": "https://github.com/teamchong/pymode/raw/a39733668869073c07c6669e2049be9d3ae48f50/scripts%2Fgenerate-stdlib-fs.py",
+      "contents_url": "https://api.github.com/repos/teamchong/pymode/contents/scripts%2Fgenerate-stdlib-fs.py?ref=a39733668869073c07c6669e2049be9d3ae48f50",
+      "patch": "@@ -1,19 +1,23 @@\n #!/usr/bin/env python3\n-\"\"\"Generate a TypeScript module containing stdlib .py files as string constants.\n+\"\"\"Generate stdlib data for the CF Workers MemFS.\n \n-Reads Python stdlib files, PyMode runtime modules, and polyfills, then writes\n-them as a TypeScript Record<string, string> for embedding in the CF Workers MemFS.\n+Reads Python stdlib files, PyMode runtime modules, and polyfills, then writes:\n+  - worker/src/stdlib-data.dat  \u2014 JSON blob loaded as Data module (ArrayBuffer)\n+  - worker/src/stdlib-fs.ts     \u2014 thin loader that decodes and exports the data\n \n-Output: worker/src/stdlib-fs.ts\n+This keeps the JS script small (~30 lines) while the stdlib content (~4MB)\n+is loaded as a separate Data module.\n \"\"\"\n \n+import json\n import os\n import sys\n \n SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))\n ROOT_DIR = os.path.dirname(SCRIPT_DIR)\n STDLIB_SRC = os.path.join(ROOT_DIR, \"cpython\", \"Lib\")\n-OUTPUT = os.path.join(ROOT_DIR, \"worker\", \"src\", \"stdlib-fs.ts\")\n+OUTPUT_DAT = os.path.join(ROOT_DIR, \"worker\", \"src\", \"stdlib-data.dat\")\n+OUTPUT_TS = os.path.join(ROOT_DIR, \"worker\", \"src\", \"stdlib-fs.ts\")\n \n # Modules Python needs to boot (from PYTHONVERBOSE trace)\n # Frozen modules are already in the binary, but encodings + site helpers\n@@ -323,9 +327,37 @@\n ]\n \n \n-def escape_for_template_literal(content: str) -> str:\n-    \"\"\"Escape content for use inside a JS template literal.\"\"\"\n-    return content.replace(\"\\\\\", \"\\\\\\\\\").replace(\"`\", \"\\\\`\").replace(\"${\", \"\\\\${\")\n+def collect_files() -> dict[str, str]:\n+    \"\"\"Collect all stdlib, pymode, and polyfill files into a dict.\"\"\"\n+    pymode_lib = os.path.join(ROOT_DIR, \"lib\")\n+    polyfill_dir = os.path.join(ROOT_DIR, \"lib\", \"polyfills\")\n+    result: dict[str, str] = {}\n+\n+    for relpath in BOOT_FILES:\n+        srcfile = os.path.join(STDLIB_SRC, relpath)\n+        if not os.path.isfile(srcfile):\n+            print(f\"  Warning: {relpath} not found, skipping\")\n+            continue\n+        with open(srcfile, \"r\") as f:\n+            result[relpath] = f.read()\n+\n+    for relpath in PYMODE_FILES:\n+        srcfile = os.path.join(pymode_lib, relpath)\n+        if not os.path.isfile(srcfile):\n+            print(f\"  Warning: pymode/{relpath} not found, skipping\")\n+            continue\n+        with open(srcfile, \"r\") as f:\n+            result[relpath] = f.read()\n+\n+    for relpath in POLYFILL_FILES:\n+        srcfile = os.path.join(polyfill_dir, relpath)\n+        if not os.path.isfile(srcfile):\n+            print(f\"  Warning: polyfill {relpath} not found, skipping\")\n+            continue\n+        with open(srcfile, \"r\") as f:\n+            result[relpath] = f.read()\n+\n+    return result\n \n \n def main():\n@@ -334,58 +366,37 @@ def main():\n         print(\"Run build-phase2.sh first.\")\n         sys.exit(1)\n \n-    print(f\"Generating {OUTPUT}...\")\n+    print(f\"Generating stdlib data...\")\n \n-    pymode_lib = os.path.join(ROOT_DIR, \"lib\")\n-    polyfill_dir = os.path.join(ROOT_DIR, \"lib\", \"polyfills\")\n-    count = 0\n+    files = collect_files()\n \n-    with open(OUTPUT, \"w\") as f:\n-        f.write(\n-            \"// Auto-generated by scripts/generate-stdlib-fs.py\\n\"\n-            \"// Contains Python stdlib files and PyMode runtime for the CF Workers MemFS.\\n\"\n-            '// Keys are paths relative to the stdlib root (e.g. \"encodings/__init__.py\").\\n'\n-            \"\\n\"\n-            \"export const stdlibFS: Record<string, string> = {\\n\"\n-        )\n+    # Write binary data file (JSON encoded as UTF-8)\n+    json_bytes = json.dumps(files, ensure_ascii=False, separators=(\",\", \":\")).encode(\"utf-8\")\n+    with open(OUTPUT_DAT, \"wb\") as f:\n+        f.write(json_bytes)\n \n-        # Bundle stdlib boot files\n-        for relpath in BOOT_FILES:\n-            srcfile = os.path.join(STDLIB_SRC, relpath)\n-            if not os.path.isfile(srcfile):\n-                print(f\"  Warning: {relpath} not found, skipping\")\n-                continue\n-            with open(srcfile, \"r\") as src:\n-                content = escape_for_template_literal(src.read())\n-            f.write(f'  \"{relpath}\": `{content}`,\\n')\n-            count += 1\n+    dat_kb = os.path.getsize(OUTPUT_DAT) // 1024\n \n-        # Bundle PyMode runtime modules\n-        for relpath in PYMODE_FILES:\n-            srcfile = os.path.join(pymode_lib, relpath)\n-            if not os.path.isfile(srcfile):\n-                print(f\"  Warning: pymode/{relpath} not found, skipping\")\n-                continue\n-            with open(srcfile, \"r\") as src:\n-                content = escape_for_template_literal(src.read())\n-            f.write(f'  \"{relpath}\": `{content}`,\\n')\n-            count += 1\n+    # Write thin TypeScript loader\n+    with open(OUTPUT_TS, \"w\") as f:\n+        f.write(\"\"\"\\\n+// Auto-generated by scripts/generate-stdlib-fs.py\n+// Loads stdlib data from a binary Data module (stdlib-data.dat).\n+// This keeps the JS script small while stdlib content is a separate asset.\n \n-        # Bundle polyfills\n-        for relpath in POLYFILL_FILES:\n-            srcfile = os.path.join(polyfill_dir, relpath)\n-            if not os.path.isfile(srcfile):\n-                print(f\"  Warning: polyfill {relpath} not found, skipping\")\n-                continue\n-            with open(srcfile, \"r\") as src:\n-                content = escape_for_template_literal(src.read())\n-            f.write(f'  \"{relpath}\": `{content}`,\\n')\n-            count += 1\n+// @ts-ignore \u2014 Data module import (ArrayBuffer), matched by wrangler rules\n+import stdlibData from \"./stdlib-data.dat\";\n \n-        f.write(\"};\\n\")\n+const _decoder = new TextDecoder();\n+export const stdlibFS: Record<string, string> = JSON.parse(\n+  _decoder.decode(stdlibData)\n+);\n+\"\"\")\n \n-    size_kb = os.path.getsize(OUTPUT) // 1024\n-    print(f\"Done: {OUTPUT} ({count} files, {size_kb}KB)\")\n+    ts_bytes = os.path.getsize(OUTPUT_TS)\n+    print(f\"Done:\")\n+    print(f\"  {OUTPUT_DAT} ({len(files)} files, {dat_kb}KB)\")\n+    print(f\"  {OUTPUT_TS} ({ts_bytes} bytes \u2014 loader only)\")\n \n \n if __name__ == \"__main__\":"
+    },
+    {
+      "sha": "a588b6274cbfa4d4effe15bda4e3805d2a82717c",
+      "filename": "test/wrangler-pydantic.jsonc",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/teamchong/pymode/blob/a39733668869073c07c6669e2049be9d3ae48f50/test%2Fwrangler-pydantic.jsonc",
+      "raw_url": "https://github.com/teamchong/pymode/raw/a39733668869073c07c6669e2049be9d3ae48f50/test%2Fwrangler-pydantic.jsonc",
+      "contents_url": "https://api.github.com/repos/teamchong/pymode/contents/test%2Fwrangler-pydantic.jsonc?ref=a39733668869073c07c6669e2049be9d3ae48f50",
+      "patch": "@@ -12,7 +12,7 @@\n     },\n     {\n       \"type\": \"Data\",\n-      \"globs\": [\"**/*.zip\"],\n+      \"globs\": [\"**/*.zip\", \"**/*.dat\"],\n       \"fallthrough\": false\n     }\n   ]"
+    },
+    {
+      "sha": "e7af5406abe14f30e931237d586e0076e04f4d0d",
+      "filename": "test/wrangler.jsonc",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/teamchong/pymode/blob/a39733668869073c07c6669e2049be9d3ae48f50/test%2Fwrangler.jsonc",
+      "raw_url": "https://github.com/teamchong/pymode/raw/a39733668869073c07c6669e2049be9d3ae48f50/test%2Fwrangler.jsonc",
+      "contents_url": "https://api.github.com/repos/teamchong/pymode/contents/test%2Fwrangler.jsonc?ref=a39733668869073c07c6669e2049be9d3ae48f50",
+      "patch": "@@ -12,7 +12,7 @@\n     },\n     {\n       \"type\": \"Data\",\n-      \"globs\": [\"**/*.zip\"],\n+      \"globs\": [\"**/*.zip\", \"**/*.dat\"],\n       \"fallthrough\": false\n     }\n   ],"
+    },
+    {
+      "sha": "80fbf968012a764edc3134402f96e7a9dde9df51",
+      "filename": "worker/wrangler.toml",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/teamchong/pymode/blob/a39733668869073c07c6669e2049be9d3ae48f50/worker%2Fwrangler.toml",
+      "raw_url": "https://github.com/teamchong/pymode/raw/a39733668869073c07c6669e2049be9d3ae48f50/worker%2Fwrangler.toml",
+      "contents_url": "https://api.github.com/repos/teamchong/pymode/contents/worker%2Fwrangler.toml?ref=a39733668869073c07c6669e2049be9d3ae48f50",
+      "patch": "@@ -11,7 +11,7 @@ globs = [\"**/*.wasm\"]\n \n [[rules]]\n type = \"Data\"\n-globs = [\"**/*.zip\"]\n+globs = [\"**/*.zip\", \"**/*.dat\"]\n \n # Persistent /data directory backed by KV\n # Create with: wrangler kv namespace create PYMODE_DATA"
+    }
+  ]
+}

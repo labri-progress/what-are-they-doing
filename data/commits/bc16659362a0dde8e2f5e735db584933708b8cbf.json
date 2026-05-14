@@ -1,0 +1,29 @@
+{
+  "message": "[review-fix] search: preserve hsearch tables on duplicate create",
+  "files": [
+    {
+      "sha": "621c209e91675ff80d151915b967c509d77c3f8e",
+      "filename": "crates/frankenlibc-abi/src/search_abi.rs",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 1,
+      "changes": 11,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/bc16659362a0dde8e2f5e735db584933708b8cbf/crates%2Ffrankenlibc-abi%2Fsrc%2Fsearch_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/bc16659362a0dde8e2f5e735db584933708b8cbf/crates%2Ffrankenlibc-abi%2Fsrc%2Fsearch_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Fsearch_abi.rs?ref=bc16659362a0dde8e2f5e735db584933708b8cbf",
+      "patch": "@@ -9,6 +9,8 @@\n use std::ffi::{c_char, c_int, c_uint, c_void};\n use std::sync::Mutex;\n \n+use crate::errno_abi::set_abi_errno;\n+\n // ---------------------------------------------------------------------------\n // POSIX ENTRY type and ACTION enum\n // ---------------------------------------------------------------------------\n@@ -118,6 +120,9 @@ static GLOBAL_HTAB: Mutex<Option<HashTable>> = Mutex::new(None);\n #[cfg_attr(not(debug_assertions), unsafe(no_mangle))]\n pub unsafe extern \"C\" fn hcreate(nel: usize) -> c_int {\n     let mut guard = GLOBAL_HTAB.lock().unwrap_or_else(|e| e.into_inner());\n+    if guard.is_some() {\n+        return 0;\n+    }\n     *guard = Some(HashTable::new(nel));\n     1\n }\n@@ -175,10 +180,14 @@ pub struct HsearchData {\n #[cfg_attr(not(debug_assertions), unsafe(no_mangle))]\n pub unsafe extern \"C\" fn hcreate_r(nel: usize, htab: *mut HsearchData) -> c_int {\n     if htab.is_null() {\n+        unsafe { set_abi_errno(libc::EINVAL) };\n         return 0;\n     }\n-    let ht = Box::new(HashTable::new(nel));\n     let htab_ref = unsafe { &mut *htab };\n+    if !htab_ref.table.is_null() {\n+        return 0;\n+    }\n+    let ht = Box::new(HashTable::new(nel));\n     htab_ref.table = Box::into_raw(ht) as *mut c_void;\n     htab_ref.size = c_uint::try_from(nel.max(1)).unwrap_or(c_uint::MAX);\n     htab_ref.filled = 0;"
+    },
+    {
+      "sha": "1d25d94b26f01f8f1aefe9882a94b786f1bf7cef",
+      "filename": "crates/frankenlibc-abi/tests/search_abi_test.rs",
+      "status": "modified",
+      "additions": 61,
+      "deletions": 0,
+      "changes": 61,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/bc16659362a0dde8e2f5e735db584933708b8cbf/crates%2Ffrankenlibc-abi%2Ftests%2Fsearch_abi_test.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/bc16659362a0dde8e2f5e735db584933708b8cbf/crates%2Ffrankenlibc-abi%2Ftests%2Fsearch_abi_test.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Ftests%2Fsearch_abi_test.rs?ref=bc16659362a0dde8e2f5e735db584933708b8cbf",
+      "patch": "@@ -10,6 +10,10 @@ use std::ffi::{CString, c_char, c_int, c_uint, c_void};\n \n use frankenlibc_abi::search_abi::*;\n \n+fn errno_value() -> c_int {\n+    unsafe { *frankenlibc_abi::errno_abi::__errno_location() }\n+}\n+\n unsafe fn malloc_tracked_unterminated(bytes: &[u8]) -> *mut c_char {\n     let raw = unsafe { frankenlibc_abi::malloc_abi::malloc(bytes.len()) }.cast::<u8>();\n     assert!(!raw.is_null());\n@@ -60,6 +64,11 @@ fn hash_global_api() {\n     // --- create and destroy ---\n     let rc = unsafe { hcreate(16) };\n     assert_eq!(rc, 1, \"hcreate should succeed\");\n+    let rc = unsafe { hcreate(32) };\n+    assert_eq!(\n+        rc, 0,\n+        \"glibc refuses hcreate on an already initialized global table\"\n+    );\n     unsafe { hdestroy() };\n \n     // --- insert and find ---\n@@ -211,13 +220,65 @@ fn hash_reentrant_lifecycle() {\n \n #[test]\n fn hash_reentrant_null_safety() {\n+    unsafe { frankenlibc_abi::errno_abi::set_abi_errno(0) };\n     let rc = unsafe { hcreate_r(16, std::ptr::null_mut()) };\n     assert_eq!(rc, 0, \"hcreate_r with null htab should fail\");\n+    assert_eq!(errno_value(), libc::EINVAL);\n \n     unsafe { hdestroy_r(std::ptr::null_mut()) };\n     // Should not crash\n }\n \n+#[test]\n+fn hash_reentrant_second_create_preserves_existing_table() {\n+    let mut htab: HsearchData = unsafe { std::mem::zeroed() };\n+    assert_eq!(unsafe { hcreate_r(16, &mut htab) }, 1);\n+\n+    let key = CString::new(\"stable-key\").unwrap();\n+    let item = Entry {\n+        key: key.as_ptr() as *mut _,\n+        data: 77usize as *mut c_void,\n+    };\n+    let mut result: *mut Entry = std::ptr::null_mut();\n+    assert_eq!(\n+        unsafe { hsearch_r(item, Action::ENTER, &mut result, &mut htab) },\n+        1\n+    );\n+    assert!(!result.is_null());\n+    assert_eq!(htab_filled(&htab), 1);\n+\n+    unsafe { frankenlibc_abi::errno_abi::set_abi_errno(0) };\n+    let rc = unsafe { hcreate_r(32, &mut htab) };\n+    assert_eq!(\n+        rc, 0,\n+        \"glibc refuses hcreate_r on an already initialized hsearch_data\"\n+    );\n+    assert_eq!(\n+        errno_value(),\n+        0,\n+        \"duplicate hcreate_r leaves errno unchanged\"\n+    );\n+    assert_eq!(\n+        htab_filled(&htab),\n+        1,\n+        \"duplicate hcreate_r must not reset filled\"\n+    );\n+\n+    let mut found: *mut Entry = std::ptr::null_mut();\n+    assert_eq!(\n+        unsafe { hsearch_r(item, Action::FIND, &mut found, &mut htab) },\n+        1\n+    );\n+    assert!(!found.is_null());\n+    assert_eq!(\n+        unsafe { (*found).data } as usize,\n+        77,\n+        \"duplicate hcreate_r must preserve existing entries\"\n+    );\n+\n+    unsafe { hdestroy_r(&mut htab) };\n+}\n+\n #[test]\n fn hsearch_r_rejects_tracked_unterminated_key() {\n     let mut htab: HsearchData = unsafe { std::mem::zeroed() };"
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "message": "fix(http,stream): reject H2-reserved H3 settings and fix Fold repoll hang\n\nh3_native.rs: reject HTTP/2 reserved setting IDs (0x00, 0x02-0x05) per\nRFC 9114 \u00a77.2.4.1 instead of silently accepting them as unknown settings.\nAdded test covering all 5 reserved IDs.\n\nfold.rs: change repoll-after-completion from returning Poll::Pending (which\ncauses a silent hang since no waker is registered) to assert-panic,\nmatching the fail-closed pattern used by Any/All/Collect combinators.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "fc96495b04a9d4c25f73ed1655c49cc7a830ddc4",
+      "filename": "src/http/h3_native.rs",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 0,
+      "changes": 20,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/518b4008cf37a5fcac8f13c80a9836fa2bbb82c2/src%2Fhttp%2Fh3_native.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/518b4008cf37a5fcac8f13c80a9836fa2bbb82c2/src%2Fhttp%2Fh3_native.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fhttp%2Fh3_native.rs?ref=518b4008cf37a5fcac8f13c80a9836fa2bbb82c2",
+      "patch": "@@ -200,6 +200,11 @@ impl H3Settings {\n             seen_ids.push(id);\n \n             match id {\n+                // RFC 9114 \u00a77.2.4.1: HTTP/2 reserved setting identifiers\n+                // MUST NOT be sent; receipt is a connection error.\n+                0x00 | 0x02 | 0x03 | 0x04 | 0x05 => {\n+                    return Err(H3NativeError::InvalidSettingValue(id));\n+                }\n                 H3_SETTING_QPACK_MAX_TABLE_CAPACITY => {\n                     settings.qpack_max_table_capacity = Some(value);\n                 }\n@@ -3028,4 +3033,19 @@ mod tests {\n             H3NativeError::InvalidFrame(\"qpack string prefix length must be less than 8\")\n         );\n     }\n+\n+    #[test]\n+    fn settings_rejects_h2_reserved_ids() {\n+        // RFC 9114 \u00a77.2.4.1: HTTP/2 reserved setting IDs (0x00, 0x02-0x05)\n+        // MUST be treated as a connection error.\n+        for reserved_id in [0x00u64, 0x02, 0x03, 0x04, 0x05] {\n+            let mut payload = Vec::new();\n+            encode_varint(reserved_id, &mut payload).expect(\"varint\");\n+            encode_varint(42, &mut payload).expect(\"varint\");\n+            let err = H3Settings::decode_payload(&payload).expect_err(&format!(\n+                \"must reject H2 reserved setting 0x{reserved_id:02x}\"\n+            ));\n+            assert_eq!(err, H3NativeError::InvalidSettingValue(reserved_id));\n+        }\n+    }\n }"
+    },
+    {
+      "sha": "f310666b57fee869522452df43353933006a77aa",
+      "filename": "src/stream/fold.rs",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 34,
+      "changes": 42,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/518b4008cf37a5fcac8f13c80a9836fa2bbb82c2/src%2Fstream%2Ffold.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/518b4008cf37a5fcac8f13c80a9836fa2bbb82c2/src%2Fstream%2Ffold.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fstream%2Ffold.rs?ref=518b4008cf37a5fcac8f13c80a9836fa2bbb82c2",
+      "patch": "@@ -50,9 +50,7 @@ where\n     #[inline]\n     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Acc> {\n         let mut this = self.project();\n-        if *this.completed {\n-            return Poll::Pending;\n-        }\n+        assert!(!*this.completed, \"Fold polled after completion\");\n         let mut folded_this_poll = 0usize;\n         loop {\n             match this.stream.as_mut().poll_next(cx) {\n@@ -282,8 +280,9 @@ mod tests {\n     }\n \n     #[test]\n-    fn fold_repoll_after_completion_returns_pending_without_repolling_upstream() {\n-        init_test(\"fold_repoll_after_completion_returns_pending_without_repolling_upstream\");\n+    #[should_panic(expected = \"Fold polled after completion\")]\n+    fn fold_repoll_after_completion_panics() {\n+        init_test(\"fold_repoll_after_completion_panics\");\n         let polls = Arc::new(AtomicUsize::new(0));\n         let mut future = Fold::new(\n             PollCountingEmptyStream::new(Arc::clone(&polls)),\n@@ -294,35 +293,10 @@ mod tests {\n         let mut cx = Context::from_waker(&waker);\n \n         let first = Pin::new(&mut future).poll(&mut cx);\n-        crate::assert_with_log!(\n-            first == Poll::Ready(7),\n-            \"first poll completes empty fold\",\n-            Poll::Ready(7),\n-            first\n-        );\n-        crate::assert_with_log!(\n-            polls.load(Ordering::SeqCst) == 1,\n-            \"first completion polls upstream once\",\n-            1,\n-            polls.load(Ordering::SeqCst)\n-        );\n+        assert_eq!(first, Poll::Ready(7));\n \n-        let repoll = Pin::new(&mut future).poll(&mut cx);\n-        crate::assert_with_log!(\n-            repoll == Poll::<usize>::Pending,\n-            \"repoll returns pending\",\n-            Poll::<usize>::Pending,\n-            repoll\n-        );\n-        crate::assert_with_log!(\n-            polls.load(Ordering::SeqCst) == 1,\n-            \"repoll does not touch upstream again\",\n-            1,\n-            polls.load(Ordering::SeqCst)\n-        );\n-\n-        crate::test_complete!(\n-            \"fold_repoll_after_completion_returns_pending_without_repolling_upstream\"\n-        );\n+        // Repoll after completion must panic (fail-closed), not return\n+        // Pending without a waker which would cause a silent hang.\n+        let _repoll = Pin::new(&mut future).poll(&mut cx);\n     }\n }"
+    }
+  ]
+}

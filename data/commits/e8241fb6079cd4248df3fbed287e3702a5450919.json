@@ -1,0 +1,29 @@
+{
+  "message": "feat(pager): WAL append gate to serialize same-process concurrent writer commits\n\nConcurrent writers sharing the same process were bouncing off the\ncross-process EXCLUSIVE file-lock escalation path during WAL commit,\nsurfacing avoidable Busy retries. This adds a per-database mutex gate\nthat queues in-process WAL commits through a narrow critical section,\neliminating lock contention between same-process concurrent writers\nwhile preserving cross-process exclusion via the existing file locks.\n\n- Add WalAppendGate type alias and global WAL_APPEND_GATES registry\n  keyed by database path\n- Wire wal_append_gate into SimpleTransaction so commit acquires\n  the in-process mutex before escalating the file lock\n- Gate is only acquired in WAL journal mode; rollback journal mode\n  is unaffected\n- Fix bench query_row() temporary lifetime in mixed DML benchmark\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "c6657bfbb1a3b22421c1ef7f8e1d77567989f1d4",
+      "filename": "crates/fsqlite-e2e/benches/e2e_bench.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/e8241fb6079cd4248df3fbed287e3702a5450919/crates%2Ffsqlite-e2e%2Fbenches%2Fe2e_bench.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/e8241fb6079cd4248df3fbed287e3702a5450919/crates%2Ffsqlite-e2e%2Fbenches%2Fe2e_bench.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-e2e%2Fbenches%2Fe2e_bench.rs?ref=e8241fb6079cd4248df3fbed287e3702a5450919",
+      "patch": "@@ -264,7 +264,8 @@ fn bench_mixed_dml(c: &mut Criterion) {\n                         .unwrap();\n                 }\n                 let stmt = conn.prepare(\"SELECT count(*) FROM t\").unwrap();\n-                let count = &stmt.query_row().unwrap().values()[0];\n+                let row = stmt.query_row().unwrap();\n+                let count = &row.values()[0];\n                 assert_eq!(*count, SqliteValue::Integer(200));\n             },\n             BatchSize::LargeInput,"
+    },
+    {
+      "sha": "38bab3ec60ccad513804451131d32e3964bdc5f4",
+      "filename": "crates/fsqlite-pager/src/pager.rs",
+      "status": "modified",
+      "additions": 36,
+      "deletions": 0,
+      "changes": 36,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/e8241fb6079cd4248df3fbed287e3702a5450919/crates%2Ffsqlite-pager%2Fsrc%2Fpager.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/e8241fb6079cd4248df3fbed287e3702a5450919/crates%2Ffsqlite-pager%2Fsrc%2Fpager.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-pager%2Fsrc%2Fpager.rs?ref=e8241fb6079cd4248df3fbed287e3702a5450919",
+      "patch": "@@ -26,6 +26,22 @@ use crate::page_buf::{PageBuf, PageBufPool};\n use crate::page_cache::{PageCache, PageCacheMetricsSnapshot};\n use crate::traits::{self, JournalMode, MvccPager, TransactionHandle, TransactionMode, WalBackend};\n \n+type WalAppendGate = Arc<Mutex<()>>;\n+\n+static WAL_APPEND_GATES: OnceLock<Mutex<HashMap<PathBuf, WalAppendGate>>> = OnceLock::new();\n+\n+fn wal_append_gate_for_path(db_path: &Path) -> WalAppendGate {\n+    let gates = WAL_APPEND_GATES.get_or_init(|| Mutex::new(HashMap::new()));\n+    let mut gates = gates\n+        .lock()\n+        .unwrap_or_else(std::sync::PoisonError::into_inner);\n+    Arc::clone(\n+        gates\n+            .entry(db_path.to_path_buf())\n+            .or_insert_with(|| Arc::new(Mutex::new(()))),\n+    )\n+}\n+\n /// The inner mutable pager state protected by a mutex.\n pub(crate) struct PagerInner<F: VfsFile> {\n     /// Handle to the main database file.\n@@ -966,7 +982,9 @@ where\n             let cleanup_cx = cx.clone();\n             return Ok(SimpleTransaction {\n                 vfs: Arc::clone(&self.vfs),\n+                db_path: self.db_path.clone(),\n                 journal_path: Self::journal_path(&self.db_path),\n+                wal_append_gate: wal_append_gate_for_path(&self.db_path),\n                 inner: Arc::clone(&self.inner),\n                 cache: Arc::clone(&self.cache),\n                 published: Arc::clone(&self.published),\n@@ -1148,7 +1166,9 @@ where\n \n         Ok(SimpleTransaction {\n             vfs: Arc::clone(&self.vfs),\n+            db_path: self.db_path.clone(),\n             journal_path: Self::journal_path(&self.db_path),\n+            wal_append_gate: wal_append_gate_for_path(&self.db_path),\n             inner: Arc::clone(&self.inner),\n             cache: Arc::clone(&self.cache),\n             published: Arc::clone(&self.published),\n@@ -1953,7 +1973,9 @@ const PAGE_LEASE_BATCH_SIZE: u32 = 8;\n \n pub struct SimpleTransaction<V: Vfs> {\n     vfs: Arc<V>,\n+    db_path: PathBuf,\n     journal_path: PathBuf,\n+    wal_append_gate: WalAppendGate,\n     inner: Arc<Mutex<PagerInner<V::File>>>,\n     cache: Arc<Mutex<PageCache>>,\n     published: Arc<PublishedPagerState>,\n@@ -2793,6 +2815,20 @@ where\n             return Ok(());\n         }\n \n+        // Queue same-process WAL commits through a narrow append gate so\n+        // concurrent writers do not bounce off the cross-process EXCLUSIVE\n+        // file-lock escalation and surface avoidable Busy retries.\n+        let wal_append_gate = Arc::clone(&self.wal_append_gate);\n+        let _wal_append_guard = if self.journal_mode == JournalMode::Wal {\n+            Some(\n+                wal_append_gate\n+                    .lock()\n+                    .unwrap_or_else(std::sync::PoisonError::into_inner),\n+            )\n+        } else {\n+            None\n+        };\n+\n         let mut inner = self\n             .inner\n             .lock()"
+    }
+  ]
+}

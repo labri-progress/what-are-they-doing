@@ -1,0 +1,89 @@
+{
+  "message": "fix(agentmail,checkpoint,health): agent registry remap on re-register, compressed scrollback restore, rate-limit restart guard\n\nAgent registry (session.go, session_test.go):\n- Fix AddAgent() to clean up stale mappings when an agent re-registers\n  with a new pane title or pane ID \u2014 previously, moving an agent to a\n  new tmux pane left orphaned entries in both Agents and PaneIDMap maps,\n  causing lookup inconsistencies\n- Guard against empty paneTitle to prevent overwriting valid mappings\n- Add TestSessionAgentRegistry_AddAgent_RefreshesMappingsForSameAgent\n  verifying old title/ID mappings are removed and count stays at 1\n\nSpawn (spawn.go):\n- Call registry.AddAgent() when reusing an existing agent name during\n  spawn, ensuring the registry stays current if the pane was recreated\n\nCheckpoint restore (restore.go, restore_test.go):\n- Switch from LoadScrollback to LoadCompressedScrollback for pane\n  context injection, supporting gzip-compressed scrollback files that\n  reduce checkpoint storage by ~70%\n- Use tmux.SendBuffer instead of tmux.SendKeys for context injection\n  to handle large scrollback content without tmux input buffering issues\n- Extract loadPaneScrollback helper for testability\n- Add TestRestorer_loadPaneScrollback_Compressed validating round-trip\n  through gzipCompress \u2192 SaveCompressedScrollback \u2192 loadPaneScrollback\n\nHealth auto-restart (health.go, health_auto_restart_test.go):\n- Extract shouldAutoRestartHealthState() from AutoRestartUnhealthyAgent\n  to make restart decision logic independently testable\n- Change rate-limited agents from triggering restart to returning a\n  \"waiting for cooldown\" reason, preventing restart loops during\n  provider rate limiting\n- Add TestShouldAutoRestartHealthState with 4 cases: unhealthy (restart),\n  rate_limited (wait), healthy (skip), degraded (skip)\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "93954429865dd808b306c5aa0a844bc38153e2ad",
+      "filename": "internal/agentmail/session.go",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 1,
+      "changes": 15,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/cb983804087556bac47feb1030d75d220236d69b/internal%2Fagentmail%2Fsession.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/cb983804087556bac47feb1030d75d220236d69b/internal%2Fagentmail%2Fsession.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fagentmail%2Fsession.go?ref=cb983804087556bac47feb1030d75d220236d69b",
+      "patch": "@@ -419,8 +419,21 @@ func (r *SessionAgentRegistry) AddAgent(paneTitle, paneID, agentName string) {\n \tif r.PaneIDMap == nil {\n \t\tr.PaneIDMap = make(map[string]string)\n \t}\n-\tr.Agents[paneTitle] = agentName\n+\n+\tif paneTitle != \"\" {\n+\t\tfor existingTitle, existingAgent := range r.Agents {\n+\t\t\tif existingAgent == agentName && existingTitle != paneTitle {\n+\t\t\t\tdelete(r.Agents, existingTitle)\n+\t\t\t}\n+\t\t}\n+\t\tr.Agents[paneTitle] = agentName\n+\t}\n \tif paneID != \"\" {\n+\t\tfor existingPaneID, existingAgent := range r.PaneIDMap {\n+\t\t\tif existingAgent == agentName && existingPaneID != paneID {\n+\t\t\t\tdelete(r.PaneIDMap, existingPaneID)\n+\t\t\t}\n+\t\t}\n \t\tr.PaneIDMap[paneID] = agentName\n \t}\n }"
+    },
+    {
+      "sha": "55b5ca19ea3a0d02c40f30c823c8c3e4ff3d033e",
+      "filename": "internal/agentmail/session_test.go",
+      "status": "modified",
+      "additions": 26,
+      "deletions": 0,
+      "changes": 26,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/cb983804087556bac47feb1030d75d220236d69b/internal%2Fagentmail%2Fsession_test.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/cb983804087556bac47feb1030d75d220236d69b/internal%2Fagentmail%2Fsession_test.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fagentmail%2Fsession_test.go?ref=cb983804087556bac47feb1030d75d220236d69b",
+      "patch": "@@ -237,6 +237,32 @@ func TestSessionAgentRegistry_AddAgentWithNilMaps(t *testing.T) {\n \t}\n }\n \n+func TestSessionAgentRegistry_AddAgent_RefreshesMappingsForSameAgent(t *testing.T) {\n+\tregistry := NewSessionAgentRegistry(\"test-session\", \"/test/project\")\n+\n+\tregistry.AddAgent(\"old_title\", \"%1\", \"GreenCastle\")\n+\tregistry.AddAgent(\"new_title\", \"%9\", \"GreenCastle\")\n+\n+\tif _, ok := registry.GetAgentByTitle(\"old_title\"); ok {\n+\t\tt.Fatal(\"expected old title mapping to be removed\")\n+\t}\n+\tif _, ok := registry.GetAgentByID(\"%1\"); ok {\n+\t\tt.Fatal(\"expected old pane ID mapping to be removed\")\n+\t}\n+\n+\tname, ok := registry.GetAgentByTitle(\"new_title\")\n+\tif !ok || name != \"GreenCastle\" {\n+\t\tt.Fatalf(\"expected new title mapping to GreenCastle, got %q, %v\", name, ok)\n+\t}\n+\tname, ok = registry.GetAgentByID(\"%9\")\n+\tif !ok || name != \"GreenCastle\" {\n+\t\tt.Fatalf(\"expected new pane ID mapping to GreenCastle, got %q, %v\", name, ok)\n+\t}\n+\tif registry.Count() != 1 {\n+\t\tt.Fatalf(\"expected count 1 after remap, got %d\", registry.Count())\n+\t}\n+}\n+\n func TestSessionAgentRegistry_GetAgentByTitle(t *testing.T) {\n \tregistry := NewSessionAgentRegistry(\"test-session\", \"/test/project\")\n \tregistry.AddAgent(\"test__cc_1\", \"%1\", \"GreenCastle\")"
+    },
+    {
+      "sha": "621d53ff04a752a59cb73f6aa6bad02ff6d07be2",
+      "filename": "internal/checkpoint/restore.go",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 2,
+      "changes": 8,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/cb983804087556bac47feb1030d75d220236d69b/internal%2Fcheckpoint%2Frestore.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/cb983804087556bac47feb1030d75d220236d69b/internal%2Fcheckpoint%2Frestore.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fcheckpoint%2Frestore.go?ref=cb983804087556bac47feb1030d75d220236d69b",
+      "patch": "@@ -293,7 +293,7 @@ func (r *Restorer) injectContext(cp *Checkpoint, maxLines int) error {\n \t\ttargetPane := panes[i]\n \n \t\t// Load scrollback content\n-\t\tcontent, err := r.storage.LoadScrollback(cp.SessionName, cp.ID, paneState.ID)\n+\t\tcontent, err := r.loadPaneScrollback(cp.SessionName, cp.ID, paneState.ID)\n \t\tif err != nil {\n \t\t\tlastErr = err\n \t\t\tcontinue\n@@ -306,14 +306,18 @@ func (r *Restorer) injectContext(cp *Checkpoint, maxLines int) error {\n \n \t\t// Send as context message\n \t\tcontextMsg := formatContextInjection(content, cp.CreatedAt)\n-\t\tif err := tmux.SendKeys(targetPane.ID, contextMsg, true); err != nil {\n+\t\tif err := tmux.SendBuffer(targetPane.ID, contextMsg, true); err != nil {\n \t\t\tlastErr = err\n \t\t}\n \t}\n \n \treturn lastErr\n }\n \n+func (r *Restorer) loadPaneScrollback(sessionName, checkpointID, paneID string) (string, error) {\n+\treturn r.storage.LoadCompressedScrollback(sessionName, checkpointID, paneID)\n+}\n+\n // checkGitState compares current git state with checkpoint and returns a warning if different.\n func (r *Restorer) checkGitState(cp *Checkpoint, workDir string) string {\n \t// Check if current branch matches"
+    },
+    {
+      "sha": "b969763fbf76f114c150ed515218a7876bee03ea",
+      "filename": "internal/checkpoint/restore_test.go",
+      "status": "modified",
+      "additions": 34,
+      "deletions": 0,
+      "changes": 34,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/cb983804087556bac47feb1030d75d220236d69b/internal%2Fcheckpoint%2Frestore_test.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/cb983804087556bac47feb1030d75d220236d69b/internal%2Fcheckpoint%2Frestore_test.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fcheckpoint%2Frestore_test.go?ref=cb983804087556bac47feb1030d75d220236d69b",
+      "patch": "@@ -292,6 +292,40 @@ func TestRestorer_ValidateCheckpoint_MissingScrollback(t *testing.T) {\n \t}\n }\n \n+func TestRestorer_loadPaneScrollback_Compressed(t *testing.T) {\n+\ttmpDir, err := os.MkdirTemp(\"\", \"ntm-restore-test\")\n+\tif err != nil {\n+\t\tt.Fatalf(\"Failed to create temp dir: %v\", err)\n+\t}\n+\tdefer os.RemoveAll(tmpDir)\n+\n+\tstorage := NewStorageWithDir(tmpDir)\n+\tr := NewRestorerWithStorage(storage)\n+\n+\tconst (\n+\t\tsessionName  = \"test-session\"\n+\t\tcheckpointID = \"test-checkpoint\"\n+\t\tpaneID       = \"%0\"\n+\t\tcontent      = \"compressed scrollback\\nline 2\\n\"\n+\t)\n+\n+\tcompressed, err := gzipCompress([]byte(content))\n+\tif err != nil {\n+\t\tt.Fatalf(\"gzipCompress failed: %v\", err)\n+\t}\n+\tif _, err := storage.SaveCompressedScrollback(sessionName, checkpointID, paneID, compressed); err != nil {\n+\t\tt.Fatalf(\"SaveCompressedScrollback failed: %v\", err)\n+\t}\n+\n+\tgot, err := r.loadPaneScrollback(sessionName, checkpointID, paneID)\n+\tif err != nil {\n+\t\tt.Fatalf(\"loadPaneScrollback failed: %v\", err)\n+\t}\n+\tif got != content {\n+\t\tt.Fatalf(\"loadPaneScrollback = %q, want %q\", got, content)\n+\t}\n+}\n+\n func TestTruncateToLines(t *testing.T) {\n \ttests := []struct {\n \t\tcontent  string"
+    },
+    {
+      "sha": "6e45a156866f26fcf76b49016533c95de49ac600",
+      "filename": "internal/cli/spawn.go",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/cb983804087556bac47feb1030d75d220236d69b/internal%2Fcli%2Fspawn.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/cb983804087556bac47feb1030d75d220236d69b/internal%2Fcli%2Fspawn.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fcli%2Fspawn.go?ref=cb983804087556bac47feb1030d75d220236d69b",
+      "patch": "@@ -2553,6 +2553,7 @@ func registerSpawnedAgents(workingDir, sessionName string, agents []spawnedAgent\n \t\t\t\tlegacyPath := legacyIdentityFilePath(workingDir, agent.paneID)\n \t\t\t\t_ = os.WriteFile(legacyPath, []byte(existingName+\"\\n\"), 0o600)\n \t\t\t}\n+\t\t\tregistry.AddAgent(agent.paneTitle, agent.paneID, existingName)\n \t\t\tcontinue\n \t\t}\n "
+    },
+    {
+      "sha": "22717ebc947ed6ae9717fd72011566c77488c118",
+      "filename": "internal/robot/health.go",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 3,
+      "changes": 16,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/cb983804087556bac47feb1030d75d220236d69b/internal%2Frobot%2Fhealth.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/cb983804087556bac47feb1030d75d220236d69b/internal%2Frobot%2Fhealth.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Frobot%2Fhealth.go?ref=cb983804087556bac47feb1030d75d220236d69b",
+      "patch": "@@ -2106,13 +2106,12 @@ func AutoRestartUnhealthyAgent(ctx context.Context, session, paneID, agentType s\n \t\t}\n \t}\n \n-\t// Only restart if unhealthy\n-\tif check.HealthState != HealthUnhealthy && check.HealthState != HealthRateLimited {\n+\tif restart, reason := shouldAutoRestartHealthState(check.HealthState); !restart {\n \t\treturn &RestartResult{\n \t\t\tPaneID:    paneID,\n \t\t\tAgentType: agentType,\n \t\t\tType:      RestartNone,\n-\t\t\tReason:    fmt.Sprintf(\"agent is %s, no restart needed\", check.HealthState),\n+\t\t\tReason:    reason,\n \t\t}\n \t}\n \n@@ -2121,6 +2120,17 @@ func AutoRestartUnhealthyAgent(ctx context.Context, session, paneID, agentType s\n \treturn manager.TryRestart(ctx, paneID, agentType, check.HealthState)\n }\n \n+func shouldAutoRestartHealthState(state HealthState) (bool, string) {\n+\tswitch state {\n+\tcase HealthUnhealthy:\n+\t\treturn true, \"\"\n+\tcase HealthRateLimited:\n+\t\treturn false, \"agent is rate_limited, waiting for cooldown\"\n+\tdefault:\n+\t\treturn false, fmt.Sprintf(\"agent is %s, no restart needed\", state)\n+\t}\n+}\n+\n // =============================================================================\n // Auto-Restart Stuck Agents (bd-krqz)\n // ============================================================================="
+    },
+    {
+      "sha": "5d350789c28d68889fe3d50e12bc6ed04845dc1e",
+      "filename": "internal/robot/health_auto_restart_test.go",
+      "status": "modified",
+      "additions": 49,
+      "deletions": 0,
+      "changes": 49,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/cb983804087556bac47feb1030d75d220236d69b/internal%2Frobot%2Fhealth_auto_restart_test.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/cb983804087556bac47feb1030d75d220236d69b/internal%2Frobot%2Fhealth_auto_restart_test.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Frobot%2Fhealth_auto_restart_test.go?ref=cb983804087556bac47feb1030d75d220236d69b",
+      "patch": "@@ -444,6 +444,55 @@ func TestAutoRestartStuckOutput_JSONFields(t *testing.T) {\n \t}\n }\n \n+func TestShouldAutoRestartHealthState(t *testing.T) {\n+\tt.Parallel()\n+\n+\ttests := []struct {\n+\t\tname        string\n+\t\tstate       HealthState\n+\t\twantRestart bool\n+\t\twantReason  string\n+\t}{\n+\t\t{\n+\t\t\tname:        \"unhealthy restarts\",\n+\t\t\tstate:       HealthUnhealthy,\n+\t\t\twantRestart: true,\n+\t\t},\n+\t\t{\n+\t\t\tname:        \"rate limited waits\",\n+\t\t\tstate:       HealthRateLimited,\n+\t\t\twantRestart: false,\n+\t\t\twantReason:  \"agent is rate_limited, waiting for cooldown\",\n+\t\t},\n+\t\t{\n+\t\t\tname:        \"healthy does not restart\",\n+\t\t\tstate:       HealthHealthy,\n+\t\t\twantRestart: false,\n+\t\t\twantReason:  \"agent is healthy, no restart needed\",\n+\t\t},\n+\t\t{\n+\t\t\tname:        \"degraded does not restart\",\n+\t\t\tstate:       HealthDegraded,\n+\t\t\twantRestart: false,\n+\t\t\twantReason:  \"agent is degraded, no restart needed\",\n+\t\t},\n+\t}\n+\n+\tfor _, tt := range tests {\n+\t\tt.Run(tt.name, func(t *testing.T) {\n+\t\t\tt.Parallel()\n+\n+\t\t\tgotRestart, gotReason := shouldAutoRestartHealthState(tt.state)\n+\t\t\tif gotRestart != tt.wantRestart {\n+\t\t\t\tt.Fatalf(\"shouldAutoRestartHealthState(%q) restart = %v, want %v\", tt.state, gotRestart, tt.wantRestart)\n+\t\t\t}\n+\t\t\tif gotReason != tt.wantReason {\n+\t\t\t\tt.Fatalf(\"shouldAutoRestartHealthState(%q) reason = %q, want %q\", tt.state, gotReason, tt.wantReason)\n+\t\t\t}\n+\t\t})\n+\t}\n+}\n+\n // =============================================================================\n // Helpers\n // ============================================================================="
+    }
+  ]
+}

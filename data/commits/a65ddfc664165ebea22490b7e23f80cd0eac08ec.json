@@ -1,0 +1,65 @@
+{
+  "message": "fix(core): eliminate integer overflow risks and improve borrow patterns across hostcall subsystems\n\nCompaction (compaction.rs):\n- Refactor find_cut_point() to use message_from_entry() helper instead of\n  direct SessionEntry::Message pattern matching, making the token\n  accumulation logic more robust against future entry type additions\n\nAMAC stall telemetry (hostcall_amac.rs):\n- Replace .sum() with .fold(0u64, |acc, x| acc.saturating_add(x)) for\n  elapsed_ns accumulation to prevent panic on overflow when summing many\n  large nanosecond samples\n- Apply the same saturating fold pattern to variance computation to prevent\n  overflow when squaring large differences\n\nHostcall queue (hostcall_queue.rs):\n- Replace entry().or_insert(0) + saturating_add(1) pattern with explicit\n  get_mut/insert to avoid unnecessary String allocation when the key already\n  exists in the tenant_backlog map\n\nS3-FIFO policy (hostcall_s3_fifo.rs):\n- Apply the same get_mut/insert optimization to increment_owner() to avoid\n  cloning the owner string on every increment when the entry already exists\n- Refactor decrement_owner() to compute the should_remove decision while\n  holding the mutable borrow, then perform the removal after releasing it,\n  avoiding a double-lookup pattern\n\nTrace JIT compiler (hostcall_trace_jit.rs):\n- Restructure execute_compiled() to evaluate all guards while holding only\n  a shared borrow of the cache, extracting tier_improvement_delta and any\n  failed guard info before releasing the borrow\n- This eliminates the previous pattern where a compiled entry was cloned\n  just to avoid borrow conflicts, reducing allocation overhead on the JIT\n  hot path\n- Guard failure handling now happens after the shared borrow is released,\n  allowing record_guard_failure() to take its required mutable borrow\n  without conflict\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "4d8135026ed25548e4f495c0ada02b9460ab99f6",
+      "filename": "src/compaction.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 3,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/pi_agent_rust/blob/a65ddfc664165ebea22490b7e23f80cd0eac08ec/src%2Fcompaction.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/pi_agent_rust/raw/a65ddfc664165ebea22490b7e23f80cd0eac08ec/src%2Fcompaction.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/pi_agent_rust/contents/src%2Fcompaction.rs?ref=a65ddfc664165ebea22490b7e23f80cd0eac08ec",
+      "patch": "@@ -481,10 +481,11 @@ fn find_cut_point(\n \n     for i in (start_index..end_index).rev() {\n         let entry = &entries[i];\n-        let SessionEntry::Message(msg_entry) = entry else {\n+        if let Some(msg) = message_from_entry(entry) {\n+            accumulated_tokens = accumulated_tokens.saturating_add(estimate_tokens(&msg));\n+        } else {\n             continue;\n-        };\n-        accumulated_tokens = accumulated_tokens.saturating_add(estimate_tokens(&msg_entry.message));\n+        }\n \n         if accumulated_tokens >= u64::from(keep_recent_tokens) {\n             // Binary search: find the largest cut point <= i."
+    },
+    {
+      "sha": "506cbcbc4ed26a26b057da763dbd3713f0adae75",
+      "filename": "src/hostcall_amac.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 3,
+      "changes": 5,
+      "blob_url": "https://github.com/Dicklesworthstone/pi_agent_rust/blob/a65ddfc664165ebea22490b7e23f80cd0eac08ec/src%2Fhostcall_amac.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/pi_agent_rust/raw/a65ddfc664165ebea22490b7e23f80cd0eac08ec/src%2Fhostcall_amac.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/pi_agent_rust/contents/src%2Fhostcall_amac.rs?ref=a65ddfc664165ebea22490b7e23f80cd0eac08ec",
+      "patch": "@@ -288,8 +288,7 @@ impl AmacStallTelemetry {\n         let sum: u64 = self\n             .recent_samples\n             .iter()\n-            .map(|sample| sample.elapsed_ns)\n-            .sum();\n+            .fold(0u64, |acc, sample| acc.saturating_add(sample.elapsed_ns));\n         let mean = sum / n;\n         let variance: u64 = self\n             .recent_samples\n@@ -298,7 +297,7 @@ impl AmacStallTelemetry {\n                 let diff = sample.elapsed_ns.abs_diff(mean);\n                 diff.saturating_mul(diff)\n             })\n-            .sum::<u64>()\n+            .fold(0u64, |acc, val| acc.saturating_add(val))\n             / n;\n         variance\n     }"
+    },
+    {
+      "sha": "2100d4a15b8d8f426912ea50b469274bab3b040b",
+      "filename": "src/hostcall_queue.rs",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 5,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/pi_agent_rust/blob/a65ddfc664165ebea22490b7e23f80cd0eac08ec/src%2Fhostcall_queue.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/pi_agent_rust/raw/a65ddfc664165ebea22490b7e23f80cd0eac08ec/src%2Fhostcall_queue.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/pi_agent_rust/contents/src%2Fhostcall_queue.rs?ref=a65ddfc664165ebea22490b7e23f80cd0eac08ec",
+      "patch": "@@ -453,11 +453,11 @@ impl S3FifoState {\n             return;\n         }\n         if let Some(tenant_key) = tenant_key {\n-            let entry = self\n-                .tenant_backlog\n-                .entry(tenant_key.to_string())\n-                .or_insert(0);\n-            *entry = entry.saturating_add(1);\n+            if let Some(backlog) = self.tenant_backlog.get_mut(tenant_key) {\n+                *backlog = backlog.saturating_add(1);\n+            } else {\n+                self.tenant_backlog.insert(tenant_key.to_string(), 1);\n+            }\n         }\n         self.unstable_rejection_streak = 0;\n     }"
+    },
+    {
+      "sha": "4d08311b398425b4bb457161659dd0dbb4bd9c47",
+      "filename": "src/hostcall_s3_fifo.rs",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 7,
+      "changes": 23,
+      "blob_url": "https://github.com/Dicklesworthstone/pi_agent_rust/blob/a65ddfc664165ebea22490b7e23f80cd0eac08ec/src%2Fhostcall_s3_fifo.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/pi_agent_rust/raw/a65ddfc664165ebea22490b7e23f80cd0eac08ec/src%2Fhostcall_s3_fifo.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/pi_agent_rust/contents/src%2Fhostcall_s3_fifo.rs?ref=a65ddfc664165ebea22490b7e23f80cd0eac08ec",
+      "patch": "@@ -421,17 +421,26 @@ impl<K: Ord + Clone> S3FifoPolicy<K> {\n     }\n \n     fn increment_owner(&mut self, owner: &str) {\n-        let entry = self.owner_live_counts.entry(owner.to_string()).or_insert(0);\n-        *entry = entry.saturating_add(1);\n+        if let Some(count) = self.owner_live_counts.get_mut(owner) {\n+            *count = count.saturating_add(1);\n+        } else {\n+            self.owner_live_counts.insert(owner.to_string(), 1);\n+        }\n     }\n \n     fn decrement_owner(&mut self, owner: &str) {\n-        let Some(count) = self.owner_live_counts.get_mut(owner) else {\n-            return;\n-        };\n-        if *count > 1 {\n-            *count -= 1;\n+        let should_remove = if let Some(count) = self.owner_live_counts.get_mut(owner) {\n+            if *count > 1 {\n+                *count -= 1;\n+                false\n+            } else {\n+                true\n+            }\n         } else {\n+            false\n+        };\n+        \n+        if should_remove {\n             self.owner_live_counts.remove(owner);\n         }\n     }"
+    },
+    {
+      "sha": "95b25b44de12f08408d7ca48fe7af69749f01c9e",
+      "filename": "src/hostcall_trace_jit.rs",
+      "status": "modified",
+      "additions": 35,
+      "deletions": 28,
+      "changes": 63,
+      "blob_url": "https://github.com/Dicklesworthstone/pi_agent_rust/blob/a65ddfc664165ebea22490b7e23f80cd0eac08ec/src%2Fhostcall_trace_jit.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/pi_agent_rust/raw/a65ddfc664165ebea22490b7e23f80cd0eac08ec/src%2Fhostcall_trace_jit.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/pi_agent_rust/contents/src%2Fhostcall_trace_jit.rs?ref=a65ddfc664165ebea22490b7e23f80cd0eac08ec",
+      "patch": "@@ -431,47 +431,54 @@ impl TraceJitCompiler {\n \n         self.generation += 1;\n \n-        // Check if trace is compiled.\n-        let compiled = match self.cache.get(plan_id) {\n-            Some(compiled) => compiled.clone(),\n-            None => {\n+        // Check if trace is compiled, evaluating guards without holding mutable borrow or cloning\n+        let (tier_improvement_delta, failed_guard) = {\n+            let Some(compiled) = self.cache.get(plan_id) else {\n                 return JitExecutionResult {\n                     jit_hit: false,\n                     plan_id: Some(plan_id.to_string()),\n                     deopt_reason: Some(DeoptReason::NotCompiled),\n                     cost_delta: 0,\n                 };\n+            };\n+            \n+            let mut failed_guard = None;\n+            for (idx, guard) in compiled.guards.iter().enumerate() {\n+                if !guard.check(trace, ctx) {\n+                    let description = match guard {\n+                        TraceGuard::OpcodePrefix(_) => \"opcode_prefix_mismatch\",\n+                        TraceGuard::SafetyEnvelopeNotVetoing => \"safety_envelope_vetoing\",\n+                        TraceGuard::MinSupportCount(_) => \"support_count_below_threshold\",\n+                    };\n+                    failed_guard = Some((idx, description));\n+                    break;\n+                }\n             }\n+            \n+            (compiled.tier_improvement_delta, failed_guard)\n         };\n \n         // Update LRU.\n         if let Some(profile) = self.profiles.get_mut(plan_id) {\n             profile.last_access_generation = self.generation;\n         }\n \n-        // Check guards.\n-        for (idx, guard) in compiled.guards.iter().enumerate() {\n-            if !guard.check(trace, ctx) {\n-                let invalidated_after_failures = self.record_guard_failure(plan_id);\n-                let description = match guard {\n-                    TraceGuard::OpcodePrefix(_) => \"opcode_prefix_mismatch\",\n-                    TraceGuard::SafetyEnvelopeNotVetoing => \"safety_envelope_vetoing\",\n-                    TraceGuard::MinSupportCount(_) => \"support_count_below_threshold\",\n-                };\n-                let deopt_reason = invalidated_after_failures.map_or_else(\n-                    || DeoptReason::GuardFailure {\n-                        guard_index: idx,\n-                        description: description.to_string(),\n-                    },\n-                    |total_failures| DeoptReason::TraceInvalidated { total_failures },\n-                );\n-                return JitExecutionResult {\n-                    jit_hit: false,\n-                    plan_id: Some(plan_id.to_string()),\n-                    deopt_reason: Some(deopt_reason),\n-                    cost_delta: 0,\n-                };\n-            }\n+        // Handle guard failure if one occurred.\n+        if let Some((idx, description)) = failed_guard {\n+            let invalidated_after_failures = self.record_guard_failure(plan_id);\n+            let deopt_reason = invalidated_after_failures.map_or_else(\n+                || DeoptReason::GuardFailure {\n+                    guard_index: idx,\n+                    description: description.to_string(),\n+                },\n+                |total_failures| DeoptReason::TraceInvalidated { total_failures },\n+            );\n+            return JitExecutionResult {\n+                jit_hit: false,\n+                plan_id: Some(plan_id.to_string()),\n+                deopt_reason: Some(deopt_reason),\n+                cost_delta: 0,\n+            };\n         }\n \n         // All guards passed \u2014 JIT dispatch.\n@@ -484,7 +491,7 @@ impl TraceJitCompiler {\n             jit_hit: true,\n             plan_id: Some(plan_id.to_string()),\n             deopt_reason: None,\n-            cost_delta: compiled.tier_improvement_delta,\n+            cost_delta: tier_improvement_delta,\n         }\n     }\n "
+    }
+  ]
+}

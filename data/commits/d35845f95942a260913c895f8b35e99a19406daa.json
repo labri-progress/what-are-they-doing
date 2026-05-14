@@ -1,0 +1,77 @@
+{
+  "message": "fix: make gitcrawl portable search usable",
+  "files": [
+    {
+      "sha": "3494522c8aaeb06e57732a47c7b0a82c47e4185f",
+      "filename": "CHANGELOG.md",
+      "status": "added",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/openclaw/gitcrawl/blob/d35845f95942a260913c895f8b35e99a19406daa/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/gitcrawl/raw/d35845f95942a260913c895f8b35e99a19406daa/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/gitcrawl/contents/CHANGELOG.md?ref=d35845f95942a260913c895f8b35e99a19406daa",
+      "patch": "@@ -0,0 +1,6 @@\n+# Changelog\n+\n+## Unreleased\n+\n+- Add `gitcrawl sync --state open|closed|all` so incremental backups can refresh recently closed issues and pull requests.\n+- Let `gitcrawl search` fall back to compact thread title/body data when portable stores have pruned generated document indexes."
+    },
+    {
+      "sha": "84553d5fdbd8f5eb371858b026085cbf007bb68a",
+      "filename": "internal/cli/app.go",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 1,
+      "changes": 4,
+      "blob_url": "https://github.com/openclaw/gitcrawl/blob/d35845f95942a260913c895f8b35e99a19406daa/internal%2Fcli%2Fapp.go",
+      "raw_url": "https://github.com/openclaw/gitcrawl/raw/d35845f95942a260913c895f8b35e99a19406daa/internal%2Fcli%2Fapp.go",
+      "contents_url": "https://api.github.com/repos/openclaw/gitcrawl/contents/internal%2Fcli%2Fapp.go?ref=d35845f95942a260913c895f8b35e99a19406daa",
+      "patch": "@@ -1140,11 +1140,12 @@ func (a *App) runSync(ctx context.Context, args []string) error {\n \tfs := flag.NewFlagSet(\"sync\", flag.ContinueOnError)\n \tfs.SetOutput(io.Discard)\n \tsince := fs.String(\"since\", \"\", \"GitHub since timestamp\")\n+\tstate := fs.String(\"state\", \"\", \"GitHub issue state: open|closed|all\")\n \tlimitRaw := fs.String(\"limit\", \"\", \"maximum issue/PR rows\")\n \tjsonOut := fs.Bool(\"json\", false, \"write JSON output\")\n \tincludeComments := fs.Bool(\"include-comments\", false, \"hydrate issue comments, PR reviews, and PR review comments\")\n \tfs.Bool(\"include-code\", false, \"accepted for compatibility; code hydration is not implemented yet\")\n-\tif err := fs.Parse(normalizeCommandArgs(args, map[string]bool{\"since\": true, \"limit\": true})); err != nil {\n+\tif err := fs.Parse(normalizeCommandArgs(args, map[string]bool{\"since\": true, \"state\": true, \"limit\": true})); err != nil {\n \t\treturn usageErr(err)\n \t}\n \ta.applyCommandJSON(*jsonOut)\n@@ -1182,6 +1183,7 @@ func (a *App) runSync(ctx context.Context, args []string) error {\n \tstats, err := service.Sync(ctx, syncer.Options{\n \t\tOwner:           owner,\n \t\tRepo:            repo,\n+\t\tState:           strings.TrimSpace(*state),\n \t\tSince:           strings.TrimSpace(*since),\n \t\tLimit:           limit,\n \t\tIncludeComments: *includeComments,"
+    },
+    {
+      "sha": "30ec40a07fda735685e9e1868253a06e6d5c2382",
+      "filename": "internal/store/search.go",
+      "status": "modified",
+      "additions": 57,
+      "deletions": 0,
+      "changes": 57,
+      "blob_url": "https://github.com/openclaw/gitcrawl/blob/d35845f95942a260913c895f8b35e99a19406daa/internal%2Fstore%2Fsearch.go",
+      "raw_url": "https://github.com/openclaw/gitcrawl/raw/d35845f95942a260913c895f8b35e99a19406daa/internal%2Fstore%2Fsearch.go",
+      "contents_url": "https://api.github.com/repos/openclaw/gitcrawl/contents/internal%2Fstore%2Fsearch.go?ref=d35845f95942a260913c895f8b35e99a19406daa",
+      "patch": "@@ -4,6 +4,7 @@ import (\n \t\"context\"\n \t\"database/sql\"\n \t\"fmt\"\n+\t\"strings\"\n )\n \n type SearchHit struct {\n@@ -49,5 +50,61 @@ func (s *Store) SearchDocuments(ctx context.Context, repoID int64, query string,\n \tif err := rows.Err(); err != nil {\n \t\treturn nil, fmt.Errorf(\"iterate search hits: %w\", err)\n \t}\n+\tif len(out) == 0 {\n+\t\treturn s.searchThreads(ctx, repoID, query, limit)\n+\t}\n+\treturn out, nil\n+}\n+\n+func (s *Store) searchThreads(ctx context.Context, repoID int64, query string, limit int) ([]SearchHit, error) {\n+\tneedle := strings.TrimSpace(strings.ToLower(query))\n+\tif needle == \"\" {\n+\t\treturn nil, nil\n+\t}\n+\tpattern := \"%\" + escapeLike(needle) + \"%\"\n+\trows, err := s.db.QueryContext(ctx, `\n+\t\tselect id, number, kind, state, title, html_url, author_login,\n+\t\t\tcoalesce(nullif(body, ''), title)\n+\t\tfrom threads\n+\t\twhere repo_id = ?\n+\t\t  and (\n+\t\t\tlower(title) like ? escape '\\'\n+\t\t\tor lower(coalesce(body, '')) like ? escape '\\'\n+\t\t  )\n+\t\torder by coalesce(updated_at_gh, updated_at) desc, number desc\n+\t\tlimit ?\n+\t`, repoID, pattern, pattern, limit)\n+\tif err != nil {\n+\t\treturn nil, fmt.Errorf(\"search threads: %w\", err)\n+\t}\n+\tdefer rows.Close()\n+\n+\tout := make([]SearchHit, 0)\n+\tfor rows.Next() {\n+\t\tvar hit SearchHit\n+\t\tvar author sql.NullString\n+\t\tvar snippet sql.NullString\n+\t\tif err := rows.Scan(&hit.ThreadID, &hit.Number, &hit.Kind, &hit.State, &hit.Title, &hit.HTMLURL, &author, &snippet); err != nil {\n+\t\t\treturn nil, fmt.Errorf(\"scan thread search hit: %w\", err)\n+\t\t}\n+\t\thit.AuthorLogin = author.String\n+\t\thit.Snippet = snippet.String\n+\t\tout = append(out, hit)\n+\t}\n+\tif err := rows.Err(); err != nil {\n+\t\treturn nil, fmt.Errorf(\"iterate thread search hits: %w\", err)\n+\t}\n \treturn out, nil\n }\n+\n+func escapeLike(value string) string {\n+\tvar b strings.Builder\n+\tfor _, r := range value {\n+\t\tswitch r {\n+\t\tcase '\\\\', '%', '_':\n+\t\t\tb.WriteRune('\\\\')\n+\t\t}\n+\t\tb.WriteRune(r)\n+\t}\n+\treturn b.String()\n+}"
+    },
+    {
+      "sha": "b1c223bb76a3d27d7676eebe04b7477242791e4f",
+      "filename": "internal/store/store_test.go",
+      "status": "modified",
+      "additions": 27,
+      "deletions": 0,
+      "changes": 27,
+      "blob_url": "https://github.com/openclaw/gitcrawl/blob/d35845f95942a260913c895f8b35e99a19406daa/internal%2Fstore%2Fstore_test.go",
+      "raw_url": "https://github.com/openclaw/gitcrawl/raw/d35845f95942a260913c895f8b35e99a19406daa/internal%2Fstore%2Fstore_test.go",
+      "contents_url": "https://api.github.com/repos/openclaw/gitcrawl/contents/internal%2Fstore%2Fstore_test.go?ref=d35845f95942a260913c895f8b35e99a19406daa",
+      "patch": "@@ -193,6 +193,33 @@ func TestDocumentsFTSWorks(t *testing.T) {\n \t}\n }\n \n+func TestSearchFallsBackToThreadPayloadsWhenDocumentsArePruned(t *testing.T) {\n+\tctx := context.Background()\n+\tst, err := Open(ctx, filepath.Join(t.TempDir(), \"gitcrawl.db\"))\n+\tif err != nil {\n+\t\tt.Fatalf(\"open store: %v\", err)\n+\t}\n+\tdefer st.Close()\n+\n+\t_, err = st.DB().ExecContext(ctx, `\n+\t\tinsert into repositories(id, owner, name, full_name, raw_json, updated_at)\n+\t\tvalues(1, 'openclaw', 'openclaw', 'openclaw/openclaw', '{}', '2026-04-26T00:00:00Z');\n+\t\tinsert into threads(repo_id, github_id, number, kind, state, title, body, html_url, labels_json, assignees_json, raw_json, content_hash, updated_at)\n+\t\tvalues(1, '1', 73038, 'pull_request', 'open', 'feat(providers): add DeepInfra provider plugin', 'DeepInfra provider plugin', 'https://github.com/openclaw/openclaw/pull/73038', '[]', '[]', '{}', 'hash', '2026-04-27T00:00:00Z');\n+\t`)\n+\tif err != nil {\n+\t\tt.Fatalf(\"seed threads: %v\", err)\n+\t}\n+\n+\thits, err := st.SearchDocuments(ctx, 1, \"DeepInfra\", 10)\n+\tif err != nil {\n+\t\tt.Fatalf(\"search documents: %v\", err)\n+\t}\n+\tif len(hits) != 1 || hits[0].Number != 73038 {\n+\t\tt.Fatalf(\"hits = %#v, want PR 73038\", hits)\n+\t}\n+}\n+\n func TestPrunePortablePayloads(t *testing.T) {\n \tctx := context.Background()\n \tst, err := Open(ctx, filepath.Join(t.TempDir(), \"gitcrawl.db\"))"
+    },
+    {
+      "sha": "84f5a0f7db716be1784e09722059902b4a5d2c9d",
+      "filename": "internal/syncer/syncer.go",
+      "status": "modified",
+      "additions": 19,
+      "deletions": 1,
+      "changes": 20,
+      "blob_url": "https://github.com/openclaw/gitcrawl/blob/d35845f95942a260913c895f8b35e99a19406daa/internal%2Fsyncer%2Fsyncer.go",
+      "raw_url": "https://github.com/openclaw/gitcrawl/raw/d35845f95942a260913c895f8b35e99a19406daa/internal%2Fsyncer%2Fsyncer.go",
+      "contents_url": "https://api.github.com/repos/openclaw/gitcrawl/contents/internal%2Fsyncer%2Fsyncer.go?ref=d35845f95942a260913c895f8b35e99a19406daa",
+      "patch": "@@ -32,6 +32,7 @@ type Syncer struct {\n type Options struct {\n \tOwner           string\n \tRepo            string\n+\tState           string\n \tSince           string\n \tLimit           int\n \tIncludeComments bool\n@@ -65,6 +66,10 @@ func (s *Syncer) Sync(ctx context.Context, options Options) (Stats, error) {\n \tif err != nil {\n \t\treturn Stats{}, err\n \t}\n+\tstate, err := normalizeState(options.State)\n+\tif err != nil {\n+\t\treturn Stats{}, err\n+\t}\n \trepoRaw, err := s.client.GetRepo(ctx, options.Owner, options.Repo, options.Reporter)\n \tif err != nil {\n \t\treturn Stats{}, err\n@@ -82,7 +87,7 @@ func (s *Syncer) Sync(ctx context.Context, options Options) (Stats, error) {\n \t}\n \n \trows, err := s.client.ListRepositoryIssues(ctx, options.Owner, options.Repo, gh.ListIssuesOptions{\n-\t\tState: \"open\",\n+\t\tState: state,\n \t\tSince: since,\n \t\tLimit: options.Limit,\n \t}, options.Reporter)\n@@ -150,6 +155,19 @@ func (s *Syncer) Sync(ctx context.Context, options Options) (Stats, error) {\n \treturn stats, nil\n }\n \n+func normalizeState(value string) (string, error) {\n+\tvalue = strings.TrimSpace(strings.ToLower(value))\n+\tif value == \"\" {\n+\t\treturn \"open\", nil\n+\t}\n+\tswitch value {\n+\tcase \"open\", \"closed\", \"all\":\n+\t\treturn value, nil\n+\tdefault:\n+\t\treturn \"\", fmt.Errorf(\"invalid state %q: use open, closed, or all\", value)\n+\t}\n+}\n+\n func normalizeSince(value string, now time.Time) (string, error) {\n \tvalue = strings.TrimSpace(value)\n \tif value == \"\" {"
+    },
+    {
+      "sha": "0b0da781218baa9e0595ea555e5db004b16ea43a",
+      "filename": "internal/syncer/syncer_test.go",
+      "status": "modified",
+      "additions": 42,
+      "deletions": 0,
+      "changes": 42,
+      "blob_url": "https://github.com/openclaw/gitcrawl/blob/d35845f95942a260913c895f8b35e99a19406daa/internal%2Fsyncer%2Fsyncer_test.go",
+      "raw_url": "https://github.com/openclaw/gitcrawl/raw/d35845f95942a260913c895f8b35e99a19406daa/internal%2Fsyncer%2Fsyncer_test.go",
+      "contents_url": "https://api.github.com/repos/openclaw/gitcrawl/contents/internal%2Fsyncer%2Fsyncer_test.go?ref=d35845f95942a260913c895f8b35e99a19406daa",
+      "patch": "@@ -79,6 +79,16 @@ func (f *sinceCaptureGitHub) ListRepositoryIssues(ctx context.Context, owner, re\n \treturn nil, nil\n }\n \n+type stateCaptureGitHub struct {\n+\tfakeGitHub\n+\tstate string\n+}\n+\n+func (f *stateCaptureGitHub) ListRepositoryIssues(ctx context.Context, owner, repo string, options gh.ListIssuesOptions, reporter gh.Reporter) ([]map[string]any, error) {\n+\tf.state = options.State\n+\treturn nil, nil\n+}\n+\n func TestSyncPersistsIssuesAndPullRequests(t *testing.T) {\n \tctx := context.Background()\n \tst, err := store.Open(ctx, filepath.Join(t.TempDir(), \"gitcrawl.db\"))\n@@ -160,3 +170,35 @@ func TestSyncRejectsInvalidSince(t *testing.T) {\n \t\tt.Fatal(\"expected invalid since to fail\")\n \t}\n }\n+\n+func TestSyncPassesRequestedState(t *testing.T) {\n+\tctx := context.Background()\n+\tst, err := store.Open(ctx, filepath.Join(t.TempDir(), \"gitcrawl.db\"))\n+\tif err != nil {\n+\t\tt.Fatalf(\"open store: %v\", err)\n+\t}\n+\tdefer st.Close()\n+\n+\tclient := &stateCaptureGitHub{}\n+\ts := New(client, st)\n+\tif _, err := s.Sync(ctx, Options{Owner: \"openclaw\", Repo: \"gitcrawl\", State: \"all\"}); err != nil {\n+\t\tt.Fatalf(\"sync: %v\", err)\n+\t}\n+\tif client.state != \"all\" {\n+\t\tt.Fatalf(\"state = %q, want all\", client.state)\n+\t}\n+}\n+\n+func TestSyncRejectsInvalidState(t *testing.T) {\n+\tctx := context.Background()\n+\tst, err := store.Open(ctx, filepath.Join(t.TempDir(), \"gitcrawl.db\"))\n+\tif err != nil {\n+\t\tt.Fatalf(\"open store: %v\", err)\n+\t}\n+\tdefer st.Close()\n+\n+\ts := New(fakeGitHub{}, st)\n+\tif _, err := s.Sync(ctx, Options{Owner: \"openclaw\", Repo: \"gitcrawl\", State: \"merged\"}); err == nil {\n+\t\tt.Fatal(\"expected invalid state to fail\")\n+\t}\n+}"
+    }
+  ]
+}

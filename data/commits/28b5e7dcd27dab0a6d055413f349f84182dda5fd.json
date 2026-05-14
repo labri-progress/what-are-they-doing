@@ -1,0 +1,53 @@
+{
+  "message": "fix(abi): thread-safe fallback errno, lgamma/lgammaf signgam update, feupdateenv error propagation, and tgammaf(0) ERANGE\n\nerrno_abi: The static mut FALLBACK_ERRNO (used when TLS is unavailable during\nthread teardown) was a data race \u2014 all threads shared one mutable word.\nReplaces with a LazyLock<Mutex<HashMap<ThreadId, Box<c_int>>>> that gives\neach thread its own stable fallback slot. Two new tests verify per-thread\nstability and cross-thread isolation.\n\nmath_abi: lgamma/lgammaf were not updating the global signgam/__signgam\nvariables, which glibc users depend on to recover the sign of Gamma(x).\nNow calls lgamma_r/lgammaf_r first to get the sign, writes it to both\nglobals, then proceeds with the existing unary_entry path. Also fixes\ntgammaf(0) which was not setting ERANGE (pole error) and adds logb(0)\nERANGE (pole error: returns -Infinity).\n\nfenv_abi: feupdateenv was ignoring the return value of fesetenv \u2014 if the\nenvironment pointer was invalid (null), fesetenv returned -1 but\nfeupdateenv still proceeded to feraiseexcept and returned 0 (success).\nNow propagates the error. New test feupdateenv_null_is_rejected verifies.\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "2176a2604c93b301b9af84538bac1a711fc8758f",
+      "filename": "crates/frankenlibc-abi/src/errno_abi.rs",
+      "status": "modified",
+      "additions": 35,
+      "deletions": 2,
+      "changes": 37,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/28b5e7dcd27dab0a6d055413f349f84182dda5fd/crates%2Ffrankenlibc-abi%2Fsrc%2Ferrno_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/28b5e7dcd27dab0a6d055413f349f84182dda5fd/crates%2Ffrankenlibc-abi%2Fsrc%2Ferrno_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Ferrno_abi.rs?ref=28b5e7dcd27dab0a6d055413f349f84182dda5fd",
+      "patch": "@@ -5,16 +5,29 @@\n \n use std::cell::UnsafeCell;\n use std::ffi::c_int;\n+use std::sync::{LazyLock, Mutex};\n+\n+static FALLBACK_ERRNO_SLOTS: LazyLock<\n+    Mutex<std::collections::HashMap<std::thread::ThreadId, Box<c_int>>>,\n+> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));\n+\n+fn fallback_errno_slot_for_current_thread() -> *mut c_int {\n+    let thread_id = std::thread::current().id();\n+    let mut slots = FALLBACK_ERRNO_SLOTS\n+        .lock()\n+        .unwrap_or_else(|e| e.into_inner());\n+    let slot = slots.entry(thread_id).or_insert_with(|| Box::new(0));\n+    slot.as_mut() as *mut c_int\n+}\n \n #[cfg_attr(not(debug_assertions), unsafe(no_mangle))]\n pub unsafe extern \"C\" fn __errno_location() -> *mut c_int {\n-    static mut FALLBACK_ERRNO: c_int = 0;\n     thread_local! {\n         static ERRNO: UnsafeCell<c_int> = const { UnsafeCell::new(0) };\n     }\n     match ERRNO.try_with(|cell| cell.get()) {\n         Ok(ptr) => ptr,\n-        Err(_) => core::ptr::addr_of_mut!(FALLBACK_ERRNO),\n+        Err(_) => fallback_errno_slot_for_current_thread(),\n     }\n }\n \n@@ -27,3 +40,23 @@ pub unsafe fn set_abi_errno(val: c_int) {\n     let p = unsafe { __errno_location() };\n     unsafe { std::ptr::write_volatile(p, val) };\n }\n+\n+#[cfg(test)]\n+mod tests {\n+    use super::*;\n+\n+    #[test]\n+    fn fallback_errno_slot_is_stable_per_thread() {\n+        let p1 = fallback_errno_slot_for_current_thread();\n+        let p2 = fallback_errno_slot_for_current_thread();\n+        assert_eq!(p1, p2);\n+    }\n+\n+    #[test]\n+    fn fallback_errno_slot_isolated_across_threads() {\n+        let main_ptr = fallback_errno_slot_for_current_thread() as usize;\n+        let handle = std::thread::spawn(|| fallback_errno_slot_for_current_thread() as usize);\n+        let other_ptr = handle.join().unwrap();\n+        assert_ne!(main_ptr, other_ptr);\n+    }\n+}"
+    },
+    {
+      "sha": "6b4a3c390dd46b23ec55aa86d16568469fcd652c",
+      "filename": "crates/frankenlibc-abi/src/fenv_abi.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 1,
+      "changes": 5,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/28b5e7dcd27dab0a6d055413f349f84182dda5fd/crates%2Ffrankenlibc-abi%2Fsrc%2Ffenv_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/28b5e7dcd27dab0a6d055413f349f84182dda5fd/crates%2Ffrankenlibc-abi%2Fsrc%2Ffenv_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Ffenv_abi.rs?ref=28b5e7dcd27dab0a6d055413f349f84182dda5fd",
+      "patch": "@@ -343,7 +343,10 @@ pub unsafe extern \"C\" fn feupdateenv(envp: *const c_void) -> c_int {\n     unsafe {\n         // Capture currently pending exceptions before restoring environment\n         let pending = fetestexcept(HW_ALL_EXCEPT as c_int);\n-        fesetenv(envp);\n+        let rc = fesetenv(envp);\n+        if rc != 0 {\n+            return rc;\n+        }\n         feraiseexcept(pending);\n     }\n     0"
+    },
+    {
+      "sha": "4e2f1073eb6d495b90d47246dc82bbaf438863a2",
+      "filename": "crates/frankenlibc-abi/src/math_abi.rs",
+      "status": "modified",
+      "additions": 21,
+      "deletions": 4,
+      "changes": 25,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/28b5e7dcd27dab0a6d055413f349f84182dda5fd/crates%2Ffrankenlibc-abi%2Fsrc%2Fmath_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/28b5e7dcd27dab0a6d055413f349f84182dda5fd/crates%2Ffrankenlibc-abi%2Fsrc%2Fmath_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Fmath_abi.rs?ref=28b5e7dcd27dab0a6d055413f349f84182dda5fd",
+      "patch": "@@ -424,6 +424,14 @@ pub unsafe extern \"C\" fn tgamma(x: f64) -> f64 {\n \n #[cfg_attr(not(debug_assertions), unsafe(no_mangle))]\n pub unsafe extern \"C\" fn lgamma(x: f64) -> f64 {\n+    // Compute via reentrant version to get sign, then update global signgam.\n+    let (_, sign) = frankenlibc_core::math::lgamma_r(x);\n+    unsafe {\n+        signgam = sign;\n+        __signgam = sign;\n+    }\n+    // Run through unary_entry for membrane accounting. lgamma computes\n+    // the same value as lgamma_r; the sign is a side-channel.\n     let out = unary_entry(x, 10, frankenlibc_core::math::lgamma);\n     if x.is_finite() && (x == 0.0 || (x < 0.0 && is_integral_f64(x)) || out.is_infinite()) {\n         set_range_errno();\n@@ -612,6 +620,9 @@ pub unsafe extern \"C\" fn ilogb(x: f64) -> c_int {\n \n #[cfg_attr(not(debug_assertions), unsafe(no_mangle))]\n pub unsafe extern \"C\" fn logb(x: f64) -> f64 {\n+    if x == 0.0 {\n+        set_range_errno(); // pole error: logb(0) = -Infinity\n+    }\n     frankenlibc_core::math::logb(x)\n }\n \n@@ -1140,17 +1151,23 @@ pub unsafe extern \"C\" fn erfcf(x: f32) -> f32 {\n pub unsafe extern \"C\" fn tgammaf(x: f32) -> f32 {\n     let out = unary_entry_f32(x, 10, frankenlibc_core::math::tgammaf);\n     if x.is_finite() {\n-        if x <= 0.0 && x == x.floor() {\n-            set_domain_errno();\n-        } else if out.is_infinite() || out == 0.0 {\n-            set_range_errno();\n+        if x < 0.0 && x == x.floor() {\n+            set_domain_errno(); // negative integer: domain error\n+        } else if x == 0.0 || out.is_infinite() || out == 0.0 {\n+            set_range_errno(); // zero or overflow/underflow: range error\n         }\n     }\n     out\n }\n \n #[cfg_attr(not(debug_assertions), unsafe(no_mangle))]\n pub unsafe extern \"C\" fn lgammaf(x: f32) -> f32 {\n+    // Compute via reentrant version to get sign, then update global signgam.\n+    let (_, sign) = frankenlibc_core::math::lgammaf_r(x);\n+    unsafe {\n+        signgam = sign;\n+        __signgam = sign;\n+    }\n     let out = unary_entry_f32(x, 10, frankenlibc_core::math::lgammaf);\n     if x.is_finite() && ((x <= 0.0 && x == x.floor()) || out.is_infinite()) {\n         set_range_errno();"
+    },
+    {
+      "sha": "28e5ab48c9693ba73bf54562683fcb9f1fa1f19e",
+      "filename": "crates/frankenlibc-abi/tests/fenv_abi_test.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 0,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/28b5e7dcd27dab0a6d055413f349f84182dda5fd/crates%2Ffrankenlibc-abi%2Ftests%2Ffenv_abi_test.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/28b5e7dcd27dab0a6d055413f349f84182dda5fd/crates%2Ffrankenlibc-abi%2Ftests%2Ffenv_abi_test.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Ftests%2Ffenv_abi_test.rs?ref=28b5e7dcd27dab0a6d055413f349f84182dda5fd",
+      "patch": "@@ -427,6 +427,13 @@ fn fesetenv_null_is_rejected() {\n     }\n }\n \n+#[test]\n+fn feupdateenv_null_is_rejected() {\n+    unsafe {\n+        assert_eq!(feupdateenv(std::ptr::null()), -1);\n+    }\n+}\n+\n #[test]\n fn fetestexcept_zero_returns_zero() {\n     unsafe {"
+    }
+  ]
+}

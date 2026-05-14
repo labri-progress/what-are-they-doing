@@ -1,0 +1,161 @@
+{
+  "message": "refactor: unify gateway handshake timeout wiring",
+  "files": [
+    {
+      "sha": "4e15c7bc89708b682c280ac86f1926ff7e8a8448",
+      "filename": "src/gateway/android-node.capabilities.live.test.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/f5408d82d2101e9842447448e1bddd925c60abe2/src%2Fgateway%2Fandroid-node.capabilities.live.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/f5408d82d2101e9842447448e1bddd925c60abe2/src%2Fgateway%2Fandroid-node.capabilities.live.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fandroid-node.capabilities.live.test.ts?ref=f5408d82d2101e9842447448e1bddd925c60abe2",
+      "patch": "@@ -281,7 +281,7 @@ async function connectGatewayClient(params: {\n       url: params.url,\n       token: params.token,\n       password: params.password,\n-      connectDelayMs: 0,\n+      connectChallengeTimeoutMs: 0,\n       clientName: GATEWAY_CLIENT_NAMES.TEST,\n       clientDisplayName: \"android-live-test\",\n       clientVersion: \"dev\","
+    },
+    {
+      "sha": "7a22cae41b68af1bc2e676385513fd2b9162b072",
+      "filename": "src/gateway/client.ts",
+      "status": "modified",
+      "additions": 38,
+      "deletions": 16,
+      "changes": 54,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/f5408d82d2101e9842447448e1bddd925c60abe2/src%2Fgateway%2Fclient.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/f5408d82d2101e9842447448e1bddd925c60abe2/src%2Fgateway%2Fclient.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fclient.ts?ref=f5408d82d2101e9842447448e1bddd925c60abe2",
+      "patch": "@@ -22,6 +22,7 @@ import {\n } from \"../utils/message-channel.js\";\n import { VERSION } from \"../version.js\";\n import { buildDeviceAuthPayloadV3 } from \"./device-auth.js\";\n+import { resolveConnectChallengeTimeoutMs } from \"./handshake-timeouts.js\";\n import { isLoopbackHost, isSecureWebSocketUrl } from \"./net.js\";\n import {\n   ConnectErrorDetailCodes,\n@@ -77,6 +78,8 @@ class GatewayClientRequestError extends Error {\n \n export type GatewayClientOptions = {\n   url?: string; // ws://127.0.0.1:18789\n+  connectChallengeTimeoutMs?: number;\n+  /** @deprecated Use connectChallengeTimeoutMs. */\n   connectDelayMs?: number;\n   tickWatchMinIntervalMs?: number;\n   requestTimeoutMs?: number;\n@@ -119,9 +122,29 @@ export function describeGatewayCloseCode(code: number): string | undefined {\n   return GATEWAY_CLOSE_CODE_HINTS[code];\n }\n \n+function readConnectChallengeTimeoutOverride(\n+  opts: Pick<GatewayClientOptions, \"connectChallengeTimeoutMs\" | \"connectDelayMs\">,\n+): number | undefined {\n+  if (\n+    typeof opts.connectChallengeTimeoutMs === \"number\" &&\n+    Number.isFinite(opts.connectChallengeTimeoutMs)\n+  ) {\n+    return opts.connectChallengeTimeoutMs;\n+  }\n+  if (typeof opts.connectDelayMs === \"number\" && Number.isFinite(opts.connectDelayMs)) {\n+    return opts.connectDelayMs;\n+  }\n+  return undefined;\n+}\n+\n+export function resolveGatewayClientConnectChallengeTimeoutMs(\n+  opts: Pick<GatewayClientOptions, \"connectChallengeTimeoutMs\" | \"connectDelayMs\">,\n+): number {\n+  return resolveConnectChallengeTimeoutMs(readConnectChallengeTimeoutOverride(opts));\n+}\n+\n const FORCE_STOP_TERMINATE_GRACE_MS = 250;\n const STOP_AND_WAIT_TIMEOUT_MS = 1_000;\n-const DEFAULT_CONNECT_CHALLENGE_TIMEOUT_MS = 5_000;\n \n type PendingStop = {\n   ws: WebSocket;\n@@ -238,7 +261,7 @@ export class GatewayClient {\n           return;\n         }\n       }\n-      this.queueConnect();\n+      this.beginPreauthHandshake();\n     });\n     ws.on(\"message\", (data) => this.handleMessage(rawDataToString(data)));\n     ws.on(\"close\", (code, reason) => {\n@@ -328,10 +351,7 @@ export class GatewayClient {\n       clearInterval(this.tickTimer);\n       this.tickTimer = null;\n     }\n-    if (this.connectTimer) {\n-      clearTimeout(this.connectTimer);\n-      this.connectTimer = null;\n-    }\n+    this.clearConnectChallengeTimeout();\n     if (this.pendingStop) {\n       this.flushPendingErrors(new Error(\"gateway client stopped\"));\n       return this.pendingStop.promise;\n@@ -387,10 +407,7 @@ export class GatewayClient {\n       return;\n     }\n     this.connectSent = true;\n-    if (this.connectTimer) {\n-      clearTimeout(this.connectTimer);\n-      this.connectTimer = null;\n-    }\n+    this.clearConnectChallengeTimeout();\n     const role = this.opts.role ?? \"operator\";\n     const {\n       authToken,\n@@ -695,17 +712,22 @@ export class GatewayClient {\n     }\n   }\n \n-  private queueConnect() {\n+  private beginPreauthHandshake() {\n     this.connectNonce = null;\n     this.connectSent = false;\n-    const rawConnectDelayMs = this.opts.connectDelayMs;\n-    const connectChallengeTimeoutMs =\n-      typeof rawConnectDelayMs === \"number\" && Number.isFinite(rawConnectDelayMs)\n-        ? Math.max(250, Math.min(10_000, rawConnectDelayMs))\n-        : DEFAULT_CONNECT_CHALLENGE_TIMEOUT_MS;\n+    this.armConnectChallengeTimeout();\n+  }\n+\n+  private clearConnectChallengeTimeout() {\n     if (this.connectTimer) {\n       clearTimeout(this.connectTimer);\n+      this.connectTimer = null;\n     }\n+  }\n+\n+  private armConnectChallengeTimeout() {\n+    const connectChallengeTimeoutMs = resolveGatewayClientConnectChallengeTimeoutMs(this.opts);\n+    this.clearConnectChallengeTimeout();\n     this.connectTimer = setTimeout(() => {\n       if (this.connectSent || this.ws?.readyState !== WebSocket.OPEN) {\n         return;"
+    },
+    {
+      "sha": "456ad5a368f60c882ea6e9d2b26def4671c12044",
+      "filename": "src/gateway/client.watchdog.test.ts",
+      "status": "modified",
+      "additions": 24,
+      "deletions": 44,
+      "changes": 68,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/f5408d82d2101e9842447448e1bddd925c60abe2/src%2Fgateway%2Fclient.watchdog.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/f5408d82d2101e9842447448e1bddd925c60abe2/src%2Fgateway%2Fclient.watchdog.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fclient.watchdog.test.ts?ref=f5408d82d2101e9842447448e1bddd925c60abe2",
+      "patch": "@@ -3,7 +3,12 @@ import { createServer } from \"node:net\";\n import { afterEach, describe, expect, test, vi } from \"vitest\";\n import { WebSocket, WebSocketServer } from \"ws\";\n import { rawDataToString } from \"../infra/ws.js\";\n-import { GatewayClient } from \"./client.js\";\n+import { GatewayClient, resolveGatewayClientConnectChallengeTimeoutMs } from \"./client.js\";\n+import {\n+  DEFAULT_PREAUTH_HANDSHAKE_TIMEOUT_MS,\n+  MAX_CONNECT_CHALLENGE_TIMEOUT_MS,\n+  MIN_CONNECT_CHALLENGE_TIMEOUT_MS,\n+} from \"./handshake-timeouts.js\";\n \n // Find a free localhost port for ad-hoc WS servers.\n async function getFreePort(): Promise<number> {\n@@ -36,47 +41,22 @@ describe(\"GatewayClient\", () => {\n     }\n   });\n \n-  test(\"uses a 5s default connect-challenge timeout\", async () => {\n-    vi.useFakeTimers();\n-    try {\n-      const onConnectError = vi.fn();\n-      const close = vi.fn();\n-      const client = new GatewayClient({ onConnectError });\n-      (\n-        client as unknown as {\n-          ws:\n-            | WebSocket\n-            | {\n-                readyState: number;\n-                send: () => void;\n-                close: (code: number, reason: string) => void;\n-              };\n-          queueConnect: () => void;\n-        }\n-      ).ws = {\n-        readyState: WebSocket.OPEN,\n-        send: vi.fn(),\n-        close,\n-      };\n-\n-      (\n-        client as unknown as {\n-          queueConnect: () => void;\n-        }\n-      ).queueConnect();\n-\n-      await vi.advanceTimersByTimeAsync(4_999);\n-      expect(onConnectError).not.toHaveBeenCalled();\n-      expect(close).not.toHaveBeenCalled();\n-\n-      await vi.advanceTimersByTimeAsync(1);\n-      expect(onConnectError).toHaveBeenCalledWith(\n-        expect.objectContaining({ message: \"gateway connect challenge timeout\" }),\n-      );\n-      expect(close).toHaveBeenCalledWith(1008, \"connect challenge timeout\");\n-    } finally {\n-      vi.useRealTimers();\n-    }\n+  test(\"prefers connectChallengeTimeoutMs and still honors the legacy alias\", () => {\n+    expect(resolveGatewayClientConnectChallengeTimeoutMs({})).toBe(\n+      DEFAULT_PREAUTH_HANDSHAKE_TIMEOUT_MS,\n+    );\n+    expect(resolveGatewayClientConnectChallengeTimeoutMs({ connectDelayMs: 0 })).toBe(\n+      MIN_CONNECT_CHALLENGE_TIMEOUT_MS,\n+    );\n+    expect(resolveGatewayClientConnectChallengeTimeoutMs({ connectDelayMs: 20_000 })).toBe(\n+      MAX_CONNECT_CHALLENGE_TIMEOUT_MS,\n+    );\n+    expect(\n+      resolveGatewayClientConnectChallengeTimeoutMs({\n+        connectDelayMs: 2_000,\n+        connectChallengeTimeoutMs: 5_000,\n+      }),\n+    ).toBe(5_000);\n   });\n \n   test(\"closes on missing ticks\", async () => {\n@@ -112,7 +92,7 @@ describe(\"GatewayClient\", () => {\n     const closed = new Promise<{ code: number; reason: string }>((resolve) => {\n       const client = new GatewayClient({\n         url: `ws://127.0.0.1:${port}`,\n-        connectDelayMs: 0,\n+        connectChallengeTimeoutMs: 0,\n         tickWatchMinIntervalMs: 5,\n         onClose: (code, reason) => resolve({ code, reason }),\n       });\n@@ -363,7 +343,7 @@ r1USnb+wUdA7Zoj/mQ==\n       }, 2000);\n       client = new GatewayClient({\n         url: `wss://127.0.0.1:${port}`,\n-        connectDelayMs: 0,\n+        connectChallengeTimeoutMs: 0,\n         tlsFingerprint: \"deadbeef\",\n         onConnectError: (err) => {\n           clearTimeout(timeout);"
+    },
+    {
+      "sha": "13fe14ea7462e2d6520f0529d3797057531b5ab9",
+      "filename": "src/gateway/handshake-timeouts.test.ts",
+      "status": "added",
+      "additions": 37,
+      "deletions": 0,
+      "changes": 37,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/f5408d82d2101e9842447448e1bddd925c60abe2/src%2Fgateway%2Fhandshake-timeouts.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/f5408d82d2101e9842447448e1bddd925c60abe2/src%2Fgateway%2Fhandshake-timeouts.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fhandshake-timeouts.test.ts?ref=f5408d82d2101e9842447448e1bddd925c60abe2",
+      "patch": "@@ -0,0 +1,37 @@\n+import { describe, expect, test } from \"vitest\";\n+import {\n+  clampConnectChallengeTimeoutMs,\n+  DEFAULT_PREAUTH_HANDSHAKE_TIMEOUT_MS,\n+  getPreauthHandshakeTimeoutMsFromEnv,\n+  MAX_CONNECT_CHALLENGE_TIMEOUT_MS,\n+  MIN_CONNECT_CHALLENGE_TIMEOUT_MS,\n+  resolveConnectChallengeTimeoutMs,\n+} from \"./handshake-timeouts.js\";\n+\n+describe(\"gateway handshake timeouts\", () => {\n+  test(\"defaults connect challenge timeout to the shared pre-auth handshake timeout\", () => {\n+    expect(resolveConnectChallengeTimeoutMs()).toBe(DEFAULT_PREAUTH_HANDSHAKE_TIMEOUT_MS);\n+  });\n+\n+  test(\"clamps connect challenge timeouts into the supported range\", () => {\n+    expect(clampConnectChallengeTimeoutMs(0)).toBe(MIN_CONNECT_CHALLENGE_TIMEOUT_MS);\n+    expect(clampConnectChallengeTimeoutMs(2_000)).toBe(2_000);\n+    expect(clampConnectChallengeTimeoutMs(20_000)).toBe(MAX_CONNECT_CHALLENGE_TIMEOUT_MS);\n+  });\n+\n+  test(\"prefers OPENCLAW_HANDSHAKE_TIMEOUT_MS and falls back on the test-only env\", () => {\n+    expect(\n+      getPreauthHandshakeTimeoutMsFromEnv({\n+        OPENCLAW_HANDSHAKE_TIMEOUT_MS: \"75\",\n+        OPENCLAW_TEST_HANDSHAKE_TIMEOUT_MS: \"20\",\n+      }),\n+    ).toBe(75);\n+    expect(\n+      getPreauthHandshakeTimeoutMsFromEnv({\n+        OPENCLAW_HANDSHAKE_TIMEOUT_MS: \"\",\n+        OPENCLAW_TEST_HANDSHAKE_TIMEOUT_MS: \"20\",\n+        VITEST: \"1\",\n+      }),\n+    ).toBe(20);\n+  });\n+});"
+    },
+    {
+      "sha": "1911db2265835f042b9e7977a9ec46a7106f0e06",
+      "filename": "src/gateway/handshake-timeouts.ts",
+      "status": "added",
+      "additions": 28,
+      "deletions": 0,
+      "changes": 28,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/f5408d82d2101e9842447448e1bddd925c60abe2/src%2Fgateway%2Fhandshake-timeouts.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/f5408d82d2101e9842447448e1bddd925c60abe2/src%2Fgateway%2Fhandshake-timeouts.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fhandshake-timeouts.ts?ref=f5408d82d2101e9842447448e1bddd925c60abe2",
+      "patch": "@@ -0,0 +1,28 @@\n+export const DEFAULT_PREAUTH_HANDSHAKE_TIMEOUT_MS = 10_000;\n+export const MIN_CONNECT_CHALLENGE_TIMEOUT_MS = 250;\n+export const MAX_CONNECT_CHALLENGE_TIMEOUT_MS = DEFAULT_PREAUTH_HANDSHAKE_TIMEOUT_MS;\n+\n+export function clampConnectChallengeTimeoutMs(timeoutMs: number): number {\n+  return Math.max(\n+    MIN_CONNECT_CHALLENGE_TIMEOUT_MS,\n+    Math.min(MAX_CONNECT_CHALLENGE_TIMEOUT_MS, timeoutMs),\n+  );\n+}\n+\n+export function resolveConnectChallengeTimeoutMs(timeoutMs?: number | null): number {\n+  return typeof timeoutMs === \"number\" && Number.isFinite(timeoutMs)\n+    ? clampConnectChallengeTimeoutMs(timeoutMs)\n+    : DEFAULT_PREAUTH_HANDSHAKE_TIMEOUT_MS;\n+}\n+\n+export function getPreauthHandshakeTimeoutMsFromEnv(env: NodeJS.ProcessEnv = process.env): number {\n+  const configuredTimeout =\n+    env.OPENCLAW_HANDSHAKE_TIMEOUT_MS || (env.VITEST && env.OPENCLAW_TEST_HANDSHAKE_TIMEOUT_MS);\n+  if (configuredTimeout) {\n+    const parsed = Number(configuredTimeout);\n+    if (Number.isFinite(parsed) && parsed > 0) {\n+      return parsed;\n+    }\n+  }\n+  return DEFAULT_PREAUTH_HANDSHAKE_TIMEOUT_MS;\n+}"
+    },
+    {
+      "sha": "02f9fa93cecb3456287a0916046294e29fb57f11",
+      "filename": "src/gateway/server-constants.ts",
+      "status": "modified",
+      "additions": 0,
+      "deletions": 14,
+      "changes": 14,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/f5408d82d2101e9842447448e1bddd925c60abe2/src%2Fgateway%2Fserver-constants.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/f5408d82d2101e9842447448e1bddd925c60abe2/src%2Fgateway%2Fserver-constants.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fserver-constants.ts?ref=f5408d82d2101e9842447448e1bddd925c60abe2",
+      "patch": "@@ -21,20 +21,6 @@ export const __setMaxChatHistoryMessagesBytesForTest = (value?: number) => {\n     maxChatHistoryMessagesBytes = value;\n   }\n };\n-export const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;\n-export const getHandshakeTimeoutMs = () => {\n-  // User-facing env var (works in all environments); test-only var gated behind VITEST\n-  const envKey =\n-    process.env.OPENCLAW_HANDSHAKE_TIMEOUT_MS ||\n-    (process.env.VITEST && process.env.OPENCLAW_TEST_HANDSHAKE_TIMEOUT_MS);\n-  if (envKey) {\n-    const parsed = Number(envKey);\n-    if (Number.isFinite(parsed) && parsed > 0) {\n-      return parsed;\n-    }\n-  }\n-  return DEFAULT_HANDSHAKE_TIMEOUT_MS;\n-};\n export const TICK_INTERVAL_MS = 30_000;\n export const HEALTH_REFRESH_INTERVAL_MS = 60_000;\n export const DEDUPE_TTL_MS = 5 * 60_000;"
+    },
+    {
+      "sha": "71a276aa084744bcbc6550633d7f16f0dffb83f6",
+      "filename": "src/gateway/server.auth.default-token.suite.ts",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 4,
+      "changes": 8,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/f5408d82d2101e9842447448e1bddd925c60abe2/src%2Fgateway%2Fserver.auth.default-token.suite.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/f5408d82d2101e9842447448e1bddd925c60abe2/src%2Fgateway%2Fserver.auth.default-token.suite.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fserver.auth.default-token.suite.ts?ref=f5408d82d2101e9842447448e1bddd925c60abe2",
+      "patch": "@@ -6,7 +6,7 @@ import {\n   createSignedDevice,\n   expectHelloOkServerVersion,\n   getFreePort,\n-  getHandshakeTimeoutMs,\n+  getPreauthHandshakeTimeoutMsFromEnv,\n   GATEWAY_CLIENT_MODES,\n   GATEWAY_CLIENT_NAMES,\n   NODE_CLIENT,\n@@ -81,7 +81,7 @@ export function registerDefaultAuthTokenSuite(): void {\n       process.env.OPENCLAW_TEST_HANDSHAKE_TIMEOUT_MS = \"20\";\n       try {\n         const ws = await openWs(port);\n-        const handshakeTimeoutMs = getHandshakeTimeoutMs();\n+        const handshakeTimeoutMs = getPreauthHandshakeTimeoutMsFromEnv();\n         const closed = await waitForWsClose(ws, handshakeTimeoutMs + 500);\n         expect(closed).toBe(true);\n       } finally {\n@@ -99,9 +99,9 @@ export function registerDefaultAuthTokenSuite(): void {\n       process.env.OPENCLAW_HANDSHAKE_TIMEOUT_MS = \"75\";\n       process.env.OPENCLAW_TEST_HANDSHAKE_TIMEOUT_MS = \"20\";\n       try {\n-        expect(getHandshakeTimeoutMs()).toBe(75);\n+        expect(getPreauthHandshakeTimeoutMsFromEnv()).toBe(75);\n         process.env.OPENCLAW_HANDSHAKE_TIMEOUT_MS = \"\";\n-        expect(getHandshakeTimeoutMs()).toBe(20);\n+        expect(getPreauthHandshakeTimeoutMsFromEnv()).toBe(20);\n       } finally {\n         if (prevHandshakeTimeout === undefined) {\n           delete process.env.OPENCLAW_HANDSHAKE_TIMEOUT_MS;"
+    },
+    {
+      "sha": "bba4f9be9ea7055995ffd2886c84312247c5fe26",
+      "filename": "src/gateway/server.auth.shared.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/f5408d82d2101e9842447448e1bddd925c60abe2/src%2Fgateway%2Fserver.auth.shared.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/f5408d82d2101e9842447448e1bddd925c60abe2/src%2Fgateway%2Fserver.auth.shared.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fserver.auth.shared.ts?ref=f5408d82d2101e9842447448e1bddd925c60abe2",
+      "patch": "@@ -390,6 +390,6 @@ export {\n   writeTrustedProxyControlUiConfig,\n };\n export { ConnectErrorDetailCodes } from \"./protocol/connect-error-details.js\";\n-export { getHandshakeTimeoutMs } from \"./server-constants.js\";\n+export { getPreauthHandshakeTimeoutMsFromEnv } from \"./handshake-timeouts.js\";\n export { PROTOCOL_VERSION } from \"./protocol/index.js\";\n export { GATEWAY_CLIENT_MODES, GATEWAY_CLIENT_NAMES } from \"../utils/message-channel.js\";"
+    },
+    {
+      "sha": "7cd7ce20865fb949a03d881700603458dfb54df7",
+      "filename": "src/gateway/server.device-token-rotate-authz.test.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/f5408d82d2101e9842447448e1bddd925c60abe2/src%2Fgateway%2Fserver.device-token-rotate-authz.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/f5408d82d2101e9842447448e1bddd925c60abe2/src%2Fgateway%2Fserver.device-token-rotate-authz.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fserver.device-token-rotate-authz.test.ts?ref=f5408d82d2101e9842447448e1bddd925c60abe2",
+      "patch": "@@ -149,7 +149,7 @@ async function connectApprovedNode(params: {\n \n   const client = new GatewayClient({\n     url: `ws://127.0.0.1:${params.port}`,\n-    connectDelayMs: 2_000,\n+    connectChallengeTimeoutMs: 2_000,\n     token: \"secret\",\n     role: \"node\",\n     clientName: GATEWAY_CLIENT_NAMES.NODE_HOST,"
+    },
+    {
+      "sha": "42bb2b079b712f1957b9b8642c74c9b037bbe97d",
+      "filename": "src/gateway/server.node-invoke-approval-bypass.test.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/f5408d82d2101e9842447448e1bddd925c60abe2/src%2Fgateway%2Fserver.node-invoke-approval-bypass.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/f5408d82d2101e9842447448e1bddd925c60abe2/src%2Fgateway%2Fserver.node-invoke-approval-bypass.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fserver.node-invoke-approval-bypass.test.ts?ref=f5408d82d2101e9842447448e1bddd925c60abe2",
+      "patch": "@@ -216,7 +216,7 @@ describe(\"node.invoke approval bypass\", () => {\n       url: `ws://127.0.0.1:${port}`,\n       // Keep challenge timeout realistic in tests; 0 maps to a 250ms timeout and can\n       // trigger reconnect backoff loops under load.\n-      connectDelayMs: 2_000,\n+      connectChallengeTimeoutMs: 2_000,\n       token: \"secret\",\n       role: \"node\",\n       clientName: GATEWAY_CLIENT_NAMES.NODE_HOST,"
+    },
+    {
+      "sha": "4add43d3cbd709920838ebacf2083bb65ecb1188",
+      "filename": "src/gateway/server/ws-connection.ts",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/f5408d82d2101e9842447448e1bddd925c60abe2/src%2Fgateway%2Fserver%2Fws-connection.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/f5408d82d2101e9842447448e1bddd925c60abe2/src%2Fgateway%2Fserver%2Fws-connection.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fserver%2Fws-connection.ts?ref=f5408d82d2101e9842447448e1bddd925c60abe2",
+      "patch": "@@ -8,8 +8,8 @@ import { truncateUtf16Safe } from \"../../utils.js\";\n import { isWebchatClient } from \"../../utils/message-channel.js\";\n import type { AuthRateLimiter } from \"../auth-rate-limit.js\";\n import type { ResolvedGatewayAuth } from \"../auth.js\";\n+import { getPreauthHandshakeTimeoutMsFromEnv } from \"../handshake-timeouts.js\";\n import { isLoopbackAddress } from \"../net.js\";\n-import { getHandshakeTimeoutMs } from \"../server-constants.js\";\n import type { GatewayRequestContext, GatewayRequestHandlers } from \"../server-methods/types.js\";\n import { formatError } from \"../server-utils.js\";\n import { logWs } from \"../ws-log.js\";\n@@ -265,7 +265,7 @@ export function attachGatewayWsConnectionHandler(params: AttachGatewayWsConnecti\n       close();\n     });\n \n-    const handshakeTimeoutMs = getHandshakeTimeoutMs();\n+    const handshakeTimeoutMs = getPreauthHandshakeTimeoutMsFromEnv();\n     const handshakeTimer = setTimeout(() => {\n       if (!client) {\n         handshakeState = \"failed\";"
+    },
+    {
+      "sha": "6504cea4c5de03ffd9bcba2f1bf3a48398903c68",
+      "filename": "src/gateway/test-helpers.e2e.ts",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/f5408d82d2101e9842447448e1bddd925c60abe2/src%2Fgateway%2Ftest-helpers.e2e.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/f5408d82d2101e9842447448e1bddd925c60abe2/src%2Fgateway%2Ftest-helpers.e2e.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Ftest-helpers.e2e.ts?ref=f5408d82d2101e9842447448e1bddd925c60abe2",
+      "patch": "@@ -43,7 +43,7 @@ export async function connectGatewayClient(params: {\n   instanceId?: string;\n   deviceIdentity?: DeviceIdentity;\n   onEvent?: (evt: { event?: string; payload?: unknown }) => void;\n-  connectDelayMs?: number;\n+  connectChallengeTimeoutMs?: number;\n   timeoutMs?: number;\n   timeoutMessage?: string;\n }) {\n@@ -78,7 +78,7 @@ export async function connectGatewayClient(params: {\n     const client = new GatewayClient({\n       url: params.url,\n       token: params.token,\n-      connectDelayMs: params.connectDelayMs ?? 0,\n+      connectChallengeTimeoutMs: params.connectChallengeTimeoutMs ?? 0,\n       clientName: params.clientName ?? GATEWAY_CLIENT_NAMES.TEST,\n       clientDisplayName: params.clientDisplayName ?? \"vitest\",\n       clientVersion: params.clientVersion ?? \"dev\","
+    },
+    {
+      "sha": "e4b05c101029728498e25e59eb02fb60239f0e4a",
+      "filename": "test/helpers/gateway-e2e-harness.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/f5408d82d2101e9842447448e1bddd925c60abe2/test%2Fhelpers%2Fgateway-e2e-harness.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/f5408d82d2101e9842447448e1bddd925c60abe2/test%2Fhelpers%2Fgateway-e2e-harness.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/test%2Fhelpers%2Fgateway-e2e-harness.ts?ref=f5408d82d2101e9842447448e1bddd925c60abe2",
+      "patch": "@@ -312,7 +312,7 @@ async function connectStatusClient(\n \n     const client = new GatewayClient({\n       url: `ws://127.0.0.1:${inst.port}`,\n-      connectDelayMs: 0,\n+      connectChallengeTimeoutMs: 0,\n       token: inst.gatewayToken,\n       clientName: GATEWAY_CLIENT_NAMES.CLI,\n       clientDisplayName: `status-${inst.name}`,"
+    }
+  ]
+}

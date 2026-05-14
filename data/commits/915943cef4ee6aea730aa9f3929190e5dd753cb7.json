@@ -1,0 +1,89 @@
+{
+  "message": "feat: ESP32 CSI MAC address filtering with NVS/Kconfig support (#101)\n\n* feat: add MAC address filter for ESP32 CSI collection\n\nIn multi-AP environments, CSI frames from different access points get\nmixed together, corrupting the sensing signal. Add transmitter MAC\nfiltering so only frames from a specified AP are processed.\n\nImplementation:\n- csi_collector: filter in wifi_csi_callback by comparing info->mac\n  against configured MAC; log transmitter MAC in periodic debug output\n- csi_collector_set_filter_mac(): runtime API to enable/disable filter\n- Kconfig: CSI_FILTER_MAC option (format \"AA:BB:CC:DD:EE:FF\")\n- NVS: \"filter_mac\" 6-byte blob overrides Kconfig at runtime\n- nvs_config: parse Kconfig MAC string at boot, load NVS override\n- main: apply filter from config after csi_collector_init()\n\nWhen no filter is configured (default), behavior is unchanged \u2014\nall transmitter MACs are accepted for backward compatibility.\n\nFixes #98\n\nCo-Authored-By: claude-flow <ruv@ruv.net>\n\n* chore: add CLAUDE.local.md to .gitignore\n\nLocal machine configuration (ESP-IDF paths, COM port, build\ninstructions) should not be committed to the repository.\n\nCo-Authored-By: claude-flow <ruv@ruv.net>",
+  "files": [
+    {
+      "sha": "197fc73a51abe2708ef54c172d8d4a529c33ec94",
+      "filename": ".gitignore",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/ruvnet/RuView/blob/915943cef4ee6aea730aa9f3929190e5dd753cb7/.gitignore",
+      "raw_url": "https://github.com/ruvnet/RuView/raw/915943cef4ee6aea730aa9f3929190e5dd753cb7/.gitignore",
+      "contents_url": "https://api.github.com/repos/ruvnet/RuView/contents/.gitignore?ref=915943cef4ee6aea730aa9f3929190e5dd753cb7",
+      "patch": "@@ -1,3 +1,6 @@\n+# Local machine configuration (not shared)\n+CLAUDE.local.md\n+\n # ESP32 firmware build artifacts and local config (contains WiFi credentials)\n firmware/esp32-csi-node/build/\n firmware/esp32-csi-node/sdkconfig"
+    },
+    {
+      "sha": "245d023d7876add23269ecaa21f31ae5295194a6",
+      "filename": "firmware/esp32-csi-node/main/Kconfig.projbuild",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 0,
+      "changes": 14,
+      "blob_url": "https://github.com/ruvnet/RuView/blob/915943cef4ee6aea730aa9f3929190e5dd753cb7/firmware%2Fesp32-csi-node%2Fmain%2FKconfig.projbuild",
+      "raw_url": "https://github.com/ruvnet/RuView/raw/915943cef4ee6aea730aa9f3929190e5dd753cb7/firmware%2Fesp32-csi-node%2Fmain%2FKconfig.projbuild",
+      "contents_url": "https://api.github.com/repos/ruvnet/RuView/contents/firmware%2Fesp32-csi-node%2Fmain%2FKconfig.projbuild?ref=915943cef4ee6aea730aa9f3929190e5dd753cb7",
+      "patch": "@@ -39,4 +39,18 @@ menu \"CSI Node Configuration\"\n         help\n             WiFi channel to listen on for CSI data.\n \n+    config CSI_FILTER_MAC\n+        string \"CSI source MAC filter (AA:BB:CC:DD:EE:FF or empty)\"\n+        default \"\"\n+        help\n+            When set to a valid MAC address (e.g. \"AA:BB:CC:DD:EE:FF\"),\n+            only CSI frames from that transmitter are processed. All\n+            other frames are silently dropped. This prevents signal\n+            mixing in multi-AP environments.\n+\n+            Leave empty to accept CSI from all transmitters.\n+\n+            Can be overridden at runtime via NVS key \"filter_mac\"\n+            (6-byte blob) without reflashing.\n+\n endmenu"
+    },
+    {
+      "sha": "aaed5d9237af03727cad4ae0aa700fa9d3c66193",
+      "filename": "firmware/esp32-csi-node/main/csi_collector.c",
+      "status": "modified",
+      "additions": 45,
+      "deletions": 2,
+      "changes": 47,
+      "blob_url": "https://github.com/ruvnet/RuView/blob/915943cef4ee6aea730aa9f3929190e5dd753cb7/firmware%2Fesp32-csi-node%2Fmain%2Fcsi_collector.c",
+      "raw_url": "https://github.com/ruvnet/RuView/raw/915943cef4ee6aea730aa9f3929190e5dd753cb7/firmware%2Fesp32-csi-node%2Fmain%2Fcsi_collector.c",
+      "contents_url": "https://api.github.com/repos/ruvnet/RuView/contents/firmware%2Fesp32-csi-node%2Fmain%2Fcsi_collector.c?ref=915943cef4ee6aea730aa9f3929190e5dd753cb7",
+      "patch": "@@ -26,6 +26,15 @@ static uint32_t s_sequence = 0;\n static uint32_t s_cb_count = 0;\n static uint32_t s_send_ok = 0;\n static uint32_t s_send_fail = 0;\n+static uint32_t s_filtered = 0;\n+\n+/* ---- MAC address filter (Issue #98) ---- */\n+\n+/** When non-zero, only CSI from s_filter_mac is accepted. */\n+static uint8_t s_filter_enabled = 0;\n+\n+/** The accepted transmitter MAC address (6 bytes). */\n+static uint8_t s_filter_mac[6] = {0};\n \n /* ---- ADR-029: Channel-hop state ---- */\n \n@@ -124,18 +133,52 @@ size_t csi_serialize_frame(const wifi_csi_info_t *info, uint8_t *buf, size_t buf\n     return frame_size;\n }\n \n+void csi_collector_set_filter_mac(const uint8_t *mac)\n+{\n+    if (mac == NULL) {\n+        s_filter_enabled = 0;\n+        memset(s_filter_mac, 0, 6);\n+        ESP_LOGI(TAG, \"MAC filter disabled \u2014 accepting CSI from all transmitters\");\n+    } else {\n+        memcpy(s_filter_mac, mac, 6);\n+        s_filter_enabled = 1;\n+        ESP_LOGI(TAG, \"MAC filter enabled: only accepting %02X:%02X:%02X:%02X:%02X:%02X\",\n+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);\n+    }\n+    s_filtered = 0;\n+}\n+\n /**\n  * WiFi CSI callback \u2014 invoked by ESP-IDF when CSI data is available.\n+ *\n+ * When a MAC filter is active, frames from non-matching transmitters are\n+ * silently dropped to prevent signal mixing in multi-AP environments.\n  */\n static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)\n {\n     (void)ctx;\n     s_cb_count++;\n \n+    /* ---- MAC address filter (Issue #98) ---- */\n+    if (s_filter_enabled) {\n+        if (memcmp(info->mac, s_filter_mac, 6) != 0) {\n+            s_filtered++;\n+            if (s_filtered <= 3 || (s_filtered % 500) == 0) {\n+                ESP_LOGD(TAG, \"Filtered CSI from %02X:%02X:%02X:%02X:%02X:%02X (dropped %lu)\",\n+                         info->mac[0], info->mac[1], info->mac[2],\n+                         info->mac[3], info->mac[4], info->mac[5],\n+                         (unsigned long)s_filtered);\n+            }\n+            return;\n+        }\n+    }\n+\n     if (s_cb_count <= 3 || (s_cb_count % 100) == 0) {\n-        ESP_LOGI(TAG, \"CSI cb #%lu: len=%d rssi=%d ch=%d\",\n+        ESP_LOGI(TAG, \"CSI cb #%lu: len=%d rssi=%d ch=%d mac=%02X:%02X:%02X:%02X:%02X:%02X\",\n                  (unsigned long)s_cb_count, info->len,\n-                 info->rx_ctrl.rssi, info->rx_ctrl.channel);\n+                 info->rx_ctrl.rssi, info->rx_ctrl.channel,\n+                 info->mac[0], info->mac[1], info->mac[2],\n+                 info->mac[3], info->mac[4], info->mac[5]);\n     }\n \n     uint8_t frame_buf[CSI_MAX_FRAME_SIZE];"
+    },
+    {
+      "sha": "5aeef1bc33bf2dac3f1a2a3aac3959902e306ede",
+      "filename": "firmware/esp32-csi-node/main/csi_collector.h",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 0,
+      "changes": 16,
+      "blob_url": "https://github.com/ruvnet/RuView/blob/915943cef4ee6aea730aa9f3929190e5dd753cb7/firmware%2Fesp32-csi-node%2Fmain%2Fcsi_collector.h",
+      "raw_url": "https://github.com/ruvnet/RuView/raw/915943cef4ee6aea730aa9f3929190e5dd753cb7/firmware%2Fesp32-csi-node%2Fmain%2Fcsi_collector.h",
+      "contents_url": "https://api.github.com/repos/ruvnet/RuView/contents/firmware%2Fesp32-csi-node%2Fmain%2Fcsi_collector.h?ref=915943cef4ee6aea730aa9f3929190e5dd753cb7",
+      "patch": "@@ -22,12 +22,28 @@\n /** Maximum number of channels in the hop table (ADR-029). */\n #define CSI_HOP_CHANNELS_MAX 6\n \n+/** Length of a MAC address in bytes. */\n+#define CSI_MAC_LEN 6\n+\n /**\n  * Initialize CSI collection.\n  * Registers the WiFi CSI callback.\n  */\n void csi_collector_init(void);\n \n+/**\n+ * Set a MAC address filter for CSI collection.\n+ *\n+ * When set, only CSI frames from the specified transmitter MAC are processed;\n+ * all others are silently dropped. This prevents signal mixing in multi-AP\n+ * environments.\n+ *\n+ * Pass NULL to disable filtering (accept CSI from all transmitters).\n+ *\n+ * @param mac  6-byte MAC address to accept, or NULL to disable filtering.\n+ */\n+void csi_collector_set_filter_mac(const uint8_t *mac);\n+\n /**\n  * Serialize CSI data into ADR-018 binary frame format.\n  *"
+    },
+    {
+      "sha": "5652fd9b39302e4cf9898ad1c37635928bd1cbc0",
+      "filename": "firmware/esp32-csi-node/main/main.c",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 0,
+      "changes": 7,
+      "blob_url": "https://github.com/ruvnet/RuView/blob/915943cef4ee6aea730aa9f3929190e5dd753cb7/firmware%2Fesp32-csi-node%2Fmain%2Fmain.c",
+      "raw_url": "https://github.com/ruvnet/RuView/raw/915943cef4ee6aea730aa9f3929190e5dd753cb7/firmware%2Fesp32-csi-node%2Fmain%2Fmain.c",
+      "contents_url": "https://api.github.com/repos/ruvnet/RuView/contents/firmware%2Fesp32-csi-node%2Fmain%2Fmain.c?ref=915943cef4ee6aea730aa9f3929190e5dd753cb7",
+      "patch": "@@ -134,6 +134,13 @@ void app_main(void)\n     /* Initialize CSI collection */\n     csi_collector_init();\n \n+    /* Apply MAC address filter if configured (Issue #98) */\n+    if (s_cfg.filter_mac_enabled) {\n+        csi_collector_set_filter_mac(s_cfg.filter_mac);\n+    } else {\n+        ESP_LOGI(TAG, \"No MAC filter \u2014 accepting CSI from all transmitters\");\n+    }\n+\n     ESP_LOGI(TAG, \"CSI streaming active \u2192 %s:%d\",\n              s_cfg.target_ip, s_cfg.target_port);\n "
+    },
+    {
+      "sha": "a8452cf3a0d7a070e6c622331c455f7bb9c43e5a",
+      "filename": "firmware/esp32-csi-node/main/nvs_config.c",
+      "status": "modified",
+      "additions": 45,
+      "deletions": 0,
+      "changes": 45,
+      "blob_url": "https://github.com/ruvnet/RuView/blob/915943cef4ee6aea730aa9f3929190e5dd753cb7/firmware%2Fesp32-csi-node%2Fmain%2Fnvs_config.c",
+      "raw_url": "https://github.com/ruvnet/RuView/raw/915943cef4ee6aea730aa9f3929190e5dd753cb7/firmware%2Fesp32-csi-node%2Fmain%2Fnvs_config.c",
+      "contents_url": "https://api.github.com/repos/ruvnet/RuView/contents/firmware%2Fesp32-csi-node%2Fmain%2Fnvs_config.c?ref=915943cef4ee6aea730aa9f3929190e5dd753cb7",
+      "patch": "@@ -9,6 +9,7 @@\n #include \"nvs_config.h\"\n \n #include <string.h>\n+#include <stdio.h>\n #include \"esp_log.h\"\n #include \"nvs_flash.h\"\n #include \"nvs.h\"\n@@ -51,6 +52,29 @@ void nvs_config_load(nvs_config_t *cfg)\n     cfg->tdm_slot_index = 0;\n     cfg->tdm_node_count = 1;\n \n+    /* MAC filter: default disabled (all zeros) */\n+    memset(cfg->filter_mac, 0, 6);\n+    cfg->filter_mac_enabled = 0;\n+\n+    /* Parse compile-time Kconfig MAC filter if set (format: \"AA:BB:CC:DD:EE:FF\") */\n+#ifdef CONFIG_CSI_FILTER_MAC\n+    {\n+        const char *mac_str = CONFIG_CSI_FILTER_MAC;\n+        unsigned int m[6];\n+        if (mac_str[0] != '\\0' &&\n+            sscanf(mac_str, \"%x:%x:%x:%x:%x:%x\",\n+                   &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) == 6) {\n+            for (int i = 0; i < 6; i++) {\n+                cfg->filter_mac[i] = (uint8_t)m[i];\n+            }\n+            cfg->filter_mac_enabled = 1;\n+            ESP_LOGI(TAG, \"Kconfig MAC filter: %02X:%02X:%02X:%02X:%02X:%02X\",\n+                     cfg->filter_mac[0], cfg->filter_mac[1], cfg->filter_mac[2],\n+                     cfg->filter_mac[3], cfg->filter_mac[4], cfg->filter_mac[5]);\n+        }\n+    }\n+#endif\n+\n     /* Try to override from NVS */\n     nvs_handle_t handle;\n     esp_err_t err = nvs_open(\"csi_cfg\", NVS_READONLY, &handle);\n@@ -152,6 +176,27 @@ void nvs_config_load(nvs_config_t *cfg)\n         }\n     }\n \n+    /* MAC filter (stored as a 6-byte blob in NVS key \"filter_mac\") */\n+    uint8_t mac_blob[6];\n+    size_t mac_len = 6;\n+    if (nvs_get_blob(handle, \"filter_mac\", mac_blob, &mac_len) == ESP_OK && mac_len == 6) {\n+        /* Check it's not all zeros (which would mean \"no filter\") */\n+        uint8_t is_zero = 1;\n+        for (int i = 0; i < 6; i++) {\n+            if (mac_blob[i] != 0) { is_zero = 0; break; }\n+        }\n+        if (!is_zero) {\n+            memcpy(cfg->filter_mac, mac_blob, 6);\n+            cfg->filter_mac_enabled = 1;\n+            ESP_LOGI(TAG, \"NVS override: filter_mac=%02X:%02X:%02X:%02X:%02X:%02X\",\n+                     mac_blob[0], mac_blob[1], mac_blob[2],\n+                     mac_blob[3], mac_blob[4], mac_blob[5]);\n+        } else {\n+            cfg->filter_mac_enabled = 0;\n+            ESP_LOGI(TAG, \"NVS override: filter_mac disabled (all zeros)\");\n+        }\n+    }\n+\n     /* Validate tdm_slot_index < tdm_node_count */\n     if (cfg->tdm_slot_index >= cfg->tdm_node_count) {\n         ESP_LOGW(TAG, \"tdm_slot_index=%u >= tdm_node_count=%u, clamping to 0\","
+    },
+    {
+      "sha": "8779585da0c654ff5667ef0bd6d6ec9c5485c6bb",
+      "filename": "firmware/esp32-csi-node/main/nvs_config.h",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/ruvnet/RuView/blob/915943cef4ee6aea730aa9f3929190e5dd753cb7/firmware%2Fesp32-csi-node%2Fmain%2Fnvs_config.h",
+      "raw_url": "https://github.com/ruvnet/RuView/raw/915943cef4ee6aea730aa9f3929190e5dd753cb7/firmware%2Fesp32-csi-node%2Fmain%2Fnvs_config.h",
+      "contents_url": "https://api.github.com/repos/ruvnet/RuView/contents/firmware%2Fesp32-csi-node%2Fmain%2Fnvs_config.h?ref=915943cef4ee6aea730aa9f3929190e5dd753cb7",
+      "patch": "@@ -35,6 +35,10 @@ typedef struct {\n     uint32_t dwell_ms;                        /**< Dwell time per channel in ms. */\n     uint8_t  tdm_slot_index;                  /**< This node's TDM slot index (0-based). */\n     uint8_t  tdm_node_count;                  /**< Total nodes in the TDM schedule. */\n+\n+    /* MAC address filter for CSI source selection (Issue #98) */\n+    uint8_t  filter_mac[6];                   /**< Transmitter MAC to accept (all zeros = no filter). */\n+    uint8_t  filter_mac_enabled;              /**< 1 = filter active, 0 = accept all. */\n } nvs_config_t;\n \n /**"
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "message": "fix(fr-command): XINFO STREAM lookup-before-parse + subcommand-syntax-error wording [bd-frankenredis-y8m7]\n\nThree divergences vs vendored redis 7.2.4 t_stream.c::xinfoCommand:\n\n1. Key-lookup ordering: upstream calls lookupKeyReadOrReply BEFORE\n   dispatching to the STREAM/FULL branch, so 'XINFO STREAM nokey\n   FULL extra' replies 'no such key'. fr validated args first,\n   leaking 'wrong number of arguments' for missing keys.\n\n2. Arg-validation wording: when the key exists but the FULL [COUNT]\n   tail is malformed, upstream's xinfoReplyWithStreamInfo calls\n   addReplySubcommandSyntaxError producing 'unknown subcommand or\n   wrong number of arguments for STREAM. Try XINFO HELP.'. fr was\n   emitting 'wrong number of arguments for xinfo|stream command'.\n\n3. Negative COUNT: upstream silently treats a negative COUNT as the\n   default 10. fr returned InvalidInteger.\n\nFix:\n- Move xinfo_stream() lookup ahead of full-mode arg parsing.\n- Build the addReplySubcommandSyntaxError-style wording in a closure\n  and emit it from the four arg-shape failure paths.\n- Default negative COUNT to 10.",
+  "files": [
+    {
+      "sha": "e77656d85e9e0aac53ddd1db32ddaa51ad91d3c3",
+      "filename": ".beads/issues.jsonl",
+      "status": "modified",
+      "additions": 27,
+      "deletions": 26,
+      "changes": 53,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/c4ed796d2c5bdcff23331c2142a8c2cd214833c1/.beads%2Fissues.jsonl",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/c4ed796d2c5bdcff23331c2142a8c2cd214833c1/.beads%2Fissues.jsonl",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/.beads%2Fissues.jsonl?ref=c4ed796d2c5bdcff23331c2142a8c2cd214833c1"
+    },
+    {
+      "sha": "55e2336cee269e8f2d0e39a6fec802895d6d2d09",
+      "filename": "crates/fr-command/src/lib.rs",
+      "status": "modified",
+      "additions": 30,
+      "deletions": 13,
+      "changes": 43,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/c4ed796d2c5bdcff23331c2142a8c2cd214833c1/crates%2Ffr-command%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/c4ed796d2c5bdcff23331c2142a8c2cd214833c1/crates%2Ffr-command%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/crates%2Ffr-command%2Fsrc%2Flib.rs?ref=c4ed796d2c5bdcff23331c2142a8c2cd214833c1",
+      "patch": "@@ -6266,36 +6266,53 @@ fn xinfo(argv: &[Vec<u8>], store: &mut Store, now_ms: u64) -> Result<RespFrame,\n     }\n \n     // XINFO STREAM key [FULL [COUNT count]]\n-    let full_mode = argv.len() >= 4 && eq_ascii_command(&argv[3], b\"FULL\");\n-    if !full_mode && argv.len() != 3 {\n+    if argv.len() < 3 {\n         return Err(CommandError::WrongSubcommandArity {\n             command: \"XINFO\",\n             subcommand: sub.to_string(),\n         });\n     }\n+    // Upstream t_stream.c::xinfoCommand looks up the key BEFORE\n+    // dispatching to the STREAM/FULL branch, so any missing key\n+    // (or wrong-type key) replies with 'no such key' /\n+    // 'WRONGTYPE\u2026' regardless of any unrecognised trailing args.\n+    // (br-frankenredis-xinfokey)\n+    let Some((len, first, last)) = store.xinfo_stream(&argv[2], now_ms)? else {\n+        return Err(CommandError::NoSuchKey);\n+    };\n+    // Upstream xinfoReplyWithStreamInfo uses addReplySubcommandSyntaxError\n+    // for any unrecognised tail, which renders as 'unknown subcommand\n+    // or wrong number of arguments for <SUB>. Try XINFO HELP.'.\n+    // (br-frankenredis-xinfokey)\n+    let xinfo_subcommand_syntax_error = || {\n+        CommandError::Custom(format!(\n+            \"ERR unknown subcommand or wrong number of arguments for '{sub}'. Try XINFO HELP.\"\n+        ))\n+    };\n+    let full_mode = argv.len() >= 4 && eq_ascii_command(&argv[3], b\"FULL\");\n+    if !full_mode && argv.len() != 3 {\n+        return Err(xinfo_subcommand_syntax_error());\n+    }\n     if full_mode && argv.len() != 4 && argv.len() != 6 {\n-        return Err(CommandError::WrongSubcommandArity {\n-            command: \"XINFO\",\n-            subcommand: sub.to_string(),\n-        });\n+        return Err(xinfo_subcommand_syntax_error());\n     }\n     let full_count: usize = if full_mode && argv.len() == 6 {\n         if !eq_ascii_command(&argv[4], b\"COUNT\") {\n-            return Err(CommandError::SyntaxError);\n+            return Err(xinfo_subcommand_syntax_error());\n         }\n+        // Upstream parses COUNT via getLongLongFromObjectOrReply\n+        // (which uses 'value is not an integer or out of range')\n+        // and silently treats negative counts as the default 10.\n         let n = parse_i64_arg(&argv[5])?;\n         if n < 0 {\n-            return Err(CommandError::InvalidInteger);\n+            10\n+        } else {\n+            usize::try_from(n).map_err(|_| CommandError::InvalidInteger)?\n         }\n-        usize::try_from(n).map_err(|_| CommandError::InvalidInteger)?\n     } else {\n         10 // Redis default COUNT for FULL is 10\n     };\n \n-    let Some((len, first, last)) = store.xinfo_stream(&argv[2], now_ms)? else {\n-        return Err(CommandError::NoSuchKey);\n-    };\n-\n     let last_generated_id = last\n         .as_ref()\n         .map(|(id, _)| format_stream_id(*id))"
+    }
+  ]
+}

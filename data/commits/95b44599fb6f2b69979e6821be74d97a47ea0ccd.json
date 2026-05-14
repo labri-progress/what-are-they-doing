@@ -1,0 +1,29 @@
+{
+  "message": "fix: queryToSql now emits DISTINCT and COUNT(DISTINCT col) for WASM SQL\n\nqueryToSql silently dropped the DISTINCT keyword, causing WASM to\nreturn all rows for DISTINCT queries (TS DistinctOperator caught it,\nbut at the cost of transferring extra data). Also fixed count_distinct\ngenerating invalid COUNT_DISTINCT() instead of COUNT(DISTINCT col).",
+  "files": [
+    {
+      "sha": "1649d9631e9ee320135673e8863629634e20a0f3",
+      "filename": "src/wasm-engine.integration.test.ts",
+      "status": "modified",
+      "additions": 47,
+      "deletions": 1,
+      "changes": 48,
+      "blob_url": "https://github.com/teamchong/querymode/blob/95b44599fb6f2b69979e6821be74d97a47ea0ccd/src%2Fwasm-engine.integration.test.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/95b44599fb6f2b69979e6821be74d97a47ea0ccd/src%2Fwasm-engine.integration.test.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fwasm-engine.integration.test.ts?ref=95b44599fb6f2b69979e6821be74d97a47ea0ccd",
+      "patch": "@@ -4,7 +4,7 @@\n  * Skips gracefully if binary not found.\n  */\n import { describe, it, expect, beforeAll } from \"vitest\";\n-import { instantiateWasm, type WasmEngine } from \"./wasm-engine.js\";\n+import { instantiateWasm, queryToSql, type WasmEngine } from \"./wasm-engine.js\";\n import type { QueryDescriptor } from \"./client.js\";\n import type { PageInfo } from \"./types.js\";\n import * as fs from \"node:fs/promises\";\n@@ -343,3 +343,49 @@ describe.skipIf(!hasWasm)(\"WASM integration\", () => {\n     });\n   });\n });\n+\n+// Pure-TS tests \u2014 no WASM binary required\n+describe(\"queryToSql\", () => {\n+  const base = { table: \"t\", filters: [] as any[], projections: [] as string[] };\n+\n+  it(\"generates SELECT DISTINCT\", () => {\n+    const sql = queryToSql({ ...base, distinct: [\"a\", \"b\"] });\n+    expect(sql).toBe('SELECT DISTINCT * FROM t');\n+  });\n+\n+  it(\"generates SELECT DISTINCT with projections\", () => {\n+    const sql = queryToSql({ ...base, distinct: [\"a\"], projections: [\"a\", \"b\"] });\n+    expect(sql).toBe('SELECT DISTINCT a, b FROM t');\n+  });\n+\n+  it(\"generates COUNT(DISTINCT col) for count_distinct\", () => {\n+    const sql = queryToSql({ ...base, aggregates: [{ fn: \"count_distinct\", column: \"user_id\" }] });\n+    expect(sql).toContain(\"COUNT(DISTINCT user_id)\");\n+  });\n+\n+  it(\"generates COUNT(*) for count with star\", () => {\n+    const sql = queryToSql({ ...base, aggregates: [{ fn: \"count\", column: \"*\" }] });\n+    expect(sql).toContain(\"COUNT(*)\");\n+  });\n+\n+  it(\"includes OR filterGroups\", () => {\n+    const sql = queryToSql({\n+      ...base,\n+      filterGroups: [\n+        [{ column: \"a\", op: \"eq\", value: 1 }],\n+        [{ column: \"b\", op: \"eq\", value: 2 }],\n+      ],\n+    });\n+    expect(sql).toContain(\"(a = 1 OR b = 2)\");\n+  });\n+\n+  it(\"handles NOT IN filter\", () => {\n+    const sql = queryToSql({ ...base, filters: [{ column: \"id\", op: \"not_in\", value: [1, 2] }] });\n+    expect(sql).toContain(\"NOT IN (1, 2)\");\n+  });\n+\n+  it(\"handles NOT BETWEEN filter\", () => {\n+    const sql = queryToSql({ ...base, filters: [{ column: \"x\", op: \"not_between\", value: [10, 20] }] });\n+    expect(sql).toContain(\"NOT BETWEEN 10 AND 20\");\n+  });\n+});"
+    },
+    {
+      "sha": "3d6769d7234865390f81c913de0a0187eada9f00",
+      "filename": "src/wasm-engine.ts",
+      "status": "modified",
+      "additions": 12,
+      "deletions": 5,
+      "changes": 17,
+      "blob_url": "https://github.com/teamchong/querymode/blob/95b44599fb6f2b69979e6821be74d97a47ea0ccd/src%2Fwasm-engine.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/95b44599fb6f2b69979e6821be74d97a47ea0ccd/src%2Fwasm-engine.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fwasm-engine.ts?ref=95b44599fb6f2b69979e6821be74d97a47ea0ccd",
+      "patch": "@@ -1027,21 +1027,28 @@ function filterToSql(f: FilterOp): string {\n   return `${quote(f.column)} ${COMPARISON_OP_MAP[f.op] ?? \"=\"} ${val}`;\n }\n \n-function queryToSql(query: QueryDescriptor): string {\n+/** @internal \u2014 exported for testing */\n+export function queryToSql(query: QueryDescriptor): string {\n   const parts: string[] = [];\n \n+  const distinctKw = query.distinct?.length ? \"DISTINCT \" : \"\";\n   if (query.aggregates?.length) {\n     const exprs: string[] = [];\n     if (query.groupBy) exprs.push(...query.groupBy.map(quote));\n     for (const agg of query.aggregates) {\n-      const expr = `${agg.fn.toUpperCase()}(${agg.column === \"*\" ? \"*\" : quote(agg.column)})`;\n+      let expr: string;\n+      if (agg.fn === \"count_distinct\") {\n+        expr = `COUNT(DISTINCT ${agg.column === \"*\" ? \"*\" : quote(agg.column)})`;\n+      } else {\n+        expr = `${agg.fn.toUpperCase()}(${agg.column === \"*\" ? \"*\" : quote(agg.column)})`;\n+      }\n       exprs.push(agg.alias ? `${expr} AS ${quote(agg.alias)}` : expr);\n     }\n-    parts.push(`SELECT ${exprs.join(\", \")}`);\n+    parts.push(`SELECT ${distinctKw}${exprs.join(\", \")}`);\n   } else if (query.projections.length > 0) {\n-    parts.push(`SELECT ${query.projections.map(quote).join(\", \")}`);\n+    parts.push(`SELECT ${distinctKw}${query.projections.map(quote).join(\", \")}`);\n   } else {\n-    parts.push(\"SELECT *\");\n+    parts.push(`SELECT ${distinctKw}*`);\n   }\n \n   parts.push(`FROM ${quote(query.table)}`);"
+    }
+  ]
+}

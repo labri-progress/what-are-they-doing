@@ -1,0 +1,53 @@
+{
+  "message": "fix(runtime): harden NaN propagation guards across statistical subsystems\n\nAdds defensive NaN checks to prevent silent corruption in four\nstatistical/control-theory components that process floating-point\ntelemetry data. NaN inputs can arise from division-by-zero in\nupstream metric collection (e.g. zero-sample-count means, degenerate\ntimer ratios), and without guards they propagate through the entire\nstate, permanently corrupting accumulators and control signals.\n\nalloc_budget.rs (AllocLeakDetector):\n  - Guards log_factor against NaN before exponentiation in the\n    e-process update. A NaN residual (from degenerate standardization)\n    would otherwise produce NaN * e_value, permanently poisoning the\n    leak detector's e-value accumulator.\n\nbudget.rs (PidState + EProcessState):\n  - PidState::update: Returns 0.0 control signal immediately on NaN\n    error input, preventing NaN from infecting the integral and\n    derivative accumulators which would make the PID controller\n    permanently unresponsive.\n  - EProcessState: Wraps the e-value multiplication and clamping in\n    a NaN guard on log_factor. Previously, a NaN log_factor would\n    set e_value to NaN, breaking all subsequent threshold comparisons.\n\nbocpd.rs (BocpdDetector):\n  - Config sanitization: All clamp/max calls on config fields\n    (min_observation_ms, max_observation_ms, steady_threshold,\n    burst_threshold, burst_prior) now check for NaN first and\n    substitute sensible defaults, because f64::max(NaN, x) returns\n    NaN and f64::clamp with NaN bounds is undefined.\n  - Posterior odds: Guards the p_burst calculation against NaN from\n    Inf/Inf or 0/0 posterior odds ratios, falling back to 0.5\n    (maximum uncertainty) or 1.0 (for infinite odds).\n\nvoi_sampling.rs (VoiSampler):\n  - All config field sanitizations (prior_alpha, prior_beta, mu_0,\n    lambda, value_scale, boundary_weight, sample_cost) check for\n    NaN before applying max/clamp, substituting the lower bound or\n    a neutral default. This prevents a single NaN config value from\n    cascading through the Beta-Bernoulli VOI computation.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "9a96d093615e35aaad3eec8797a345f59a1a4f3b",
+      "filename": "crates/ftui-render/src/alloc_budget.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/frankentui/blob/b346386e38afbacb3c953be69b43f09348dac817/crates%2Fftui-render%2Fsrc%2Falloc_budget.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankentui/raw/b346386e38afbacb3c953be69b43f09348dac817/crates%2Fftui-render%2Fsrc%2Falloc_budget.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankentui/contents/crates%2Fftui-render%2Fsrc%2Falloc_budget.rs?ref=b346386e38afbacb3c953be69b43f09348dac817",
+      "patch": "@@ -277,6 +277,7 @@ impl AllocLeakDetector {\n         let lambda = self.config.lambda;\n         let log_factor = lambda * residual - (lambda * lambda) / 2.0;\n         // Clamp to prevent overflow.\n+        let log_factor = if log_factor.is_nan() { 0.0 } else { log_factor };\n         let factor = log_factor.clamp(-10.0, 10.0).exp();\n         self.e_value *= factor;\n "
+    },
+    {
+      "sha": "26a00fe791e9930e657fa420aa3f7df4273b0e8e",
+      "filename": "crates/ftui-render/src/budget.rs",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 5,
+      "changes": 14,
+      "blob_url": "https://github.com/Dicklesworthstone/frankentui/blob/b346386e38afbacb3c953be69b43f09348dac817/crates%2Fftui-render%2Fsrc%2Fbudget.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankentui/raw/b346386e38afbacb3c953be69b43f09348dac817/crates%2Fftui-render%2Fsrc%2Fbudget.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankentui/contents/crates%2Fftui-render%2Fsrc%2Fbudget.rs?ref=b346386e38afbacb3c953be69b43f09348dac817",
+      "patch": "@@ -139,6 +139,9 @@ impl PidState {\n     ///\n     /// Returns the control signal `u_t`.\n     fn update(&mut self, error: f64, gains: &PidGains) -> f64 {\n+        if error.is_nan() {\n+            return 0.0;\n+        }\n         // Integral with anti-windup clamping\n         self.integral = (self.integral + error).clamp(-gains.integral_max, gains.integral_max);\n \n@@ -288,11 +291,12 @@ impl EProcessState {\n         // Since r_t is already standardized, \u03c3 in the exponent is 1.0.\n         let lambda = config.lambda;\n         let log_factor = lambda * residual - lambda * lambda / 2.0;\n-        self.e_value *= log_factor.exp();\n-\n-        // Clamp to avoid numerical issues (but preserve the supermartingale property\n-        // by allowing it to grow large or shrink small).\n-        self.e_value = self.e_value.clamp(1e-10, 1e10);\n+        if !log_factor.is_nan() {\n+            self.e_value *= log_factor.exp();\n+            // Clamp to avoid numerical issues (but preserve the supermartingale property\n+            // by allowing it to grow large or shrink small).\n+            self.e_value = self.e_value.clamp(1e-10, 1e10);\n+        }\n \n         self.e_value\n     }"
+    },
+    {
+      "sha": "7ed39283b135f2a17055ebd02dfc8ef6d88b7842",
+      "filename": "crates/ftui-runtime/src/bocpd.rs",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 6,
+      "changes": 16,
+      "blob_url": "https://github.com/Dicklesworthstone/frankentui/blob/b346386e38afbacb3c953be69b43f09348dac817/crates%2Fftui-runtime%2Fsrc%2Fbocpd.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankentui/raw/b346386e38afbacb3c953be69b43f09348dac817/crates%2Fftui-runtime%2Fsrc%2Fbocpd.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankentui/contents/crates%2Fftui-runtime%2Fsrc%2Fbocpd.rs?ref=b346386e38afbacb3c953be69b43f09348dac817",
+      "patch": "@@ -503,14 +503,14 @@ impl BocpdDetector {\n         config.mu_steady_ms = config.mu_steady_ms.max(1.0);\n         config.mu_burst_ms = config.mu_burst_ms.max(1.0);\n         config.hazard_lambda = config.hazard_lambda.max(1.0);\n-        config.min_observation_ms = config.min_observation_ms.max(0.1);\n-        config.max_observation_ms = config.max_observation_ms.max(config.min_observation_ms);\n-        config.steady_threshold = config.steady_threshold.clamp(0.0, 1.0);\n-        config.burst_threshold = config.burst_threshold.clamp(0.0, 1.0);\n+        config.min_observation_ms = if config.min_observation_ms.is_nan() { 0.1 } else { config.min_observation_ms.max(0.1) };\n+        config.max_observation_ms = if config.max_observation_ms.is_nan() { config.min_observation_ms } else { config.max_observation_ms.max(config.min_observation_ms) };\n+        config.steady_threshold = if config.steady_threshold.is_nan() { 0.3 } else { config.steady_threshold.clamp(0.0, 1.0) };\n+        config.burst_threshold = if config.burst_threshold.is_nan() { 0.7 } else { config.burst_threshold.clamp(0.0, 1.0) };\n         if config.burst_threshold < config.steady_threshold {\n             std::mem::swap(&mut config.steady_threshold, &mut config.burst_threshold);\n         }\n-        config.burst_prior = config.burst_prior.clamp(0.001, 0.999);\n+        config.burst_prior = if config.burst_prior.is_nan() { 0.1 } else { config.burst_prior.clamp(0.001, 0.999) };\n \n         let k = config.max_run_length;\n \n@@ -792,7 +792,11 @@ impl BocpdDetector {\n         let posterior_odds = prior_odds * likelihood_ratio;\n         \n         // Clamp to prevent total float lock-in, but the transition prior does the heavy lifting now\n-        self.p_burst = (posterior_odds / (1.0 + posterior_odds)).clamp(0.001, 0.999);\n+        let mut p_burst_raw = posterior_odds / (1.0 + posterior_odds);\n+        if p_burst_raw.is_nan() {\n+            p_burst_raw = if posterior_odds.is_infinite() { 1.0 } else { 0.5 };\n+        }\n+        self.p_burst = p_burst_raw.clamp(0.001, 0.999);\n \n         // Update run-length distribution\n         // The predictive likelihood for RL update is the mixture of regimes:"
+    },
+    {
+      "sha": "dc4a598c65cf049d2ccafef5699f70880fd00949",
+      "filename": "crates/ftui-runtime/src/voi_sampling.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 7,
+      "changes": 14,
+      "blob_url": "https://github.com/Dicklesworthstone/frankentui/blob/b346386e38afbacb3c953be69b43f09348dac817/crates%2Fftui-runtime%2Fsrc%2Fvoi_sampling.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankentui/raw/b346386e38afbacb3c953be69b43f09348dac817/crates%2Fftui-runtime%2Fsrc%2Fvoi_sampling.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankentui/contents/crates%2Fftui-runtime%2Fsrc%2Fvoi_sampling.rs?ref=b346386e38afbacb3c953be69b43f09348dac817",
+      "patch": "@@ -377,15 +377,15 @@ impl VoiSampler {\n     pub fn new_at(config: VoiConfig, now: Instant) -> Self {\n         let mut cfg = config;\n \n-        let prior_alpha = cfg.prior_alpha.max(EPS);\n-        let prior_beta = cfg.prior_beta.max(EPS);\n-        let mu_0 = cfg.mu_0.clamp(MU_0_MIN, MU_0_MAX);\n+        let prior_alpha = if cfg.prior_alpha.is_nan() { EPS } else { cfg.prior_alpha.max(EPS) };\n+        let prior_beta = if cfg.prior_beta.is_nan() { EPS } else { cfg.prior_beta.max(EPS) };\n+        let mu_0 = if cfg.mu_0.is_nan() { 0.5 } else { cfg.mu_0.clamp(MU_0_MIN, MU_0_MAX) };\n         let lambda_max = (1.0 / (1.0 - mu_0)) - LAMBDA_EPS;\n-        let lambda = cfg.lambda.clamp(LAMBDA_EPS, lambda_max);\n+        let lambda = if cfg.lambda.is_nan() { LAMBDA_EPS } else { cfg.lambda.clamp(LAMBDA_EPS, lambda_max) };\n \n-        cfg.value_scale = cfg.value_scale.max(EPS);\n-        cfg.boundary_weight = cfg.boundary_weight.max(0.0);\n-        cfg.sample_cost = cfg.sample_cost.max(EPS);\n+        cfg.value_scale = if cfg.value_scale.is_nan() { EPS } else { cfg.value_scale.max(EPS) };\n+        cfg.boundary_weight = if cfg.boundary_weight.is_nan() { 0.0 } else { cfg.boundary_weight.max(0.0) };\n+        cfg.sample_cost = if cfg.sample_cost.is_nan() { EPS } else { cfg.sample_cost.max(EPS) };\n         cfg.max_log_entries = cfg.max_log_entries.max(1);\n \n         let e_threshold = 1.0 / cfg.alpha.max(EPS);"
+    }
+  ]
+}

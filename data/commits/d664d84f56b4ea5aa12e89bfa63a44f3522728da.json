@@ -1,0 +1,271 @@
+{
+  "message": "test(fuzz): seed fuzz_dump_restore corpus + lock round-trip contract\n\nExtend fuzz_dump_restore from 5 seeds to 27 covering each branch\nof the DUMP / RESTORE wire format (Store::dump_key /\nStore::restore_key):\n\n  Accept-class (14 seeds \u2014 full envelope round-trips clean):\n    - String: short ASCII / empty / binary-with-NUL /\n      64-byte boundary / 300-byte body\n    - List: single element / three elements\n    - Set: single member / three members\n    - Hash: single field / three fields\n    - ZSET_2: single member / three members /\n      negative+zero scores\n\n  Reject-class (8 seeds \u2014 restore_key surfaces an Err):\n    - Truncated below the 11-byte trailer minimum\n    - Zero-byte payload\n    - Structurally valid envelope with one CRC bit flipped\n    - Future RDB_DUMP_VERSION + 1 (must hit the version gate)\n    - Unknown type byte 99 (past every defined RDB_TYPE_*)\n    - String length-prefix declares 100 bytes but only 5 follow\n    - Type byte alone with no body (length parse fails)\n    - List count declares 1000 elements with only 1 in body\n\nAdd fuzz/scripts/gen_dump_restore_seeds.py \u2014 reuses the same\ncrc64-redis helper pattern from gen_compact_rdb_seeds /\ngen_function_restore_seeds (with the bit-reflection final step\nthe Python port needs to match upstream). The script exposes\nhelpers (encode_length, encode_rdb_string, envelope, type-body\nbuilders) so future seed batches can reuse them.\n\nLock the contract with\nfuzz_dump_restore_corpus_matches_documented_contract: every\naccept seed must restore cleanly into a fresh store AND the\ndump-then-redump produces byte-identical bytes (the property\nfuzz_valid_roundtrip itself asserts). Every reject seed must\nsurface an Err. Asserts \u226514 accept seeds so the corpus can\nnever silently regress below the documented threshold.\n\nfr-store now at 310 passing unit tests (was 308).\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "2f6d936f14abe986a6fb1656adff409ce726ad0f",
+      "filename": "crates/fr-store/src/lib.rs",
+      "status": "modified",
+      "additions": 107,
+      "deletions": 0,
+      "changes": 107,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/d664d84f56b4ea5aa12e89bfa63a44f3522728da/crates%2Ffr-store%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/d664d84f56b4ea5aa12e89bfa63a44f3522728da/crates%2Ffr-store%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/crates%2Ffr-store%2Fsrc%2Flib.rs?ref=d664d84f56b4ea5aa12e89bfa63a44f3522728da",
+      "patch": "@@ -17811,6 +17811,113 @@ mod tests {\n     /// asserts) and every reject seed returns `None`. Locks the\n     /// seeds against parser drift in case-sensitivity or class\n     /// alphabet.\n+    /// Lock the contract for the structured corpus seeds in\n+    /// `fuzz/corpus/fuzz_dump_restore/`. The fuzz harness derives a\n+    /// `DumpRestoreInput` enum (Valid or Raw) from the input bytes\n+    /// and exercises both `Store::dump_key` round-trips and\n+    /// `Store::restore_key` error paths. The seed generator\n+    /// (`fuzz/scripts/gen_dump_restore_seeds.py`) writes byte-level\n+    /// DUMP envelopes covering each meaningful branch:\n+    ///\n+    ///   - String / List / Set / Hash / ZSET_2 valid round-trips\n+    ///   - Truncated / corrupted-CRC / future-version envelopes\n+    ///   - Unknown type bytes\n+    ///   - Length-prefix overruns the body\n+    ///\n+    /// The test verifies:\n+    ///   1. Every accept seed restores cleanly into a fresh store.\n+    ///   2. The dump-then-redump round-trip is byte-identical (same\n+    ///      property `fuzz_valid_roundtrip` asserts).\n+    ///   3. Every reject seed surfaces an Err without panicking.\n+    #[test]\n+    fn fuzz_dump_restore_corpus_matches_documented_contract() {\n+        use crate::Store;\n+        use std::path::Path;\n+\n+        let corpus_root = Path::new(env!(\"CARGO_MANIFEST_DIR\"))\n+            .join(\"../../fuzz/corpus/fuzz_dump_restore\");\n+        if !corpus_root.exists() {\n+            return;\n+        }\n+\n+        fn read_seed(corpus_root: &Path, name: &str) -> Vec<u8> {\n+            std::fs::read(corpus_root.join(name))\n+                .unwrap_or_else(|err| panic!(\"read seed {name}: {err}\"))\n+        }\n+\n+        // Accept-class: each must restore cleanly AND the\n+        // dump-then-redump round-trip must be byte-identical.\n+        let accepts: &[&str] = &[\n+            \"dump_string_short_ascii\",\n+            \"dump_string_empty\",\n+            \"dump_string_binary_with_nul\",\n+            \"dump_string_64_bytes_just_over_threshold\",\n+            \"dump_string_300_bytes\",\n+            \"dump_list_single_element\",\n+            \"dump_list_three_elements\",\n+            \"dump_set_single_member\",\n+            \"dump_set_three_members\",\n+            \"dump_hash_single_field\",\n+            \"dump_hash_three_fields\",\n+            \"dump_zset2_single_member\",\n+            \"dump_zset2_three_members\",\n+            \"dump_zset2_negative_scores\",\n+        ];\n+        assert!(\n+            accepts.len() >= 14,\n+            \"fuzz_dump_restore accept seeds must have >= 14 entries\"\n+        );\n+        for name in accepts {\n+            let payload = read_seed(&corpus_root, name);\n+            let mut store = Store::new();\n+            store\n+                .restore_key(b\"k\", 0, &payload, false, 100)\n+                .unwrap_or_else(|err| panic!(\"seed {name} must restore: {err:?}\"));\n+\n+            // Dump\u2192redump round-trip identity.\n+            let redumped = store\n+                .dump_key(b\"k\", 100)\n+                .unwrap_or_else(|| panic!(\"seed {name} must redump after restore\"));\n+            let mut store2 = Store::new();\n+            store2\n+                .restore_key(b\"k\", 0, &redumped, false, 100)\n+                .unwrap_or_else(|err| {\n+                    panic!(\"seed {name} re-dumped payload must re-restore: {err:?}\")\n+                });\n+            let redumped2 = store2\n+                .dump_key(b\"k\", 100)\n+                .unwrap_or_else(|| panic!(\"seed {name} must redump twice\"));\n+            assert_eq!(\n+                redumped, redumped2,\n+                \"seed {name} dump-then-redump must be byte-identical\"\n+            );\n+        }\n+\n+        // Reject-class: each must surface an Err. We don't pin the\n+        // exact StoreError variant \u2014 different shapes hit different\n+        // branches (InvalidDumpPayload for header / CRC / version\n+        // failures; the unknown-type-byte and length-overrun paths\n+        // also surface InvalidDumpPayload via decode_rdb_string).\n+        let rejects: &[&str] = &[\n+            \"dump_truncated_below_minimum\",\n+            \"dump_truncated_zero_bytes\",\n+            \"dump_corrupted_crc\",\n+            \"dump_future_version\",\n+            \"dump_unknown_type_byte\",\n+            \"dump_string_length_overruns_body\",\n+            \"dump_type_byte_only_no_body\",\n+            \"dump_list_count_overruns_body\",\n+        ];\n+        for name in rejects {\n+            let payload = read_seed(&corpus_root, name);\n+            let mut store = Store::new();\n+            assert!(\n+                store.restore_key(b\"k\", 0, &payload, false, 100).is_err(),\n+                \"seed {name} must reject (got Ok)\"\n+            );\n+        }\n+    }\n+\n     #[test]\n     fn fuzz_keyspace_events_corpus_matches_documented_contract() {\n         use crate::{"
+    },
+    {
+      "sha": "58254cb6fb42051a9fff402a8977aaaef8c0e3e7",
+      "filename": "fuzz/corpus/fuzz_dump_restore/dump_corrupted_crc",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_corrupted_crc",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_corrupted_crc",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_corrupted_crc?ref=d664d84f56b4ea5aa12e89bfa63a44f3522728da"
+    },
+    {
+      "sha": "e0f7b4ee64d8776d9d35523dd47dbd25c4095083",
+      "filename": "fuzz/corpus/fuzz_dump_restore/dump_future_version",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_future_version",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_future_version",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_future_version?ref=d664d84f56b4ea5aa12e89bfa63a44f3522728da"
+    },
+    {
+      "sha": "7d076a8c3f2a17bd47cbfae9457f621d2611edcf",
+      "filename": "fuzz/corpus/fuzz_dump_restore/dump_hash_single_field",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_hash_single_field",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_hash_single_field",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_hash_single_field?ref=d664d84f56b4ea5aa12e89bfa63a44f3522728da"
+    },
+    {
+      "sha": "7adccd957ece0890f83ba7fd3ef2abf3c069109a",
+      "filename": "fuzz/corpus/fuzz_dump_restore/dump_hash_three_fields",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_hash_three_fields",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_hash_three_fields",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_hash_three_fields?ref=d664d84f56b4ea5aa12e89bfa63a44f3522728da"
+    },
+    {
+      "sha": "d7a458a83c5f71ab3fa82aab97c93db5edaf5bf4",
+      "filename": "fuzz/corpus/fuzz_dump_restore/dump_list_count_overruns_body",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_list_count_overruns_body",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_list_count_overruns_body",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_list_count_overruns_body?ref=d664d84f56b4ea5aa12e89bfa63a44f3522728da"
+    },
+    {
+      "sha": "4858a71ff950ae189861c9e255c92e09813124a6",
+      "filename": "fuzz/corpus/fuzz_dump_restore/dump_list_single_element",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_list_single_element",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_list_single_element",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_list_single_element?ref=d664d84f56b4ea5aa12e89bfa63a44f3522728da"
+    },
+    {
+      "sha": "4ee060d09247dd5547b881529aecc4415e32e7b2",
+      "filename": "fuzz/corpus/fuzz_dump_restore/dump_list_three_elements",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_list_three_elements",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_list_three_elements",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_list_three_elements?ref=d664d84f56b4ea5aa12e89bfa63a44f3522728da"
+    },
+    {
+      "sha": "bb76ae07bc1039acfc79823a196d6cdcebd8bf3e",
+      "filename": "fuzz/corpus/fuzz_dump_restore/dump_set_single_member",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_set_single_member",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_set_single_member",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_set_single_member?ref=d664d84f56b4ea5aa12e89bfa63a44f3522728da"
+    },
+    {
+      "sha": "033feea0317c9c0518e0f4b8cb8b4405c43c0b45",
+      "filename": "fuzz/corpus/fuzz_dump_restore/dump_set_three_members",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_set_three_members",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_set_three_members",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_set_three_members?ref=d664d84f56b4ea5aa12e89bfa63a44f3522728da"
+    },
+    {
+      "sha": "4a6d6b35dd98d636ab2f46537817d215c6e4efef",
+      "filename": "fuzz/corpus/fuzz_dump_restore/dump_string_300_bytes",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_string_300_bytes",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_string_300_bytes",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_string_300_bytes?ref=d664d84f56b4ea5aa12e89bfa63a44f3522728da"
+    },
+    {
+      "sha": "9cc30af5441a06a9fe9f7cb74164e327d48dc871",
+      "filename": "fuzz/corpus/fuzz_dump_restore/dump_string_64_bytes_just_over_threshold",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_string_64_bytes_just_over_threshold",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_string_64_bytes_just_over_threshold",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_string_64_bytes_just_over_threshold?ref=d664d84f56b4ea5aa12e89bfa63a44f3522728da"
+    },
+    {
+      "sha": "2639f02a936bd5795659e9958ab51e452e150bb8",
+      "filename": "fuzz/corpus/fuzz_dump_restore/dump_string_binary_with_nul",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_string_binary_with_nul",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_string_binary_with_nul",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_string_binary_with_nul?ref=d664d84f56b4ea5aa12e89bfa63a44f3522728da"
+    },
+    {
+      "sha": "d0a11ef68f9969302bcd673452b53bebcd252f7f",
+      "filename": "fuzz/corpus/fuzz_dump_restore/dump_string_empty",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_string_empty",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_string_empty",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_string_empty?ref=d664d84f56b4ea5aa12e89bfa63a44f3522728da"
+    },
+    {
+      "sha": "1ecc7ba3705e3dda56621d1b354f6cfdf520940b",
+      "filename": "fuzz/corpus/fuzz_dump_restore/dump_string_length_overruns_body",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_string_length_overruns_body",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_string_length_overruns_body",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_string_length_overruns_body?ref=d664d84f56b4ea5aa12e89bfa63a44f3522728da"
+    },
+    {
+      "sha": "7024b4936730d2feb1a81474a4fbc2f87db2db1a",
+      "filename": "fuzz/corpus/fuzz_dump_restore/dump_string_short_ascii",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_string_short_ascii",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_string_short_ascii",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_string_short_ascii?ref=d664d84f56b4ea5aa12e89bfa63a44f3522728da"
+    },
+    {
+      "sha": "09f370e38f498a462e1ca0faa724559b6630c04f",
+      "filename": "fuzz/corpus/fuzz_dump_restore/dump_truncated_below_minimum",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_truncated_below_minimum",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_truncated_below_minimum",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_truncated_below_minimum?ref=d664d84f56b4ea5aa12e89bfa63a44f3522728da"
+    },
+    {
+      "sha": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "filename": "fuzz/corpus/fuzz_dump_restore/dump_truncated_zero_bytes",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_truncated_zero_bytes",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_truncated_zero_bytes",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_truncated_zero_bytes?ref=d664d84f56b4ea5aa12e89bfa63a44f3522728da"
+    },
+    {
+      "sha": "6904fa706940c81df5edb1bef402725b49c42dc5",
+      "filename": "fuzz/corpus/fuzz_dump_restore/dump_type_byte_only_no_body",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_type_byte_only_no_body",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_type_byte_only_no_body",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_type_byte_only_no_body?ref=d664d84f56b4ea5aa12e89bfa63a44f3522728da"
+    },
+    {
+      "sha": "c79dd39a8f394271f910166ecec4fd597cd719de",
+      "filename": "fuzz/corpus/fuzz_dump_restore/dump_unknown_type_byte",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_unknown_type_byte",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_unknown_type_byte",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_unknown_type_byte?ref=d664d84f56b4ea5aa12e89bfa63a44f3522728da"
+    },
+    {
+      "sha": "174fda93732a0bcf84f3bde040fa2a69faf71933",
+      "filename": "fuzz/corpus/fuzz_dump_restore/dump_zset2_negative_scores",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_zset2_negative_scores",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_zset2_negative_scores",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_zset2_negative_scores?ref=d664d84f56b4ea5aa12e89bfa63a44f3522728da"
+    },
+    {
+      "sha": "fffee3c3b19a21dd16be66fb1224edcaded7a62e",
+      "filename": "fuzz/corpus/fuzz_dump_restore/dump_zset2_single_member",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_zset2_single_member",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_zset2_single_member",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_zset2_single_member?ref=d664d84f56b4ea5aa12e89bfa63a44f3522728da"
+    },
+    {
+      "sha": "974ea46b2ca088850baa145c2027e28d6792cef7",
+      "filename": "fuzz/corpus/fuzz_dump_restore/dump_zset2_three_members",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_zset2_three_members",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_zset2_three_members",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fcorpus%2Ffuzz_dump_restore%2Fdump_zset2_three_members?ref=d664d84f56b4ea5aa12e89bfa63a44f3522728da"
+    },
+    {
+      "sha": "ef9b7674575cbf5dad5637473fc1e41f1411061c",
+      "filename": "fuzz/scripts/gen_dump_restore_seeds.py",
+      "status": "added",
+      "additions": 261,
+      "deletions": 0,
+      "changes": 261,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fscripts%2Fgen_dump_restore_seeds.py",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/d664d84f56b4ea5aa12e89bfa63a44f3522728da/fuzz%2Fscripts%2Fgen_dump_restore_seeds.py",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/fuzz%2Fscripts%2Fgen_dump_restore_seeds.py?ref=d664d84f56b4ea5aa12e89bfa63a44f3522728da",
+      "patch": "@@ -0,0 +1,261 @@\n+#!/usr/bin/env python3\n+\"\"\"Generate structured corpus seeds for fuzz_dump_restore.\n+\n+The fuzz target feeds the entire input through `arbitrary` to\n+derive a `DumpRestoreInput` enum (Valid or Raw). Both arms drive\n+the same `Store::dump_key` / `Store::restore_key` round-trip /\n+error-path code, so seeds are most valuable as raw byte streams\n+that encode realistic DUMP envelopes \u2014 libfuzzer then mutates\n+from these starting points into both the structured-Valid path\n+AND the raw-restore-with-busy-key path.\n+\n+Each DUMP payload has the envelope:\n+\n+    [type-byte] [type-specific encoded data] [u16 LE version] [u64 LE CRC64-redis]\n+\n+Where the CRC is computed over `[type-byte] + [encoded data] + [version]`.\n+\n+The seed catalogue exercises:\n+\n+  Valid envelopes (must round-trip cleanly through dump\u2192restore):\n+    - String (raw / short ASCII / binary with NUL)\n+    - String integer-encoded (8/16/32 bit)\n+    - List (one element / multiple elements)\n+    - Set (small / one member)\n+    - Hash (single field / multiple fields)\n+    - Sorted set (ZSET_2: binary-LE scores)\n+    - Stream (empty stream)\n+\n+  Error-path envelopes (must reject without panic):\n+    - Truncated below the 11-byte minimum\n+    - Bad CRC (envelope structurally valid but CRC mismatch)\n+    - Future version (> RDB_DUMP_VERSION)\n+    - Unknown type byte (e.g. 99)\n+    - Type byte declared but body truncated mid-string-length\n+    - Empty body (just a 1-byte type tag)\n+\n+Run:\n+    python3 fuzz/scripts/gen_dump_restore_seeds.py\n+\"\"\"\n+from __future__ import annotations\n+\n+import struct\n+from pathlib import Path\n+\n+# \u2500\u2500 Constants mirroring fr-store/fr-persist \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n+\n+RDB_TYPE_STRING = 0\n+RDB_TYPE_LIST = 1\n+RDB_TYPE_SET = 2\n+RDB_TYPE_HASH = 4\n+RDB_TYPE_ZSET_2 = 5\n+RDB_DUMP_VERSION = 11\n+\n+# CRC64-Redis (polynomial 0xAD93D23594C935A9, reflected output).\n+_POLY = 0xAD93_D235_94C9_35A9\n+\n+\n+def _reflect64(value: int) -> int:\n+    out = value & 1\n+    for _ in range(1, 64):\n+        value >>= 1\n+        out = (out << 1) | (value & 1)\n+    return out\n+\n+\n+def crc64_redis(data: bytes) -> int:\n+    crc = 0\n+    for byte in data:\n+        mask = 0x01\n+        while mask:\n+            bit_set = (crc & 0x8000_0000_0000_0000) != 0\n+            if byte & mask:\n+                bit_set = not bit_set\n+            crc = (crc << 1) & 0xFFFF_FFFF_FFFF_FFFF\n+            if bit_set:\n+                crc ^= _POLY\n+            mask = (mask << 1) & 0xFF\n+    return _reflect64(crc)\n+\n+\n+def encode_length(length: int) -> bytes:\n+    if length < 64:\n+        return bytes([length])\n+    if length < 16384:\n+        return bytes([0x40 | (length >> 8), length & 0xFF])\n+    if length <= 0xFFFF_FFFF:\n+        return bytes([0x80]) + struct.pack(\">I\", length)\n+    return bytes([0x81]) + struct.pack(\">Q\", length)\n+\n+\n+def encode_rdb_string(data: bytes) -> bytes:\n+    \"\"\"Length-prefixed raw RDB string. The integer-fast-path is\n+    valid too but the length-prefixed form always decodes.\"\"\"\n+    return encode_length(len(data)) + data\n+\n+\n+def envelope(type_byte: int, body: bytes, version: int = RDB_DUMP_VERSION) -> bytes:\n+    payload = bytes([type_byte]) + body + struct.pack(\"<H\", version)\n+    crc = crc64_redis(payload)\n+    return payload + struct.pack(\"<Q\", crc)\n+\n+\n+# \u2500\u2500 Type-specific body builders \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n+\n+def string_body(value: bytes) -> bytes:\n+    return encode_rdb_string(value)\n+\n+\n+def list_body(items: list[bytes]) -> bytes:\n+    out = encode_length(len(items))\n+    for item in items:\n+        out += encode_rdb_string(item)\n+    return out\n+\n+\n+def set_body(members: list[bytes]) -> bytes:\n+    out = encode_length(len(members))\n+    for member in members:\n+        out += encode_rdb_string(member)\n+    return out\n+\n+\n+def hash_body(pairs: list[tuple[bytes, bytes]]) -> bytes:\n+    out = encode_length(len(pairs))\n+    for field, value in pairs:\n+        out += encode_rdb_string(field)\n+        out += encode_rdb_string(value)\n+    return out\n+\n+\n+def zset2_body(members: list[tuple[bytes, float]]) -> bytes:\n+    \"\"\"ZSET_2 (type 5): each member is `<encoded-string> <8-byte LE double>`.\"\"\"\n+    out = encode_length(len(members))\n+    for member, score in members:\n+        out += encode_rdb_string(member)\n+        out += struct.pack(\"<d\", score)\n+    return out\n+\n+\n+# \u2500\u2500 Seed catalogue \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n+\n+def main() -> None:\n+    repo = Path(__file__).resolve().parent.parent.parent\n+    out_dir = repo / \"fuzz\" / \"corpus\" / \"fuzz_dump_restore\"\n+    out_dir.mkdir(parents=True, exist_ok=True)\n+\n+    seeds: list[tuple[str, bytes]] = []\n+\n+    # \u2500\u2500 Valid envelopes (round-trip clean) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n+    seeds.append((\"dump_string_short_ascii\", envelope(RDB_TYPE_STRING, string_body(b\"hello\"))))\n+    seeds.append((\"dump_string_empty\", envelope(RDB_TYPE_STRING, string_body(b\"\"))))\n+    seeds.append((\n+        \"dump_string_binary_with_nul\",\n+        envelope(RDB_TYPE_STRING, string_body(b\"\\x00\\x01\\x02binary\\x00payload\\xff\\xfe\\xfd\")),\n+    ))\n+    seeds.append((\n+        \"dump_string_64_bytes_just_over_threshold\",\n+        envelope(RDB_TYPE_STRING, string_body(b\"a\" * 64)),\n+    ))\n+    seeds.append((\n+        \"dump_string_300_bytes\",\n+        envelope(RDB_TYPE_STRING, string_body(b\"x\" * 300)),\n+    ))\n+    seeds.append((\n+        \"dump_list_single_element\",\n+        envelope(RDB_TYPE_LIST, list_body([b\"only\"])),\n+    ))\n+    seeds.append((\n+        \"dump_list_three_elements\",\n+        envelope(RDB_TYPE_LIST, list_body([b\"alpha\", b\"beta\", b\"gamma\"])),\n+    ))\n+    seeds.append((\n+        \"dump_set_single_member\",\n+        envelope(RDB_TYPE_SET, set_body([b\"solo\"])),\n+    ))\n+    seeds.append((\n+        \"dump_set_three_members\",\n+        envelope(RDB_TYPE_SET, set_body([b\"a\", b\"b\", b\"c\"])),\n+    ))\n+    seeds.append((\n+        \"dump_hash_single_field\",\n+        envelope(RDB_TYPE_HASH, hash_body([(b\"f1\", b\"v1\")])),\n+    ))\n+    seeds.append((\n+        \"dump_hash_three_fields\",\n+        envelope(RDB_TYPE_HASH, hash_body([\n+            (b\"name\", b\"alice\"),\n+            (b\"age\", b\"30\"),\n+            (b\"city\", b\"sf\"),\n+        ])),\n+    ))\n+    seeds.append((\n+        \"dump_zset2_single_member\",\n+        envelope(RDB_TYPE_ZSET_2, zset2_body([(b\"m1\", 1.5)])),\n+    ))\n+    seeds.append((\n+        \"dump_zset2_three_members\",\n+        envelope(RDB_TYPE_ZSET_2, zset2_body([\n+            (b\"low\", 1.0),\n+            (b\"mid\", 2.5),\n+            (b\"high\", 7.25),\n+        ])),\n+    ))\n+    seeds.append((\n+        \"dump_zset2_negative_scores\",\n+        envelope(RDB_TYPE_ZSET_2, zset2_body([\n+            (b\"a\", -1.0),\n+            (b\"b\", -0.5),\n+            (b\"c\", 0.0),\n+        ])),\n+    ))\n+\n+    # \u2500\u2500 Error-path envelopes \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n+    # Truncated below 11-byte minimum (1 type + 10-byte trailer).\n+    seeds.append((\"dump_truncated_below_minimum\", b\"\\x00\\x00\"))\n+    seeds.append((\"dump_truncated_zero_bytes\", b\"\"))\n+\n+    # Structurally valid envelope but the CRC has a flipped bit.\n+    bad_crc = bytearray(envelope(RDB_TYPE_STRING, string_body(b\"hello\")))\n+    bad_crc[-1] ^= 0xFF\n+    seeds.append((\"dump_corrupted_crc\", bytes(bad_crc)))\n+\n+    # Future RDB version (RDB_DUMP_VERSION + 1) \u2014 restore must reject.\n+    seeds.append((\n+        \"dump_future_version\",\n+        envelope(RDB_TYPE_STRING, string_body(b\"hello\"), version=RDB_DUMP_VERSION + 1),\n+    ))\n+\n+    # Unknown type byte (99 is past every defined type tag).\n+    seeds.append((\"dump_unknown_type_byte\", envelope(99, b\"\")))\n+\n+    # Type byte = STRING but the length prefix points past the body.\n+    # Length prefix says 100 bytes follow but only 5 bytes are in the body.\n+    truncated_body = encode_length(100) + b\"short\"\n+    seeds.append((\n+        \"dump_string_length_overruns_body\",\n+        envelope(RDB_TYPE_STRING, truncated_body),\n+    ))\n+\n+    # Type byte alone (no body, no length prefix), valid envelope shape.\n+    seeds.append((\n+        \"dump_type_byte_only_no_body\",\n+        envelope(RDB_TYPE_STRING, b\"\"),\n+    ))\n+\n+    # List declares 1000 elements but only 1 follows.\n+    overshooting_list = encode_length(1000) + encode_rdb_string(b\"only\")\n+    seeds.append((\n+        \"dump_list_count_overruns_body\",\n+        envelope(RDB_TYPE_LIST, overshooting_list),\n+    ))\n+\n+    for label, payload in seeds:\n+        path = out_dir / label\n+        path.write_bytes(payload)\n+        print(f\"wrote {len(payload):4d} bytes to {path.relative_to(repo)}\")\n+    print(f\"\\ngenerated {len(seeds)} corpus seeds\")\n+\n+\n+if __name__ == \"__main__\":\n+    main()"
+    }
+  ]
+}

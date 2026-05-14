@@ -1,0 +1,65 @@
+{
+  "message": "fix: unbounded cache growth + stale WASM buffer pool + vector string alloc\n\nMemory leaks in long-running DOs:\n- partitionCatalogs Map in QueryDO had no eviction \u2014 now evicted\n  alongside datasetCache when oldest entry is removed\n- FragmentDO footerCache (plain Map) had no size cap \u2014 now capped\n  at 500 entries with oldest-eviction and SQLite cleanup\n- local-executor readerFragmentCache had no eviction \u2014 now capped\n  at 1000 entries matching metaCache policy\n\nCache invalidation:\n- refreshStaleTables cleared WASM table but not buffer pool \u2014 stale\n  page data at same byte offsets could be returned from L1 cache.\n  Now calls cacheClear() after clearTable().\n\nString allocation:\n- Vector serialization in queryToSql and pg-wire formatValue used\n  per-element += loop \u2014 replaced with Array.from().join() to avoid\n  O(dim) intermediate string allocations.",
+  "files": [
+    {
+      "sha": "72b5e705f69373b734f65c9df6fcefdd26c6dff1",
+      "filename": "src/fragment-do.ts",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 0,
+      "changes": 13,
+      "blob_url": "https://github.com/teamchong/querymode/blob/a593bfe1ef0812b6987b0355c261f934fd6dcadb/src%2Ffragment-do.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/a593bfe1ef0812b6987b0355c261f934fd6dcadb/src%2Ffragment-do.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Ffragment-do.ts?ref=a593bfe1ef0812b6987b0355c261f934fd6dcadb",
+      "patch": "@@ -16,6 +16,7 @@ import { concatQMCBBatches, decodeColumnarBatch, columnarBatchToRows } from \"./c\n import wasmModule from \"./wasm-module.js\";\n \n const R2_TIMEOUT_MS = 10_000;\n+const FOOTER_CACHE_MAX = 500;\n \n interface ScanRequest {\n   fragments: { r2Key: string; meta: TableMeta }[];\n@@ -73,6 +74,18 @@ export class FragmentDO extends DurableObject<Env> {\n       if (!cachedMeta || cachedMeta.updatedAt < meta.updatedAt) {\n         this.footerCache.set(r2Key, meta);\n         void this.ctx.storage.put(`frag:${r2Key}`, meta).catch(() => {});\n+        // Evict oldest when cache exceeds cap\n+        if (this.footerCache.size > FOOTER_CACHE_MAX) {\n+          let oldestKey: string | undefined;\n+          let oldestTime = Infinity;\n+          for (const [k, m] of this.footerCache) {\n+            if (m.updatedAt < oldestTime) { oldestTime = m.updatedAt; oldestKey = k; }\n+          }\n+          if (oldestKey) {\n+            this.footerCache.delete(oldestKey);\n+            void this.ctx.storage.delete(`frag:${oldestKey}`).catch(() => {});\n+          }\n+        }\n       }\n \n       const neededNames = queryReferencedColumns(query, effectiveMeta.columns.map(c => c.name));"
+    },
+    {
+      "sha": "be5a7d5aff351765e2e0ef523ac47db05475f15d",
+      "filename": "src/local-executor.ts",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/teamchong/querymode/blob/a593bfe1ef0812b6987b0355c261f934fd6dcadb/src%2Flocal-executor.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/a593bfe1ef0812b6987b0355c261f934fd6dcadb/src%2Flocal-executor.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Flocal-executor.ts?ref=a593bfe1ef0812b6987b0355c261f934fd6dcadb",
+      "patch": "@@ -947,6 +947,10 @@ export class LocalExecutor implements QueryExecutor {\n           // Cache fragment sources for later use in execute()\n           const fragments = await reader.createFragments(source, meta.columns);\n           this.readerFragmentCache.set(path, fragments);\n+          if (this.readerFragmentCache.size > 1000) {\n+            const firstKey = this.readerFragmentCache.keys().next().value;\n+            if (firstKey) this.readerFragmentCache.delete(firstKey);\n+          }\n           return { columns: meta.columns, fileSize };\n         }\n         throw new QueryModeError(\"INVALID_FORMAT\", `Invalid file format: unrecognized magic in ${path}. Supported formats: .lance, .parquet, .csv, .tsv, .json, .ndjson, .jsonl, .arrow, .ipc, .feather`);"
+    },
+    {
+      "sha": "53445e2da229d9300f166c3ec2f2ec2b2c154e26",
+      "filename": "src/pg-wire/handler.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 3,
+      "changes": 4,
+      "blob_url": "https://github.com/teamchong/querymode/blob/a593bfe1ef0812b6987b0355c261f934fd6dcadb/src%2Fpg-wire%2Fhandler.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/a593bfe1ef0812b6987b0355c261f934fd6dcadb/src%2Fpg-wire%2Fhandler.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fpg-wire%2Fhandler.ts?ref=a593bfe1ef0812b6987b0355c261f934fd6dcadb",
+      "patch": "@@ -186,9 +186,7 @@ function formatValue(val: unknown): string | null {\n   if (val === null || val === undefined) return null;\n   if (typeof val === \"bigint\") return val.toString();\n   if (val instanceof Float32Array) {\n-    let s = \"[\";\n-    for (let i = 0; i < val.length; i++) { if (i > 0) s += \",\"; s += val[i]; }\n-    return s + \"]\";\n+    return \"[\" + Array.from(val).join(\",\") + \"]\";\n   }\n   return String(val);\n }"
+    },
+    {
+      "sha": "1761c2c609a1486ec8d74f16e6ba7f66783eed12",
+      "filename": "src/query-do.ts",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 1,
+      "changes": 6,
+      "blob_url": "https://github.com/teamchong/querymode/blob/a593bfe1ef0812b6987b0355c261f934fd6dcadb/src%2Fquery-do.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/a593bfe1ef0812b6987b0355c261f934fd6dcadb/src%2Fquery-do.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fquery-do.ts?ref=a593bfe1ef0812b6987b0355c261f934fd6dcadb",
+      "patch": "@@ -497,7 +497,10 @@ export class QueryDO extends DurableObject<Env> {\n         oldestKey = key;\n       }\n     }\n-    if (oldestKey) this.datasetCache.delete(oldestKey);\n+    if (oldestKey) {\n+      this.datasetCache.delete(oldestKey);\n+      this.partitionCatalogs.delete(oldestKey);\n+    }\n   }\n \n   private async ensureInitialized(): Promise<void> {\n@@ -590,6 +593,7 @@ export class QueryDO extends DurableObject<Env> {\n \n       this.footerCache.set(table, meta);\n       this.wasmEngine.clearTable(table);\n+      this.wasmEngine.cacheClear();\n       await this.ctx.storage.put(`table:${table}`, meta);\n     }\n   }"
+    },
+    {
+      "sha": "536f873d389cc37f6f286c6a9e5d84d183bc9ead",
+      "filename": "src/wasm-engine.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 3,
+      "changes": 4,
+      "blob_url": "https://github.com/teamchong/querymode/blob/a593bfe1ef0812b6987b0355c261f934fd6dcadb/src%2Fwasm-engine.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/a593bfe1ef0812b6987b0355c261f934fd6dcadb/src%2Fwasm-engine.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fwasm-engine.ts?ref=a593bfe1ef0812b6987b0355c261f934fd6dcadb",
+      "patch": "@@ -1133,9 +1133,7 @@ export function queryToSql(query: QueryDescriptor): string {\n \n   if (query.vectorSearch) {\n     const vs = query.vectorSearch;\n-    let vecStr = \"[\";\n-    for (let i = 0; i < vs.queryVector.length; i++) { if (i > 0) vecStr += \",\"; vecStr += vs.queryVector[i]; }\n-    vecStr += \"]\";\n+    const vecStr = \"[\" + Array.from(vs.queryVector).join(\",\") + \"]\";\n     const hasWhere = andConditions.length > 0 || orGroupConditions.length > 0;\n     parts.push(`${hasWhere ? \"AND\" : \"WHERE\"} ${quote(vs.column)} NEAR ${vecStr} TOPK ${vs.topK}`);\n   }"
+    }
+  ]
+}

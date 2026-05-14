@@ -1,0 +1,53 @@
+{
+  "message": "fix: bigint group key restoration, cache key collision, distinct columnar perf\n\nThree issues found during code quality audit:\n\n1. partial-agg.ts: finalizePartialAgg restored bigint group keys as strings.\n   String(Number(\"9007199254740993\")) !== \"9007199254740993\" caused fallback\n   to string instead of BigInt. Now detects integer-only strings that fail\n   Number round-trip and restores via BigInt().\n\n2. query-do.ts + local-executor.ts: queryKey/queryCacheKey hashed\n   computedColumns by alias only \u2014 different function bodies with the same\n   alias caused cache collisions. Now includes fn.toString() in the hash.\n\n3. operators.ts: DistinctOperator.nextColumnar called Map.get(col) per\n   column per row in the dedup loop. Pre-extracts column arrays before\n   the row loop, matching the pattern used by computePartialAggColumnar.",
+  "files": [
+    {
+      "sha": "b776b358d8f6c47e06fb5e739e2d10dcc2b52949",
+      "filename": "src/local-executor.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/teamchong/querymode/blob/47dc97b3313c87e2fac407d9005e0c21e51fa312/src%2Flocal-executor.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/47dc97b3313c87e2fac407d9005e0c21e51fa312/src%2Flocal-executor.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Flocal-executor.ts?ref=47dc97b3313c87e2fac407d9005e0c21e51fa312",
+      "patch": "@@ -416,7 +416,7 @@ export class LocalExecutor implements QueryExecutor {\n       if (w.args?.offset !== undefined) { feed(String(w.args.offset)); feed(\"\\0\"); }\n       if (w.args?.default_ !== undefined) { feed(String(w.args.default_)); feed(\"\\0\"); }\n     }\n-    if (query.computedColumns) for (const cc of query.computedColumns) { feed(cc.alias); feed(\"\\0\"); }\n+    if (query.computedColumns) for (const cc of query.computedColumns) { feed(cc.alias); feed(\"\\0\"); if (cc.fn) { feed(cc.fn.toString()); feed(\"\\0\"); } }\n     if (query.setOperation) { feed(query.setOperation.mode); feed(\"\\0\"); feed(this.queryCacheKey(query.setOperation.right)); feed(\"\\0\"); }\n     if (query.subqueryIn) for (const sq of query.subqueryIn) { feed(sq.column); feed(\"\\0\"); for (const v of sq.valueSet) { feed(v); feed(\"\\0\"); } }\n     if (query.join) { feed(query.join.type ?? \"inner\"); feed(\"\\0\"); feed(query.join.leftKey); feed(\"\\0\"); feed(query.join.rightKey); feed(\"\\0\"); feed(this.queryCacheKey(query.join.right)); feed(\"\\0\"); }"
+    },
+    {
+      "sha": "1ff70e2ca2e9be05db3925c10730dae35eed6432",
+      "filename": "src/operators.ts",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 2,
+      "changes": 6,
+      "blob_url": "https://github.com/teamchong/querymode/blob/47dc97b3313c87e2fac407d9005e0c21e51fa312/src%2Foperators.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/47dc97b3313c87e2fac407d9005e0c21e51fa312/src%2Foperators.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Foperators.ts?ref=47dc97b3313c87e2fac407d9005e0c21e51fa312",
+      "patch": "@@ -1101,14 +1101,16 @@ export class DistinctOperator implements Operator {\n       const indices = batch.selection ?? identityIndices(batch.rowCount);\n       const kept: number[] = [];\n       const cols = this.columns.length > 0 ? this.columns : Array.from(batch.columns.keys());\n+      // Pre-extract column arrays to avoid Map.get per column per row\n+      const colArrays: ((number | bigint | string | boolean | null)[] | undefined)[] = new Array(cols.length);\n+      for (let g = 0; g < cols.length; g++) colArrays[g] = batch.columns.get(cols[g]) ?? undefined;\n \n       for (let ii = 0; ii < indices.length; ii++) {\n         const idx = indices[ii];\n         let key = \"\";\n         for (let g = 0; g < cols.length; g++) {\n           if (g > 0) key += \"\\x00\";\n-          const vals = batch.columns.get(cols[g]);\n-          const v = vals ? vals[idx] : null;\n+          const v = colArrays[g] ? colArrays[g]![idx] : null;\n           key += v === null || v === undefined ? NULL_SENTINEL : String(v);\n         }\n         if (!this.seen.has(key)) {"
+    },
+    {
+      "sha": "06c3c701154d15a982c58de6fd811218623e8acd",
+      "filename": "src/partial-agg.ts",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 1,
+      "changes": 9,
+      "blob_url": "https://github.com/teamchong/querymode/blob/47dc97b3313c87e2fac407d9005e0c21e51fa312/src%2Fpartial-agg.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/47dc97b3313c87e2fac407d9005e0c21e51fa312/src%2Fpartial-agg.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fpartial-agg.ts?ref=47dc97b3313c87e2fac407d9005e0c21e51fa312",
+      "patch": "@@ -292,7 +292,14 @@ export function finalizePartialAgg(\n       } else {\n         // Attempt to restore numeric types\n         const num = Number(part);\n-        row[groupCols[i]] = part !== \"\" && !isNaN(num) && isFinite(num) && String(num) === part ? num : part;\n+        if (part !== \"\" && !isNaN(num) && isFinite(num) && String(num) === part) {\n+          row[groupCols[i]] = num;\n+        } else if (part !== \"\" && /^-?\\d+$/.test(part)) {\n+          // Number round-trip lost precision \u2014 restore as bigint\n+          try { row[groupCols[i]] = BigInt(part); } catch { row[groupCols[i]] = part; }\n+        } else {\n+          row[groupCols[i]] = part;\n+        }\n       }\n     }\n     for (let i = 0; i < states.length; i++) {"
+    },
+    {
+      "sha": "d88a8d514156806244ed950550751735cdf3c231",
+      "filename": "src/query-do.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/teamchong/querymode/blob/47dc97b3313c87e2fac407d9005e0c21e51fa312/src%2Fquery-do.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/47dc97b3313c87e2fac407d9005e0c21e51fa312/src%2Fquery-do.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fquery-do.ts?ref=47dc97b3313c87e2fac407d9005e0c21e51fa312",
+      "patch": "@@ -684,7 +684,7 @@ export class QueryDO extends DurableObject<Env> {\n       if (w.args?.offset !== undefined) { feed(String(w.args.offset)); feed(\"\\0\"); }\n       if (w.args?.default_ !== undefined) { feed(String(w.args.default_)); feed(\"\\0\"); }\n     }\n-    if (query.computedColumns) for (const cc of query.computedColumns) { feed(cc.alias); feed(\"\\0\"); }\n+    if (query.computedColumns) for (const cc of query.computedColumns) { feed(cc.alias); feed(\"\\0\"); if (cc.fn) { feed(cc.fn.toString()); feed(\"\\0\"); } }\n     if (query.setOperation) { feed(query.setOperation.mode); feed(\"\\0\"); feed(this.queryKey(query.setOperation.right)); feed(\"\\0\"); }\n     if (query.subqueryIn) for (const sq of query.subqueryIn) { feed(sq.column); feed(\"\\0\"); for (const v of sq.valueSet) { feed(v); feed(\"\\0\"); } }\n     if (query.join) { feed(query.join.type ?? \"inner\"); feed(\"\\0\"); feed(query.join.leftKey); feed(\"\\0\"); feed(query.join.rightKey); feed(\"\\0\"); feed(this.queryKey(query.join.right)); feed(\"\\0\"); }"
+    }
+  ]
+}

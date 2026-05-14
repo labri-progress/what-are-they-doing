@@ -1,0 +1,137 @@
+{
+  "message": "Port enumerate operator to new executor (#5859)\n\n## Summary\n\n- port `enumerate` to the new executor with `OperatorPlugin` +\n`Describer`\n- keep the legacy `operator_plugin2` implementation so non-neo execution\nstill works\n- share grouping logic and preserve existing signed/unsigned integer\ngrouping behavior\n- snapshot mutable executor state (`next_id`, grouped counters)\n\n## Verification\n\n- `cmake --build build/xcode/release --target tenzir --parallel 8`\n- `uvx tenzir-test --root test-legacy --match operators/enumerate`\n- manual smoke check of `test-legacy/tests/operators/enumerate.tql` with\nand without `--neo`\n\n## Changelog\n\n- no changelog entry (internal port; no user-facing behavior change)\n\n<sub>resolves TNZ-168</sub>",
+  "files": [
+    {
+      "sha": "2d11f11288d3b487668ed756678bf55bada2dddf",
+      "filename": "libtenzir/builtins/operators/enumerate.cpp",
+      "status": "modified",
+      "additions": 106,
+      "deletions": 45,
+      "changes": 151,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/0dccd475150e8892ecb4adec310809b618c2533c/libtenzir%2Fbuiltins%2Foperators%2Fenumerate.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/0dccd475150e8892ecb4adec310809b618c2533c/libtenzir%2Fbuiltins%2Foperators%2Fenumerate.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Fbuiltins%2Foperators%2Fenumerate.cpp?ref=0dccd475150e8892ecb4adec310809b618c2533c",
+      "patch": "@@ -6,87 +6,99 @@\n // SPDX-FileCopyrightText: (c) 2023 The Tenzir Contributors\n // SPDX-License-Identifier: BSD-3-Clause\n \n-#include <tenzir/arrow_table_slice.hpp>\n #include <tenzir/arrow_utils.hpp>\n-#include <tenzir/concept/parseable/tenzir/option_set.hpp>\n-#include <tenzir/concept/parseable/tenzir/pipeline.hpp>\n-#include <tenzir/detail/escapers.hpp>\n+#include <tenzir/concepts.hpp>\n #include <tenzir/detail/narrow.hpp>\n-#include <tenzir/detail/string.hpp>\n #include <tenzir/error.hpp>\n-#include <tenzir/pipeline.hpp>\n+#include <tenzir/operator_plugin.hpp>\n #include <tenzir/plugin.hpp>\n #include <tenzir/table_slice.hpp>\n #include <tenzir/tql2/eval.hpp>\n-#include <tenzir/tql2/plugin.hpp>\n #include <tenzir/tql2/set.hpp>\n \n #include <arrow/type.h>\n-#include <arrow/type_fwd.h>\n+\n+#include <type_traits>\n+#include <utility>\n \n namespace tenzir::plugins::enumerate {\n \n namespace {\n \n-struct enumerate_args {\n-  ast::field_path out;\n+auto default_output_field() -> ast::field_path {\n+  auto out = ast::field_path::try_from(\n+    ast::root_field{ast::identifier{\"#\", location::unknown}});\n+  TENZIR_ASSERT(out);\n+  return std::move(*out);\n+}\n+\n+struct EnumerateArgs {\n+  ast::field_path out = default_output_field();\n   std::optional<ast::expression> group;\n \n-  friend auto inspect(auto& f, enumerate_args& x) -> bool {\n+  friend auto inspect(auto& f, EnumerateArgs& x) -> bool {\n     return f.object(x).fields(f.field(\"out\", x.out), f.field(\"group\", x.group));\n   }\n };\n \n+using GroupMap = tsl::robin_map<data, int64_t>;\n+\n+auto find_group(GroupMap& groups, data_view const value) -> GroupMap::iterator {\n+  auto key = materialize(value);\n+  auto it = groups.find(key);\n+  match(\n+    value,\n+    [&]<class T>(T const& x)\n+      requires concepts::integer<T>\n+    {\n+      using OtherType\n+        = std::conditional_t<std::same_as<T, int64_t>, uint64_t, int64_t>;\n+      if (it == groups.end() and std::in_range<OtherType>(x)) {\n+        it = groups.find(data_view{static_cast<OtherType>(x)});\n+      }\n+    },\n+    [](auto const&) {});\n+  if (it == groups.end()) {\n+    it = groups.emplace_hint(it, std::move(key), int64_t{0});\n+  }\n+  return it;\n+}\n+\n class enumerate_operator final : public crtp_operator<enumerate_operator> {\n public:\n   enumerate_operator() = default;\n \n-  explicit enumerate_operator(enumerate_args args) : args_{std::move(args)} {\n+  explicit enumerate_operator(EnumerateArgs args) : args_{std::move(args)} {\n   }\n \n   auto\n   operator()(generator<table_slice> input, operator_control_plane& ctrl) const\n     -> generator<table_slice> {\n     auto& dh = ctrl.diagnostics();\n-    auto idx = int64_t{};\n-    auto groups = tsl::robin_map<data, int64_t>{};\n+    auto next_id = int64_t{0};\n+    auto groups = GroupMap{};\n     for (auto&& slice : input) {\n       if (slice.rows() == 0) {\n         co_yield {};\n         continue;\n       }\n-      auto b = int64_type::make_arrow_builder(arrow_memory_pool());\n-      check(b->Reserve(detail::narrow_cast<int64_t>(slice.rows())));\n+      auto builder = int64_type::make_arrow_builder(arrow_memory_pool());\n+      check(builder->Reserve(detail::narrow_cast<int64_t>(slice.rows())));\n       if (args_.group) {\n-        for (const auto& s : eval(args_.group.value(), slice, dh)) {\n-          for (const auto& val : s.values()) {\n-            auto it = groups.find(materialize(val));\n-            match(\n-              val,\n-              [&]<typename T>(const T& x)\n-                requires concepts::integer<T>\n-              {\n-                using to_type = std::conditional_t<std::same_as<int64_t, T>,\n-                                                   uint64_t, int64_t>;\n-                if (it == groups.end() and std::in_range<to_type>(x)) {\n-                  it = groups.find(data_view{static_cast<to_type>(x)});\n-                }\n-              },\n-              [](const auto&) {});\n-            if (it == groups.end()) {\n-              it = groups.emplace_hint(it, materialize(val), 0);\n-            }\n-            check(b->Append(it.value()++));\n+        for (auto const& result : eval(*args_.group, slice, dh)) {\n+          for (auto const& value : result.values()) {\n+            auto it = find_group(groups, value);\n+            check(builder->Append(it.value()++));\n           }\n         }\n       } else {\n-        for (auto i = int64_t{}; i < detail::narrow<int64_t>(slice.rows());\n+        for (auto i = int64_t{0}; i < detail::narrow<int64_t>(slice.rows());\n              ++i) {\n-          check(b->Append(idx++));\n+          check(builder->Append(next_id++));\n         }\n       }\n-      co_yield assign(args_.out, series{int64_type{}, finish(*b)}, slice, dh,\n-                      assign_position::front);\n+      co_yield assign(args_.out, series{int64_type{}, finish(*builder)}, slice,\n+                      dh, assign_position::front);\n     }\n   }\n \n@@ -104,28 +116,77 @@ class enumerate_operator final : public crtp_operator<enumerate_operator> {\n     return f.apply(x.args_);\n   }\n \n-  enumerate_args args_;\n+  EnumerateArgs args_;\n+};\n+\n+class Enumerate final : public Operator<table_slice, table_slice> {\n+public:\n+  explicit Enumerate(EnumerateArgs args) : args_{std::move(args)} {\n+  }\n+\n+  auto process(table_slice input, Push<table_slice>& push, OpCtx& ctx)\n+    -> Task<void> override {\n+    if (input.rows() == 0) {\n+      co_return;\n+    }\n+    auto builder = int64_type::make_arrow_builder(arrow_memory_pool());\n+    check(builder->Reserve(detail::narrow_cast<int64_t>(input.rows())));\n+    if (args_.group) {\n+      for (auto const& result : eval(*args_.group, input, ctx)) {\n+        for (auto const& value : result.values()) {\n+          auto it = find_group(groups_, value);\n+          check(builder->Append(it.value()++));\n+        }\n+      }\n+    } else {\n+      for (auto i = int64_t{0}; i < detail::narrow<int64_t>(input.rows());\n+           ++i) {\n+        check(builder->Append(next_id_++));\n+      }\n+    }\n+    auto output = assign(args_.out, series{int64_type{}, finish(*builder)},\n+                         input, ctx, assign_position::front);\n+    co_await push(std::move(output));\n+  }\n+\n+  auto snapshot(Serde& serde) -> void override {\n+    serde(\"next_id\", next_id_);\n+    serde(\"groups\", groups_);\n+  }\n+\n+private:\n+  EnumerateArgs args_;\n+  int64_t next_id_ = 0;\n+  GroupMap groups_;\n };\n \n-class plugin final : public operator_plugin2<enumerate_operator> {\n+class Plugin final : public virtual operator_plugin2<enumerate_operator>,\n+                     public virtual OperatorPlugin {\n public:\n   auto make(invocation inv, session ctx) const\n     -> failure_or<operator_ptr> override {\n-    auto args = enumerate_args{};\n+    auto args = EnumerateArgs{};\n     auto out = ast::field_path::try_from(\n       ast::root_field{ast::identifier{\"#\", inv.self.get_location()}});\n-    TENZIR_ASSERT(out.has_value());\n+    TENZIR_ASSERT(out);\n     TRY(argument_parser2::operator_(\"enumerate\")\n           .positional(\"out\", out)\n           .named(\"group\", args.group, \"any\")\n           .parse(inv, ctx));\n-    args.out = std::move(out).value();\n+    args.out = std::move(*out);\n     return std::make_unique<enumerate_operator>(std::move(args));\n   }\n+\n+  auto describe() const -> Description override {\n+    auto d = Describer<EnumerateArgs, Enumerate>{};\n+    d.optional_positional(\"out\", &EnumerateArgs::out);\n+    d.named(\"group\", &EnumerateArgs::group, \"any\");\n+    return d.without_optimize();\n+  }\n };\n \n } // namespace\n \n } // namespace tenzir::plugins::enumerate\n \n-TENZIR_REGISTER_PLUGIN(tenzir::plugins::enumerate::plugin)\n+TENZIR_REGISTER_PLUGIN(tenzir::plugins::enumerate::Plugin)"
+    },
+    {
+      "sha": "0aadfb06b6267b08a65dffa1e34d6e3d504b79f3",
+      "filename": "test/tests/operators/enumerate/basic.tql",
+      "status": "added",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/0dccd475150e8892ecb4adec310809b618c2533c/test%2Ftests%2Foperators%2Fenumerate%2Fbasic.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/0dccd475150e8892ecb4adec310809b618c2533c/test%2Ftests%2Foperators%2Fenumerate%2Fbasic.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fenumerate%2Fbasic.tql?ref=0dccd475150e8892ecb4adec310809b618c2533c",
+      "patch": "@@ -0,0 +1,4 @@\n+from {x: 1},\n+     {x: 2},\n+     {x: 3}\n+enumerate"
+    },
+    {
+      "sha": "536127fe83d1e2e5d998c0b2125b6ec09d69208e",
+      "filename": "test/tests/operators/enumerate/basic.txt",
+      "status": "added",
+      "additions": 12,
+      "deletions": 0,
+      "changes": 12,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/0dccd475150e8892ecb4adec310809b618c2533c/test%2Ftests%2Foperators%2Fenumerate%2Fbasic.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/0dccd475150e8892ecb4adec310809b618c2533c/test%2Ftests%2Foperators%2Fenumerate%2Fbasic.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fenumerate%2Fbasic.txt?ref=0dccd475150e8892ecb4adec310809b618c2533c",
+      "patch": "@@ -0,0 +1,12 @@\n+{\n+  \"#\": 0,\n+  x: 1,\n+}\n+{\n+  \"#\": 1,\n+  x: 2,\n+}\n+{\n+  \"#\": 2,\n+  x: 3,\n+}"
+    },
+    {
+      "sha": "a679960f86453d152255a4f1f951b0db47de5b97",
+      "filename": "test/tests/operators/enumerate/custom_out.tql",
+      "status": "added",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/0dccd475150e8892ecb4adec310809b618c2533c/test%2Ftests%2Foperators%2Fenumerate%2Fcustom_out.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/0dccd475150e8892ecb4adec310809b618c2533c/test%2Ftests%2Foperators%2Fenumerate%2Fcustom_out.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fenumerate%2Fcustom_out.tql?ref=0dccd475150e8892ecb4adec310809b618c2533c",
+      "patch": "@@ -0,0 +1,3 @@\n+from {x: 10},\n+     {x: 11}\n+enumerate index"
+    },
+    {
+      "sha": "0f083ceb82a652a0ca9ea322f762e35bffd927f9",
+      "filename": "test/tests/operators/enumerate/custom_out.txt",
+      "status": "added",
+      "additions": 8,
+      "deletions": 0,
+      "changes": 8,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/0dccd475150e8892ecb4adec310809b618c2533c/test%2Ftests%2Foperators%2Fenumerate%2Fcustom_out.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/0dccd475150e8892ecb4adec310809b618c2533c/test%2Ftests%2Foperators%2Fenumerate%2Fcustom_out.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fenumerate%2Fcustom_out.txt?ref=0dccd475150e8892ecb4adec310809b618c2533c",
+      "patch": "@@ -0,0 +1,8 @@\n+{\n+  index: 0,\n+  x: 10,\n+}\n+{\n+  index: 1,\n+  x: 11,\n+}"
+    },
+    {
+      "sha": "9bf0824e8128d53b94e38a5adab3c108ab2cf677",
+      "filename": "test/tests/operators/enumerate/group.tql",
+      "status": "renamed",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/0dccd475150e8892ecb4adec310809b618c2533c/test%2Ftests%2Foperators%2Fenumerate%2Fgroup.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/0dccd475150e8892ecb4adec310809b618c2533c/test%2Ftests%2Foperators%2Fenumerate%2Fgroup.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fenumerate%2Fgroup.tql?ref=0dccd475150e8892ecb4adec310809b618c2533c",
+      "previous_filename": "test-legacy/tests/operators/enumerate.tql"
+    },
+    {
+      "sha": "d24d7a43c56a73df00032b34e618cc9006839681",
+      "filename": "test/tests/operators/enumerate/group.txt",
+      "status": "renamed",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/0dccd475150e8892ecb4adec310809b618c2533c/test%2Ftests%2Foperators%2Fenumerate%2Fgroup.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/0dccd475150e8892ecb4adec310809b618c2533c/test%2Ftests%2Foperators%2Fenumerate%2Fgroup.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fenumerate%2Fgroup.txt?ref=0dccd475150e8892ecb4adec310809b618c2533c",
+      "previous_filename": "test-legacy/tests/operators/enumerate.txt"
+    },
+    {
+      "sha": "56b31f8e30f977cbed503623e83628939c1974cd",
+      "filename": "test/tests/operators/enumerate/group_expression.tql",
+      "status": "added",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/0dccd475150e8892ecb4adec310809b618c2533c/test%2Ftests%2Foperators%2Fenumerate%2Fgroup_expression.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/0dccd475150e8892ecb4adec310809b618c2533c/test%2Ftests%2Foperators%2Fenumerate%2Fgroup_expression.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fenumerate%2Fgroup_expression.tql?ref=0dccd475150e8892ecb4adec310809b618c2533c",
+      "patch": "@@ -0,0 +1,5 @@\n+from {x: 1},\n+     {x: 2},\n+     {x: 3},\n+     {x: 4}\n+enumerate group=x > 2"
+    },
+    {
+      "sha": "2f27642493ea12da51a3f7001e5fa808253692b4",
+      "filename": "test/tests/operators/enumerate/group_expression.txt",
+      "status": "added",
+      "additions": 16,
+      "deletions": 0,
+      "changes": 16,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/0dccd475150e8892ecb4adec310809b618c2533c/test%2Ftests%2Foperators%2Fenumerate%2Fgroup_expression.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/0dccd475150e8892ecb4adec310809b618c2533c/test%2Ftests%2Foperators%2Fenumerate%2Fgroup_expression.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fenumerate%2Fgroup_expression.txt?ref=0dccd475150e8892ecb4adec310809b618c2533c",
+      "patch": "@@ -0,0 +1,16 @@\n+{\n+  \"#\": 0,\n+  x: 1,\n+}\n+{\n+  \"#\": 1,\n+  x: 2,\n+}\n+{\n+  \"#\": 0,\n+  x: 3,\n+}\n+{\n+  \"#\": 1,\n+  x: 4,\n+}"
+    },
+    {
+      "sha": "ae6fdc05edce56b9aa5e275ca46818d9321a5648",
+      "filename": "test/tests/operators/enumerate/invalid_out.tql",
+      "status": "added",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/0dccd475150e8892ecb4adec310809b618c2533c/test%2Ftests%2Foperators%2Fenumerate%2Finvalid_out.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/0dccd475150e8892ecb4adec310809b618c2533c/test%2Ftests%2Foperators%2Fenumerate%2Finvalid_out.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fenumerate%2Finvalid_out.tql?ref=0dccd475150e8892ecb4adec310809b618c2533c",
+      "patch": "@@ -0,0 +1,6 @@\n+---\n+error: true\n+---\n+\n+from {x: 1}\n+enumerate 1"
+    },
+    {
+      "sha": "56fab7e1dc0273726ef889372fc4a9583ee15c15",
+      "filename": "test/tests/operators/enumerate/invalid_out.txt",
+      "status": "added",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/0dccd475150e8892ecb4adec310809b618c2533c/test%2Ftests%2Foperators%2Fenumerate%2Finvalid_out.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/0dccd475150e8892ecb4adec310809b618c2533c/test%2Ftests%2Foperators%2Fenumerate%2Finvalid_out.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fenumerate%2Finvalid_out.txt?ref=0dccd475150e8892ecb4adec310809b618c2533c",
+      "patch": "@@ -0,0 +1,6 @@\n+error: expected a field path\n+ --> tests/operators/enumerate/invalid_out.tql:6:11\n+  |\n+6 | enumerate 1\n+  |           ^ \n+  |"
+    }
+  ]
+}

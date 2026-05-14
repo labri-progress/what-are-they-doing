@@ -1,0 +1,41 @@
+{
+  "message": "fix(sync,replay_pack): use saturating_mul for timeout, prefer backend.ok rollout stage, and make atomic rename portable\n\nUse saturating_mul instead of plain multiplication when converting timeout\nseconds to milliseconds to prevent overflow at u64::MAX. In replay_pack,\nprefer the backend.ok event over routing.decision_contract when resolving\nnative_rollout_stage so the final authoritative value wins. Extract a\nreplace_file_atomically helper in sync that uses plain rename on Unix\n(which is already atomic) and only falls back to remove-then-rename on\nnon-Unix platforms.\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "4d6621c078dca32bf38c349edf1e87acb97dc8f3",
+      "filename": "src/cli.rs",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 1,
+      "changes": 11,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_whisper/blob/9f94946753a775d253da17f5b8d3e88a8195d442/src%2Fcli.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_whisper/raw/9f94946753a775d253da17f5b8d3e88a8195d442/src%2Fcli.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_whisper/contents/src%2Fcli.rs?ref=9f94946753a775d253da17f5b8d3e88a8195d442",
+      "patch": "@@ -836,7 +836,7 @@ impl TranscribeArgs {\n             diarize: self.diarize,\n             persist: !self.no_persist,\n             db_path: self.db.clone(),\n-            timeout_ms: self.timeout.map(|secs| secs * 1000),\n+            timeout_ms: self.timeout.map(|secs| secs.saturating_mul(1000)),\n             backend_params,\n         })\n     }\n@@ -1825,6 +1825,15 @@ mod tests {\n         assert_eq!(request.timeout_ms, Some((u64::MAX / 1000) * 1000));\n     }\n \n+    #[test]\n+    fn timeout_u64_max_saturates_to_u64_max_millis() {\n+        let mut args = minimal_args();\n+        args.timeout = Some(u64::MAX);\n+\n+        let request = args.to_request().expect(\"should succeed\");\n+        assert_eq!(request.timeout_ms, Some(u64::MAX));\n+    }\n+\n     #[test]\n     fn robot_summary_default_args_has_all_expected_keys() {\n         let args = minimal_args();"
+    },
+    {
+      "sha": "cf17948ecafeda24c24b21d0c8896f24182359de",
+      "filename": "src/replay_pack.rs",
+      "status": "modified",
+      "additions": 32,
+      "deletions": 2,
+      "changes": 34,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_whisper/blob/9f94946753a775d253da17f5b8d3e88a8195d442/src%2Freplay_pack.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_whisper/raw/9f94946753a775d253da17f5b8d3e88a8195d442/src%2Freplay_pack.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_whisper/contents/src%2Freplay_pack.rs?ref=9f94946753a775d253da17f5b8d3e88a8195d442",
+      "patch": "@@ -104,13 +104,15 @@ fn rollout_stage_from_report(report: &RunReport) -> String {\n     report\n         .events\n         .iter()\n-        .find(|event| event.code == \"backend.routing.decision_contract\")\n+        .rev()\n+        .find(|event| event.code == \"backend.ok\")\n         .and_then(|event| event.payload.get(\"native_rollout_stage\"))\n         .or_else(|| {\n             report\n                 .events\n                 .iter()\n-                .find(|event| event.code == \"backend.ok\")\n+                .rev()\n+                .find(|event| event.code == \"backend.routing.decision_contract\")\n                 .and_then(|event| event.payload.get(\"native_rollout_stage\"))\n         })\n         .and_then(serde_json::Value::as_str)\n@@ -783,6 +785,34 @@ mod tests {\n         assert_eq!(tolerance.native_rollout_stage, \"shadow\");\n     }\n \n+    #[test]\n+    fn tolerance_manifest_prefers_backend_ok_rollout_stage_over_routing_decision() {\n+        use crate::model::RunEvent;\n+\n+        let mut report = fixture_report();\n+        report.events.extend([\n+            RunEvent {\n+                seq: 1,\n+                ts_rfc3339: \"2026-01-01T00:00:00Z\".to_owned(),\n+                stage: \"backend_routing\".to_owned(),\n+                code: \"backend.routing.decision_contract\".to_owned(),\n+                message: \"routing decision\".to_owned(),\n+                payload: json!({\"native_rollout_stage\": \"shadow\"}),\n+            },\n+            RunEvent {\n+                seq: 2,\n+                ts_rfc3339: \"2026-01-01T00:00:01Z\".to_owned(),\n+                stage: \"backend\".to_owned(),\n+                code: \"backend.ok\".to_owned(),\n+                message: \"backend completed\".to_owned(),\n+                payload: json!({\"native_rollout_stage\": \"primary\"}),\n+            },\n+        ]);\n+\n+        let tolerance = build_tolerance_manifest(&report);\n+        assert_eq!(tolerance.native_rollout_stage, \"primary\");\n+    }\n+\n     #[test]\n     fn write_replay_pack_with_all_empty_strings() {\n         let dir = tempfile::tempdir().expect(\"tempdir\");"
+    },
+    {
+      "sha": "37816f718d71da256696243ef75c3e03b1f22099",
+      "filename": "src/sync.rs",
+      "status": "modified",
+      "additions": 19,
+      "deletions": 8,
+      "changes": 27,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_whisper/blob/9f94946753a775d253da17f5b8d3e88a8195d442/src%2Fsync.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_whisper/raw/9f94946753a775d253da17f5b8d3e88a8195d442/src%2Fsync.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_whisper/contents/src%2Fsync.rs?ref=9f94946753a775d253da17f5b8d3e88a8195d442",
+      "patch": "@@ -1655,10 +1655,7 @@ fn verify_schema_exists(connection: &Connection) -> FwResult<()> {\n // ---------------------------------------------------------------------------\n \n fn atomic_rename(from: &Path, to: &Path) -> FwResult<()> {\n-    if to.exists() {\n-        fs::remove_file(to)?;\n-    }\n-    fs::rename(from, to)?;\n+    replace_file_atomically(from, to)?;\n     sync_parent_dir(to)?;\n     Ok(())\n }\n@@ -1671,14 +1668,28 @@ fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> FwResult<()> {\n         file.flush()?;\n         file.sync_all()?;\n     }\n-    if path.exists() {\n-        fs::remove_file(path)?;\n-    }\n-    fs::rename(tmp, path)?;\n+    replace_file_atomically(&tmp, path)?;\n     sync_parent_dir(path)?;\n     Ok(())\n }\n \n+fn replace_file_atomically(from: &Path, to: &Path) -> FwResult<()> {\n+    #[cfg(unix)]\n+    {\n+        fs::rename(from, to)?;\n+        Ok(())\n+    }\n+\n+    #[cfg(not(unix))]\n+    {\n+        if to.exists() {\n+            fs::remove_file(to)?;\n+        }\n+        fs::rename(from, to)?;\n+        Ok(())\n+    }\n+}\n+\n fn sync_parent_dir(path: &Path) -> FwResult<()> {\n     #[cfg(unix)]\n     {"
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "message": "fix(database): cap SCRAM iterations to prevent DoS, flush TLS writes, eagerly rollback dropped transactions\n\nPostgreSQL (postgres.rs):\n- Cap SCRAM PBKDF2 iteration count at 600,000. A malicious server could\n  previously send an arbitrarily high iteration count (e.g., 2^31),\n  causing the client to spend minutes in PBKDF2 computation. Real\n  PostgreSQL uses 4096; 600K matches the OWASP PBKDF2 ceiling.\n- Add poll_flush after write_all completes. TLS streams (rustls, etc.)\n  may buffer outgoing data and only transmit on explicit flush. Without\n  this, pipelined messages could stall waiting for the TLS layer to\n  flush, causing apparent hangs on authenticated connections.\n\nSQLite (sqlite.rs):\n- When a SqliteTransaction is dropped without commit/rollback, the\n  existing code sets needs_rollback=true but relies on the *next*\n  operation to drain it. If no subsequent operation arrives, the\n  database stays locked indefinitely. Now explicitly spawns a blocking-\n  pool task that acquires the connection lock and executes ROLLBACK\n  immediately, preventing lock starvation.\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "ee707250b455c5118aa00d664aac47302739fb84",
+      "filename": "src/database/postgres.rs",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 5,
+      "changes": 20,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/9abcf8df2060552599542c1d46e4b2d0be7a0e42/src%2Fdatabase%2Fpostgres.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/9abcf8df2060552599542c1d46e4b2d0be7a0e42/src%2Fdatabase%2Fpostgres.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fdatabase%2Fpostgres.rs?ref=9abcf8df2060552599542c1d46e4b2d0be7a0e42",
+      "patch": "@@ -1294,10 +1294,14 @@ impl ScramAuth {\n         let salt = salt.ok_or_else(|| PgError::AuthenticationFailed(\"missing salt\".to_string()))?;\n         let iterations = iterations\n             .ok_or_else(|| PgError::AuthenticationFailed(\"missing iterations\".to_string()))?;\n-        if iterations == 0 {\n-            return Err(PgError::AuthenticationFailed(\n-                \"invalid iterations\".to_string(),\n-            ));\n+        // Reject unreasonable iteration counts to prevent DoS from a malicious\n+        // server. Real PostgreSQL uses 4096; anything above 600,000 is suspicious\n+        // and would cause multi-second PBKDF2 computation.\n+        const MAX_PBKDF2_ITERATIONS: u32 = 600_000;\n+        if iterations == 0 || iterations > MAX_PBKDF2_ITERATIONS {\n+            return Err(PgError::AuthenticationFailed(format!(\n+                \"SCRAM iteration count {iterations} outside safe range 1..={MAX_PBKDF2_ITERATIONS}\"\n+            )));\n         }\n \n         // Verify server nonce starts with our client nonce\n@@ -3031,7 +3035,10 @@ impl PgConnection {\n         Ok(())\n     }\n \n-    /// Write data to the stream using async I/O.\n+    /// Write data to the stream using async I/O and flush.\n+    ///\n+    /// The flush is necessary for TLS streams which may buffer outgoing\n+    /// data until explicitly flushed.\n     async fn write_all(&mut self, data: &[u8]) -> Result<(), PgError> {\n         let mut pos = 0;\n         while pos < data.len() {\n@@ -3049,6 +3056,9 @@ impl PgConnection {\n             }\n             pos += written;\n         }\n+        std::future::poll_fn(|cx| Pin::new(&mut self.inner.stream).poll_flush(cx))\n+            .await\n+            .map_err(PgError::Io)?;\n         Ok(())\n     }\n "
+    },
+    {
+      "sha": "64ddb2ebdbe5c5425826c988bd96d931f11ef921",
+      "filename": "src/database/sqlite.rs",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 1,
+      "changes": 14,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/9abcf8df2060552599542c1d46e4b2d0be7a0e42/src%2Fdatabase%2Fsqlite.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/9abcf8df2060552599542c1d46e4b2d0be7a0e42/src%2Fdatabase%2Fsqlite.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fdatabase%2Fsqlite.rs?ref=9abcf8df2060552599542c1d46e4b2d0be7a0e42",
+      "patch": "@@ -1090,8 +1090,20 @@ impl Drop for SqliteTransaction<'_> {\n         if !self.finished {\n             // Asynchronously enqueue a rollback via an atomic flag so we don't\n             // block the async executor thread waiting for the connection lock.\n-            // The next operation spawned on the blocking pool will process the rollback.\n+            // We also explicitly spawn a task to drain the rollback immediately if\n+            // the connection is otherwise idle, preventing lock starvation for the database.\n             self.conn.needs_rollback.store(true, Ordering::Release);\n+\n+            let inner = Arc::clone(&self.conn.inner);\n+            let needs_rollback = Arc::clone(&self.conn.needs_rollback);\n+            self.conn.pool.spawn(move || {\n+                let guard = inner.lock();\n+                if needs_rollback.swap(false, Ordering::AcqRel) {\n+                    if let Ok(conn) = guard.get() {\n+                        let _ = conn.execute(\"ROLLBACK\", []);\n+                    }\n+                }\n+            });\n         }\n     }\n }"
+    }
+  ]
+}

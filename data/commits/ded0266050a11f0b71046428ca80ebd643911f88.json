@@ -1,0 +1,101 @@
+{
+  "message": "Port `to_stdout` (#6003)\n\n## \ud83d\udd0d Problem\n- neo does not support the `to_stdout` operator yet.\n\n## \ud83d\udee0\ufe0f Solution\n- port `to_stdout` to the async executor\n- require the nested pipeline to return bytes\n- write stdout asynchronously via `AsyncPipeWriter`\n- add integration tests for basic output and invalid nested pipelines\n\n## \ud83d\udcac Review\n- Focus on the direct non-blocking stdout path and subpipeline\nfinalization.\n\n<sub>Resolves TNZ-210</sub>",
+  "files": [
+    {
+      "sha": "598a44c72b7db61b97f3b864e644085425b8af1a",
+      "filename": ".agents/references/executor.md",
+      "status": "modified",
+      "additions": 21,
+      "deletions": 3,
+      "changes": 24,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/ded0266050a11f0b71046428ca80ebd643911f88/.agents%2Freferences%2Fexecutor.md",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/ded0266050a11f0b71046428ca80ebd643911f88/.agents%2Freferences%2Fexecutor.md",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/.agents%2Freferences%2Fexecutor.md?ref=ded0266050a11f0b71046428ca80ebd643911f88",
+      "patch": "@@ -215,10 +215,28 @@ auto state() -> OperatorState override {\n ## Cross-Executor I/O (folly EventBase)\n \n Socket operations via folly's `AsyncSocket` / `Transport` must run on the\n-owning `EventBase` thread. Use `co_withExecutor` to schedule each call there:\n+owning `EventBase` thread. Prefer `ctx.io_executor()` inside operators over\n+reaching for `folly::getGlobalIOExecutor()` directly.\n+\n+### KeepAlive pattern\n+\n+`ctx.io_executor()` returns a\n+`folly::Executor::KeepAlive<folly::IOExecutor>`. If an operator keeps using the\n+executor after `start()`, store that `KeepAlive` handle as a member. Use\n+`io_executor_->getEventBase()` only for APIs that require a raw `EventBase*`.\n+Do not keep only a raw `EventBase*`.\n+\n+```cpp\n+io_executor_ = ctx.io_executor();\n+writer_ = folly::AsyncPipeWriter::newWriter(\n+  io_executor_->getEventBase(), folly::NetworkSocket::fromFd(fd));\n+co_await folly::coro::co_withExecutor(io_executor_, do_io());\n+```\n+\n+Use `co_withExecutor` to schedule each call there:\n \n ```cpp\n-auto n = co_await co_withExecutor(evb_, transport_->read(buf, timeout));\n+auto n = co_await co_withExecutor(io_executor_, transport_->read(buf, timeout));\n ```\n \n Do not use `co_viaIfAsync` \u2014 it only controls where the caller resumes, not\n@@ -227,7 +245,7 @@ where the task executes. Do not use the deprecated `.scheduleOn()` method.\n For multi-statement blocks, wrap with `co_invoke`:\n \n ```cpp\n-co_await co_withExecutor(evb_,\n+co_await co_withExecutor(io_executor_,\n   folly::coro::co_invoke([&]() -> folly::coro::Task<folly::Unit> {\n     ssl_ptr->sslConn(&cb);\n     co_await cb.wait();"
+    },
+    {
+      "sha": "07bea9744d76c960d8f517e2c57133e98536e099",
+      "filename": "libtenzir/builtins/operators/to_stdout.cpp",
+      "status": "added",
+      "additions": 294,
+      "deletions": 0,
+      "changes": 294,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/ded0266050a11f0b71046428ca80ebd643911f88/libtenzir%2Fbuiltins%2Foperators%2Fto_stdout.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/ded0266050a11f0b71046428ca80ebd643911f88/libtenzir%2Fbuiltins%2Foperators%2Fto_stdout.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Fbuiltins%2Foperators%2Fto_stdout.cpp?ref=ded0266050a11f0b71046428ca80ebd643911f88",
+      "patch": "@@ -0,0 +1,294 @@\n+//\n+//  \u2580\u2580\u2588\u2580\u2580 \u2588\u2580\u2580\u2580 \u2588\u2584  \u2588 \u2580\u2580\u2580\u2588\u2580 \u2580\u2588\u2580 \u2588\u2580\u2580\u2584\n+//    \u2588   \u2588\u2580\u2580  \u2588 \u2580\u2584\u2588  \u2584\u2580    \u2588  \u2588\u2580\u2580\u2584\n+//    \u2580   \u2580\u2580\u2580\u2580 \u2580   \u2580 \u2580\u2580\u2580\u2580\u2580 \u2580\u2580\u2580 \u2580  \u2580\n+//\n+// SPDX-FileCopyrightText: (c) 2026 The Tenzir Contributors\n+// SPDX-License-Identifier: BSD-3-Clause\n+\n+#include \"tenzir/async.hpp\"\n+\n+#include <tenzir/compile_ctx.hpp>\n+#include <tenzir/detail/posix.hpp>\n+#include <tenzir/operator_plugin.hpp>\n+#include <tenzir/plugin/register.hpp>\n+#include <tenzir/session.hpp>\n+#include <tenzir/substitute_ctx.hpp>\n+#include <tenzir/tql2/parser.hpp>\n+\n+#include <folly/CancellationToken.h>\n+#include <folly/coro/Baton.h>\n+#include <folly/coro/BoundedQueue.h>\n+#include <folly/coro/Error.h>\n+#include <folly/io/IOBuf.h>\n+#include <folly/io/async/AsyncPipe.h>\n+#include <folly/io/async/AsyncSocketException.h>\n+#include <folly/net/NetworkSocket.h>\n+\n+#include <fcntl.h>\n+#include <memory>\n+#include <string>\n+#include <unistd.h>\n+\n+namespace tenzir::plugins::to_stdout {\n+\n+namespace {\n+\n+constexpr auto error_queue_capacity = uint32_t{1};\n+\n+struct ToStdoutArgs {\n+  location self;\n+  Option<located<ir::pipeline>> pipe;\n+};\n+\n+auto make_default_printer(base_ctx ctx) -> failure_or<ir::pipeline> {\n+  auto sessions = session_provider::make(static_cast<diagnostic_handler&>(ctx));\n+  TRY(auto pipe, parse(\"write_tql\", sessions.as_session()));\n+  auto root = compile_ctx::make_root(ctx);\n+  return std::move(pipe).compile(root);\n+}\n+\n+class StdoutNonblockingGuard {\n+public:\n+  StdoutNonblockingGuard() = default;\n+  StdoutNonblockingGuard(StdoutNonblockingGuard const&) = delete;\n+  auto operator=(StdoutNonblockingGuard const&)\n+    -> StdoutNonblockingGuard& = delete;\n+  StdoutNonblockingGuard(StdoutNonblockingGuard&& other) noexcept\n+    : active_{std::exchange(other.active_, false)},\n+      orig_flags_{std::exchange(other.orig_flags_, -1)} {\n+  }\n+  auto operator=(StdoutNonblockingGuard&& other) noexcept\n+    -> StdoutNonblockingGuard& {\n+    if (this != &other) {\n+      restore();\n+      active_ = std::exchange(other.active_, false);\n+      orig_flags_ = std::exchange(other.orig_flags_, -1);\n+    }\n+    return *this;\n+  }\n+  ~StdoutNonblockingGuard() {\n+    restore();\n+  }\n+\n+  auto activate() -> Option<std::string> {\n+    TENZIR_ASSERT(not active_);\n+    auto orig_flags = ::fcntl(STDOUT_FILENO, F_GETFL, 0);\n+    if (orig_flags < 0) {\n+      return fmt::format(\"failed to get stdout flags: {}\",\n+                         detail::describe_errno());\n+    }\n+    if (::fcntl(STDOUT_FILENO, F_SETFL, orig_flags | O_NONBLOCK) < 0) {\n+      return fmt::format(\"failed to enable non-blocking mode for stdout: {}\",\n+                         detail::describe_errno());\n+    }\n+    active_ = true;\n+    orig_flags_ = orig_flags;\n+    return {};\n+  }\n+\n+  auto restore() -> void {\n+    if (not active_) {\n+      return;\n+    }\n+    TENZIR_ASSERT(orig_flags_ >= 0);\n+    ::fcntl(STDOUT_FILENO, F_SETFL, orig_flags_);\n+    active_ = false;\n+    orig_flags_ = -1;\n+  }\n+\n+private:\n+  bool active_ = false;\n+  int orig_flags_ = -1;\n+};\n+\n+auto write_chunk(folly::AsyncPipeWriter& writer, chunk_ptr chunk)\n+  -> Task<Option<std::string>> {\n+  using ResultQueue = folly::coro::BoundedQueue<Option<std::string>>;\n+\n+  class WriteCallback final : public folly::AsyncWriter::WriteCallback {\n+  public:\n+    explicit WriteCallback(std::shared_ptr<ResultQueue> result_queue)\n+      : result_queue_{std::move(result_queue)} {\n+    }\n+\n+    void writeSuccess() noexcept override {\n+      std::ignore = result_queue_->try_enqueue(Option<std::string>{});\n+      delete this;\n+    }\n+\n+    void\n+    writeErr(size_t, folly::AsyncSocketException const& ex) noexcept override {\n+      std::ignore = result_queue_->try_enqueue(Option<std::string>{ex.what()});\n+      delete this;\n+    }\n+\n+  private:\n+    std::shared_ptr<ResultQueue> result_queue_;\n+  };\n+\n+  TENZIR_ASSERT(chunk);\n+  auto result_queue = std::make_shared<ResultQueue>(1);\n+  auto write_callback = std::make_unique<WriteCallback>(result_queue);\n+  auto buffer = folly::IOBuf::copyBuffer(chunk->data(), chunk->size());\n+  writer.write(std::move(buffer), write_callback.get());\n+  std::ignore = write_callback.release();\n+  co_return co_await result_queue->dequeue();\n+}\n+\n+class ToStdout final : public Operator<table_slice, void> {\n+public:\n+  explicit ToStdout(ToStdoutArgs args) : args_{std::move(args)} {\n+  }\n+\n+  auto start(OpCtx& ctx) -> Task<void> override {\n+    auto pipe = ir::pipeline{};\n+    if (args_.pipe) {\n+      pipe = std::move(args_.pipe->inner);\n+    } else {\n+      auto default_printer = make_default_printer(ctx);\n+      if (not default_printer) {\n+        done_ = true;\n+        co_return;\n+      }\n+      pipe = std::move(*default_printer);\n+    }\n+    if (not pipe.substitute(substitute_ctx{{ctx}, nullptr}, true)) {\n+      diagnostic::error(\"failed to substitute pipeline\")\n+        .primary(args_.pipe ? args_.pipe->source : args_.self)\n+        .emit(ctx);\n+      done_ = true;\n+      co_return;\n+    }\n+    if (auto error = stdout_nonblocking_.activate()) {\n+      diagnostic::error(\"{}\", *error).primary(args_.self).emit(ctx);\n+      done_ = true;\n+      co_return;\n+    }\n+    io_executor_ = ctx.io_executor();\n+    writer_ = folly::AsyncPipeWriter::newWriter(\n+      io_executor_->getEventBase(),\n+      folly::NetworkSocket::fromFd(STDOUT_FILENO));\n+    // Avoid closing the process-global stdout when the writer shuts down.\n+    writer_->setCloseCallback([](folly::NetworkSocket) {});\n+    co_await ctx.spawn_sub<table_slice>(caf::none, std::move(pipe));\n+    TENZIR_ASSERT(ctx.get_sub(caf::none));\n+  }\n+\n+  auto await_task(diagnostic_handler&) const -> Task<Any> override {\n+    co_return co_await queue_->dequeue();\n+  }\n+\n+  auto process_task(Any result, OpCtx& ctx) -> Task<void> override {\n+    auto* error = result.try_as<std::string>();\n+    TENZIR_ASSERT(error);\n+    diagnostic::error(\"failed to write to stdout: {}\", *error)\n+      .primary(args_.self)\n+      .emit(ctx);\n+    done_ = true;\n+    co_return;\n+  }\n+\n+  auto process(table_slice input, OpCtx& ctx) -> Task<void> override {\n+    if (done_) {\n+      co_return;\n+    }\n+    auto sub = ctx.get_sub(caf::none);\n+    if (not sub) {\n+      done_ = true;\n+      co_return;\n+    }\n+    auto& pipeline = as<SubHandle<table_slice>>(*sub);\n+    auto push_result = co_await pipeline.push(std::move(input));\n+    if (push_result.is_err()) {\n+      done_ = true;\n+    }\n+  }\n+\n+  auto process_sub(SubKeyView, chunk_ptr chunk, OpCtx&) -> Task<void> override {\n+    if (not chunk or chunk->size() == 0 or not writer_) {\n+      co_return;\n+    }\n+    auto error = co_await folly::coro::co_withExecutor(\n+      io_executor_, write_chunk(*writer_, std::move(chunk)));\n+    if (error) {\n+      auto write_error = std::move(*error);\n+      // Only the first write error matters; blocking here would let concurrent\n+      // `process_sub()` calls stall behind an already queued error.\n+      std::ignore = queue_->try_enqueue(std::move(write_error));\n+    }\n+    co_return;\n+  }\n+\n+  auto state() -> OperatorState override {\n+    return done_ ? OperatorState::done : OperatorState::unspecified;\n+  }\n+\n+  auto finalize(OpCtx& ctx) -> Task<FinalizeBehavior> override {\n+    if (auto sub = ctx.get_sub(caf::none)) {\n+      auto& pipeline = as<SubHandle<table_slice>>(*sub);\n+      co_await pipeline.close();\n+      // `continue_` keeps the executor alive until the subpipeline drains and\n+      // reports `finish_sub()`.\n+      co_return FinalizeBehavior::continue_;\n+    }\n+    writer_.reset();\n+    stdout_nonblocking_.restore();\n+    co_return FinalizeBehavior::done;\n+  }\n+\n+  auto finish_sub(SubKeyView, OpCtx&) -> Task<void> override {\n+    writer_.reset();\n+    stdout_nonblocking_.restore();\n+    done_ = true;\n+    co_return;\n+  }\n+\n+private:\n+  using ErrorQueue = folly::coro::BoundedQueue<std::string>;\n+\n+  ToStdoutArgs args_;\n+  folly::Executor::KeepAlive<folly::IOExecutor> io_executor_;\n+  StdoutNonblockingGuard stdout_nonblocking_;\n+  folly::AsyncPipeWriter::UniquePtr writer_;\n+  // `process_sub()` reports the first stdout write error back to the main\n+  // loop, which owns the operator lifecycle state.\n+  mutable Box<ErrorQueue> queue_{std::in_place, error_queue_capacity};\n+  bool done_ = false;\n+};\n+\n+class ToStdoutPlugin final : public OperatorPlugin {\n+public:\n+  auto name() const -> std::string override {\n+    return \"to_stdout\";\n+  }\n+\n+  auto describe() const -> Description override {\n+    auto d = Describer<ToStdoutArgs, ToStdout>{};\n+    d.operator_location(&ToStdoutArgs::self);\n+    auto pipe_arg = d.pipeline(&ToStdoutArgs::pipe);\n+    d.validate([=](DescribeCtx& ctx) -> Empty {\n+      auto pipe = ctx.get(pipe_arg);\n+      if (not pipe) {\n+        return {};\n+      }\n+      auto output = pipe->inner.infer_type(tag_v<table_slice>, ctx);\n+      if (output.is_error()) {\n+        return {};\n+      }\n+      if (not *output or (*output)->is_not<chunk_ptr>()) {\n+        diagnostic::error(\"pipeline must return bytes\")\n+          .primary(pipe->source.subloc(0, 1))\n+          .emit(ctx);\n+      }\n+      return {};\n+    });\n+    return d.without_optimize();\n+  }\n+};\n+\n+} // namespace\n+\n+} // namespace tenzir::plugins::to_stdout\n+\n+TENZIR_REGISTER_PLUGIN(tenzir::plugins::to_stdout::ToStdoutPlugin)"
+    },
+    {
+      "sha": "f321d47f433bf7f338501399c7808775d58d2d18",
+      "filename": "test/tests/operators/to_stdout/basic.tql",
+      "status": "added",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/ded0266050a11f0b71046428ca80ebd643911f88/test%2Ftests%2Foperators%2Fto_stdout%2Fbasic.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/ded0266050a11f0b71046428ca80ebd643911f88/test%2Ftests%2Foperators%2Fto_stdout%2Fbasic.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fto_stdout%2Fbasic.tql?ref=ded0266050a11f0b71046428ca80ebd643911f88",
+      "patch": "@@ -0,0 +1,2 @@\n+from {x: 1}, {x: 2}\n+to_stdout"
+    },
+    {
+      "sha": "dcebd00f3a77ac34e83477d1372353108ecb71f3",
+      "filename": "test/tests/operators/to_stdout/basic.txt",
+      "status": "added",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/ded0266050a11f0b71046428ca80ebd643911f88/test%2Ftests%2Foperators%2Fto_stdout%2Fbasic.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/ded0266050a11f0b71046428ca80ebd643911f88/test%2Ftests%2Foperators%2Fto_stdout%2Fbasic.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fto_stdout%2Fbasic.txt?ref=ded0266050a11f0b71046428ca80ebd643911f88",
+      "patch": "@@ -0,0 +1,6 @@\n+{\n+  x: 1,\n+}\n+{\n+  x: 2,\n+}"
+    },
+    {
+      "sha": "93ad229e8b07afe6f9cbe06a4f50344bfa01135a",
+      "filename": "test/tests/operators/to_stdout/invalid_pipeline.tql",
+      "status": "added",
+      "additions": 8,
+      "deletions": 0,
+      "changes": 8,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/ded0266050a11f0b71046428ca80ebd643911f88/test%2Ftests%2Foperators%2Fto_stdout%2Finvalid_pipeline.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/ded0266050a11f0b71046428ca80ebd643911f88/test%2Ftests%2Foperators%2Fto_stdout%2Finvalid_pipeline.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fto_stdout%2Finvalid_pipeline.tql?ref=ded0266050a11f0b71046428ca80ebd643911f88",
+      "patch": "@@ -0,0 +1,8 @@\n+---\n+error: true\n+---\n+\n+from {x: 1}\n+to_stdout {\n+  pass\n+}"
+    },
+    {
+      "sha": "4b377311c13e28824d0b770929a8ce31021690ec",
+      "filename": "test/tests/operators/to_stdout/invalid_pipeline.txt",
+      "status": "added",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/ded0266050a11f0b71046428ca80ebd643911f88/test%2Ftests%2Foperators%2Fto_stdout%2Finvalid_pipeline.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/ded0266050a11f0b71046428ca80ebd643911f88/test%2Ftests%2Foperators%2Fto_stdout%2Finvalid_pipeline.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fto_stdout%2Finvalid_pipeline.txt?ref=ded0266050a11f0b71046428ca80ebd643911f88",
+      "patch": "@@ -0,0 +1,6 @@\n+error: pipeline must return bytes\n+ --> tests/operators/to_stdout/invalid_pipeline.tql:6:11\n+  |\n+6 | to_stdout {\n+  |           ^ \n+  |"
+    },
+    {
+      "sha": "44df5ac1337212fca31db7a0bb47d29794b229ec",
+      "filename": "test/tests/operators/to_stdout/subpipeline.tql",
+      "status": "added",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/ded0266050a11f0b71046428ca80ebd643911f88/test%2Ftests%2Foperators%2Fto_stdout%2Fsubpipeline.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/ded0266050a11f0b71046428ca80ebd643911f88/test%2Ftests%2Foperators%2Fto_stdout%2Fsubpipeline.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fto_stdout%2Fsubpipeline.tql?ref=ded0266050a11f0b71046428ca80ebd643911f88",
+      "patch": "@@ -0,0 +1,4 @@\n+from {x: 1}, {x: 2}\n+to_stdout {\n+  write_ndjson\n+}"
+    },
+    {
+      "sha": "15ed9966fbbc969d71ea758f9f35c8d5a4e080a9",
+      "filename": "test/tests/operators/to_stdout/subpipeline.txt",
+      "status": "added",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/ded0266050a11f0b71046428ca80ebd643911f88/test%2Ftests%2Foperators%2Fto_stdout%2Fsubpipeline.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/ded0266050a11f0b71046428ca80ebd643911f88/test%2Ftests%2Foperators%2Fto_stdout%2Fsubpipeline.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Fto_stdout%2Fsubpipeline.txt?ref=ded0266050a11f0b71046428ca80ebd643911f88",
+      "patch": "@@ -0,0 +1,2 @@\n+{\"x\":1}\n+{\"x\":2}"
+    }
+  ]
+}

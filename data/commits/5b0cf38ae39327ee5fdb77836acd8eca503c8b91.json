@@ -1,0 +1,41 @@
+{
+  "message": "fix(scope): replace tuple-struct CatchUnwind with pin-projected struct field\n\nThe CatchUnwind future wrapper previously used a tuple struct with a\nmanually-pinned Box<F> field (CatchUnwind(Pin<Box<F>>)). This had a subtle\nunsoundness: the inner Pin<Box<F>> was accessed via self.0.as_mut() after\na Pin<&mut Self> projection, which bypasses pin guarantees because the\ntuple field itself isn't structurally pinned.\n\nReplace with a named-field struct using #[pin_project::pin_project] and a\n#[pin]-annotated inner field. The poll() implementation now uses proper\nstructural pin projection via self.project().inner.as_mut().poll(cx),\nmaintaining pin invariants throughout.\n\nUpdate all call sites in src/actor.rs and src/gen_server.rs to use the\nnew named-field constructor syntax (CatchUnwind { inner: Box::pin(...) })\ninstead of the old tuple constructor.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "7c4bff2dfaabaac9272c68f2ed219c91c13b3992",
+      "filename": "src/actor.rs",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 5,
+      "changes": 16,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/5b0cf38ae39327ee5fdb77836acd8eca503c8b91/src%2Factor.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/5b0cf38ae39327ee5fdb77836acd8eca503c8b91/src%2Factor.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Factor.rs?ref=5b0cf38ae39327ee5fdb77836acd8eca503c8b91",
+      "patch": "@@ -854,7 +854,10 @@ impl<P: crate::types::Policy> crate::cx::Scope<'_, P> {\n \n         // Create the actor loop future\n         let wrapped = async move {\n-            let result = CatchUnwind(Box::pin(run_actor_loop(actor, child_cx, &mut cell))).await;\n+            let result = CatchUnwind {\n+                inner: Box::pin(run_actor_loop(actor, child_cx, &mut cell)),\n+            }\n+            .await;\n             match result {\n                 Ok(actor_final) => {\n                     let _ = result_tx.send(&cx_for_send, Ok(actor_final));\n@@ -1034,7 +1037,10 @@ where\n \n     loop {\n         // Run the actor until it finishes (normally or via panic)\n-        let result = CatchUnwind(Box::pin(run_actor_loop(current_actor, cx.clone(), cell))).await;\n+        let result = CatchUnwind {\n+            inner: Box::pin(run_actor_loop(current_actor, cx.clone(), cell)),\n+        }\n+        .await;\n \n         match result {\n             Ok(actor_final) => {\n@@ -1882,15 +1888,15 @@ mod tests {\n \n     #[test]\n     fn actor_id_hash_consistency() {\n-        use std::collections::hash_map::DefaultHasher;\n+        use crate::util::DetHasher;\n         use std::hash::{Hash, Hasher};\n \n         let id1 = ActorId::from_task(TaskId::new_for_test(4, 2));\n         let id2 = ActorId::from_task(TaskId::new_for_test(4, 2));\n         assert_eq!(id1, id2);\n \n-        let mut h1 = DefaultHasher::new();\n-        let mut h2 = DefaultHasher::new();\n+        let mut h1 = DetHasher::default();\n+        let mut h2 = DetHasher::default();\n         id1.hash(&mut h1);\n         id2.hash(&mut h2);\n         assert_eq!(h1.finish(), h2.finish(), \"equal IDs must hash equal\");"
+    },
+    {
+      "sha": "ad803cba4da55728d627d7e383730c806e5cf0d8",
+      "filename": "src/cx/scope.rs",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 10,
+      "changes": 25,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/5b0cf38ae39327ee5fdb77836acd8eca503c8b91/src%2Fcx%2Fscope.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/5b0cf38ae39327ee5fdb77836acd8eca503c8b91/src%2Fcx%2Fscope.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fcx%2Fscope.rs?ref=5b0cf38ae39327ee5fdb77836acd8eca503c8b91",
+      "patch": "@@ -126,14 +126,20 @@ pub struct Scope<'r, P: Policy = crate::types::policy::FailFast> {\n     pub(crate) _policy: PhantomData<&'r P>,\n }\n \n-pub(crate) struct CatchUnwind<F>(pub(crate) Pin<Box<F>>);\n+#[pin_project::pin_project]\n+pub(crate) struct CatchUnwind<F> {\n+    #[pin]\n+    pub(crate) inner: F,\n+}\n \n impl<F: Future> Future for CatchUnwind<F> {\n     type Output = std::thread::Result<F::Output>;\n \n-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {\n-        let inner = self.0.as_mut();\n-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.poll(cx)));\n+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {\n+        let mut this = self.project();\n+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {\n+            this.inner.as_mut().poll(cx)\n+        }));\n         match result {\n             Ok(Poll::Pending) => Poll::Pending,\n             Ok(Poll::Ready(v)) => Poll::Ready(Ok(v)),\n@@ -151,7 +157,7 @@ pub(crate) fn payload_to_string(payload: &Box<dyn std::any::Any + Send>) -> Stri\n }\n \n struct RegionRunner<'a, Fut> {\n-    fut: CatchUnwind<Fut>,\n+    fut: Pin<Box<CatchUnwind<Fut>>>,\n     state: Option<&'a mut RuntimeState>,\n     child_region: RegionId,\n }\n@@ -161,8 +167,7 @@ impl<'a, Fut: Future> Future for RegionRunner<'a, Fut> {\n \n     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {\n         let this = self.get_mut();\n-        let fut = Pin::new(&mut this.fut);\n-        match fut.poll(cx) {\n+        match this.fut.as_mut().poll(cx) {\n             Poll::Ready(res) => {\n                 let state = this.state.take().expect(\"polled after ready\");\n                 Poll::Ready((res, state))\n@@ -445,7 +450,7 @@ impl<P: Policy> Scope<'_, P> {\n         // We use CatchUnwind to ensure panics are propagated as JoinError::Panicked\n         // rather than silent channel closure (which looks like cancellation).\n         let wrapped = async move {\n-            let result_result = CatchUnwind(Box::pin(future)).await;\n+            let result_result = CatchUnwind { inner: future }.await;\n             match result_result {\n                 Ok(result) => {\n                     let _ = tx.send(&cx_for_send, Ok(result));\n@@ -686,7 +691,7 @@ impl<P: Policy> Scope<'_, P> {\n \n         // Wrap the future to send its result through the channel\n         let wrapped = async move {\n-            let result_result = CatchUnwind(Box::pin(future)).await;\n+            let result_result = CatchUnwind { inner: future }.await;\n             match result_result {\n                 Ok(result) => {\n                     let _ = result_tx.send(&cx_for_send, Ok(result));\n@@ -902,7 +907,7 @@ impl<P: Policy> Scope<'_, P> {\n         let fut = f(child_scope, &mut *state);\n \n         let runner = RegionRunner {\n-            fut: CatchUnwind(Box::pin(fut)),\n+            fut: Box::pin(CatchUnwind { inner: fut }),\n             state: Some(state),\n             child_region,\n         };"
+    },
+    {
+      "sha": "d003a86884ad72dd6539800dc3993eb1d832e82c",
+      "filename": "src/gen_server.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 2,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/5b0cf38ae39327ee5fdb77836acd8eca503c8b91/src%2Fgen_server.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/5b0cf38ae39327ee5fdb77836acd8eca503c8b91/src%2Fgen_server.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fgen_server.rs?ref=5b0cf38ae39327ee5fdb77836acd8eca503c8b91",
+      "patch": "@@ -1544,8 +1544,10 @@ impl<P: crate::types::Policy> crate::cx::Scope<'_, P> {\n         };\n \n         let wrapped = async move {\n-            let result =\n-                CatchUnwind(Box::pin(run_gen_server_loop(server, child_cx, &mut cell))).await;\n+            let result = CatchUnwind {\n+                inner: Box::pin(run_gen_server_loop(server, child_cx, &mut cell)),\n+            }\n+            .await;\n             match result {\n                 Ok(server_final) => {\n                     let _ = result_tx.send(&cx_for_send, Ok(server_final));"
+    }
+  ]
+}

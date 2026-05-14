@@ -1,0 +1,89 @@
+{
+  "message": "fix(auth): backfill account subjects on refresh",
+  "files": [
+    {
+      "sha": "476b9194f5fe63e78da5cb30991c6f6dd02c316a",
+      "filename": "internal/googleapi/client_auth.go",
+      "status": "modified",
+      "additions": 50,
+      "deletions": 9,
+      "changes": 59,
+      "blob_url": "https://github.com/openclaw/gogcli/blob/8addfcee8b39041ecc6e71e6a354ca17f188c013/internal%2Fgoogleapi%2Fclient_auth.go",
+      "raw_url": "https://github.com/openclaw/gogcli/raw/8addfcee8b39041ecc6e71e6a354ca17f188c013/internal%2Fgoogleapi%2Fclient_auth.go",
+      "contents_url": "https://api.github.com/repos/openclaw/gogcli/contents/internal%2Fgoogleapi%2Fclient_auth.go?ref=8addfcee8b39041ecc6e71e6a354ca17f188c013",
+      "patch": "@@ -34,6 +34,10 @@ type persistingTokenSource struct {\n \ttok secrets.Token\n }\n \n+type tokenAliasDeleter interface {\n+\tDeleteTokenAlias(client string, email string) error\n+}\n+\n func newPersistingTokenSource(base oauth2.TokenSource, store secrets.Store, client string, email string, tok secrets.Token) oauth2.TokenSource {\n \treturn &persistingTokenSource{\n \t\tbase:   base,\n@@ -51,27 +55,64 @@ func (p *persistingTokenSource) Token() (*oauth2.Token, error) {\n \t}\n \n \trefreshToken := strings.TrimSpace(t.RefreshToken)\n-\tif refreshToken == \"\" {\n-\t\treturn t, nil\n-\t}\n \n \tp.mu.Lock()\n \tdefer p.mu.Unlock()\n \n-\tif refreshToken == p.tok.RefreshToken {\n+\tupdated := p.tok\n+\tchanged := false\n+\temailChangedFromIdentity := false\n+\n+\tif refreshToken != \"\" && refreshToken != p.tok.RefreshToken {\n+\t\tupdated.RefreshToken = refreshToken\n+\t\tchanged = true\n+\t}\n+\n+\tif rawIDToken, ok := t.Extra(\"id_token\").(string); ok && strings.TrimSpace(rawIDToken) != \"\" {\n+\t\tif identity, identityErr := googleauth.IdentityFromIDToken(rawIDToken); identityErr == nil {\n+\t\t\tif strings.TrimSpace(identity.Subject) != \"\" && strings.TrimSpace(identity.Subject) != strings.TrimSpace(updated.Subject) {\n+\t\t\t\tupdated.Subject = strings.TrimSpace(identity.Subject)\n+\t\t\t\tchanged = true\n+\t\t\t}\n+\n+\t\t\tif email := strings.TrimSpace(identity.Email); email != \"\" && !strings.EqualFold(email, updated.Email) {\n+\t\t\t\tupdated.Email = email\n+\t\t\t\tchanged = true\n+\t\t\t\temailChangedFromIdentity = true\n+\t\t\t}\n+\t\t}\n+\t}\n+\n+\tif !changed {\n \t\treturn t, nil\n \t}\n \n-\tupdated := p.tok\n-\tupdated.RefreshToken = refreshToken\n+\tpersistEmail := strings.TrimSpace(p.email)\n+\tif emailChangedFromIdentity || persistEmail == \"\" {\n+\t\tpersistEmail = strings.TrimSpace(updated.Email)\n+\t}\n+\n+\tif persistEmail == \"\" {\n+\t\tpersistEmail = p.email\n+\t}\n \n-\tif err := p.store.SetToken(p.client, p.email, updated); err != nil {\n-\t\tslog.Warn(\"persist rotated refresh token failed\", \"email\", p.email, \"client\", p.client, \"err\", err)\n+\tif err := p.store.SetToken(p.client, persistEmail, updated); err != nil {\n+\t\tslog.Warn(\"persist refreshed token metadata failed\", \"email\", persistEmail, \"client\", p.client, \"err\", err)\n \t\treturn t, nil\n \t}\n \n+\tif !strings.EqualFold(p.email, persistEmail) {\n+\t\taliasDeleter, ok := p.store.(tokenAliasDeleter)\n+\t\tif !ok {\n+\t\t\tslog.Debug(\"token store cannot delete renamed email alias\", \"old_email\", p.email, \"new_email\", persistEmail, \"client\", p.client)\n+\t\t} else if err := aliasDeleter.DeleteTokenAlias(p.client, p.email); err != nil {\n+\t\t\tslog.Warn(\"delete renamed token alias failed\", \"old_email\", p.email, \"new_email\", persistEmail, \"client\", p.client, \"err\", err)\n+\t\t}\n+\t}\n+\n \tp.tok = updated\n-\tslog.Debug(\"persisted rotated refresh token\", \"email\", p.email, \"client\", p.client)\n+\tp.email = persistEmail\n+\tslog.Debug(\"persisted refreshed token metadata\", \"email\", persistEmail, \"client\", p.client)\n \n \treturn t, nil\n }"
+    },
+    {
+      "sha": "fe4b176bfc56c50de332a5e897d9a5b3ed4635dd",
+      "filename": "internal/googleapi/client_more_test.go",
+      "status": "modified",
+      "additions": 113,
+      "deletions": 1,
+      "changes": 114,
+      "blob_url": "https://github.com/openclaw/gogcli/blob/8addfcee8b39041ecc6e71e6a354ca17f188c013/internal%2Fgoogleapi%2Fclient_more_test.go",
+      "raw_url": "https://github.com/openclaw/gogcli/raw/8addfcee8b39041ecc6e71e6a354ca17f188c013/internal%2Fgoogleapi%2Fclient_more_test.go",
+      "contents_url": "https://api.github.com/repos/openclaw/gogcli/contents/internal%2Fgoogleapi%2Fclient_more_test.go?ref=8addfcee8b39041ecc6e71e6a354ca17f188c013",
+      "patch": "@@ -3,6 +3,8 @@ package googleapi\n import (\n \t\"context\"\n \t\"crypto/tls\"\n+\t\"encoding/base64\"\n+\t\"encoding/json\"\n \t\"errors\"\n \t\"net/http\"\n \t\"os\"\n@@ -38,6 +40,11 @@ type stubStore struct {\n \tlastSet   secrets.Token\n \tsetCalls  int\n \tsetErr    error\n+\n+\tdeleteClient string\n+\tdeleteEmail  string\n+\tdeleteCalls  int\n+\tdeleteErr    error\n }\n \n func (s *stubStore) Keys() ([]string, error) { return nil, nil }\n@@ -55,7 +62,23 @@ func (s *stubStore) SetToken(client string, email string, tok secrets.Token) err\n \n \treturn nil\n }\n-func (s *stubStore) DeleteToken(string, string) error         { return nil }\n+\n+func (s *stubStore) DeleteToken(client string, email string) error {\n+\ts.deleteClient = client\n+\ts.deleteEmail = email\n+\ts.deleteCalls++\n+\n+\tif s.deleteErr != nil {\n+\t\treturn s.deleteErr\n+\t}\n+\n+\treturn nil\n+}\n+\n+func (s *stubStore) DeleteTokenAlias(client string, email string) error {\n+\treturn s.DeleteToken(client, email)\n+}\n+\n func (s *stubStore) ListTokens() ([]secrets.Token, error)     { return nil, nil }\n func (s *stubStore) GetDefaultAccount(string) (string, error) { return \"\", nil }\n func (s *stubStore) SetDefaultAccount(string, string) error   { return nil }\n@@ -208,6 +231,79 @@ func TestPersistingTokenSource_NoRotationDoesNotPersist(t *testing.T) {\n \t}\n }\n \n+func TestPersistingTokenSource_BackfillsSubjectFromIDToken(t *testing.T) {\n+\tstored := secrets.Token{Email: \"a@b.com\", RefreshToken: \"same-token\"}\n+\tstore := &stubStore{tok: stored}\n+\tbase := oauth2.StaticTokenSource((&oauth2.Token{\n+\t\tAccessToken:  \"access\",\n+\t\tRefreshToken: \"same-token\",\n+\t}).WithExtra(map[string]any{\n+\t\t\"id_token\": unsignedIDTokenForTest(t, \"sub-123\", \"a@b.com\"),\n+\t}))\n+\tts := newPersistingTokenSource(base, store, config.DefaultClientName, \"a@b.com\", stored)\n+\n+\tif _, err := ts.Token(); err != nil {\n+\t\tt.Fatalf(\"Token: %v\", err)\n+\t}\n+\n+\tif store.setCalls != 1 {\n+\t\tt.Fatalf(\"expected 1 SetToken call, got %d\", store.setCalls)\n+\t}\n+\n+\tif store.setEmail != \"a@b.com\" {\n+\t\tt.Fatalf(\"unexpected email: %q\", store.setEmail)\n+\t}\n+\n+\tif store.lastSet.Subject != \"sub-123\" {\n+\t\tt.Fatalf(\"expected subject to persist, got %q\", store.lastSet.Subject)\n+\t}\n+\n+\tif store.lastSet.RefreshToken != \"same-token\" {\n+\t\tt.Fatalf(\"refresh token changed unexpectedly: %q\", store.lastSet.RefreshToken)\n+\t}\n+}\n+\n+func TestPersistingTokenSource_MigratesRenamedEmailFromIDToken(t *testing.T) {\n+\tstored := secrets.Token{Email: \"old@example.com\", RefreshToken: \"same-token\", Subject: \"sub-123\"}\n+\tstore := &stubStore{tok: stored}\n+\tbase := oauth2.StaticTokenSource((&oauth2.Token{\n+\t\tAccessToken:  \"access\",\n+\t\tRefreshToken: \"same-token\",\n+\t}).WithExtra(map[string]any{\n+\t\t\"id_token\": unsignedIDTokenForTest(t, \"sub-123\", \"new@example.com\"),\n+\t}))\n+\tts := newPersistingTokenSource(base, store, config.DefaultClientName, \"old@example.com\", stored)\n+\n+\tif _, err := ts.Token(); err != nil {\n+\t\tt.Fatalf(\"Token: %v\", err)\n+\t}\n+\n+\tif store.setCalls != 1 {\n+\t\tt.Fatalf(\"expected 1 SetToken call, got %d\", store.setCalls)\n+\t}\n+\n+\tif store.setEmail != \"new@example.com\" {\n+\t\tt.Fatalf(\"expected new email to persist, got %q\", store.setEmail)\n+\t}\n+\n+\tif store.lastSet.Email != \"new@example.com\" || store.lastSet.Subject != \"sub-123\" {\n+\t\tt.Fatalf(\"unexpected stored token: %#v\", store.lastSet)\n+\t}\n+\n+\tif store.deleteCalls != 1 || store.deleteClient != config.DefaultClientName || store.deleteEmail != \"old@example.com\" {\n+\t\tt.Fatalf(\"expected old alias delete, got calls=%d client=%q email=%q\", store.deleteCalls, store.deleteClient, store.deleteEmail)\n+\t}\n+\n+\tpts, ok := ts.(*persistingTokenSource)\n+\tif !ok {\n+\t\tt.Fatalf(\"expected persistingTokenSource\")\n+\t}\n+\n+\tif pts.email != \"new@example.com\" {\n+\t\tt.Fatalf(\"expected source email updated, got %q\", pts.email)\n+\t}\n+}\n+\n func TestPersistingTokenSource_PersistFailureIsNonFatal(t *testing.T) {\n \tstored := secrets.Token{Email: \"a@b.com\", RefreshToken: \"old-token\"}\n \tstore := &stubStore{tok: stored, setErr: errBoom}\n@@ -232,6 +328,22 @@ func TestPersistingTokenSource_PersistFailureIsNonFatal(t *testing.T) {\n \t}\n }\n \n+func unsignedIDTokenForTest(t *testing.T, subject string, email string) string {\n+\tt.Helper()\n+\n+\theader, err := json.Marshal(map[string]string{\"alg\": \"none\"})\n+\tif err != nil {\n+\t\tt.Fatalf(\"marshal header: %v\", err)\n+\t}\n+\n+\tpayload, err := json.Marshal(map[string]string{\"sub\": subject, \"email\": email})\n+\tif err != nil {\n+\t\tt.Fatalf(\"marshal payload: %v\", err)\n+\t}\n+\n+\treturn base64.RawURLEncoding.EncodeToString(header) + \".\" + base64.RawURLEncoding.EncodeToString(payload) + \".\"\n+}\n+\n func TestTokenSourceForAccount_ReadCredsError(t *testing.T) {\n \torigRead := readClientCredentials\n "
+    },
+    {
+      "sha": "6b577112870d226461acf186a3271f6bcf1c1f34",
+      "filename": "internal/googleauth/accounts_server.go",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 3,
+      "changes": 6,
+      "blob_url": "https://github.com/openclaw/gogcli/blob/8addfcee8b39041ecc6e71e6a354ca17f188c013/internal%2Fgoogleauth%2Faccounts_server.go",
+      "raw_url": "https://github.com/openclaw/gogcli/raw/8addfcee8b39041ecc6e71e6a354ca17f188c013/internal%2Fgoogleauth%2Faccounts_server.go",
+      "contents_url": "https://api.github.com/repos/openclaw/gogcli/contents/internal%2Fgoogleauth%2Faccounts_server.go?ref=8addfcee8b39041ecc6e71e6a354ca17f188c013",
+      "patch": "@@ -531,7 +531,7 @@ func fetchUserIdentityDefault(ctx context.Context, tok *oauth2.Token) (Identity,\n \t}\n \n \tif raw, ok := tok.Extra(\"id_token\").(string); ok && raw != \"\" {\n-\t\tif identity, err := identityFromIDToken(raw); err == nil {\n+\t\tif identity, err := IdentityFromIDToken(raw); err == nil {\n \t\t\treturn identity, nil\n \t\t}\n \t}\n@@ -614,15 +614,15 @@ func fetchUserIdentityWithURL(ctx context.Context, accessToken string, url strin\n }\n \n func emailFromIDToken(idToken string) (string, error) {\n-\tidentity, err := identityFromIDToken(idToken)\n+\tidentity, err := IdentityFromIDToken(idToken)\n \tif err != nil {\n \t\treturn \"\", err\n \t}\n \n \treturn identity.Email, nil\n }\n \n-func identityFromIDToken(idToken string) (Identity, error) {\n+func IdentityFromIDToken(idToken string) (Identity, error) {\n \tparts := strings.Split(idToken, \".\")\n \tif len(parts) < 2 {\n \t\treturn Identity{}, errInvalidIDToken"
+    },
+    {
+      "sha": "9b2f7c06cc4fa5f765281d10d68a34f30a9e525e",
+      "filename": "internal/googleauth/accounts_server_test.go",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/openclaw/gogcli/blob/8addfcee8b39041ecc6e71e6a354ca17f188c013/internal%2Fgoogleauth%2Faccounts_server_test.go",
+      "raw_url": "https://github.com/openclaw/gogcli/raw/8addfcee8b39041ecc6e71e6a354ca17f188c013/internal%2Fgoogleauth%2Faccounts_server_test.go",
+      "contents_url": "https://api.github.com/repos/openclaw/gogcli/contents/internal%2Fgoogleauth%2Faccounts_server_test.go?ref=8addfcee8b39041ecc6e71e6a354ca17f188c013",
+      "patch": "@@ -853,9 +853,9 @@ func TestEmailFromIDToken(t *testing.T) {\n \t\t\tt.Fatalf(\"expected me@example.com, got %q\", email)\n \t\t}\n \n-\t\tidentity, err := identityFromIDToken(idToken)\n+\t\tidentity, err := IdentityFromIDToken(idToken)\n \t\tif err != nil {\n-\t\t\tt.Fatalf(\"identityFromIDToken: %v\", err)\n+\t\t\tt.Fatalf(\"IdentityFromIDToken: %v\", err)\n \t\t}\n \n \t\tif identity.Subject != \"sub-123\" || identity.Email != \"me@example.com\" {"
+    },
+    {
+      "sha": "2bf0103981ee9ce883b51038a8484fc3981d7ad4",
+      "filename": "internal/googleauth/token_email.go",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/openclaw/gogcli/blob/8addfcee8b39041ecc6e71e6a354ca17f188c013/internal%2Fgoogleauth%2Ftoken_email.go",
+      "raw_url": "https://github.com/openclaw/gogcli/raw/8addfcee8b39041ecc6e71e6a354ca17f188c013/internal%2Fgoogleauth%2Ftoken_email.go",
+      "contents_url": "https://api.github.com/repos/openclaw/gogcli/contents/internal%2Fgoogleauth%2Ftoken_email.go?ref=8addfcee8b39041ecc6e71e6a354ca17f188c013",
+      "patch": "@@ -47,7 +47,7 @@ func IdentityForRefreshToken(ctx context.Context, client string, refreshToken st\n \t}\n \n \tif raw, ok := tok.Extra(\"id_token\").(string); ok {\n-\t\tif identity, err := identityFromIDToken(raw); err == nil {\n+\t\tif identity, err := IdentityFromIDToken(raw); err == nil {\n \t\t\treturn identity, nil\n \t\t}\n \t}"
+    },
+    {
+      "sha": "8f5198df19207d69169efb6de9a66ab34daa365b",
+      "filename": "internal/secrets/store.go",
+      "status": "modified",
+      "additions": 26,
+      "deletions": 0,
+      "changes": 26,
+      "blob_url": "https://github.com/openclaw/gogcli/blob/8addfcee8b39041ecc6e71e6a354ca17f188c013/internal%2Fsecrets%2Fstore.go",
+      "raw_url": "https://github.com/openclaw/gogcli/raw/8addfcee8b39041ecc6e71e6a354ca17f188c013/internal%2Fsecrets%2Fstore.go",
+      "contents_url": "https://api.github.com/repos/openclaw/gogcli/contents/internal%2Fsecrets%2Fstore.go?ref=8addfcee8b39041ecc6e71e6a354ca17f188c013",
+      "patch": "@@ -520,6 +520,32 @@ func (s *KeyringStore) DeleteToken(client string, email string) error {\n \treturn nil\n }\n \n+// DeleteTokenAlias removes only the email-address key for a token, preserving\n+// the subject-keyed canonical copy.\n+func (s *KeyringStore) DeleteTokenAlias(client string, email string) error {\n+\temail = normalize(email)\n+\tif email == \"\" {\n+\t\treturn errMissingEmail\n+\t}\n+\n+\tnormalizedClient, err := normalizeClient(client)\n+\tif err != nil {\n+\t\treturn err\n+\t}\n+\n+\tif err := s.ring.Remove(tokenKey(normalizedClient, email)); err != nil && !errors.Is(err, keyring.ErrKeyNotFound) {\n+\t\treturn fmt.Errorf(\"delete token alias: %w\", err)\n+\t}\n+\n+\tif normalizedClient == config.DefaultClientName {\n+\t\tif err := s.ring.Remove(legacyTokenKey(email)); err != nil && !errors.Is(err, keyring.ErrKeyNotFound) {\n+\t\t\treturn fmt.Errorf(\"delete legacy token alias: %w\", err)\n+\t\t}\n+\t}\n+\n+\treturn nil\n+}\n+\n func (s *KeyringStore) ListTokens() ([]Token, error) {\n \tkeys, err := s.Keys()\n \tif err != nil {"
+    },
+    {
+      "sha": "da4966b4bf3d053e7a7e6e2a5acf10d98d70b625",
+      "filename": "internal/secrets/store_more_test.go",
+      "status": "modified",
+      "additions": 27,
+      "deletions": 0,
+      "changes": 27,
+      "blob_url": "https://github.com/openclaw/gogcli/blob/8addfcee8b39041ecc6e71e6a354ca17f188c013/internal%2Fsecrets%2Fstore_more_test.go",
+      "raw_url": "https://github.com/openclaw/gogcli/raw/8addfcee8b39041ecc6e71e6a354ca17f188c013/internal%2Fsecrets%2Fstore_more_test.go",
+      "contents_url": "https://api.github.com/repos/openclaw/gogcli/contents/internal%2Fsecrets%2Fstore_more_test.go?ref=8addfcee8b39041ecc6e71e6a354ca17f188c013",
+      "patch": "@@ -223,6 +223,33 @@ func TestKeyringStoreSubjectKeyRoundTripAndDelete(t *testing.T) {\n \t}\n }\n \n+func TestKeyringStoreDeleteTokenAliasPreservesSubjectKey(t *testing.T) {\n+\tring := keyring.NewArrayKeyring(nil)\n+\tstore := &KeyringStore{ring: ring}\n+\tclient := config.DefaultClientName\n+\n+\ttok := Token{\n+\t\tSubject:      \"google-sub-123\",\n+\t\tEmail:        \"old@example.com\",\n+\t\tRefreshToken: \"rt\",\n+\t}\n+\tif err := store.SetToken(client, tok.Email, tok); err != nil {\n+\t\tt.Fatalf(\"SetToken: %v\", err)\n+\t}\n+\n+\tif err := store.DeleteTokenAlias(client, \"old@example.com\"); err != nil {\n+\t\tt.Fatalf(\"DeleteTokenAlias: %v\", err)\n+\t}\n+\n+\tif _, err := ring.Get(tokenKey(client, \"old@example.com\")); !errors.Is(err, keyring.ErrKeyNotFound) {\n+\t\tt.Fatalf(\"expected email token removed, got %v\", err)\n+\t}\n+\n+\tif _, err := ring.Get(subjectTokenKey(client, tok.Subject)); err != nil {\n+\t\tt.Fatalf(\"expected subject key preserved, got %v\", err)\n+\t}\n+}\n+\n func TestKeyringStoreSetTokenRemovesStaleSubjectKey(t *testing.T) {\n \tring := keyring.NewArrayKeyring(nil)\n \tstore := &KeyringStore{ring: ring}"
+    }
+  ]
+}

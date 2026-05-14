@@ -1,0 +1,29 @@
+{
+  "message": "Fix exec stdin deadlock on unix websockets",
+  "files": [
+    {
+      "sha": "5e8c2d55f6a5b20d12c8b81fc629ec5f06e7a080",
+      "filename": "src/incus.ts",
+      "status": "modified",
+      "additions": 25,
+      "deletions": 12,
+      "changes": 37,
+      "blob_url": "https://github.com/philipp-spiess/incus-ts/blob/cfea39866934f58534d834e1ed8dcb8d4dbe4a4d/src%2Fincus.ts",
+      "raw_url": "https://github.com/philipp-spiess/incus-ts/raw/cfea39866934f58534d834e1ed8dcb8d4dbe4a4d/src%2Fincus.ts",
+      "contents_url": "https://api.github.com/repos/philipp-spiess/incus-ts/contents/src%2Fincus.ts?ref=cfea39866934f58534d834e1ed8dcb8d4dbe4a4d",
+      "patch": "@@ -2274,20 +2274,33 @@ function streamWebSocketToWritable(\n \n async function sendToWebSocket(socket: WebSocketLike, data: Uint8Array): Promise<void> {\n   if (isNodeWebSocket(socket)) {\n+    const send = (socket as unknown as {\n+      send: (\n+        payload: Uint8Array,\n+        callback?: (error?: Error) => void,\n+      ) => void;\n+    }).send;\n+\n+    // Unix-socket websocket shims expose a synchronous `send(data)` API, while\n+    // libraries like `ws` use the callback form to signal flush completion.\n+    if (send.length < 2) {\n+      send.call(socket, data);\n+      return;\n+    }\n+\n     await new Promise<void>((resolve, reject) => {\n-      (socket as unknown as {\n-        send: (\n-          payload: Uint8Array,\n-          callback: (error?: Error) => void,\n-        ) => void;\n-      }).send(data, (error?: Error) => {\n-        if (error) {\n-          reject(error);\n-          return;\n-        }\n+      try {\n+        send.call(socket, data, (error?: Error) => {\n+          if (error) {\n+            reject(error);\n+            return;\n+          }\n \n-        resolve();\n-      });\n+          resolve();\n+        });\n+      } catch (error) {\n+        reject(error);\n+      }\n     });\n     return;\n   }"
+    },
+    {
+      "sha": "a3e8cb8bd086878c7918e7a2f425da7e34561687",
+      "filename": "test/incus.test.ts",
+      "status": "modified",
+      "additions": 71,
+      "deletions": 2,
+      "changes": 73,
+      "blob_url": "https://github.com/philipp-spiess/incus-ts/blob/cfea39866934f58534d834e1ed8dcb8d4dbe4a4d/test%2Fincus.test.ts",
+      "raw_url": "https://github.com/philipp-spiess/incus-ts/raw/cfea39866934f58534d834e1ed8dcb8d4dbe4a4d/test%2Fincus.test.ts",
+      "contents_url": "https://api.github.com/repos/philipp-spiess/incus-ts/contents/test%2Fincus.test.ts?ref=cfea39866934f58534d834e1ed8dcb8d4dbe4a4d",
+      "patch": "@@ -67,6 +67,8 @@ class FakeTransport implements IncusTransport {\n \n class FakeWebSocket {\n   private readonly events = new EventEmitter();\n+  readonly sentMessages: unknown[] = [];\n+  closedCount = 0;\n \n   on(type: string, listener: (...args: unknown[]) => void) {\n     this.events.on(type, listener);\n@@ -76,11 +78,12 @@ class FakeWebSocket {\n     this.events.off(type, listener);\n   }\n \n-  send(_data: unknown) {\n-    // No-op for tests.\n+  send(data: unknown) {\n+    this.sentMessages.push(data);\n   }\n \n   close() {\n+    this.closedCount += 1;\n     this.events.emit(\"close\");\n   }\n \n@@ -288,6 +291,72 @@ test(\"instances.exec supports pipe streaming with async iterators\", async () =>\n   ]);\n });\n \n+test(\"instances.exec keeps streaming stdin over callback-less node-style websockets\", async () => {\n+  const transport = new FakeTransport();\n+  const stdinSocket = new FakeWebSocket();\n+  const encoder = new TextEncoder();\n+  const decoder = new TextDecoder();\n+  let stdinController: ReadableStreamDefaultController<Uint8Array> | undefined;\n+\n+  transport.on(\"POST\", \"/1.0/instances/c1/exec\", () => ({\n+    status: 200,\n+    data: {\n+      type: \"async\",\n+      status: \"Operation created\",\n+      status_code: 100,\n+      operation: \"/1.0/operations/op-exec-stdin\",\n+      metadata: {\n+        fds: {\n+          \"0\": \"sec-in\",\n+        },\n+      },\n+    },\n+    headers: new Headers(),\n+  }));\n+  transport.onWebsocket(\"/1.0/operations/op-exec-stdin/websocket?secret=sec-in\", () => (\n+    stdinSocket as unknown as WebSocket\n+  ));\n+\n+  const stdin = new ReadableStream<Uint8Array>({\n+    start(controller) {\n+      stdinController = controller;\n+    },\n+  });\n+\n+  const client = Incus.fromTransport(\"https://incus.example.internal\", transport);\n+  const proc = client.instances.instance(\"c1\").exec(\n+    { command: [\"/bin/cat\"] },\n+    { stdin },\n+  );\n+\n+  for (let attempt = 0; attempt < 20 && proc.id.length === 0; attempt += 1) {\n+    await new Promise<void>((resolve) => setTimeout(resolve, 0));\n+  }\n+  expect(proc.id).toBe(\"op-exec-stdin\");\n+\n+  stdinController?.enqueue(encoder.encode(\"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":1}\\n\"));\n+  stdinController?.enqueue(encoder.encode(\"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":2}\\n\"));\n+  stdinController?.close();\n+\n+  for (\n+    let attempt = 0;\n+    attempt < 20 && (stdinSocket.sentMessages.length < 2 || stdinSocket.closedCount === 0);\n+    attempt += 1\n+  ) {\n+    await new Promise<void>((resolve) => setTimeout(resolve, 0));\n+  }\n+\n+  expect(\n+    stdinSocket.sentMessages.map((message) => (\n+      decoder.decode(Buffer.from(message as Uint8Array))\n+    )),\n+  ).toEqual([\n+    \"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":1}\\n\",\n+    \"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":2}\\n\",\n+  ]);\n+  expect(stdinSocket.closedCount).toBeGreaterThan(0);\n+});\n+\n test(\"instance snapshots support lifecycle and restore\", async () => {\n   const transport = new FakeTransport();\n "
+    }
+  ]
+}

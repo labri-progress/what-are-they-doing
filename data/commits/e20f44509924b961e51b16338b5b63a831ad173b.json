@@ -1,0 +1,41 @@
+{
+  "message": "fix(supervisor): keep service-managed children attached (#38463, thanks @spirittechie)\n\nCo-authored-by: Jesse Paul <drzin69@gmail.com>",
+  "files": [
+    {
+      "sha": "8d3773321c33334f77fc906a8287badeed7e35e6",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/e20f44509924b961e51b16338b5b63a831ad173b/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/e20f44509924b961e51b16338b5b63a831ad173b/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=e20f44509924b961e51b16338b5b63a831ad173b",
+      "patch": "@@ -282,6 +282,7 @@ Docs: https://docs.openclaw.ai\n - Config/env substitution degraded mode: convert missing `${VAR}` resolution in config reads from hard-fail to warning-backed degraded behavior, while preventing unresolved placeholders from being accepted as gateway credentials. (#39050) Thanks @akz142857.\n - Discord inbound listener non-blocking dispatch: make `MESSAGE_CREATE` listener handoff asynchronous (no per-listener queue blocking), so long runs no longer stall unrelated incoming events. (#39154) Thanks @yaseenkadlemakki.\n - Daemon/Windows PATH freeze fix: stop persisting install-time `PATH` snapshots into Scheduled Task scripts so runtime tool lookup follows current host PATH updates; also refresh local TUI history on silent local finals. (#39139) Thanks @Narcooo.\n+- Gateway/systemd service restart hardening: clear stale gateway listeners by explicit run-port before service bind, add restart stale-pid port-override support, tune systemd start/stop/exit handling, and disable detached child mode only in service-managed runtime so cgroup stop semantics clean up descendants reliably. (#38463) Thanks @spirittechie.\n \n ## 2026.3.2\n "
+    },
+    {
+      "sha": "88885800b57d24aacfff0b5b77510dabfbafa90f",
+      "filename": "src/process/supervisor/adapters/child.test.ts",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 0,
+      "changes": 20,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/e20f44509924b961e51b16338b5b63a831ad173b/src%2Fprocess%2Fsupervisor%2Fadapters%2Fchild.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/e20f44509924b961e51b16338b5b63a831ad173b/src%2Fprocess%2Fsupervisor%2Fadapters%2Fchild.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fprocess%2Fsupervisor%2Fadapters%2Fchild.test.ts?ref=e20f44509924b961e51b16338b5b63a831ad173b",
+      "patch": "@@ -49,13 +49,20 @@ async function createAdapterHarness(params?: {\n }\n \n describe(\"createChildAdapter\", () => {\n+  const originalServiceMarker = process.env.OPENCLAW_SERVICE_MARKER;\n+\n   beforeAll(async () => {\n     ({ createChildAdapter } = await import(\"./child.js\"));\n   });\n \n   beforeEach(() => {\n     spawnWithFallbackMock.mockClear();\n     killProcessTreeMock.mockClear();\n+    if (originalServiceMarker === undefined) {\n+      delete process.env.OPENCLAW_SERVICE_MARKER;\n+    } else {\n+      process.env.OPENCLAW_SERVICE_MARKER = originalServiceMarker;\n+    }\n   });\n \n   it(\"uses process-tree kill for default SIGKILL\", async () => {\n@@ -90,6 +97,19 @@ describe(\"createChildAdapter\", () => {\n     expect(killMock).toHaveBeenCalledWith(\"SIGTERM\");\n   });\n \n+  it(\"disables detached mode in service-managed runtime\", async () => {\n+    process.env.OPENCLAW_SERVICE_MARKER = \"openclaw\";\n+\n+    await createAdapterHarness({ pid: 7777 });\n+\n+    const spawnArgs = spawnWithFallbackMock.mock.calls[0]?.[0] as {\n+      options?: { detached?: boolean };\n+      fallbacks?: Array<{ options?: { detached?: boolean } }>;\n+    };\n+    expect(spawnArgs.options?.detached).toBe(false);\n+    expect(spawnArgs.fallbacks ?? []).toEqual([]);\n+  });\n+\n   it(\"keeps inherited env when no override env is provided\", async () => {\n     await createAdapterHarness({\n       pid: 3333,"
+    },
+    {
+      "sha": "44275df6e64f79a6d52b2aa8610c863275e2980c",
+      "filename": "src/process/supervisor/adapters/child.ts",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 5,
+      "changes": 13,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/e20f44509924b961e51b16338b5b63a831ad173b/src%2Fprocess%2Fsupervisor%2Fadapters%2Fchild.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/e20f44509924b961e51b16338b5b63a831ad173b/src%2Fprocess%2Fsupervisor%2Fadapters%2Fchild.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fprocess%2Fsupervisor%2Fadapters%2Fchild.ts?ref=e20f44509924b961e51b16338b5b63a831ad173b",
+      "patch": "@@ -21,6 +21,10 @@ function resolveCommand(command: string): string {\n \n export type ChildAdapter = SpawnProcessAdapter<NodeJS.Signals | null>;\n \n+function isServiceManagedRuntime(): boolean {\n+  return Boolean(process.env.OPENCLAW_SERVICE_MARKER?.trim());\n+}\n+\n export async function createChildAdapter(params: {\n   argv: string[];\n   cwd?: string;\n@@ -34,11 +38,10 @@ export async function createChildAdapter(params: {\n \n   const stdinMode = params.stdinMode ?? (params.input !== undefined ? \"pipe-closed\" : \"inherit\");\n \n-  // On Windows, `detached: true` creates a new process group and can prevent\n-  // stdout/stderr pipes from connecting when running under a Scheduled Task\n-  // (headless, no console). Default to `detached: false` on Windows; on\n-  // POSIX systems keep `detached: true` so the child survives parent exit.\n-  const useDetached = process.platform !== \"win32\";\n+  // In service-managed mode keep children attached so systemd/launchd can\n+  // stop the full process tree reliably. Outside service mode preserve the\n+  // existing POSIX detached behavior.\n+  const useDetached = process.platform !== \"win32\" && !isServiceManagedRuntime();\n \n   const options: SpawnOptions = {\n     cwd: params.cwd,"
+    }
+  ]
+}

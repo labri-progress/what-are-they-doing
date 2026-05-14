@@ -1,0 +1,41 @@
+{
+  "message": "Security: log silent catch blocks, handle binary content in show/read-file APIs\n\n- Add error logging to pack-worker.ts deflate catch and git-engine.ts node:zlib fallback\n- Detect binary blobs (null byte in first 8KB) and return base64-encoded content\n- Prevents garbled JSON responses when reading binary files via REST API",
+  "files": [
+    {
+      "sha": "034244ddf5d1bd87604c14cee1b3306d44c8a70b",
+      "filename": "src/git-engine.ts",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/1cddf359f09dc9128a9dd874d6872b22b9e0f98a/src%2Fgit-engine.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/1cddf359f09dc9128a9dd874d6872b22b9e0f98a/src%2Fgit-engine.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Fgit-engine.ts?ref=1cddf359f09dc9128a9dd874d6872b22b9e0f98a",
+      "patch": "@@ -348,7 +348,8 @@ export class GitEngine {\n           inflate.on(\"error\", reject);\n           inflate.end(Buffer.from(compressed.buffer, compressed.byteOffset, compressed.byteLength));\n         });\n-      } catch {\n+      } catch (err) {\n+        console.error(`readObject: node:zlib inflate failed for ${sha} (${compressed.length} bytes): ${err}`);\n         return null;\n       }\n     }"
+    },
+    {
+      "sha": "809ce66c902c9f01d5d69ac4838d2a1c40bcb7f3",
+      "filename": "src/pack-worker.ts",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 2,
+      "changes": 12,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/1cddf359f09dc9128a9dd874d6872b22b9e0f98a/src%2Fpack-worker.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/1cddf359f09dc9128a9dd874d6872b22b9e0f98a/src%2Fpack-worker.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Fpack-worker.ts?ref=1cddf359f09dc9128a9dd874d6872b22b9e0f98a",
+      "patch": "@@ -176,7 +176,12 @@ export class PackWorkerDO extends DurableObject<Env> {\n         raw = wasm.zlibInflate(compressed, maxSize);\n         if (raw.length > 0) break;\n         raw = null;\n-      } catch { raw = null; }\n+      } catch (err) {\n+        raw = null;\n+        if (mult === sizes[sizes.length - 1]) {\n+          console.error(`pack-worker: inflate failed after all attempts (${compressed.length} bytes): ${err}`);\n+        }\n+      }\n     }\n     if (!raw || raw.length === 0) return null;\n \n@@ -195,7 +200,10 @@ export class PackWorkerDO extends DurableObject<Env> {\n     let packCompressed: Uint8Array;\n     try {\n       packCompressed = wasm.zlibDeflate(content);\n-    } catch { return null; }\n+    } catch (err) {\n+      console.error(`pack-worker: deflate failed (${content.length} bytes): ${err}`);\n+      return null;\n+    }\n     if (packCompressed.length === 0) return null;\n \n     // Build packfile entry: type/size header + compressed content"
+    },
+    {
+      "sha": "32a6f320e5a0b38295e8741bca21fee11bb19a26",
+      "filename": "src/repo-store.ts",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 6,
+      "changes": 28,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/1cddf359f09dc9128a9dd874d6872b22b9e0f98a/src%2Frepo-store.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/1cddf359f09dc9128a9dd874d6872b22b9e0f98a/src%2Frepo-store.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Frepo-store.ts?ref=1cddf359f09dc9128a9dd874d6872b22b9e0f98a",
+      "patch": "@@ -25,6 +25,10 @@ const MAX_FILES_PER_COMMIT = 10_000;\n const MAX_API_BODY = 10 * 1024 * 1024; // 10MB\n const INVALID_REF_CHARS = /[\\x00-\\x1f\\x7f ~^:?*\\[\\\\]/;\n \n+function bufferToBase64(data: Uint8Array): string {\n+  return Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString(\"base64\");\n+}\n+\n export function validateRefName(name: string): void {\n   if (!name || typeof name !== \"string\") throw new Error(\"Ref name is required\");\n   if (name.length > MAX_REF_NAME_LEN) throw new Error(\"Ref name too long\");\n@@ -287,8 +291,11 @@ async function handleApiAction(\n       const path = url.searchParams.get(\"path\") ?? \"\";\n       const content = await porcelain.catFile(ref, path);\n       if (!content) return Response.json({ error: \"not found\" }, { status: 404 });\n-      const text = decoder.decode(content);\n-      return Response.json({ content: text, size: content.length });\n+      const isBinary = content.subarray(0, 8192).includes(0x00);\n+      if (isBinary) {\n+        return Response.json({ content: bufferToBase64(content), size: content.length, encoding: \"base64\" });\n+      }\n+      return Response.json({ content: decoder.decode(content), size: content.length });\n     }\n \n     case \"list-files\": {\n@@ -567,11 +574,20 @@ async function handleApiAction(\n       const obj = await engine.readObject(resolved);\n       if (!obj) return Response.json({ error: \"not found\" }, { status: 404 });\n       const typeNames = [\"\", \"blob\", \"tree\", \"commit\", \"tag\"];\n-      return Response.json({\n-        type: typeNames[obj.type] ?? \"unknown\",\n+      const typeName = typeNames[obj.type] ?? \"unknown\";\n+      // Blobs may be binary \u2014 detect via null bytes in first 8KB\n+      const isBinary = typeName === \"blob\" && obj.content.subarray(0, 8192).includes(0x00);\n+      const result: Record<string, unknown> = {\n+        type: typeName,\n         size: obj.content.length,\n-        content: decoder.decode(obj.content),\n-      });\n+      };\n+      if (isBinary) {\n+        result.encoding = \"base64\";\n+        result.content = bufferToBase64(obj.content);\n+      } else {\n+        result.content = decoder.decode(obj.content);\n+      }\n+      return Response.json(result);\n     }\n \n     default:"
+    }
+  ]
+}

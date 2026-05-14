@@ -1,0 +1,53 @@
+{
+  "message": "fix: harden lexical cleanup approval + memo GC + readiness serde\n\nFive review findings addressed:\n\n1. lexical_generation: compute_approval_fingerprint is now invariant under\n   manifest/shard iteration order.  reclaim_candidates, inspection_items,\n   active_generation_ids, and protected_generation_ids are hashed in sorted\n   order so filesystem/HashMap-backed callers produce stable fingerprints.\n2. lexical_generation: add #[serde(default)] to new LexicalCleanupApplyGate\n   fields (approval_fingerprint, provided_approval_fingerprint,\n   approval_fingerprint_status, approval_fingerprint_matches, generation_count,\n   total_artifact_bytes, total_retained_bytes) so older JSON payloads\n   deserialize cleanly.  LexicalCleanupApprovalFingerprintStatus gains a\n   Default (NotRequested) to support that.\n3. lexical_generation: LexicalCleanupDryRunPlan.generation_count uses\n   saturating_add, consistent with sibling counters.\n4. memoization: quarantine() no longer double-counts stats.quarantined when\n   called a second time on an already-quarantined key.  Guards the increment\n   on !contains_key.\n5. search::readiness: ReadinessSnapshot.last_search_refinement gets\n   #[serde(default)] so older payloads without the field deserialize.\n\nAll compile + 62 existing tests (memoization, lexical_generation, readiness)\npass.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "b1777d7f889951d5f05da96e107911f46210a8df",
+      "filename": "src/indexer/lexical_generation.rs",
+      "status": "modified",
+      "additions": 41,
+      "deletions": 6,
+      "changes": 47,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/94b89e1e03be26eb016803ff272a3ee844a9f872/src%2Findexer%2Flexical_generation.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/94b89e1e03be26eb016803ff272a3ee844a9f872/src%2Findexer%2Flexical_generation.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/src%2Findexer%2Flexical_generation.rs?ref=94b89e1e03be26eb016803ff272a3ee844a9f872",
+      "patch": "@@ -395,9 +395,10 @@ pub(crate) struct LexicalCleanupGenerationDispositionSummary {\n     pub retained_bytes: u64,\n }\n \n-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]\n+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]\n #[serde(rename_all = \"snake_case\")]\n pub(crate) enum LexicalCleanupApprovalFingerprintStatus {\n+    #[default]\n     NotRequested,\n     Missing,\n     Matched,\n@@ -419,12 +420,19 @@ pub(crate) struct LexicalCleanupApplyGate {\n     pub apply_allowed: bool,\n     pub dry_run: bool,\n     pub explicit_operator_approval: bool,\n+    #[serde(default)]\n     pub approval_fingerprint: String,\n+    #[serde(default)]\n     pub provided_approval_fingerprint: Option<String>,\n+    #[serde(default)]\n     pub approval_fingerprint_status: LexicalCleanupApprovalFingerprintStatus,\n+    #[serde(default)]\n     pub approval_fingerprint_matches: bool,\n+    #[serde(default)]\n     pub generation_count: usize,\n+    #[serde(default)]\n     pub total_artifact_bytes: u64,\n+    #[serde(default)]\n     pub total_retained_bytes: u64,\n     pub candidate_count: usize,\n     pub reclaimable_bytes: u64,\n@@ -608,7 +616,7 @@ impl LexicalCleanupDryRunPlan {\n     }\n \n     fn record_inventory(&mut self, inventory: LexicalGenerationCleanupInventory) {\n-        self.generation_count += 1;\n+        self.generation_count = self.generation_count.saturating_add(1);\n         self.total_artifact_bytes = self\n             .total_artifact_bytes\n             .saturating_add(inventory.artifact_bytes);\n@@ -745,6 +753,9 @@ impl LexicalCleanupDryRunPlan {\n     }\n \n     fn compute_approval_fingerprint(&self) -> String {\n+        // Deterministic: hash over sorted snapshots so the fingerprint is\n+        // invariant under manifest/shard iteration order (filesystem scans,\n+        // HashMap-backed callers, etc.). BTreeMaps already iterate in order.\n         let mut hasher = blake3::Hasher::new();\n         hash_str(&mut hasher, \"cass.lexical_cleanup_approval.v1\");\n         hash_usize(&mut hasher, self.generation_count);\n@@ -753,26 +764,50 @@ impl LexicalCleanupDryRunPlan {\n         hash_u64(&mut hasher, self.total_retained_bytes);\n         hash_u64(&mut hasher, self.protected_retained_bytes);\n \n-        for candidate in &self.reclaim_candidates {\n+        let mut candidates: Vec<&LexicalCleanupReclaimCandidate> =\n+            self.reclaim_candidates.iter().collect();\n+        candidates.sort_by(|a, b| {\n+            (&a.generation_id, &a.shard_id, a.disposition.as_str())\n+                .cmp(&(&b.generation_id, &b.shard_id, b.disposition.as_str()))\n+        });\n+        for candidate in candidates {\n             hash_str(&mut hasher, &candidate.generation_id);\n             hash_str(&mut hasher, &candidate.shard_id);\n             hash_str(&mut hasher, candidate.disposition.as_str());\n             hash_str(&mut hasher, &candidate.reason);\n             hash_u64(&mut hasher, candidate.reclaimable_bytes);\n         }\n \n-        for item in &self.inspection_items {\n+        let mut inspections: Vec<&LexicalCleanupInspectionItem> =\n+            self.inspection_items.iter().collect();\n+        inspections.sort_by(|a, b| {\n+            (\n+                &a.generation_id,\n+                a.shard_id.as_deref().unwrap_or(\"\"),\n+                a.disposition.as_str(),\n+            )\n+                .cmp(&(\n+                    &b.generation_id,\n+                    b.shard_id.as_deref().unwrap_or(\"\"),\n+                    b.disposition.as_str(),\n+                ))\n+        });\n+        for item in inspections {\n             hash_str(&mut hasher, &item.generation_id);\n             hash_str(&mut hasher, item.shard_id.as_deref().unwrap_or(\"\"));\n             hash_str(&mut hasher, item.disposition.as_str());\n             hash_str(&mut hasher, &item.reason);\n             hash_u64(&mut hasher, item.retained_bytes);\n         }\n \n-        for generation_id in &self.active_generation_ids {\n+        let mut active: Vec<&String> = self.active_generation_ids.iter().collect();\n+        active.sort();\n+        for generation_id in active {\n             hash_str(&mut hasher, generation_id);\n         }\n-        for generation_id in &self.protected_generation_ids {\n+        let mut protected: Vec<&String> = self.protected_generation_ids.iter().collect();\n+        protected.sort();\n+        for generation_id in protected {\n             hash_str(&mut hasher, generation_id);\n         }\n         for (disposition, count) in &self.disposition_counts {"
+    },
+    {
+      "sha": "ede7e21b95f26079078772e1a15c754887e911d6",
+      "filename": "src/indexer/memoization.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 1,
+      "changes": 5,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/94b89e1e03be26eb016803ff272a3ee844a9f872/src%2Findexer%2Fmemoization.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/94b89e1e03be26eb016803ff272a3ee844a9f872/src%2Findexer%2Fmemoization.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/src%2Findexer%2Fmemoization.rs?ref=94b89e1e03be26eb016803ff272a3ee844a9f872",
+      "patch": "@@ -239,8 +239,11 @@ impl<V: Clone> ContentAddressedMemoCache<V> {\n         let reason = reason.into();\n         self.entries.remove(&key);\n         self.lru.retain(|existing| existing != &key);\n+        let newly_quarantined = !self.quarantined.contains_key(&key);\n         self.quarantined.insert(key, reason);\n-        self.stats.quarantined = self.stats.quarantined.saturating_add(1);\n+        if newly_quarantined {\n+            self.stats.quarantined = self.stats.quarantined.saturating_add(1);\n+        }\n         self.stats.live_entries = self.entries.len() as u64;\n     }\n "
+    },
+    {
+      "sha": "a0a4fab05079c2a3f9d1446d354498da1ab73469",
+      "filename": "src/search/readiness.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/94b89e1e03be26eb016803ff272a3ee844a9f872/src%2Fsearch%2Freadiness.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/94b89e1e03be26eb016803ff272a3ee844a9f872/src%2Fsearch%2Freadiness.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/src%2Fsearch%2Freadiness.rs?ref=94b89e1e03be26eb016803ff272a3ee844a9f872",
+      "patch": "@@ -153,6 +153,7 @@ pub(crate) struct ReadinessSnapshot {\n     /// Optional: the refinement level the most recent completed\n     /// search actually achieved. `None` when no search has run since\n     /// startup.\n+    #[serde(default)]\n     pub last_search_refinement: Option<SearchRefinementLevel>,\n }\n "
+    },
+    {
+      "sha": "a77d3cb82503993c24aff2f9ce8abd3d4d028791",
+      "filename": "tests/lifecycle_matrix.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 4,
+      "changes": 5,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/94b89e1e03be26eb016803ff272a3ee844a9f872/tests%2Flifecycle_matrix.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/94b89e1e03be26eb016803ff272a3ee844a9f872/tests%2Flifecycle_matrix.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/tests%2Flifecycle_matrix.rs?ref=94b89e1e03be26eb016803ff272a3ee844a9f872",
+      "patch": "@@ -3417,10 +3417,7 @@ fn idle_rebuild_block_collapses_metadata_and_has_actionable_recommendation() {\n     let healthy = status[\"healthy\"]\n         .as_bool()\n         .expect(\"status.healthy must be a bool\");\n-    assert!(\n-        !healthy,\n-        \"isolated HOME unexpectedly reports healthy=true\"\n-    );\n+    assert!(!healthy, \"isolated HOME unexpectedly reports healthy=true\");\n     let rec = status[\"recommended_action\"]\n         .as_str()\n         .expect(\"status.recommended_action must be a string when healthy=false\");"
+    }
+  ]
+}

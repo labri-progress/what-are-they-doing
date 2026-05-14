@@ -1,0 +1,41 @@
+{
+  "message": "fix(voice-call): coalesce webhook server starts",
+  "files": [
+    {
+      "sha": "e18ecae01994ba88a0884be510fdecc6dbb44b78",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/f7caf83da49c4214980faca0fe00527646c7395b/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/f7caf83da49c4214980faca0fe00527646c7395b/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=f7caf83da49c4214980faca0fe00527646c7395b",
+      "patch": "@@ -75,6 +75,7 @@ Docs: https://docs.openclaw.ai\n - Browser/sandbox: clean up idle tracked tabs opened by primary-agent browser sessions, while preserving active tab reuse and lifecycle cleanup for subagents, cron, and ACP sessions. Fixes #71165. Thanks @dwbutler.\n - Plugins/Voice Call: reuse the webhook runtime across in-process plugin contexts, avoiding `EADDRINUSE` when agent tools or CLI commands run while the Gateway already owns the voice webhook port. Fixes #58115. Thanks @sfbrian.\n - Plugins/Voice Call: answer accepted Telnyx inbound Call Control legs on `call.initiated`, so webhooks that reach OpenClaw no longer leave the caller ringing until hangup. Fixes #58231 and #40131. Thanks @KonsultDigital.\n+- Plugins/Voice Call: coalesce concurrent webhook server starts on the same runtime instance, avoiding a second `listen()` bind when overlapping startup paths race. Thanks @education-01.\n - Plugins/Voice Call: pin voice response sessions to `responseModel` before embedded agent runs, avoiding live-session model switch failures when the global default model differs. Fixes #60118. Thanks @xinbenlv.\n - Media tools: honor the configured web-fetch SSRF policy for media understanding, image/music/video generation references, and PDF inputs, so explicit RFC2544 opt-ins cover WebChat OSS uploads without weakening defaults. Fixes #71300. (#71321) Thanks @neeravmakwana.\n - Agents/TTS: suppress successful spoken transcripts from verbose chat tool output when structured voice media is already queued, while preserving text output for non-builtin tool-name collisions. Fixes #71282. Thanks @neeravmakwana."
+    },
+    {
+      "sha": "f0a13b802b38b5177b3a35abea011df711cb0f40",
+      "filename": "extensions/voice-call/src/webhook.test.ts",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 0,
+      "changes": 15,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/f7caf83da49c4214980faca0fe00527646c7395b/extensions%2Fvoice-call%2Fsrc%2Fwebhook.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/f7caf83da49c4214980faca0fe00527646c7395b/extensions%2Fvoice-call%2Fsrc%2Fwebhook.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fvoice-call%2Fsrc%2Fwebhook.test.ts?ref=f7caf83da49c4214980faca0fe00527646c7395b",
+      "patch": "@@ -1002,6 +1002,21 @@ describe(\"VoiceCallWebhookServer start idempotency\", () => {\n     }\n   });\n \n+  it(\"supports concurrent start() calls without double-binding the port\", async () => {\n+    const { manager } = createManager([]);\n+    const config = createConfig({ serve: { port: 0, bind: \"127.0.0.1\", path: \"/voice/webhook\" } });\n+    const server = new VoiceCallWebhookServer(config, manager, provider);\n+\n+    try {\n+      const [firstUrl, secondUrl] = await Promise.all([server.start(), server.start()]);\n+\n+      expectWebhookUrl(firstUrl, \"/voice/webhook\");\n+      expect(secondUrl).toBe(firstUrl);\n+    } finally {\n+      await server.stop();\n+    }\n+  });\n+\n   it(\"can start again after stop()\", async () => {\n     const { manager } = createManager([]);\n     const config = createConfig({ serve: { port: 0, bind: \"127.0.0.1\", path: \"/voice/webhook\" } });"
+    },
+    {
+      "sha": "24b3a9088789a7adc8720c1c2209be6e4f536e01",
+      "filename": "extensions/voice-call/src/webhook.ts",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 2,
+      "changes": 18,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/f7caf83da49c4214980faca0fe00527646c7395b/extensions%2Fvoice-call%2Fsrc%2Fwebhook.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/f7caf83da49c4214980faca0fe00527646c7395b/extensions%2Fvoice-call%2Fsrc%2Fwebhook.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fvoice-call%2Fsrc%2Fwebhook.ts?ref=f7caf83da49c4214980faca0fe00527646c7395b",
+      "patch": "@@ -150,6 +150,7 @@ function buildRealtimeRejectedTwiML(): WebhookResponsePayload {\n export class VoiceCallWebhookServer {\n   private server: http.Server | null = null;\n   private listeningUrl: string | null = null;\n+  private startPromise: Promise<string> | null = null;\n   private config: VoiceCallConfig;\n   private manager: CallManager;\n   private provider: VoiceCallProvider;\n@@ -443,7 +444,11 @@ export class VoiceCallWebhookServer {\n       await this.initializeMediaStreaming();\n     }\n \n-    return new Promise((resolve, reject) => {\n+    if (this.startPromise) {\n+      return this.startPromise;\n+    }\n+\n+    this.startPromise = new Promise((resolve, reject) => {\n       this.server = http.createServer((req, res) => {\n         this.handleRequest(req, res, webhookPath).catch((err) => {\n           console.error(\"[voice-call] Webhook error:\", err);\n@@ -468,11 +473,17 @@ export class VoiceCallWebhookServer {\n         });\n       }\n \n-      this.server.on(\"error\", reject);\n+      this.server.on(\"error\", (err) => {\n+        this.server = null;\n+        this.listeningUrl = null;\n+        this.startPromise = null;\n+        reject(err);\n+      });\n \n       this.server.listen(port, bind, () => {\n         const url = this.resolveListeningUrl(bind, webhookPath);\n         this.listeningUrl = url;\n+        this.startPromise = null;\n         console.log(`[voice-call] Webhook server listening on ${url}`);\n         if (this.mediaStreamHandler) {\n           const address = this.server?.address();\n@@ -491,6 +502,8 @@ export class VoiceCallWebhookServer {\n         });\n       });\n     });\n+\n+    return this.startPromise;\n   }\n \n   /**\n@@ -502,6 +515,7 @@ export class VoiceCallWebhookServer {\n     }\n     this.pendingDisconnectHangups.clear();\n     this.webhookInFlightLimiter.clear();\n+    this.startPromise = null;\n \n     if (this.stopStaleCallReaper) {\n       this.stopStaleCallReaper();"
+    }
+  ]
+}

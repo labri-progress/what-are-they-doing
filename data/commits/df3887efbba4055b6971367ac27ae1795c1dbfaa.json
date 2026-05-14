@@ -1,0 +1,41 @@
+{
+  "message": "fix(database): MySQL row limit safety, Postgres orphaned txn cleanup, pool parking_lot\n\nmysql.rs:\n  When a result set exceeds max_rows, mark the connection as closed\n  (self.inner.closed = true) before returning the error. The server\n  is still streaming row packets that cannot be drained synchronously,\n  so reusing the connection would cause protocol desync. Marking it\n  closed forces the pool to discard it.\n\npostgres.rs:\n  Add clear_orphaned_transaction() calls at the top of query(),\n  execute(), prepare(), execute_prepared(), fetch_prepared(), and\n  close_prepared(). If a prior operation left the connection in an\n  errored transaction state, this issues a ROLLBACK to restore it\n  to a usable state before proceeding. Prevents \"current transaction\n  is aborted\" cascading failures across pooled connection reuse.\n\npool.rs:\n  Migrate from std::sync::Mutex to parking_lot::Mutex for the\n  connection pool internals. Eliminates .unwrap() on lock() calls\n  and avoids poison propagation, consistent with the rest of the\n  codebase's parking_lot adoption.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "07f4212502969f4ce156787917484b42b2ea2d86",
+      "filename": "src/database/mysql.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/df3887efbba4055b6971367ac27ae1795c1dbfaa/src%2Fdatabase%2Fmysql.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/df3887efbba4055b6971367ac27ae1795c1dbfaa/src%2Fdatabase%2Fmysql.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fdatabase%2Fmysql.rs?ref=df3887efbba4055b6971367ac27ae1795c1dbfaa",
+      "patch": "@@ -1551,6 +1551,10 @@ impl MySqlConnection {\n                 _ => match Self::parse_data_row_or_terminator(&data, &columns, deprecate_eof)? {\n                     Some(values) => {\n                         if rows.len() >= max_rows {\n+                            // The server is still sending row packets that we\n+                            // cannot drain synchronously. Mark the connection\n+                            // as closed to prevent protocol desync on reuse.\n+                            self.inner.closed = true;\n                             return Err(MySqlError::Protocol(format!(\n                                 \"result set exceeds maximum row limit ({max_rows})\"\n                             )));"
+    },
+    {
+      "sha": "e8f2c9ab8f29818ba60bbb5e460e71bf5d36a7c9",
+      "filename": "src/database/pool.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/df3887efbba4055b6971367ac27ae1795c1dbfaa/src%2Fdatabase%2Fpool.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/df3887efbba4055b6971367ac27ae1795c1dbfaa/src%2Fdatabase%2Fpool.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fdatabase%2Fpool.rs?ref=df3887efbba4055b6971367ac27ae1795c1dbfaa",
+      "patch": "@@ -32,7 +32,8 @@ use crate::combinator::{RetryPolicy, calculate_delay};\n use std::collections::VecDeque;\n use std::fmt;\n use std::sync::atomic::{AtomicU64, Ordering};\n-use std::sync::{Arc, Mutex};\n+use std::sync::Arc;\n+use parking_lot::Mutex;\n use std::time::{Duration, Instant};\n \n // \u2500\u2500\u2500 ConnectionManager trait \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
+    },
+    {
+      "sha": "9cbdbff35c176bf5f9c22e68f2d508615655f981",
+      "filename": "src/database/postgres.rs",
+      "status": "modified",
+      "additions": 24,
+      "deletions": 0,
+      "changes": 24,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/df3887efbba4055b6971367ac27ae1795c1dbfaa/src%2Fdatabase%2Fpostgres.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/df3887efbba4055b6971367ac27ae1795c1dbfaa/src%2Fdatabase%2Fpostgres.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fdatabase%2Fpostgres.rs?ref=df3887efbba4055b6971367ac27ae1795c1dbfaa",
+      "patch": "@@ -2289,6 +2289,10 @@ impl PgConnection {\n             return Outcome::Err(PgError::ConnectionClosed);\n         }\n \n+        if let Err(e) = self.clear_orphaned_transaction().await {\n+            return Outcome::Err(e);\n+        }\n+\n         let param_oids: Vec<u32> = params.iter().map(|p| p.type_oid()).collect();\n         let parse = match build_parse_msg(\"\", sql, &param_oids) {\n             Ok(p) => p,\n@@ -2364,6 +2368,10 @@ impl PgConnection {\n             return Outcome::Err(PgError::ConnectionClosed);\n         }\n \n+        if let Err(e) = self.clear_orphaned_transaction().await {\n+            return Outcome::Err(e);\n+        }\n+\n         let param_oids: Vec<u32> = params.iter().map(|p| p.type_oid()).collect();\n         let parse = match build_parse_msg(\"\", sql, &param_oids) {\n             Ok(p) => p,\n@@ -2415,6 +2423,10 @@ impl PgConnection {\n             return Outcome::Err(PgError::ConnectionClosed);\n         }\n \n+        if let Err(e) = self.clear_orphaned_transaction().await {\n+            return Outcome::Err(e);\n+        }\n+\n         let stmt_name = format!(\"__asupersync_s{}\", self.inner.next_stmt_id);\n         self.inner.next_stmt_id = self.inner.next_stmt_id.wrapping_add(1);\n \n@@ -2505,6 +2517,10 @@ impl PgConnection {\n             return Outcome::Err(PgError::ConnectionClosed);\n         }\n \n+        if let Err(e) = self.clear_orphaned_transaction().await {\n+            return Outcome::Err(e);\n+        }\n+\n         let bind = match build_bind_msg(\"\", &stmt.name, params, Format::Text) {\n             Ok(b) => b,\n             Err(e) => return Outcome::Err(e),\n@@ -2544,6 +2560,10 @@ impl PgConnection {\n             return Outcome::Err(PgError::ConnectionClosed);\n         }\n \n+        if let Err(e) = self.clear_orphaned_transaction().await {\n+            return Outcome::Err(e);\n+        }\n+\n         let bind = match build_bind_msg(\"\", &stmt.name, params, Format::Text) {\n             Ok(b) => b,\n             Err(e) => return Outcome::Err(e),\n@@ -2576,6 +2596,10 @@ impl PgConnection {\n             return Outcome::Err(PgError::ConnectionClosed);\n         }\n \n+        if let Err(e) = self.clear_orphaned_transaction().await {\n+            return Outcome::Err(e);\n+        }\n+\n         let close = build_close_msg(b'S', &stmt.name);\n         let sync = build_sync_msg();\n "
+    }
+  ]
+}

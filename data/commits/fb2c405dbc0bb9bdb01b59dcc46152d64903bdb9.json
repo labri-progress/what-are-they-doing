@@ -1,0 +1,41 @@
+{
+  "message": "fix: bound gateway usage cost cache (#68842)",
+  "files": [
+    {
+      "sha": "21f1bd454590acc7095ef7b5381ad29ce7e3b93a",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/fb2c405dbc0bb9bdb01b59dcc46152d64903bdb9/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/fb2c405dbc0bb9bdb01b59dcc46152d64903bdb9/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=fb2c405dbc0bb9bdb01b59dcc46152d64903bdb9",
+      "patch": "@@ -26,6 +26,7 @@ Docs: https://docs.openclaw.ai\n - Webchat/images: treat inline image attachments as media for empty-turn gating while still ignoring metadata-only blank turns. (#69474) Thanks @Jaswir.\n - Discord/think: only show `adaptive` in `/think` autocomplete for provider/model pairs that actually support provider-managed adaptive thinking, so GPT/OpenAI models no longer advertise an Anthropic-only option.\n - Thinking: only expose `max` for models that explicitly support provider max reasoning, and remap stored `max` settings to the largest supported thinking mode when users switch to another model.\n+- Gateway/usage: bound the cost usage cache with FIFO eviction so date/range lookups cannot grow unbounded. (#68842) Thanks @Feelw00.\n - OpenAI/Responses: resolve `/think` levels against each GPT model's supported reasoning efforts so `/think off` no longer becomes high reasoning or sends unsupported `reasoning.effort: \"none\"` payloads.\n - Lobster/TaskFlow: allow managed approval resumes to use `approvalId` without a resume token, and persist that id in approval wait state. (#69559) Thanks @kirkluokun.\n - Plugins/startup: install bundled runtime dependencies into each plugin's own runtime directory, reuse source-checkout repair caches after rebuilds, and log only packages that were actually installed so repeated Gateway starts stay quiet once deps are present."
+    },
+    {
+      "sha": "085aa015a18e829d79ec7892910a53b6eadf54bd",
+      "filename": "src/gateway/server-methods/usage.cost-usage-cache.test.ts",
+      "status": "modified",
+      "additions": 57,
+      "deletions": 14,
+      "changes": 71,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/fb2c405dbc0bb9bdb01b59dcc46152d64903bdb9/src%2Fgateway%2Fserver-methods%2Fusage.cost-usage-cache.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/fb2c405dbc0bb9bdb01b59dcc46152d64903bdb9/src%2Fgateway%2Fserver-methods%2Fusage.cost-usage-cache.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fserver-methods%2Fusage.cost-usage-cache.test.ts?ref=fb2c405dbc0bb9bdb01b59dcc46152d64903bdb9",
+      "patch": "@@ -21,26 +21,34 @@\n import { beforeEach, describe, expect, it, vi } from \"vitest\";\n import type { OpenClawConfig } from \"../../config/config.js\";\n \n+const mocks = vi.hoisted(() => ({\n+  loadCostUsageSummary: vi.fn(),\n+}));\n+\n+function createSummary() {\n+  return {\n+    updatedAt: Date.now(),\n+    startDate: \"2026-02-01\",\n+    endDate: \"2026-02-02\",\n+    daily: [],\n+    totals: {\n+      totalTokens: 1,\n+      input: 0,\n+      output: 0,\n+      cacheRead: 0,\n+      cacheWrite: 0,\n+      totalCost: 0,\n+    },\n+  };\n+}\n+\n vi.mock(\"../../infra/session-cost-usage.js\", async () => {\n   const actual = await vi.importActual<typeof import(\"../../infra/session-cost-usage.js\")>(\n     \"../../infra/session-cost-usage.js\",\n   );\n   return {\n     ...actual,\n-    loadCostUsageSummary: vi.fn(async () => ({\n-      updatedAt: Date.now(),\n-      startDate: \"2026-02-01\",\n-      endDate: \"2026-02-02\",\n-      daily: [],\n-      totals: {\n-        totalTokens: 1,\n-        input: 0,\n-        output: 0,\n-        cacheRead: 0,\n-        cacheWrite: 0,\n-        totalCost: 0,\n-      },\n-    })),\n+    loadCostUsageSummary: mocks.loadCostUsageSummary,\n   };\n });\n \n@@ -53,6 +61,7 @@ describe(\"costUsageCache bounded growth\", () => {\n     __test.costUsageCache.clear();\n     vi.useRealTimers();\n     vi.clearAllMocks();\n+    mocks.loadCostUsageSummary.mockResolvedValue(createSummary());\n   });\n \n   it(\"does not grow without bound when (startMs, endMs) varies across day rollover and range switches\", async () => {\n@@ -87,4 +96,38 @@ describe(\"costUsageCache bounded growth\", () => {\n     const firstCacheKey = `${firstStartMs}-${firstEndMs}`;\n     expect(__test.costUsageCache.has(firstCacheKey)).toBe(false);\n   });\n+\n+  it(\"evicts settled entries before in-flight entries when possible\", async () => {\n+    const config = {} as OpenClawConfig;\n+    const pending = new Promise<ReturnType<typeof createSummary>>(() => {});\n+    mocks.loadCostUsageSummary.mockReturnValueOnce(pending);\n+\n+    const inFlight = __test.loadCostUsageSummaryCached({\n+      startMs: 1,\n+      endMs: 2,\n+      config,\n+    });\n+    await Promise.resolve();\n+\n+    for (let i = 0; i < 256; i++) {\n+      const startMs = Date.UTC(2026, 0, 1) + i * DAY_MS;\n+      await __test.loadCostUsageSummaryCached({\n+        startMs,\n+        endMs: startMs + DAY_MS - 1,\n+        config,\n+      });\n+    }\n+\n+    const repeated = __test.loadCostUsageSummaryCached({\n+      startMs: 1,\n+      endMs: 2,\n+      config,\n+    });\n+    await Promise.resolve();\n+\n+    expect(__test.costUsageCache.has(\"1-2\")).toBe(true);\n+    expect(mocks.loadCostUsageSummary).toHaveBeenCalledTimes(257);\n+    void inFlight.catch(() => {});\n+    void repeated.catch(() => {});\n+  });\n });"
+    },
+    {
+      "sha": "8a373c4666974fac2e48614835f18d0be711903d",
+      "filename": "src/gateway/server-methods/usage.ts",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 7,
+      "changes": 21,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/fb2c405dbc0bb9bdb01b59dcc46152d64903bdb9/src%2Fgateway%2Fserver-methods%2Fusage.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/fb2c405dbc0bb9bdb01b59dcc46152d64903bdb9/src%2Fgateway%2Fserver-methods%2Fusage.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fserver-methods%2Fusage.ts?ref=fb2c405dbc0bb9bdb01b59dcc46152d64903bdb9",
+      "patch": "@@ -65,15 +65,22 @@ type CostUsageCacheEntry = {\n \n const costUsageCache = new Map<string, CostUsageCacheEntry>();\n \n-// Store an entry with FIFO eviction when adding a new key would exceed the\n-// cap. Mirrors the pattern in session-transcript-key.ts and server-session-key.ts\n-// so the cache stays bounded under sliding-window usage queries (each\n-// day/range combination produces a distinct key).\n+function findCostUsageCacheEvictionKey(): string | undefined {\n+  for (const [key, entry] of costUsageCache) {\n+    if (!entry.inFlight) {\n+      return key;\n+    }\n+  }\n+  return costUsageCache.keys().next().value;\n+}\n+\n+// Keep the cache bounded while preserving in-flight request coalescing when a\n+// settled entry is available to evict.\n function setCostUsageCache(cacheKey: string, entry: CostUsageCacheEntry): void {\n   if (!costUsageCache.has(cacheKey) && costUsageCache.size >= COST_USAGE_CACHE_MAX) {\n-    const oldest = costUsageCache.keys().next().value;\n-    if (oldest !== undefined) {\n-      costUsageCache.delete(oldest);\n+    const evictKey = findCostUsageCacheEvictionKey();\n+    if (evictKey !== undefined) {\n+      costUsageCache.delete(evictKey);\n     }\n   }\n   costUsageCache.set(cacheKey, entry);"
+    }
+  ]
+}

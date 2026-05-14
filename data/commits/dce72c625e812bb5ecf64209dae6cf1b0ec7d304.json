@@ -1,0 +1,64 @@
+{
+  "message": "fix(daemon): extend prediction and guard-trigger suppression to Yellow pressure (v0.3.8)\n\nVersion bump 0.3.7 \u2192 0.3.8\n\nTwo policy changes based on continued production observation of v0.3.7\non vmi1156319, vmi1227854, and vmi1149989:\n\nPredictive warning suppression (loop_main.rs):\nExtended from Green-only to Green+Yellow. At Yellow pressure (10-20%\nfree), compilation-burst EWMA rate spikes still produce false \"disk full\nin 5m\" predictions \u2014 the same artifact seen at Green but now verified\nto persist at Yellow. The pressure controller escalates to Orange+ before\nreal danger arrives, and the predictive policy's burst detector handles\nactual threat assessment. Notification spam at Yellow adds no signal.\n\nFallbackSafe guard trigger threshold (policy.rs):\nRaised from Yellow+ (PressureLevel::Yellow) to Orange+ only. At Yellow\npressure, guard drift alarms from EWMA rate volatility during compilation\nbursts triggered FallbackSafe mode, which blocks ALL deletions. This\ncreated a deadlock: disk can't be cleaned because guard blocks it, guard\nstays alarmed because disk stays full. At Yellow, the 0.25x penalty-scaled\nguard override already handles uncertain guard state by letting high-\nconfidence candidates through. FallbackSafe is now reserved for Orange+\nwhere genuine danger warrants full safety lockdown.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "4125289a6ca44a8b85f260365cf4741692f9118d",
+      "filename": ".beads/beads.db",
+      "status": "modified",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/blob/dce72c625e812bb5ecf64209dae6cf1b0ec7d304/.beads%2Fbeads.db",
+      "raw_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/raw/dce72c625e812bb5ecf64209dae6cf1b0ec7d304/.beads%2Fbeads.db",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/storage_ballast_helper/contents/.beads%2Fbeads.db?ref=dce72c625e812bb5ecf64209dae6cf1b0ec7d304"
+    },
+    {
+      "sha": "f7f366edfafb43e201bd361259def34f50e971e7",
+      "filename": "Cargo.lock",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/blob/dce72c625e812bb5ecf64209dae6cf1b0ec7d304/Cargo.lock",
+      "raw_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/raw/dce72c625e812bb5ecf64209dae6cf1b0ec7d304/Cargo.lock",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/storage_ballast_helper/contents/Cargo.lock?ref=dce72c625e812bb5ecf64209dae6cf1b0ec7d304",
+      "patch": "@@ -1159,7 +1159,7 @@ checksum = \"67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03\"\n \n [[package]]\n name = \"storage_ballast_helper\"\n-version = \"0.3.7\"\n+version = \"0.3.8\"\n dependencies = [\n  \"chrono\",\n  \"clap\","
+    },
+    {
+      "sha": "fd56d7ee00339dcb0e26a980af90f3a9ecd033ed",
+      "filename": "Cargo.toml",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/blob/dce72c625e812bb5ecf64209dae6cf1b0ec7d304/Cargo.toml",
+      "raw_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/raw/dce72c625e812bb5ecf64209dae6cf1b0ec7d304/Cargo.toml",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/storage_ballast_helper/contents/Cargo.toml?ref=dce72c625e812bb5ecf64209dae6cf1b0ec7d304",
+      "patch": "@@ -1,6 +1,6 @@\n [package]\n name = \"storage_ballast_helper\"\n-version = \"0.3.7\"\n+version = \"0.3.8\"\n edition = \"2024\"\n license = \"MIT\"\n description = \"System service that prevents disk-full scenarios from coding agent swarms via ballast files, artifact scanning, and special location monitoring.\""
+    },
+    {
+      "sha": "ba37100dc6034a0b399b48475b95e24a7bcb71cd",
+      "filename": "src/daemon/loop_main.rs",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 6,
+      "changes": 17,
+      "blob_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/blob/dce72c625e812bb5ecf64209dae6cf1b0ec7d304/src%2Fdaemon%2Floop_main.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/raw/dce72c625e812bb5ecf64209dae6cf1b0ec7d304/src%2Fdaemon%2Floop_main.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/storage_ballast_helper/contents/src%2Fdaemon%2Floop_main.rs?ref=dce72c625e812bb5ecf64209dae6cf1b0ec7d304",
+      "patch": "@@ -1643,12 +1643,17 @@ impl MonitoringDaemon {\n     }\n \n     fn check_predictive_warning(&mut self, response: &crate::monitor::pid::PressureResponse) {\n-        // Suppress predictions at Green pressure entirely. When the pressure\n-        // controller says Green (>20% free), \"disk full in 5m\" predictions\n-        // are EWMA spike artifacts from compilation bursts \u2014 false alarms\n-        // that pollute logs and desensitize operators. The pressure system\n-        // will escalate to Yellow+ before disk danger is real.\n-        if response.level == PressureLevel::Green {\n+        // Suppress prediction notifications at Green and Yellow pressure.\n+        //\n+        // At Green (>20% free), \"disk full in 5m\" is clearly an EWMA spike\n+        // artifact from compilation bursts \u2014 false alarms that desensitize.\n+        //\n+        // At Yellow (10-20% free), the same EWMA spikes produce false alarms\n+        // because burst consumption rates are transiently high. The pressure\n+        // system already escalates to Orange+ before real danger, and the\n+        // predictive policy's burst detector handles actual threat assessment.\n+        // Notification spam at Yellow provides no actionable signal.\n+        if response.level <= PressureLevel::Yellow {\n             return;\n         }\n "
+    },
+    {
+      "sha": "b0d1b6f5c6da92ba249ddee97656581b4b93e0a7",
+      "filename": "src/daemon/policy.rs",
+      "status": "modified",
+      "additions": 18,
+      "deletions": 7,
+      "changes": 25,
+      "blob_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/blob/dce72c625e812bb5ecf64209dae6cf1b0ec7d304/src%2Fdaemon%2Fpolicy.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/storage_ballast_helper/raw/dce72c625e812bb5ecf64209dae6cf1b0ec7d304/src%2Fdaemon%2Fpolicy.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/storage_ballast_helper/contents/src%2Fdaemon%2Fpolicy.rs?ref=dce72c625e812bb5ecf64209dae6cf1b0ec7d304",
+      "patch": "@@ -819,15 +819,26 @@ impl PolicyEngine {\n     }\n \n     fn check_guard_triggers(&mut self, diag: &GuardDiagnostics) {\n-        // Suppress guard-triggered fallback when:\n-        // - Pressure is green (drift is harmless, no deletions considered)\n-        // - Guard has too few observations to be meaningful (< 30). On fresh\n-        //   start the guard gets rate prediction observations every tick, but\n-        //   these are unreliable until the EWMA stabilizes. Letting a freshly\n-        //   started guard trigger FallbackSafe creates a deadlock.\n+        // Only enter FallbackSafe from guard drift alarm at Orange+ pressure.\n+        //\n+        // At Yellow pressure (10-20% free), guard drift alarms are common during\n+        // compilation bursts \u2014 EWMA rate volatility poisons calibration even when\n+        // the disk isn't in genuine danger. Entering FallbackSafe at Yellow blocks\n+        // ALL deletions, creating a deadlock: disk can't be cleaned because guard\n+        // is alarmed, guard stays alarmed because disk stays full.\n+        //\n+        // At Yellow, the penalty-scaled guard override (0.25\u00d7 penalty) in\n+        // enforce_policy already handles uncertain guard state by allowing\n+        // high-confidence candidates through. FallbackSafe is reserved for\n+        // genuine danger (Orange+) where we need full safety lockdown.\n+        //\n+        // Also suppressed when:\n+        // - Already in FallbackSafe (no-op)\n+        // - Guard has too few observations (< 30) \u2014 freshly started guard\n+        //   with unreliable EWMA should not trigger FallbackSafe\n         if diag.e_process_alarm\n             && self.mode != ActiveMode::FallbackSafe\n-            && self.pressure_level != PressureLevel::Green\n+            && self.pressure_level >= PressureLevel::Orange\n             && diag.observation_count >= 30\n         {\n             self.enter_fallback(FallbackReason::GuardrailDrift);"
+    }
+  ]
+}

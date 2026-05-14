@@ -1,0 +1,53 @@
+{
+  "message": "fix(core): harden credential storage and arithmetic safety\n\nAdd path traversal prevention in credential storage to reject connector_ids\ncontaining directory separators or traversal sequences. Replace panic-prone\nunwrap_or patterns with checked_sub/checked_div in supervisor window\ncalculation and coverage computation. Improve file operation error\ndifferentiation in lock store.\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "f02c495d01124f02b413e974c8cbf25e2f9ea613",
+      "filename": "crates/fcp-host/src/supervisor.rs",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 9,
+      "changes": 19,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/3d411e99628f8e09fbb76c93ea8f6c7d2887d495/crates%2Ffcp-host%2Fsrc%2Fsupervisor.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/3d411e99628f8e09fbb76c93ea8f6c7d2887d495/crates%2Ffcp-host%2Fsrc%2Fsupervisor.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-host%2Fsrc%2Fsupervisor.rs?ref=3d411e99628f8e09fbb76c93ea8f6c7d2887d495",
+      "patch": "@@ -394,13 +394,14 @@ impl RestartTracker {\n         }\n \n         // Prune events outside the window.\n-        let window_start = now.checked_sub(self.config.restart_window).unwrap_or(now);\n-        while self\n-            .history\n-            .front()\n-            .is_some_and(|event| event.timestamp < window_start)\n-        {\n-            self.history.pop_front();\n+        if let Some(window_start) = now.checked_sub(self.config.restart_window) {\n+            while self\n+                .history\n+                .front()\n+                .is_some_and(|event| event.timestamp < window_start)\n+            {\n+                self.history.pop_front();\n+            }\n         }\n \n         // Check restart count within window.\n@@ -442,11 +443,11 @@ impl RestartTracker {\n     /// Restarts within the current window.\n     #[must_use]\n     pub fn restarts_in_window(&self, now: Instant) -> u32 {\n-        let window_start = now.checked_sub(self.config.restart_window).unwrap_or(now);\n+        let window_start = now.checked_sub(self.config.restart_window);\n         u32::try_from(\n             self.history\n                 .iter()\n-                .filter(|event| event.timestamp >= window_start)\n+                .filter(|event| window_start.map_or(true, |start| event.timestamp >= start))\n                 .count(),\n         )\n         .unwrap_or(u32::MAX)"
+    },
+    {
+      "sha": "e527fd406e89938128a80041a16e65aeab794c2a",
+      "filename": "crates/fcp-store/src/coverage.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 1,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/3d411e99628f8e09fbb76c93ea8f6c7d2887d495/crates%2Ffcp-store%2Fsrc%2Fcoverage.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/3d411e99628f8e09fbb76c93ea8f6c7d2887d495/crates%2Ffcp-store%2Fsrc%2Fcoverage.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-store%2Fsrc%2Fcoverage.rs?ref=3d411e99628f8e09fbb76c93ea8f6c7d2887d495",
+      "patch": "@@ -284,7 +284,12 @@ impl CoverageEvaluation {\n             .saturating_mul(10_000)\n             .saturating_sub(max_allowed.saturating_mul(u64::from(self.total_symbols)));\n \n-        let result = (numerator.saturating_add(max_allowed.saturating_sub(1))) / max_allowed;\n+        // Defensive: max_allowed is guarded by the early return at line 270, but use\n+        // checked_div to prevent panics if guards are ever refactored.\n+        let result = numerator\n+            .saturating_add(max_allowed.saturating_sub(1))\n+            .checked_div(max_allowed)\n+            .unwrap_or(0);\n         u32::try_from(result).unwrap_or(u32::MAX)\n     }\n }"
+    },
+    {
+      "sha": "13e1be1edfebef115173961dd6fd29065643af45",
+      "filename": "crates/fwc/src/credential.rs",
+      "status": "modified",
+      "additions": 17,
+      "deletions": 5,
+      "changes": 22,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/3d411e99628f8e09fbb76c93ea8f6c7d2887d495/crates%2Ffwc%2Fsrc%2Fcredential.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/3d411e99628f8e09fbb76c93ea8f6c7d2887d495/crates%2Ffwc%2Fsrc%2Fcredential.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffwc%2Fsrc%2Fcredential.rs?ref=3d411e99628f8e09fbb76c93ea8f6c7d2887d495",
+      "patch": "@@ -260,8 +260,20 @@ impl FileBackend {\n         &self.base_dir\n     }\n \n-    fn credential_path(&self, connector_id: &str) -> PathBuf {\n-        self.base_dir.join(format!(\"{connector_id}.json\"))\n+    fn credential_path(&self, connector_id: &str) -> Result<PathBuf> {\n+        // Reject path traversal attempts: connector_id must be a simple identifier\n+        // with no directory separators, parent references, or null bytes.\n+        if connector_id.is_empty()\n+            || connector_id.contains('/')\n+            || connector_id.contains('\\\\')\n+            || connector_id.contains(\"..\")\n+            || connector_id.contains('\\0')\n+        {\n+            anyhow::bail!(\n+                \"invalid connector_id '{connector_id}': must not contain path separators or traversal sequences\"\n+            );\n+        }\n+        Ok(self.base_dir.join(format!(\"{connector_id}.json\")))\n     }\n \n     fn temp_path_for(path: &Path) -> PathBuf {\n@@ -331,7 +343,7 @@ impl CredentialBackend for FileBackend {\n             last_verified: entry.last_verified.clone(),\n         };\n         let json = serde_json::to_string_pretty(&disk)?;\n-        let path = self.credential_path(&entry.connector_id);\n+        let path = self.credential_path(&entry.connector_id)?;\n \n         let temp_path = Self::temp_path_for(&path);\n \n@@ -374,7 +386,7 @@ impl CredentialBackend for FileBackend {\n     }\n \n     fn get(&self, connector_id: &str) -> Result<Option<CredentialEntry>> {\n-        let path = self.credential_path(connector_id);\n+        let path = self.credential_path(connector_id)?;\n         if !path.exists() {\n             return Ok(None);\n         }\n@@ -412,7 +424,7 @@ impl CredentialBackend for FileBackend {\n     }\n \n     fn remove(&self, connector_id: &str) -> Result<bool> {\n-        let path = self.credential_path(connector_id);\n+        let path = self.credential_path(connector_id)?;\n         if !path.exists() {\n             return Ok(false);\n         }"
+    },
+    {
+      "sha": "0f9cca7dd81785fc340b7d6a179646d960faeec3",
+      "filename": "crates/fwc/src/op_lock.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 5,
+      "changes": 11,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/3d411e99628f8e09fbb76c93ea8f6c7d2887d495/crates%2Ffwc%2Fsrc%2Fop_lock.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/3d411e99628f8e09fbb76c93ea8f6c7d2887d495/crates%2Ffwc%2Fsrc%2Fop_lock.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffwc%2Fsrc%2Fop_lock.rs?ref=3d411e99628f8e09fbb76c93ea8f6c7d2887d495",
+      "patch": "@@ -259,12 +259,13 @@ impl LockStore {\n \n     fn load_data(&self) -> Result<LockData, String> {\n         let path = self.data_path();\n-        if !path.exists() {\n-            return Ok(LockData::default());\n+        match std::fs::read_to_string(&path) {\n+            Ok(json) => {\n+                serde_json::from_str(&json).map_err(|e| format!(\"lock store corrupted: {e}\"))\n+            }\n+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(LockData::default()),\n+            Err(e) => Err(format!(\"failed to read lock store: {e}\")),\n         }\n-        let json = std::fs::read_to_string(&path)\n-            .map_err(|e| format!(\"failed to read lock store: {e}\"))?;\n-        serde_json::from_str(&json).map_err(|e| format!(\"lock store corrupted: {e}\"))\n     }\n \n     fn save_data(&self, data: &LockData) -> Result<(), String> {"
+    }
+  ]
+}

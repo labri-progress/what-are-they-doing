@@ -1,0 +1,137 @@
+{
+  "message": "fix: harden browser existing-session flows",
+  "files": [
+    {
+      "sha": "15c0b4b006717ae8295e16bc4958e41f03846cc1",
+      "filename": "docs/tools/browser.md",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/4357cf4e37ddf8d887497cdc3532b565ef3c6e8b/docs%2Ftools%2Fbrowser.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/4357cf4e37ddf8d887497cdc3532b565ef3c6e8b/docs%2Ftools%2Fbrowser.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/docs%2Ftools%2Fbrowser.md?ref=4357cf4e37ddf8d887497cdc3532b565ef3c6e8b",
+      "patch": "@@ -398,6 +398,10 @@ Notes:\n   session only.\n - OpenClaw uses the official Chrome DevTools MCP `--autoConnect` flow here, not\n   the legacy default-profile remote debugging port workflow.\n+- Existing-session screenshots support page captures and `--ref` element\n+  captures from snapshots, but not CSS `--element` selectors.\n+- Existing-session `wait --url` supports exact, substring, and glob patterns\n+  like other browser drivers. `wait --load networkidle` is not supported yet.\n - Some features still require the extension relay or managed browser path, such\n   as PDF export and download interception.\n - Leave the relay loopback-only by default. If the relay must be reachable from a different network namespace (for example Gateway in WSL2, Chrome on Windows), set `browser.relayBindHost` to an explicit bind address such as `0.0.0.0` while keeping the surrounding network private and authenticated."
+    },
+    {
+      "sha": "a9571f312052e7decb2cb21ad2c9930a89ad89a5",
+      "filename": "src/browser/chrome-mcp.test.ts",
+      "status": "modified",
+      "additions": 60,
+      "deletions": 0,
+      "changes": 60,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/4357cf4e37ddf8d887497cdc3532b565ef3c6e8b/src%2Fbrowser%2Fchrome-mcp.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/4357cf4e37ddf8d887497cdc3532b565ef3c6e8b/src%2Fbrowser%2Fchrome-mcp.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fbrowser%2Fchrome-mcp.test.ts?ref=4357cf4e37ddf8d887497cdc3532b565ef3c6e8b",
+      "patch": "@@ -129,4 +129,64 @@ describe(\"chrome MCP page parsing\", () => {\n \n     expect(result).toBe(123);\n   });\n+\n+  it(\"surfaces MCP tool errors instead of JSON parse noise\", async () => {\n+    const factory: ChromeMcpSessionFactory = async () => {\n+      const session = createFakeSession();\n+      const callTool = vi.fn(async ({ name }: ToolCall) => {\n+        if (name === \"evaluate_script\") {\n+          return {\n+            content: [\n+              {\n+                type: \"text\",\n+                text: \"Cannot read properties of null (reading 'value')\",\n+              },\n+            ],\n+            isError: true,\n+          };\n+        }\n+        throw new Error(`unexpected tool ${name}`);\n+      });\n+      session.client.callTool = callTool as typeof session.client.callTool;\n+      return session;\n+    };\n+    setChromeMcpSessionFactoryForTest(factory);\n+\n+    await expect(\n+      evaluateChromeMcpScript({\n+        profileName: \"chrome-live\",\n+        targetId: \"1\",\n+        fn: \"() => document.getElementById('missing').value\",\n+      }),\n+    ).rejects.toThrow(/Cannot read properties of null/);\n+  });\n+\n+  it(\"reuses a single pending session for concurrent requests\", async () => {\n+    let factoryCalls = 0;\n+    let releaseFactory!: () => void;\n+    const factoryGate = new Promise<void>((resolve) => {\n+      releaseFactory = resolve;\n+    });\n+\n+    const factory: ChromeMcpSessionFactory = async () => {\n+      factoryCalls += 1;\n+      await factoryGate;\n+      return createFakeSession();\n+    };\n+    setChromeMcpSessionFactoryForTest(factory);\n+\n+    const tabsPromise = listChromeMcpTabs(\"chrome-live\");\n+    const evalPromise = evaluateChromeMcpScript({\n+      profileName: \"chrome-live\",\n+      targetId: \"1\",\n+      fn: \"() => 123\",\n+    });\n+\n+    releaseFactory();\n+    const [tabs, result] = await Promise.all([tabsPromise, evalPromise]);\n+\n+    expect(factoryCalls).toBe(1);\n+    expect(tabs).toHaveLength(2);\n+    expect(result).toBe(123);\n+  });\n });"
+    },
+    {
+      "sha": "e410cf886e95efcbe259751c1dec89cd9154d9c2",
+      "filename": "src/browser/chrome-mcp.ts",
+      "status": "modified",
+      "additions": 29,
+      "deletions": 3,
+      "changes": 32,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/4357cf4e37ddf8d887497cdc3532b565ef3c6e8b/src%2Fbrowser%2Fchrome-mcp.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/4357cf4e37ddf8d887497cdc3532b565ef3c6e8b/src%2Fbrowser%2Fchrome-mcp.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fbrowser%2Fchrome-mcp.ts?ref=4357cf4e37ddf8d887497cdc3532b565ef3c6e8b",
+      "patch": "@@ -39,6 +39,7 @@ const DEFAULT_CHROME_MCP_ARGS = [\n ];\n \n const sessions = new Map<string, ChromeMcpSession>();\n+const pendingSessions = new Map<string, Promise<ChromeMcpSession>>();\n let sessionFactory: ChromeMcpSessionFactory | null = null;\n \n function asRecord(value: unknown): Record<string, unknown> | null {\n@@ -144,6 +145,11 @@ function extractMessageText(result: ChromeMcpToolResult): string {\n   return blocks.find((block) => block.trim()) ?? \"\";\n }\n \n+function extractToolErrorMessage(result: ChromeMcpToolResult, name: string): string {\n+  const message = extractMessageText(result).trim();\n+  return message || `Chrome MCP tool \"${name}\" failed.`;\n+}\n+\n function extractJsonMessage(result: ChromeMcpToolResult): unknown {\n   const candidates = [extractMessageText(result), ...extractTextContent(result)].filter((text) =>\n     text.trim(),\n@@ -207,8 +213,22 @@ async function getSession(profileName: string): Promise<ChromeMcpSession> {\n     session = undefined;\n   }\n   if (!session) {\n-    session = await (sessionFactory ?? createRealSession)(profileName);\n-    sessions.set(profileName, session);\n+    let pending = pendingSessions.get(profileName);\n+    if (!pending) {\n+      pending = (async () => {\n+        const created = await (sessionFactory ?? createRealSession)(profileName);\n+        sessions.set(profileName, created);\n+        return created;\n+      })();\n+      pendingSessions.set(profileName, pending);\n+    }\n+    try {\n+      session = await pending;\n+    } finally {\n+      if (pendingSessions.get(profileName) === pending) {\n+        pendingSessions.delete(profileName);\n+      }\n+    }\n   }\n   try {\n     await session.ready;\n@@ -229,10 +249,14 @@ async function callTool(\n ): Promise<ChromeMcpToolResult> {\n   const session = await getSession(profileName);\n   try {\n-    return (await session.client.callTool({\n+    const result = (await session.client.callTool({\n       name,\n       arguments: args,\n     })) as ChromeMcpToolResult;\n+    if (result.isError) {\n+      throw new Error(extractToolErrorMessage(result, name));\n+    }\n+    return result;\n   } catch (err) {\n     sessions.delete(profileName);\n     await session.client.close().catch(() => {});\n@@ -268,6 +292,7 @@ export function getChromeMcpPid(profileName: string): number | null {\n }\n \n export async function closeChromeMcpSession(profileName: string): Promise<boolean> {\n+  pendingSessions.delete(profileName);\n   const session = sessions.get(profileName);\n   if (!session) {\n     return false;\n@@ -508,5 +533,6 @@ export function setChromeMcpSessionFactoryForTest(factory: ChromeMcpSessionFacto\n \n export async function resetChromeMcpSessionsForTest(): Promise<void> {\n   sessionFactory = null;\n+  pendingSessions.clear();\n   await stopAllChromeMcpSessions();\n }"
+    },
+    {
+      "sha": "4b153692a20e0ff87e3e9d1ba6cdc6df9488076a",
+      "filename": "src/browser/pw-tools-core.responses.ts",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 17,
+      "changes": 19,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/4357cf4e37ddf8d887497cdc3532b565ef3c6e8b/src%2Fbrowser%2Fpw-tools-core.responses.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/4357cf4e37ddf8d887497cdc3532b565ef3c6e8b/src%2Fbrowser%2Fpw-tools-core.responses.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fbrowser%2Fpw-tools-core.responses.ts?ref=4357cf4e37ddf8d887497cdc3532b565ef3c6e8b",
+      "patch": "@@ -1,22 +1,7 @@\n import { formatCliCommand } from \"../cli/command-format.js\";\n import { ensurePageState, getPageForTargetId } from \"./pw-session.js\";\n import { normalizeTimeoutMs } from \"./pw-tools-core.shared.js\";\n-\n-function matchUrlPattern(pattern: string, url: string): boolean {\n-  const p = pattern.trim();\n-  if (!p) {\n-    return false;\n-  }\n-  if (p === url) {\n-    return true;\n-  }\n-  if (p.includes(\"*\")) {\n-    const escaped = p.replace(/[|\\\\{}()[\\]^$+?.]/g, \"\\\\$&\");\n-    const regex = new RegExp(`^${escaped.replace(/\\*\\*/g, \".*\").replace(/\\*/g, \".*\")}$`);\n-    return regex.test(url);\n-  }\n-  return url.includes(p);\n-}\n+import { matchBrowserUrlPattern } from \"./url-pattern.js\";\n \n export async function responseBodyViaPlaywright(opts: {\n   cdpUrl: string;\n@@ -65,7 +50,7 @@ export async function responseBodyViaPlaywright(opts: {\n       }\n       const r = resp as { url?: () => string };\n       const u = r.url?.() || \"\";\n-      if (!matchUrlPattern(pattern, u)) {\n+      if (!matchBrowserUrlPattern(pattern, u)) {\n         return;\n       }\n       done = true;"
+    },
+    {
+      "sha": "e5aa5bac2e037fe41e6ab6168fd9855a0f05d1c4",
+      "filename": "src/browser/pw-tools-core.waits-next-download-saves-it.test.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/4357cf4e37ddf8d887497cdc3532b565ef3c6e8b/src%2Fbrowser%2Fpw-tools-core.waits-next-download-saves-it.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/4357cf4e37ddf8d887497cdc3532b565ef3c6e8b/src%2Fbrowser%2Fpw-tools-core.waits-next-download-saves-it.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fbrowser%2Fpw-tools-core.waits-next-download-saves-it.test.ts?ref=4357cf4e37ddf8d887497cdc3532b565ef3c6e8b",
+      "patch": "@@ -291,6 +291,6 @@ describe(\"pw-tools-core\", () => {\n         targetId: \"T1\",\n         ref: \"   \",\n       }),\n-    ).rejects.toThrow(/ref is required/i);\n+    ).rejects.toThrow(/ref or selector is required/i);\n   });\n });"
+    },
+    {
+      "sha": "ae18c044265f9a083ac23ec4f3f8cc339d03e44c",
+      "filename": "src/browser/routes/agent.act.ts",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 10,
+      "changes": 30,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/4357cf4e37ddf8d887497cdc3532b565ef3c6e8b/src%2Fbrowser%2Froutes%2Fagent.act.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/4357cf4e37ddf8d887497cdc3532b565ef3c6e8b/src%2Fbrowser%2Froutes%2Fagent.act.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fbrowser%2Froutes%2Fagent.act.ts?ref=4357cf4e37ddf8d887497cdc3532b565ef3c6e8b",
+      "patch": "@@ -12,6 +12,7 @@ import {\n import type { BrowserActRequest, BrowserFormField } from \"../client-actions-core.js\";\n import { normalizeBrowserFormField } from \"../form-fields.js\";\n import type { BrowserRouteContext } from \"../server-context.js\";\n+import { matchBrowserUrlPattern } from \"../url-pattern.js\";\n import { registerBrowserAgentActDownloadRoutes } from \"./agent.act.download.js\";\n import { registerBrowserAgentActHookRoutes } from \"./agent.act.hooks.js\";\n import {\n@@ -47,7 +48,6 @@ function buildExistingSessionWaitPredicate(params: {\n   text?: string;\n   textGone?: string;\n   selector?: string;\n-  url?: string;\n   loadState?: \"load\" | \"domcontentloaded\" | \"networkidle\";\n   fn?: string;\n }): string | null {\n@@ -61,9 +61,6 @@ function buildExistingSessionWaitPredicate(params: {\n   if (params.selector) {\n     checks.push(`Boolean(document.querySelector(${JSON.stringify(params.selector)}))`);\n   }\n-  if (params.url) {\n-    checks.push(`window.location.href === ${JSON.stringify(params.url)}`);\n-  }\n   if (params.loadState === \"domcontentloaded\") {\n     checks.push(`document.readyState === \"interactive\" || document.readyState === \"complete\"`);\n   } else if (params.loadState === \"load\") {\n@@ -94,17 +91,30 @@ async function waitForExistingSessionCondition(params: {\n     await sleep(params.timeMs);\n   }\n   const predicate = buildExistingSessionWaitPredicate(params);\n-  if (!predicate) {\n+  if (!predicate && !params.url) {\n     return;\n   }\n   const timeoutMs = Math.max(250, params.timeoutMs ?? 10_000);\n   const deadline = Date.now() + timeoutMs;\n   while (Date.now() < deadline) {\n-    const ready = await evaluateChromeMcpScript({\n-      profileName: params.profileName,\n-      targetId: params.targetId,\n-      fn: `async () => ${predicate}`,\n-    });\n+    let ready = true;\n+    if (predicate) {\n+      ready = Boolean(\n+        await evaluateChromeMcpScript({\n+          profileName: params.profileName,\n+          targetId: params.targetId,\n+          fn: `async () => ${predicate}`,\n+        }),\n+      );\n+    }\n+    if (ready && params.url) {\n+      const currentUrl = await evaluateChromeMcpScript({\n+        profileName: params.profileName,\n+        targetId: params.targetId,\n+        fn: \"() => window.location.href\",\n+      });\n+      ready = typeof currentUrl === \"string\" && matchBrowserUrlPattern(params.url, currentUrl);\n+    }\n     if (ready) {\n       return;\n     }"
+    },
+    {
+      "sha": "070a0ed41d77174afcecd76f85fe3d56e3c33706",
+      "filename": "src/browser/routes/agent.existing-session.test.ts",
+      "status": "modified",
+      "additions": 33,
+      "deletions": 0,
+      "changes": 33,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/4357cf4e37ddf8d887497cdc3532b565ef3c6e8b/src%2Fbrowser%2Froutes%2Fagent.existing-session.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/4357cf4e37ddf8d887497cdc3532b565ef3c6e8b/src%2Fbrowser%2Froutes%2Fagent.existing-session.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fbrowser%2Froutes%2Fagent.existing-session.test.ts?ref=4357cf4e37ddf8d887497cdc3532b565ef3c6e8b",
+      "patch": "@@ -195,4 +195,37 @@ describe(\"existing-session browser routes\", () => {\n     });\n     expect(chromeMcpMocks.evaluateChromeMcpScript).not.toHaveBeenCalled();\n   });\n+\n+  it(\"supports glob URL waits for existing-session profiles\", async () => {\n+    chromeMcpMocks.evaluateChromeMcpScript.mockReset();\n+    chromeMcpMocks.evaluateChromeMcpScript.mockImplementation(\n+      async ({ fn }: { fn: string }) =>\n+        (fn === \"() => window.location.href\" ? \"https://example.com/\" : true) as never,\n+    );\n+\n+    const { app, postHandlers } = createApp();\n+    registerBrowserAgentActRoutes(app, {\n+      state: () => ({ resolved: { evaluateEnabled: true } }),\n+    } as never);\n+    const handler = postHandlers.get(\"/act\");\n+    expect(handler).toBeTypeOf(\"function\");\n+\n+    const response = createResponse();\n+    await handler?.(\n+      {\n+        params: {},\n+        query: {},\n+        body: { kind: \"wait\", url: \"**/example.com/\" },\n+      },\n+      response.res,\n+    );\n+\n+    expect(response.statusCode).toBe(200);\n+    expect(response.body).toMatchObject({ ok: true, targetId: \"7\" });\n+    expect(chromeMcpMocks.evaluateChromeMcpScript).toHaveBeenCalledWith({\n+      profileName: \"chrome-live\",\n+      targetId: \"7\",\n+      fn: \"() => window.location.href\",\n+    });\n+  });\n });"
+    },
+    {
+      "sha": "77366815ca8cf7d94542b61e26c97634637e0ee0",
+      "filename": "src/browser/routes/basic.existing-session.test.ts",
+      "status": "added",
+      "additions": 80,
+      "deletions": 0,
+      "changes": 80,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/4357cf4e37ddf8d887497cdc3532b565ef3c6e8b/src%2Fbrowser%2Froutes%2Fbasic.existing-session.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/4357cf4e37ddf8d887497cdc3532b565ef3c6e8b/src%2Fbrowser%2Froutes%2Fbasic.existing-session.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fbrowser%2Froutes%2Fbasic.existing-session.test.ts?ref=4357cf4e37ddf8d887497cdc3532b565ef3c6e8b",
+      "patch": "@@ -0,0 +1,80 @@\n+import { describe, expect, it } from \"vitest\";\n+import { BrowserProfileUnavailableError } from \"../errors.js\";\n+import { registerBrowserBasicRoutes } from \"./basic.js\";\n+import type { BrowserResponse, BrowserRouteHandler, BrowserRouteRegistrar } from \"./types.js\";\n+\n+function createApp() {\n+  const getHandlers = new Map<string, BrowserRouteHandler>();\n+  const postHandlers = new Map<string, BrowserRouteHandler>();\n+  const deleteHandlers = new Map<string, BrowserRouteHandler>();\n+  const app: BrowserRouteRegistrar = {\n+    get: (path, handler) => void getHandlers.set(path, handler),\n+    post: (path, handler) => void postHandlers.set(path, handler),\n+    delete: (path, handler) => void deleteHandlers.set(path, handler),\n+  };\n+  return { app, getHandlers };\n+}\n+\n+function createResponse() {\n+  let statusCode = 200;\n+  let jsonBody: unknown;\n+  const res: BrowserResponse = {\n+    status(code) {\n+      statusCode = code;\n+      return res;\n+    },\n+    json(body) {\n+      jsonBody = body;\n+    },\n+  };\n+  return {\n+    res,\n+    get statusCode() {\n+      return statusCode;\n+    },\n+    get body() {\n+      return jsonBody;\n+    },\n+  };\n+}\n+\n+describe(\"basic browser routes\", () => {\n+  it(\"maps existing-session status failures to JSON browser errors\", async () => {\n+    const { app, getHandlers } = createApp();\n+    registerBrowserBasicRoutes(app, {\n+      state: () => ({\n+        resolved: {\n+          enabled: true,\n+          headless: false,\n+          noSandbox: false,\n+          executablePath: undefined,\n+        },\n+        profiles: new Map(),\n+      }),\n+      forProfile: () =>\n+        ({\n+          profile: {\n+            name: \"chrome-live\",\n+            driver: \"existing-session\",\n+            cdpPort: 18802,\n+            cdpUrl: \"http://127.0.0.1:18802\",\n+            color: \"#00AA00\",\n+            attachOnly: true,\n+          },\n+          isHttpReachable: async () => {\n+            throw new BrowserProfileUnavailableError(\"attach failed\");\n+          },\n+          isReachable: async () => true,\n+        }) as never,\n+    } as never);\n+\n+    const handler = getHandlers.get(\"/\");\n+    expect(handler).toBeTypeOf(\"function\");\n+\n+    const response = createResponse();\n+    await handler?.({ params: {}, query: { profile: \"chrome-live\" } }, response.res);\n+\n+    expect(response.statusCode).toBe(409);\n+    expect(response.body).toMatchObject({ error: \"attach failed\" });\n+  });\n+});"
+    },
+    {
+      "sha": "abb56d5af21870a082cf6705f275227e5004242f",
+      "filename": "src/browser/routes/basic.ts",
+      "status": "modified",
+      "additions": 48,
+      "deletions": 40,
+      "changes": 88,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/4357cf4e37ddf8d887497cdc3532b565ef3c6e8b/src%2Fbrowser%2Froutes%2Fbasic.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/4357cf4e37ddf8d887497cdc3532b565ef3c6e8b/src%2Fbrowser%2Froutes%2Fbasic.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fbrowser%2Froutes%2Fbasic.ts?ref=4357cf4e37ddf8d887497cdc3532b565ef3c6e8b",
+      "patch": "@@ -54,50 +54,58 @@ export function registerBrowserBasicRoutes(app: BrowserRouteRegistrar, ctx: Brow\n       return jsonError(res, profileCtx.status, profileCtx.error);\n     }\n \n-    const [cdpHttp, cdpReady] = await Promise.all([\n-      profileCtx.isHttpReachable(300),\n-      profileCtx.isReachable(600),\n-    ]);\n-\n-    const profileState = current.profiles.get(profileCtx.profile.name);\n-    let detectedBrowser: string | null = null;\n-    let detectedExecutablePath: string | null = null;\n-    let detectError: string | null = null;\n-\n     try {\n-      const detected = resolveBrowserExecutableForPlatform(current.resolved, process.platform);\n-      if (detected) {\n-        detectedBrowser = detected.kind;\n-        detectedExecutablePath = detected.path;\n+      const [cdpHttp, cdpReady] = await Promise.all([\n+        profileCtx.isHttpReachable(300),\n+        profileCtx.isReachable(600),\n+      ]);\n+\n+      const profileState = current.profiles.get(profileCtx.profile.name);\n+      let detectedBrowser: string | null = null;\n+      let detectedExecutablePath: string | null = null;\n+      let detectError: string | null = null;\n+\n+      try {\n+        const detected = resolveBrowserExecutableForPlatform(current.resolved, process.platform);\n+        if (detected) {\n+          detectedBrowser = detected.kind;\n+          detectedExecutablePath = detected.path;\n+        }\n+      } catch (err) {\n+        detectError = String(err);\n       }\n+\n+      res.json({\n+        enabled: current.resolved.enabled,\n+        profile: profileCtx.profile.name,\n+        driver: profileCtx.profile.driver,\n+        running: cdpReady,\n+        cdpReady,\n+        cdpHttp,\n+        pid:\n+          profileCtx.profile.driver === \"existing-session\"\n+            ? getChromeMcpPid(profileCtx.profile.name)\n+            : (profileState?.running?.pid ?? null),\n+        cdpPort: profileCtx.profile.cdpPort,\n+        cdpUrl: profileCtx.profile.cdpUrl,\n+        chosenBrowser: profileState?.running?.exe.kind ?? null,\n+        detectedBrowser,\n+        detectedExecutablePath,\n+        detectError,\n+        userDataDir: profileState?.running?.userDataDir ?? null,\n+        color: profileCtx.profile.color,\n+        headless: current.resolved.headless,\n+        noSandbox: current.resolved.noSandbox,\n+        executablePath: current.resolved.executablePath ?? null,\n+        attachOnly: profileCtx.profile.attachOnly,\n+      });\n     } catch (err) {\n-      detectError = String(err);\n+      const mapped = toBrowserErrorResponse(err);\n+      if (mapped) {\n+        return jsonError(res, mapped.status, mapped.message);\n+      }\n+      jsonError(res, 500, String(err));\n     }\n-\n-    res.json({\n-      enabled: current.resolved.enabled,\n-      profile: profileCtx.profile.name,\n-      driver: profileCtx.profile.driver,\n-      running: cdpReady,\n-      cdpReady,\n-      cdpHttp,\n-      pid:\n-        profileCtx.profile.driver === \"existing-session\"\n-          ? getChromeMcpPid(profileCtx.profile.name)\n-          : (profileState?.running?.pid ?? null),\n-      cdpPort: profileCtx.profile.cdpPort,\n-      cdpUrl: profileCtx.profile.cdpUrl,\n-      chosenBrowser: profileState?.running?.exe.kind ?? null,\n-      detectedBrowser,\n-      detectedExecutablePath,\n-      detectError,\n-      userDataDir: profileState?.running?.userDataDir ?? null,\n-      color: profileCtx.profile.color,\n-      headless: current.resolved.headless,\n-      noSandbox: current.resolved.noSandbox,\n-      executablePath: current.resolved.executablePath ?? null,\n-      attachOnly: profileCtx.profile.attachOnly,\n-    });\n   });\n \n   // Start browser (profile-aware)"
+    },
+    {
+      "sha": "837a122becde81ae904eb537e039e20af763a200",
+      "filename": "src/browser/server.agent-contract-snapshot-endpoints.test.ts",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 4,
+      "changes": 12,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/4357cf4e37ddf8d887497cdc3532b565ef3c6e8b/src%2Fbrowser%2Fserver.agent-contract-snapshot-endpoints.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/4357cf4e37ddf8d887497cdc3532b565ef3c6e8b/src%2Fbrowser%2Fserver.agent-contract-snapshot-endpoints.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fbrowser%2Fserver.agent-contract-snapshot-endpoints.test.ts?ref=4357cf4e37ddf8d887497cdc3532b565ef3c6e8b",
+      "patch": "@@ -96,10 +96,14 @@ describe(\"browser control server\", () => {\n       headers: { \"Content-Type\": \"application/json\" },\n       body: JSON.stringify({ kind: \"click\", selector: \"button.save\" }),\n     });\n-    expect(clickSelector.status).toBe(400);\n-    expect(((await clickSelector.json()) as { error?: string }).error).toMatch(\n-      /'selector' is not supported/i,\n-    );\n+    expect(clickSelector.status).toBe(200);\n+    expect(((await clickSelector.json()) as { ok?: boolean }).ok).toBe(true);\n+    expect(pwMocks.clickViaPlaywright).toHaveBeenNthCalledWith(2, {\n+      cdpUrl: state.cdpBaseUrl,\n+      targetId: \"abcd1234\",\n+      selector: \"button.save\",\n+      doubleClick: false,\n+    });\n \n     const type = await postJson<{ ok: boolean }>(`${base}/act`, {\n       kind: \"type\","
+    },
+    {
+      "sha": "2ff99657d261b968e6a9c5e2fd6f08201d91eccc",
+      "filename": "src/browser/url-pattern.ts",
+      "status": "added",
+      "additions": 15,
+      "deletions": 0,
+      "changes": 15,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/4357cf4e37ddf8d887497cdc3532b565ef3c6e8b/src%2Fbrowser%2Furl-pattern.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/4357cf4e37ddf8d887497cdc3532b565ef3c6e8b/src%2Fbrowser%2Furl-pattern.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fbrowser%2Furl-pattern.ts?ref=4357cf4e37ddf8d887497cdc3532b565ef3c6e8b",
+      "patch": "@@ -0,0 +1,15 @@\n+export function matchBrowserUrlPattern(pattern: string, url: string): boolean {\n+  const trimmedPattern = pattern.trim();\n+  if (!trimmedPattern) {\n+    return false;\n+  }\n+  if (trimmedPattern === url) {\n+    return true;\n+  }\n+  if (trimmedPattern.includes(\"*\")) {\n+    const escaped = trimmedPattern.replace(/[|\\\\{}()[\\]^$+?.]/g, \"\\\\$&\");\n+    const regex = new RegExp(`^${escaped.replace(/\\*\\*/g, \".*\").replace(/\\*/g, \".*\")}$`);\n+    return regex.test(url);\n+  }\n+  return url.includes(trimmedPattern);\n+}"
+    }
+  ]
+}

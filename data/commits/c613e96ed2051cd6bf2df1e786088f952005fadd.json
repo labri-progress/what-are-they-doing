@@ -1,0 +1,89 @@
+{
+  "message": "fix: recover auth import and device transfer",
+  "files": [
+    {
+      "sha": "2ae5ae76768f6513f90b2cadfe95589fd644b4a1",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/openclaw/spogo/blob/c613e96ed2051cd6bf2df1e786088f952005fadd/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/spogo/raw/c613e96ed2051cd6bf2df1e786088f952005fadd/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/spogo/contents/CHANGELOG.md?ref=c613e96ed2051cd6bf2df1e786088f952005fadd",
+      "patch": "@@ -5,6 +5,8 @@\n - Add `auth paste`, wire `--no-input`, and improve cookie diagnostics/cleanup (`#5`, thanks @im-zayan)\n - Add `play --shuffle`, Connect library/playlist support, and context-aware Connect play payloads (`#15`, thanks @StandardGage)\n - Fix Connect track artist extraction for nested artist containers and minimal artist fragments (`#7`, thanks @joelbdavies)\n+- Fix silent `auth import` failures by retrying Spotify auth cookie lookup across related hosts and surfacing browser warnings (`#13`)\n+- Fix `device set` when Connect state has no origin device by falling back to Web API transfer (`#8`)\n \n ## 0.3.0 - 2026-03-08\n "
+    },
+    {
+      "sha": "9ef62607401fd53d523a552662288604cc16f040",
+      "filename": "README.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/spogo/blob/c613e96ed2051cd6bf2df1e786088f952005fadd/README.md",
+      "raw_url": "https://github.com/openclaw/spogo/raw/c613e96ed2051cd6bf2df1e786088f952005fadd/README.md",
+      "contents_url": "https://api.github.com/repos/openclaw/spogo/contents/README.md?ref=c613e96ed2051cd6bf2df1e786088f952005fadd",
+      "patch": "@@ -97,6 +97,7 @@ spogo auth import --browser chrome\n ```\n \n Defaults: Chrome + Default profile. Cookies are stored under your config directory (per profile).\n+If import still fails, `spogo` now surfaces browser-store warnings instead of only printing `no cookies found`.\n \n ### Manual cookie paste (WSL fallback)\n "
+    },
+    {
+      "sha": "e0c09a56b140d42c722c73faaade8f7aaa39346d",
+      "filename": "docs/spec.md",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/openclaw/spogo/blob/c613e96ed2051cd6bf2df1e786088f952005fadd/docs%2Fspec.md",
+      "raw_url": "https://github.com/openclaw/spogo/raw/c613e96ed2051cd6bf2df1e786088f952005fadd/docs%2Fspec.md",
+      "contents_url": "https://api.github.com/repos/openclaw/spogo/contents/docs%2Fspec.md?ref=c613e96ed2051cd6bf2df1e786088f952005fadd",
+      "patch": "@@ -42,6 +42,7 @@ spogo [global flags] <command> [args]\n   - `--browser-profile <name>`\n   - `--cookie-path <file>`\n   - `--domain <host>` default `spotify.com`\n+  - when browser reads fail, surface underlying browser-store warnings\n - `spogo auth paste`\n   - reads cookie values from stdin (prompts when interactive)\n   - `--cookie-path <file>`\n@@ -112,6 +113,7 @@ spogo [global flags] <command> [args]\n \n - `spogo device list`\n - `spogo device set <name|id>`\n+  - falls back to Web API transfer when Connect state has no origin device\n \n ## Output contract\n "
+    },
+    {
+      "sha": "ca5e6bb4e89fd3c4b89b3b689f2e8043eff6944c",
+      "filename": "internal/cookies/source.go",
+      "status": "modified",
+      "additions": 103,
+      "deletions": 34,
+      "changes": 137,
+      "blob_url": "https://github.com/openclaw/spogo/blob/c613e96ed2051cd6bf2df1e786088f952005fadd/internal%2Fcookies%2Fsource.go",
+      "raw_url": "https://github.com/openclaw/spogo/raw/c613e96ed2051cd6bf2df1e786088f952005fadd/internal%2Fcookies%2Fsource.go",
+      "contents_url": "https://api.github.com/repos/openclaw/spogo/contents/internal%2Fcookies%2Fsource.go?ref=c613e96ed2051cd6bf2df1e786088f952005fadd",
+      "patch": "@@ -3,8 +3,10 @@ package cookies\n import (\n \t\"context\"\n \t\"errors\"\n+\t\"fmt\"\n \t\"net/http\"\n \t\"net/url\"\n+\t\"slices\"\n \t\"strings\"\n \t\"time\"\n \n@@ -13,6 +15,8 @@ import (\n \n var readCookies = sweetcookie.Get\n \n+var authCookieNames = []string{\"sp_dc\", \"sp_key\", \"sp_t\"}\n+\n // SetReadCookies overrides the internal cookie reader and returns a restore func.\n // Intended for tests.\n func SetReadCookies(fn func(context.Context, sweetcookie.Options) (sweetcookie.Result, error)) func() {\n@@ -40,31 +44,51 @@ type FileSource struct {\n }\n \n func (s BrowserSource) Cookies(ctx context.Context) ([]*http.Cookie, error) {\n-\tdomain := strings.TrimSpace(s.Domain)\n-\tif domain == \"\" {\n-\t\tdomain = \"spotify.com\"\n+\tresult, err := readCookies(ctx, s.cookieOptions(false))\n+\tif err != nil {\n+\t\treturn nil, err\n \t}\n-\thost := domain\n-\tif strings.Contains(domain, \"://\") {\n-\t\tif parsed, err := url.Parse(domain); err == nil && parsed.Hostname() != \"\" {\n-\t\t\thost = parsed.Hostname()\n+\tif len(result.Cookies) == 0 && s.shouldRetryAcrossHosts() {\n+\t\tretry, retryErr := readCookies(ctx, s.cookieOptions(true))\n+\t\tif retryErr != nil {\n+\t\t\treturn nil, retryErr\n \t\t}\n+\t\tresult.Cookies = retry.Cookies\n+\t\tresult.Warnings = append(result.Warnings, retry.Warnings...)\n \t}\n-\turl := \"https://\" + host\n-\torigins := []string{}\n-\tif strings.Contains(host, \"spotify.com\") {\n-\t\tif host != \"open.spotify.com\" {\n-\t\t\torigins = append(origins, \"https://open.spotify.com\")\n+\tif len(result.Cookies) == 0 {\n+\t\treturn nil, browserCookiesNotFoundError(result.Warnings)\n+\t}\n+\tret := make([]*http.Cookie, 0, len(result.Cookies))\n+\tfor _, c := range result.Cookies {\n+\t\tcookie := &http.Cookie{\n+\t\t\tName:     c.Name,\n+\t\t\tValue:    c.Value,\n+\t\t\tDomain:   c.Domain,\n+\t\t\tPath:     c.Path,\n+\t\t\tSecure:   c.Secure,\n+\t\t\tHttpOnly: c.HTTPOnly,\n \t\t}\n-\t\tif host != \"spotify.com\" {\n-\t\t\torigins = append(origins, \"https://spotify.com\")\n+\t\tif c.Expires != nil {\n+\t\t\tcookie.Expires = *c.Expires\n \t\t}\n+\t\tret = append(ret, cookie)\n \t}\n+\treturn ret, nil\n+}\n+\n+func (s BrowserSource) cookieOptions(allowAllHosts bool) sweetcookie.Options {\n+\thost := s.host()\n \topts := sweetcookie.Options{\n-\t\tURL:     url,\n-\t\tOrigins: origins,\n \t\tMode:    sweetcookie.ModeFirst,\n \t\tTimeout: 5 * time.Second,\n+\t\tNames:   authCookieNames,\n+\t}\n+\tif allowAllHosts {\n+\t\topts.AllowAllHosts = true\n+\t} else {\n+\t\topts.URL = \"https://\" + host\n+\t\topts.Origins = spotifyOrigins(host)\n \t}\n \tif s.Browser != \"\" {\n \t\tbrowser := sweetcookie.Browser(strings.ToLower(s.Browser))\n@@ -78,29 +102,74 @@ func (s BrowserSource) Cookies(ctx context.Context) ([]*http.Cookie, error) {\n \t\t\topts.Profiles[browser] = s.Profile\n \t\t}\n \t}\n-\tresult, err := readCookies(ctx, opts)\n-\tif err != nil {\n-\t\treturn nil, err\n+\treturn opts\n+}\n+\n+func (s BrowserSource) host() string {\n+\tdomain := strings.TrimSpace(s.Domain)\n+\tif domain == \"\" {\n+\t\tdomain = \"spotify.com\"\n \t}\n-\tif len(result.Cookies) == 0 {\n-\t\treturn nil, errors.New(\"no cookies found\")\n+\tif strings.Contains(domain, \"://\") {\n+\t\tif parsed, err := url.Parse(domain); err == nil && parsed.Hostname() != \"\" {\n+\t\t\treturn parsed.Hostname()\n+\t\t}\n \t}\n-\tret := make([]*http.Cookie, 0, len(result.Cookies))\n-\tfor _, c := range result.Cookies {\n-\t\tcookie := &http.Cookie{\n-\t\t\tName:     c.Name,\n-\t\t\tValue:    c.Value,\n-\t\t\tDomain:   c.Domain,\n-\t\t\tPath:     c.Path,\n-\t\t\tSecure:   c.Secure,\n-\t\t\tHttpOnly: c.HTTPOnly,\n+\treturn domain\n+}\n+\n+func (s BrowserSource) shouldRetryAcrossHosts() bool {\n+\thost := normalizeCookieHost(s.host())\n+\treturn host == \"spotify.com\" || strings.HasSuffix(host, \".spotify.com\")\n+}\n+\n+func spotifyOrigins(host string) []string {\n+\thost = normalizeCookieHost(host)\n+\tif host == \"\" {\n+\t\treturn nil\n+\t}\n+\tif !strings.Contains(host, \"spotify.com\") {\n+\t\treturn nil\n+\t}\n+\torigins := []string{}\n+\tfor _, candidate := range []string{\"spotify.com\", \"open.spotify.com\", \"accounts.spotify.com\"} {\n+\t\tif host == candidate {\n+\t\t\tcontinue\n \t\t}\n-\t\tif c.Expires != nil {\n-\t\t\tcookie.Expires = *c.Expires\n+\t\torigins = append(origins, \"https://\"+candidate)\n+\t}\n+\treturn origins\n+}\n+\n+func normalizeCookieHost(host string) string {\n+\treturn strings.ToLower(strings.TrimPrefix(strings.TrimSpace(host), \".\"))\n+}\n+\n+func browserCookiesNotFoundError(warnings []string) error {\n+\twarnings = compactWarnings(warnings)\n+\tif len(warnings) == 0 {\n+\t\treturn errors.New(\"no cookies found\")\n+\t}\n+\treturn fmt.Errorf(\"no cookies found; %s\", strings.Join(warnings, \"; \"))\n+}\n+\n+func compactWarnings(warnings []string) []string {\n+\tout := make([]string, 0, len(warnings))\n+\tfor _, warning := range warnings {\n+\t\twarning = strings.TrimSpace(warning)\n+\t\tif warning == \"\" {\n+\t\t\tcontinue\n \t\t}\n-\t\tret = append(ret, cookie)\n+\t\tout = append(out, warning)\n \t}\n-\treturn ret, nil\n+\tif len(out) == 0 {\n+\t\treturn nil\n+\t}\n+\tout = slices.Compact(out)\n+\tif len(out) > 3 {\n+\t\treturn out[:3]\n+\t}\n+\treturn out\n }\n \n func (s FileSource) Cookies(ctx context.Context) ([]*http.Cookie, error) {"
+    },
+    {
+      "sha": "888f317f893d15b4740faa3b405ee8d4ecebba41",
+      "filename": "internal/cookies/source_test.go",
+      "status": "modified",
+      "additions": 74,
+      "deletions": 0,
+      "changes": 74,
+      "blob_url": "https://github.com/openclaw/spogo/blob/c613e96ed2051cd6bf2df1e786088f952005fadd/internal%2Fcookies%2Fsource_test.go",
+      "raw_url": "https://github.com/openclaw/spogo/raw/c613e96ed2051cd6bf2df1e786088f952005fadd/internal%2Fcookies%2Fsource_test.go",
+      "contents_url": "https://api.github.com/repos/openclaw/spogo/contents/internal%2Fcookies%2Fsource_test.go?ref=c613e96ed2051cd6bf2df1e786088f952005fadd",
+      "patch": "@@ -4,6 +4,7 @@ import (\n \t\"context\"\n \t\"errors\"\n \t\"net/http\"\n+\t\"strings\"\n \t\"testing\"\n \t\"time\"\n \n@@ -39,6 +40,40 @@ func TestBrowserSourceNoCookies(t *testing.T) {\n \t}\n }\n \n+func TestBrowserSourceRetriesAcrossSpotifyHosts(t *testing.T) {\n+\tvar calls []sweetcookie.Options\n+\trestore := SetReadCookies(func(ctx context.Context, opts sweetcookie.Options) (sweetcookie.Result, error) {\n+\t\tcalls = append(calls, opts)\n+\t\tif len(calls) == 1 {\n+\t\t\treturn sweetcookie.Result{}, nil\n+\t\t}\n+\t\treturn sweetcookie.Result{\n+\t\t\tCookies: []sweetcookie.Cookie{{Name: \"sp_dc\", Value: \"token\", Domain: \".accounts.spotify.com\"}},\n+\t\t}, nil\n+\t})\n+\tdefer restore()\n+\tsrc := BrowserSource{Browser: \"chrome\", Domain: \"spotify.com\"}\n+\tcookies, err := src.Cookies(context.Background())\n+\tif err != nil {\n+\t\tt.Fatalf(\"cookies: %v\", err)\n+\t}\n+\tif len(cookies) != 1 || cookies[0].Name != \"sp_dc\" {\n+\t\tt.Fatalf(\"unexpected cookies: %#v\", cookies)\n+\t}\n+\tif len(calls) != 2 {\n+\t\tt.Fatalf(\"expected 2 calls, got %d\", len(calls))\n+\t}\n+\tif calls[0].AllowAllHosts {\n+\t\tt.Fatalf(\"expected filtered first pass\")\n+\t}\n+\tif !calls[1].AllowAllHosts {\n+\t\tt.Fatalf(\"expected allow-all fallback\")\n+\t}\n+\tif len(calls[1].Names) != len(authCookieNames) {\n+\t\tt.Fatalf(\"expected auth cookie allowlist\")\n+\t}\n+}\n+\n func TestSetReadCookies(t *testing.T) {\n \trestore := SetReadCookies(nil)\n \trestore()\n@@ -59,6 +94,45 @@ func TestBrowserSourceError(t *testing.T) {\n \t}\n }\n \n+func TestBrowserSourceNoCookiesIncludesWarnings(t *testing.T) {\n+\trestore := SetReadCookies(func(ctx context.Context, opts sweetcookie.Options) (sweetcookie.Result, error) {\n+\t\treturn sweetcookie.Result{Warnings: []string{\"sweetcookie: chrome cookie store not found\"}}, nil\n+\t})\n+\tdefer restore()\n+\tsrc := BrowserSource{Browser: \"chrome\", Domain: \"spotify.com\"}\n+\t_, err := src.Cookies(context.Background())\n+\tif err == nil {\n+\t\tt.Fatalf(\"expected error\")\n+\t}\n+\tif !strings.Contains(err.Error(), \"chrome cookie store not found\") {\n+\t\tt.Fatalf(\"expected warning in error, got %v\", err)\n+\t}\n+}\n+\n+func TestBrowserSourceUsesSpotifyOrigins(t *testing.T) {\n+\tvar got sweetcookie.Options\n+\trestore := SetReadCookies(func(ctx context.Context, opts sweetcookie.Options) (sweetcookie.Result, error) {\n+\t\tgot = opts\n+\t\treturn sweetcookie.Result{\n+\t\t\tCookies: []sweetcookie.Cookie{{Name: \"sp_dc\", Value: \"token\", Domain: \".spotify.com\"}},\n+\t\t}, nil\n+\t})\n+\tdefer restore()\n+\tsrc := BrowserSource{Browser: \"chrome\", Domain: \"spotify.com\"}\n+\tif _, err := src.Cookies(context.Background()); err != nil {\n+\t\tt.Fatalf(\"expected cookies: %v\", err)\n+\t}\n+\tif len(got.Origins) != 2 {\n+\t\tt.Fatalf(\"expected 2 spotify origins, got %v\", got.Origins)\n+\t}\n+\tif got.Origins[0] != \"https://open.spotify.com\" && got.Origins[1] != \"https://open.spotify.com\" {\n+\t\tt.Fatalf(\"expected open.spotify.com origin, got %v\", got.Origins)\n+\t}\n+\tif got.Origins[0] != \"https://accounts.spotify.com\" && got.Origins[1] != \"https://accounts.spotify.com\" {\n+\t\tt.Fatalf(\"expected accounts.spotify.com origin, got %v\", got.Origins)\n+\t}\n+}\n+\n func TestBrowserSourceDefaultDomain(t *testing.T) {\n \trestore := SetReadCookies(func(ctx context.Context, opts sweetcookie.Options) (sweetcookie.Result, error) {\n \t\treturn sweetcookie.Result{"
+    },
+    {
+      "sha": "bc920a17288022631316dbb3fbf1f9768c7130d6",
+      "filename": "internal/spotify/connect_commands.go",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 1,
+      "changes": 8,
+      "blob_url": "https://github.com/openclaw/spogo/blob/c613e96ed2051cd6bf2df1e786088f952005fadd/internal%2Fspotify%2Fconnect_commands.go",
+      "raw_url": "https://github.com/openclaw/spogo/raw/c613e96ed2051cd6bf2df1e786088f952005fadd/internal%2Fspotify%2Fconnect_commands.go",
+      "contents_url": "https://api.github.com/repos/openclaw/spogo/contents/internal%2Fspotify%2Fconnect_commands.go?ref=c613e96ed2051cd6bf2df1e786088f952005fadd",
+      "patch": "@@ -23,7 +23,7 @@ func (c *ConnectClient) transfer(ctx context.Context, deviceID string) error {\n \treturn withConnectStateErr(ctx, c, func(state connectState) error {\n \t\tfromID := connectTransferSourceID(state)\n \t\tif fromID == \"\" {\n-\t\t\treturn errors.New(\"missing origin device id\")\n+\t\t\treturn c.transferViaWebAPI(ctx, deviceID)\n \t\t}\n \t\treturn c.sendConnectCommand(ctx, fmt.Sprintf(\"%s/connect/transfer/from/%s/to/%s\", connectStateBase, fromID, deviceID), map[string]any{\n \t\t\t\"transfer_options\": map[string]any{\n@@ -34,6 +34,12 @@ func (c *ConnectClient) transfer(ctx context.Context, deviceID string) error {\n \t})\n }\n \n+func (c *ConnectClient) transferViaWebAPI(ctx context.Context, deviceID string) error {\n+\treturn withWebFallback(c, func(web *Client) error {\n+\t\treturn web.Transfer(ctx, deviceID)\n+\t})\n+}\n+\n func (c *ConnectClient) play(ctx context.Context, uri string) error {\n \treturn withConnectStateErr(ctx, c, func(state connectState) error {\n \t\tif uri == \"\" {"
+    },
+    {
+      "sha": "6bdec7317fd024ce96293657334da43d7f0d53c1",
+      "filename": "internal/spotify/connect_playback_test.go",
+      "status": "modified",
+      "additions": 45,
+      "deletions": 0,
+      "changes": 45,
+      "blob_url": "https://github.com/openclaw/spogo/blob/c613e96ed2051cd6bf2df1e786088f952005fadd/internal%2Fspotify%2Fconnect_playback_test.go",
+      "raw_url": "https://github.com/openclaw/spogo/raw/c613e96ed2051cd6bf2df1e786088f952005fadd/internal%2Fspotify%2Fconnect_playback_test.go",
+      "contents_url": "https://api.github.com/repos/openclaw/spogo/contents/internal%2Fspotify%2Fconnect_playback_test.go?ref=c613e96ed2051cd6bf2df1e786088f952005fadd",
+      "patch": "@@ -142,6 +142,51 @@ func TestConnectPlaybackActiveDeviceFromDevices(t *testing.T) {\n \t}\n }\n \n+func TestConnectTransferFallsBackToWebAPIWithoutOriginDevice(t *testing.T) {\n+\tstatePayload := map[string]any{\n+\t\t\"devices\": map[string]any{\n+\t\t\t\"device-1\": map[string]any{\n+\t\t\t\t\"name\":        \"Desk\",\n+\t\t\t\t\"device_type\": \"computer\",\n+\t\t\t},\n+\t\t},\n+\t\t\"player_state\": map[string]any{\n+\t\t\t\"is_paused\": true,\n+\t\t},\n+\t}\n+\tvar sawWebTransfer bool\n+\ttransport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {\n+\t\tswitch {\n+\t\tcase req.Method == http.MethodPut && strings.Contains(req.URL.Path, \"/devices/hobs_\"):\n+\t\t\treturn jsonResponse(http.StatusOK, statePayload), nil\n+\t\tcase req.Method == http.MethodPut && req.URL.Path == \"/v1/me/player\":\n+\t\t\tsawWebTransfer = true\n+\t\t\treturn textResponse(http.StatusNoContent, \"\"), nil\n+\t\tcase req.Method == http.MethodPost:\n+\t\t\tt.Fatalf(\"unexpected connect command: %s\", req.URL.Path)\n+\t\t\treturn nil, nil\n+\t\tdefault:\n+\t\t\treturn textResponse(http.StatusNotFound, \"missing\"), nil\n+\t\t}\n+\t})\n+\tclient := newRegisteredConnectClientForTests(transport)\n+\twebClient, err := NewClient(Options{\n+\t\tTokenProvider: staticTokenProvider{},\n+\t\tHTTPClient:    client.client,\n+\t})\n+\tif err != nil {\n+\t\tt.Fatalf(\"new web client: %v\", err)\n+\t}\n+\tclient.web = webClient\n+\n+\tif err := client.Transfer(context.Background(), \"device-1\"); err != nil {\n+\t\tt.Fatalf(\"transfer: %v\", err)\n+\t}\n+\tif !sawWebTransfer {\n+\t\tt.Fatalf(\"expected web transfer fallback\")\n+\t}\n+}\n+\n func TestSendPlayerCommandMissingDevice(t *testing.T) {\n \tclient := newConnectClientForTests(roundTripperFunc(func(req *http.Request) (*http.Response, error) {\n \t\treturn textResponse(http.StatusOK, \"\"), nil"
+    }
+  ]
+}

@@ -1,0 +1,77 @@
+{
+  "message": "refactor: extract coalesceRanges, clean up page-processor and partial-agg\n\n- Extract coalesceRanges into src/coalesce.ts shared module\n- Fragment DO now uses coalesced R2 reads instead of per-page fetches\n- Page processor uses typed exports instead of (wasm.exports as any)\n- Partial agg uses null byte separator for group keys to avoid\n  collisions with pipe characters in data\n- Hoist fs import outside fragment loop in LocalExecutor",
+  "files": [
+    {
+      "sha": "db3bd274de92f305cba0ca23db23cc1c865a9d82",
+      "filename": "src/coalesce.ts",
+      "status": "added",
+      "additions": 35,
+      "deletions": 0,
+      "changes": 35,
+      "blob_url": "https://github.com/teamchong/querymode/blob/ba5cc4c3d685108c2dc24377a93cf295c3716036/src%2Fcoalesce.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/ba5cc4c3d685108c2dc24377a93cf295c3716036/src%2Fcoalesce.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fcoalesce.ts?ref=ba5cc4c3d685108c2dc24377a93cf295c3716036",
+      "patch": "@@ -0,0 +1,35 @@\n+/** Byte range to fetch from R2 */\n+export interface Range {\n+  column: string;\n+  offset: number;\n+  length: number;\n+}\n+\n+/** Merged range containing the original sub-ranges */\n+export interface CoalescedRange {\n+  offset: number;\n+  length: number;\n+  ranges: Range[];\n+}\n+\n+/** Merge nearby byte ranges into fewer R2 reads. Sorts by offset, merges if gap <= maxGap. */\n+export function coalesceRanges(ranges: Range[], maxGap: number): CoalescedRange[] {\n+  if (ranges.length === 0) return [];\n+  const sorted = [...ranges].sort((a, b) => a.offset - b.offset);\n+  const result: CoalescedRange[] = [];\n+  let cur: CoalescedRange = { offset: sorted[0].offset, length: sorted[0].length, ranges: [sorted[0]] };\n+\n+  for (let i = 1; i < sorted.length; i++) {\n+    const r = sorted[i];\n+    const curEnd = cur.offset + cur.length;\n+    if (r.offset <= curEnd + maxGap) {\n+      cur.length = Math.max(curEnd, r.offset + r.length) - cur.offset;\n+      cur.ranges.push(r);\n+    } else {\n+      result.push(cur);\n+      cur = { offset: r.offset, length: r.length, ranges: [r] };\n+    }\n+  }\n+  result.push(cur);\n+  return result;\n+}"
+    },
+    {
+      "sha": "9ae5698ad625614196e80fda37cab631ecca1abc",
+      "filename": "src/fragment-do.ts",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 9,
+      "changes": 25,
+      "blob_url": "https://github.com/teamchong/querymode/blob/ba5cc4c3d685108c2dc24377a93cf295c3716036/src%2Ffragment-do.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/ba5cc4c3d685108c2dc24377a93cf295c3716036/src%2Ffragment-do.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Ffragment-do.ts?ref=ba5cc4c3d685108c2dc24377a93cf295c3716036",
+      "patch": "@@ -5,6 +5,7 @@ import { assembleRows, canSkipPage, bigIntReplacer } from \"./decode.js\";\n import { instantiateWasm, type WasmEngine } from \"./wasm-engine.js\";\n import { createPageProcessor, type PageProcessor } from \"./page-processor.js\";\n import { computePartialAgg, type PartialAgg } from \"./partial-agg.js\";\n+import { coalesceRanges } from \"./coalesce.js\";\n \n interface ScanRequest {\n   fragments: { r2Key: string; meta: TableMeta }[];\n@@ -100,19 +101,25 @@ export class FragmentDO implements DurableObject {\n         }\n       }\n \n-      // Parallel Range reads \u2014 one per page\n+      // Coalesce nearby ranges into fewer R2 reads (max 64KB gap to merge)\n+      const coalesced = coalesceRanges(ranges, 64 * 1024);\n       const columnData = new Map<string, ArrayBuffer[]>();\n-      await Promise.all(ranges.map(async (range) => {\n+      const fetched = await Promise.all(coalesced.map(async c => {\n         const obj = await this.env.DATA_BUCKET.get(r2Key, {\n-          range: { offset: range.offset, length: range.length },\n+          range: { offset: c.offset, length: c.length },\n         });\n-        if (!obj) return;\n-        const data = await obj.arrayBuffer();\n-        totalBytesRead += data.byteLength;\n-        const arr = columnData.get(range.column) ?? [];\n-        arr.push(data);\n-        columnData.set(range.column, arr);\n+        return obj ? { ...c, data: await obj.arrayBuffer() } : null;\n       }));\n+      for (const f of fetched) {\n+        if (!f) continue;\n+        totalBytesRead += f.data.byteLength;\n+        for (const sub of f.ranges) {\n+          const slice = f.data.slice(sub.offset - f.offset, sub.offset - f.offset + sub.length);\n+          const arr = columnData.get(sub.column) ?? [];\n+          arr.push(slice);\n+          columnData.set(sub.column, arr);\n+        }\n+      }\n \n       const rows = assembleRows(columnData, cols, query, this.wasmEngine);\n       allRows.push(...rows);"
+    },
+    {
+      "sha": "5e51afbdf50023f176e6cd36612e01ec2e743695",
+      "filename": "src/index.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/teamchong/querymode/blob/ba5cc4c3d685108c2dc24377a93cf295c3716036/src%2Findex.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/ba5cc4c3d685108c2dc24377a93cf295c3716036/src%2Findex.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Findex.ts?ref=ba5cc4c3d685108c2dc24377a93cf295c3716036",
+      "patch": "@@ -345,6 +345,7 @@ class LocalExecutor implements QueryExecutor {\n     }\n \n     // Execute query across all fragments\n+    const fsMod = await import(\"node:fs/promises\");\n     let allRows: import(\"./types.js\").Row[] = [];\n     let totalBytesRead = 0;\n     let totalPagesSkipped = 0;\n@@ -366,7 +367,6 @@ class LocalExecutor implements QueryExecutor {\n       }\n \n       const columnData = new Map<string, ArrayBuffer[]>();\n-      const fsMod = await import(\"node:fs/promises\");\n       const handle = await fsMod.open(meta.r2Key, \"r\");\n       try {\n         for (const range of pageRanges) {"
+    },
+    {
+      "sha": "6fa3cd868537c66b4881847c8822a839bacb810f",
+      "filename": "src/page-processor.ts",
+      "status": "modified",
+      "additions": 12,
+      "deletions": 15,
+      "changes": 27,
+      "blob_url": "https://github.com/teamchong/querymode/blob/ba5cc4c3d685108c2dc24377a93cf295c3716036/src%2Fpage-processor.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/ba5cc4c3d685108c2dc24377a93cf295c3716036/src%2Fpage-processor.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fpage-processor.ts?ref=ba5cc4c3d685108c2dc24377a93cf295c3716036",
+      "patch": "@@ -41,37 +41,34 @@ function createWasmProcessor(wasm: WasmEngine): PageProcessor {\n     sumFloat64(buf: ArrayBuffer): number {\n       const f64 = new Float64Array(buf);\n       if (f64.length === 0) return 0;\n-      const byteSize = f64.byteLength;\n-      const ptr = wasm.exports.wasmAlloc(byteSize);\n+      const ptr = wasm.exports.wasmAlloc(f64.byteLength);\n       if (!ptr) return tsFallbackSum(f64);\n-      new Uint8Array(wasm.exports.memory.buffer, ptr, byteSize).set(\n-        new Uint8Array(buf, 0, byteSize),\n+      new Uint8Array(wasm.exports.memory.buffer, ptr, f64.byteLength).set(\n+        new Uint8Array(buf, 0, f64.byteLength),\n       );\n-      return (wasm.exports as any).sumFloat64Buffer(ptr / 8, f64.length);\n+      return wasm.exports.sumFloat64Buffer(ptr >> 3, f64.length);\n     },\n \n     minFloat64(buf: ArrayBuffer): number {\n       const f64 = new Float64Array(buf);\n       if (f64.length === 0) return Infinity;\n-      const byteSize = f64.byteLength;\n-      const ptr = wasm.exports.wasmAlloc(byteSize);\n+      const ptr = wasm.exports.wasmAlloc(f64.byteLength);\n       if (!ptr) return tsFallbackMin(f64);\n-      new Uint8Array(wasm.exports.memory.buffer, ptr, byteSize).set(\n-        new Uint8Array(buf, 0, byteSize),\n+      new Uint8Array(wasm.exports.memory.buffer, ptr, f64.byteLength).set(\n+        new Uint8Array(buf, 0, f64.byteLength),\n       );\n-      return (wasm.exports as any).minFloat64Buffer(ptr / 8, f64.length);\n+      return wasm.exports.minFloat64Buffer(ptr >> 3, f64.length);\n     },\n \n     maxFloat64(buf: ArrayBuffer): number {\n       const f64 = new Float64Array(buf);\n       if (f64.length === 0) return -Infinity;\n-      const byteSize = f64.byteLength;\n-      const ptr = wasm.exports.wasmAlloc(byteSize);\n+      const ptr = wasm.exports.wasmAlloc(f64.byteLength);\n       if (!ptr) return tsFallbackMax(f64);\n-      new Uint8Array(wasm.exports.memory.buffer, ptr, byteSize).set(\n-        new Uint8Array(buf, 0, byteSize),\n+      new Uint8Array(wasm.exports.memory.buffer, ptr, f64.byteLength).set(\n+        new Uint8Array(buf, 0, f64.byteLength),\n       );\n-      return (wasm.exports as any).maxFloat64Buffer(ptr / 8, f64.length);\n+      return wasm.exports.maxFloat64Buffer(ptr >> 3, f64.length);\n     },\n \n     vectorSearchPage("
+    },
+    {
+      "sha": "ac9a0fc30b0c94cb4bea04a703d4f9a3e0481bd7",
+      "filename": "src/partial-agg.ts",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/teamchong/querymode/blob/ba5cc4c3d685108c2dc24377a93cf295c3716036/src%2Fpartial-agg.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/ba5cc4c3d685108c2dc24377a93cf295c3716036/src%2Fpartial-agg.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fpartial-agg.ts?ref=ba5cc4c3d685108c2dc24377a93cf295c3716036",
+      "patch": "@@ -76,7 +76,7 @@ export function computePartialAgg(\n   const groupCols = query.groupBy;\n \n   for (const row of rows) {\n-    const key = groupCols.map((c) => String(row[c] ?? \"\")).join(\"|\");\n+    const key = groupCols.map((c) => String(row[c] ?? \"\")).join(\"\\x00\");\n     let states = groups.get(key);\n     if (!states) {\n       states = aggregates.map((agg) =>\n@@ -156,7 +156,7 @@ export function finalizePartialAgg(\n \n   for (const [key, states] of agg.groups) {\n     const row: Row = {};\n-    const keyParts = key.split(\"|\");\n+    const keyParts = key.split(\"\\x00\");\n     for (let i = 0; i < groupCols.length; i++) {\n       row[groupCols[i]] = keyParts[i];\n     }"
+    },
+    {
+      "sha": "5308e38698444588046eb0c2991c3aac837492cb",
+      "filename": "src/query-do.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 24,
+      "changes": 25,
+      "blob_url": "https://github.com/teamchong/querymode/blob/ba5cc4c3d685108c2dc24377a93cf295c3716036/src%2Fquery-do.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/ba5cc4c3d685108c2dc24377a93cf295c3716036/src%2Fquery-do.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fquery-do.ts?ref=ba5cc4c3d685108c2dc24377a93cf295c3716036",
+      "patch": "@@ -7,6 +7,7 @@ import { instantiateWasm, type WasmEngine } from \"./wasm-engine.js\";\n import { createPageProcessor } from \"./page-processor.js\";\n import { mergeQueryResults } from \"./merge.js\";\n import { computePartialAgg, mergePartialAggs, finalizePartialAgg } from \"./partial-agg.js\";\n+import { coalesceRanges } from \"./coalesce.js\";\n \n const MAX_WASM_FILE = 64 * 1024 * 1024; // 64MB \u2014 stay within 128MB DO limit\n const FRAGMENT_POOL_MAX = 20; // Max Fragment DO slots per datacenter (idle slots cost nothing)\n@@ -533,27 +534,3 @@ export class QueryDO implements DurableObject {\n   }\n }\n \n-type Range = { column: string; offset: number; length: number };\n-type CoalescedRange = { offset: number; length: number; ranges: Range[] };\n-\n-/** Merge nearby byte ranges into fewer R2 reads. Sorts by offset, merges if gap <= maxGap. */\n-function coalesceRanges(ranges: Range[], maxGap: number): CoalescedRange[] {\n-  if (ranges.length === 0) return [];\n-  const sorted = [...ranges].sort((a, b) => a.offset - b.offset);\n-  const result: CoalescedRange[] = [];\n-  let cur: CoalescedRange = { offset: sorted[0].offset, length: sorted[0].length, ranges: [sorted[0]] };\n-\n-  for (let i = 1; i < sorted.length; i++) {\n-    const r = sorted[i];\n-    const curEnd = cur.offset + cur.length;\n-    if (r.offset <= curEnd + maxGap) {\n-      cur.length = Math.max(curEnd, r.offset + r.length) - cur.offset;\n-      cur.ranges.push(r);\n-    } else {\n-      result.push(cur);\n-      cur = { offset: r.offset, length: r.length, ranges: [r] };\n-    }\n-  }\n-  result.push(cur);\n-  return result;\n-}"
+    }
+  ]
+}

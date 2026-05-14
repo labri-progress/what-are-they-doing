@@ -1,0 +1,41 @@
+{
+  "message": "fix: avoid os.Getwd() dependency in schema compilation\n\nThe jsonschema library called filepath.Abs \u2192 os.Getwd() when given a\nrelative URL, which can nil-deref in transient environments (e.g. deleted\ngit worktrees in toil orchestrator). Use absolute URN instead.\n\nAlso reuse already-compiled schemas when re-registering tools, so\nregisterCoreTools doesn't redundantly recompile schemas that\nNewToolRegistry already compiled.\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "8fe07f1feb98e0f1bc2a78b964c74fab935c250f",
+      "filename": "agent/tool_registry.go",
+      "status": "modified",
+      "additions": 17,
+      "deletions": 2,
+      "changes": 19,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/ad9089da4b019fb3f016bd3aeadbaa2dade9cc32/agent%2Ftool_registry.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/ad9089da4b019fb3f016bd3aeadbaa2dade9cc32/agent%2Ftool_registry.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/agent%2Ftool_registry.go?ref=ad9089da4b019fb3f016bd3aeadbaa2dade9cc32",
+      "patch": "@@ -130,6 +130,17 @@ func (r *ToolRegistry) Register(t RegisteredTool) error {\n \tif t.Limit.MaxChars == 0 {\n \t\tt.Limit = defaultToolLimit(t.Definition.Name)\n \t}\n+\tif t.Schema == nil {\n+\t\t// Reuse already-compiled schema when re-registering a tool (e.g.\n+\t\t// registerCoreTools re-registers tools from NewToolRegistry). This\n+\t\t// avoids recompilation and guards against transient jsonschema\n+\t\t// library panics from os.Getwd() failures in ephemeral worktrees.\n+\t\tr.mu.RLock()\n+\t\tif existing, ok := r.tools[t.Definition.Name]; ok && existing.Schema != nil {\n+\t\t\tt.Schema = existing.Schema\n+\t\t}\n+\t\tr.mu.RUnlock()\n+\t}\n \tif t.Schema == nil {\n \t\ts, err := compileSchema(t.Definition.Parameters)\n \t\tif err != nil {\n@@ -408,10 +419,14 @@ func compileSchema(params map[string]any) (schema *jsonschema.Schema, err error)\n \t\treturn nil, err\n \t}\n \tc := jsonschema.NewCompiler()\n-\tif err := c.AddResource(\"schema.json\", bytes.NewReader(b)); err != nil {\n+\t// Use an absolute URI so the library never calls filepath.Abs \u2192 os.Getwd().\n+\t// A relative URL like \"schema.json\" triggers os.Getwd() which can panic\n+\t// in transient environments (e.g. deleted git worktrees).\n+\tconst schemaURI = \"urn:serf:tool-schema\"\n+\tif err := c.AddResource(schemaURI, bytes.NewReader(b)); err != nil {\n \t\treturn nil, err\n \t}\n-\treturn c.Compile(\"schema.json\")\n+\treturn c.Compile(schemaURI)\n }\n \n func toolValueToString(v any) string {"
+    },
+    {
+      "sha": "76c0e987703b6ca540dff3d68d6f9ca48570ce70",
+      "filename": "agent/tool_registry_test.go",
+      "status": "modified",
+      "additions": 54,
+      "deletions": 0,
+      "changes": 54,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/ad9089da4b019fb3f016bd3aeadbaa2dade9cc32/agent%2Ftool_registry_test.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/ad9089da4b019fb3f016bd3aeadbaa2dade9cc32/agent%2Ftool_registry_test.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/agent%2Ftool_registry_test.go?ref=ad9089da4b019fb3f016bd3aeadbaa2dade9cc32",
+      "patch": "@@ -506,6 +506,60 @@ func TestToolRegistry_Register_RecoversPanicInSchemaCompilation(t *testing.T) {\n \t}\n }\n \n+func TestRegister_ReusesCompiledSchemaOnReregistration(t *testing.T) {\n+\t// Regression test: registerCoreTools re-registers tools that were already\n+\t// registered by NewToolRegistry. Previously, each Register call recompiled\n+\t// the schema from scratch. If the jsonschema library panicked transiently\n+\t// (e.g. os.Getwd() failure in a deleted worktree), the re-registration\n+\t// failed even though the first registration succeeded. Register should\n+\t// reuse the already-compiled Schema when re-registering a tool with\n+\t// identical parameters.\n+\treg := NewToolRegistry()\n+\tparams := map[string]any{\n+\t\t\"type\":       \"object\",\n+\t\t\"properties\": map[string]any{\"file_path\": map[string]any{\"type\": \"string\"}},\n+\t\t\"required\":   []string{\"file_path\"},\n+\t}\n+\tnoop := func(ctx context.Context, env ExecutionEnvironment, args map[string]any) (any, error) {\n+\t\treturn nil, nil\n+\t}\n+\n+\t// First registration compiles the schema.\n+\tif err := reg.Register(RegisteredTool{\n+\t\tTool: llm.Tool{Definition: llm.ToolDefinition{Name: \"read_file\", Parameters: params}},\n+\t\tExec: noop,\n+\t}); err != nil {\n+\t\tt.Fatalf(\"first Register: %v\", err)\n+\t}\n+\n+\t// Verify schema was compiled.\n+\treg.mu.RLock()\n+\tfirst := reg.tools[\"read_file\"]\n+\treg.mu.RUnlock()\n+\tif first.Schema == nil {\n+\t\tt.Fatal(\"expected compiled schema after first registration\")\n+\t}\n+\n+\t// Re-register the same tool (as registerCoreTools does) without Schema.\n+\t// Register should reuse the compiled Schema from the first registration.\n+\tif err := reg.Register(RegisteredTool{\n+\t\tTool: llm.Tool{Definition: llm.ToolDefinition{Name: \"read_file\", Parameters: params}},\n+\t\tExec: noop,\n+\t}); err != nil {\n+\t\tt.Fatalf(\"second Register: %v\", err)\n+\t}\n+\n+\treg.mu.RLock()\n+\tsecond := reg.tools[\"read_file\"]\n+\treg.mu.RUnlock()\n+\tif second.Schema == nil {\n+\t\tt.Fatal(\"expected compiled schema after second registration\")\n+\t}\n+\tif first.Schema != second.Schema {\n+\t\tt.Fatal(\"Register should reuse the compiled schema from the first registration, got a different pointer\")\n+\t}\n+}\n+\n func TestExecuteCall_ImageResult_PopulatesImageFields(t *testing.T) {\n \treg := NewToolRegistry()\n \timgData := []byte{0x89, 0x50, 0x4E, 0x47} // PNG magic bytes"
+    },
+    {
+      "sha": "9fb5ea9e3c119360fdde7b87af546d44371e8a38",
+      "filename": "llm/generate.go",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 2,
+      "changes": 6,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/ad9089da4b019fb3f016bd3aeadbaa2dade9cc32/llm%2Fgenerate.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/ad9089da4b019fb3f016bd3aeadbaa2dade9cc32/llm%2Fgenerate.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/llm%2Fgenerate.go?ref=ad9089da4b019fb3f016bd3aeadbaa2dade9cc32",
+      "patch": "@@ -323,10 +323,12 @@ func compileSchema(params map[string]any) (*jsonschema.Schema, error) {\n \tif err != nil {\n \t\treturn nil, err\n \t}\n-\tif err := c.AddResource(\"schema.json\", bytes.NewReader(b)); err != nil {\n+\t// Use an absolute URI so the library never calls filepath.Abs \u2192 os.Getwd().\n+\tconst schemaURI = \"urn:serf:tool-schema\"\n+\tif err := c.AddResource(schemaURI, bytes.NewReader(b)); err != nil {\n \t\treturn nil, err\n \t}\n-\treturn c.Compile(\"schema.json\")\n+\treturn c.Compile(schemaURI)\n }\n \n func executeToolCalls(ctx context.Context, toolIndex map[string]Tool, calls []ToolCallData, messages []Message, repairFn func(context.Context, ToolCallData, error) (json.RawMessage, error)) []ToolResultData {"
+    }
+  ]
+}

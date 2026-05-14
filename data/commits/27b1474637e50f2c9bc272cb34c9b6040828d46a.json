@@ -1,0 +1,41 @@
+{
+  "message": "fix(channel+sync+bulkhead): test permit lifecycle and anti-barge verification\n\nmpsc.rs:\n  Fix try_reserve_full_when_waiter_queued test: abort the first\n  permit before testing try_reserve rejection (was leaking the\n  permit). After try_reserve returns Full, poll the queued waiter\n  to verify it acquires and abort it too. Same pattern applied\n  to the bounded reserve test \u2014 explicitly abort acquired permits\n  to prevent resource leaks in test teardown.\n\nsemaphore.rs:\n  Fix try_acquire_respects_fifo_with_available_permits test: after\n  dropping the held permit, poll the queued future to verify the\n  waiter actually acquires. Previously the test dropped held but\n  never confirmed the waiter woke up and received the permit.\n\nbulkhead.rs:\n  Add try_acquire_yields_to_queued_entry test that verifies the\n  anti-barging behavior end-to-end: acquire \u2192 enqueue waiter \u2192\n  release \u2192 try_acquire fails (waiter has priority) \u2192 process_queue\n  grants to waiter \u2192 waiter is claimable.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "337adf27723ddc3806af137c31eb96b51346fa97",
+      "filename": "src/channel/mpsc.rs",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 4,
+      "changes": 24,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/27b1474637e50f2c9bc272cb34c9b6040828d46a/src%2Fchannel%2Fmpsc.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/27b1474637e50f2c9bc272cb34c9b6040828d46a/src%2Fchannel%2Fmpsc.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fchannel%2Fmpsc.rs?ref=27b1474637e50f2c9bc272cb34c9b6040828d46a",
+      "patch": "@@ -1259,6 +1259,8 @@ mod tests {\n             format!(\"{:?}\", poll)\n         );\n \n+        permit.abort();\n+\n         let try_reserve = tx.try_reserve();\n         crate::assert_with_log!(\n             matches!(try_reserve, Err(SendError::Full(()))),\n@@ -1267,8 +1269,17 @@ mod tests {\n             format!(\"{:?}\", try_reserve)\n         );\n \n+        let poll2 = reserve_fut.as_mut().poll(&mut cx_task);\n+        let waiter_acquired = match poll2 {\n+            Poll::Ready(Ok(permit2)) => {\n+                permit2.abort();\n+                true\n+            }\n+            _ => false,\n+        };\n+        crate::assert_with_log!(waiter_acquired, \"waiter acquires\", true, waiter_acquired);\n+\n         drop(reserve_fut);\n-        permit.abort();\n         crate::test_complete!(\"try_reserve_full_when_waiter_queued\");\n     }\n \n@@ -1565,10 +1576,15 @@ mod tests {\n             format!(\"{:?}\", try_result)\n         );\n \n-        // The queued waiter should succeed on next poll.\n         let poll2 = reserve_fut.as_mut().poll(&mut cx_task);\n-        let ready = matches!(poll2, Poll::Ready(Ok(_)));\n-        crate::assert_with_log!(ready, \"waiter acquires\", true, ready);\n+        let waiter_acquired = match poll2 {\n+            Poll::Ready(Ok(permit2)) => {\n+                permit2.abort();\n+                true\n+            }\n+            _ => false,\n+        };\n+        crate::assert_with_log!(waiter_acquired, \"waiter acquires\", true, waiter_acquired);\n \n         drop(reserve_fut);\n         drop(rx);"
+    },
+    {
+      "sha": "174095eb3cec11cfdad2927b57e427c64cdcf8bd",
+      "filename": "src/combinator/bulkhead.rs",
+      "status": "modified",
+      "additions": 38,
+      "deletions": 1,
+      "changes": 39,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/27b1474637e50f2c9bc272cb34c9b6040828d46a/src%2Fcombinator%2Fbulkhead.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/27b1474637e50f2c9bc272cb34c9b6040828d46a/src%2Fcombinator%2Fbulkhead.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fcombinator%2Fbulkhead.rs?ref=27b1474637e50f2c9bc272cb34c9b6040828d46a",
+      "patch": "@@ -286,9 +286,10 @@ impl Bulkhead {\n     /// Try to acquire permit without waiting.\n     ///\n     /// Returns `Some(permit)` if acquired immediately, `None` if bulkhead is full.\n+    /// Queued operations hold priority once they enter the FIFO wait queue.\n     #[must_use]\n     pub fn try_acquire(&self, weight: u32) -> Option<BulkheadPermit<'_>> {\n-        // Prevent barging if there are queued operations\n+        // Prevent barging if there are queued operations.\n         if self.pending_queue_count.load(Ordering::Relaxed) > 0 {\n             return None;\n         }\n@@ -958,6 +959,42 @@ mod tests {\n         assert_eq!(bh.metrics().total_queued, 1);\n     }\n \n+    #[test]\n+    fn try_acquire_yields_to_queued_entry() {\n+        let bh = Bulkhead::new(BulkheadPolicy {\n+            max_concurrent: 1,\n+            max_queue: 10,\n+            queue_timeout: Duration::from_mins(1),\n+            ..Default::default()\n+        });\n+\n+        let now = Time::from_millis(0);\n+\n+        let permit = bh.try_acquire(1).unwrap();\n+        let entry_id = bh.enqueue(1, now).unwrap();\n+\n+        permit.release();\n+\n+        assert!(\n+            bh.try_acquire(1).is_none(),\n+            \"queued entry should block barging try_acquire\"\n+        );\n+\n+        let granted_id = bh.process_queue(now);\n+        assert_eq!(granted_id, Some(entry_id));\n+        assert_eq!(\n+            bh.available(),\n+            0,\n+            \"queued entry should consume the released permit\"\n+        );\n+\n+        let claimed = bh.check_entry(entry_id, now).unwrap();\n+        assert!(\n+            claimed.is_some(),\n+            \"queued entry should be claimable after process_queue\"\n+        );\n+    }\n+\n     #[test]\n     fn enqueue_rejects_when_queue_full() {\n         let bh = Bulkhead::new(BulkheadPolicy {"
+    },
+    {
+      "sha": "e359b0b5d03e843709a4177ba7b024ffca07b965",
+      "filename": "src/sync/semaphore.rs",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 0,
+      "changes": 8,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/27b1474637e50f2c9bc272cb34c9b6040828d46a/src%2Fsync%2Fsemaphore.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/27b1474637e50f2c9bc272cb34c9b6040828d46a/src%2Fsync%2Fsemaphore.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fsync%2Fsemaphore.rs?ref=27b1474637e50f2c9bc272cb34c9b6040828d46a",
+      "patch": "@@ -1255,6 +1255,14 @@ mod tests {\n         );\n \n         drop(held);\n+        let ready = poll_once(&mut fut);\n+        let waiter_acquired = matches!(ready, Some(Ok(_)));\n+        crate::assert_with_log!(\n+            waiter_acquired,\n+            \"waiter acquires after release\",\n+            true,\n+            waiter_acquired\n+        );\n         crate::test_complete!(\"try_acquire_respects_fifo_with_available_permits\");\n     }\n "
+    }
+  ]
+}

@@ -1,0 +1,65 @@
+{
+  "message": "fix(gateway): harden message action channel fallback and startup grace\n\nTake the safe, tested subset from #32367:\\n- per-channel startup connect grace in health monitor\\n- tool-context channel-provider fallback for message actions\\n\\nCo-authored-by: Munem Hashmi <munem.hashmi@gmail.com>",
+  "files": [
+    {
+      "sha": "c017c9dbcc2c093dd2dd6c98948b281001f61cba",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/71cd3371372763e1f6c3d1fa7c11cb302285f619/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/71cd3371372763e1f6c3d1fa7c11cb302285f619/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=71cd3371372763e1f6c3d1fa7c11cb302285f619",
+      "patch": "@@ -32,6 +32,7 @@ Docs: https://docs.openclaw.ai\n \n ### Fixes\n \n+- Gateway/message tool reliability: avoid false `Unknown channel` failures when `message.*` actions receive platform-specific channel ids by falling back to `toolContext.currentChannelProvider`, and prevent health-monitor restart thrash for channels that just (re)started by adding a per-channel startup-connect grace window. (from #32367) Thanks @MunemHashmi.\n - WebChat/markdown tables: ensure GitHub-flavored markdown table parsing is explicitly enabled at render time and add horizontal overflow handling for wide tables, with regression coverage for table-only and mixed text+table content. (#32365) Thanks @BlueBirdBack.\n - Feishu/default account resolution: always honor explicit `channels.feishu.defaultAccount` during outbound account selection (including top-level-credential setups where the preferred id is not present in `accounts`), instead of silently falling back to another account id. (#32253) Thanks @bmendonca3.\n - Gemini schema sanitization: coerce malformed JSON Schema `properties` values (`null`, arrays, primitives) to `{}` before provider validation, preventing downstream strict-validator crashes on invalid plugin/tool schemas. (#32332) Thanks @webdevtodayjason."
+    },
+    {
+      "sha": "97c5337132ae3e519cd978f7442661b2d085442f",
+      "filename": "src/gateway/channel-health-monitor.test.ts",
+      "status": "modified",
+      "additions": 37,
+      "deletions": 0,
+      "changes": 37,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/71cd3371372763e1f6c3d1fa7c11cb302285f619/src%2Fgateway%2Fchannel-health-monitor.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/71cd3371372763e1f6c3d1fa7c11cb302285f619/src%2Fgateway%2Fchannel-health-monitor.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fchannel-health-monitor.test.ts?ref=71cd3371372763e1f6c3d1fa7c11cb302285f619",
+      "patch": "@@ -201,6 +201,7 @@ describe(\"channel-health-monitor\", () => {\n   });\n \n   it(\"restarts a stuck channel (running but not connected)\", async () => {\n+    const now = Date.now();\n     const manager = createSnapshotManager({\n       whatsapp: {\n         default: {\n@@ -209,6 +210,7 @@ describe(\"channel-health-monitor\", () => {\n           enabled: true,\n           configured: true,\n           linked: true,\n+          lastStartAt: now - 300_000,\n         },\n       },\n     });\n@@ -219,6 +221,41 @@ describe(\"channel-health-monitor\", () => {\n     monitor.stop();\n   });\n \n+  it(\"skips recently-started channels while they are still connecting\", async () => {\n+    const now = Date.now();\n+    const manager = createSnapshotManager({\n+      discord: {\n+        default: {\n+          running: true,\n+          connected: false,\n+          enabled: true,\n+          configured: true,\n+          lastStartAt: now - 5_000,\n+        },\n+      },\n+    });\n+    await expectNoRestart(manager);\n+  });\n+\n+  it(\"respects custom per-channel startup grace\", async () => {\n+    const now = Date.now();\n+    const manager = createSnapshotManager({\n+      discord: {\n+        default: {\n+          running: true,\n+          connected: false,\n+          enabled: true,\n+          configured: true,\n+          lastStartAt: now - 30_000,\n+        },\n+      },\n+    });\n+    const monitor = await startAndRunCheck(manager, { channelStartupGraceMs: 60_000 });\n+    expect(manager.stopChannel).not.toHaveBeenCalled();\n+    expect(manager.startChannel).not.toHaveBeenCalled();\n+    monitor.stop();\n+  });\n+\n   it(\"restarts a stopped channel that gave up (reconnectAttempts >= 10)\", async () => {\n     const manager = createSnapshotManager({\n       discord: {"
+    },
+    {
+      "sha": "b0e2313c16e9341210e89dbedec9e463e8eb041e",
+      "filename": "src/gateway/channel-health-monitor.ts",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 2,
+      "changes": 13,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/71cd3371372763e1f6c3d1fa7c11cb302285f619/src%2Fgateway%2Fchannel-health-monitor.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/71cd3371372763e1f6c3d1fa7c11cb302285f619/src%2Fgateway%2Fchannel-health-monitor.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fchannel-health-monitor.ts?ref=71cd3371372763e1f6c3d1fa7c11cb302285f619",
+      "patch": "@@ -17,6 +17,7 @@ const ONE_HOUR_MS = 60 * 60_000;\n  * alive (health checks pass) but Slack silently stops delivering events.\n  */\n const DEFAULT_STALE_EVENT_THRESHOLD_MS = 30 * 60_000;\n+const DEFAULT_CHANNEL_STARTUP_GRACE_MS = 120_000;\n \n export type ChannelHealthMonitorDeps = {\n   channelManager: ChannelManager;\n@@ -25,6 +26,7 @@ export type ChannelHealthMonitorDeps = {\n   cooldownCycles?: number;\n   maxRestartsPerHour?: number;\n   staleEventThresholdMs?: number;\n+  channelStartupGraceMs?: number;\n   abortSignal?: AbortSignal;\n };\n \n@@ -50,14 +52,20 @@ function isChannelHealthy(\n     lastEventAt?: number | null;\n     lastStartAt?: number | null;\n   },\n-  opts: { now: number; staleEventThresholdMs: number },\n+  opts: { now: number; staleEventThresholdMs: number; channelStartupGraceMs: number },\n ): boolean {\n   if (!isManagedAccount(snapshot)) {\n     return true;\n   }\n   if (!snapshot.running) {\n     return false;\n   }\n+  if (snapshot.lastStartAt != null) {\n+    const upDuration = opts.now - snapshot.lastStartAt;\n+    if (upDuration < opts.channelStartupGraceMs) {\n+      return true;\n+    }\n+  }\n   if (snapshot.connected === false) {\n     return false;\n   }\n@@ -88,6 +96,7 @@ export function startChannelHealthMonitor(deps: ChannelHealthMonitorDeps): Chann\n     cooldownCycles = DEFAULT_COOLDOWN_CYCLES,\n     maxRestartsPerHour = DEFAULT_MAX_RESTARTS_PER_HOUR,\n     staleEventThresholdMs = DEFAULT_STALE_EVENT_THRESHOLD_MS,\n+    channelStartupGraceMs = DEFAULT_CHANNEL_STARTUP_GRACE_MS,\n     abortSignal,\n   } = deps;\n \n@@ -132,7 +141,7 @@ export function startChannelHealthMonitor(deps: ChannelHealthMonitorDeps): Chann\n           if (channelManager.isManuallyStopped(channelId as ChannelId, accountId)) {\n             continue;\n           }\n-          if (isChannelHealthy(status, { now, staleEventThresholdMs })) {\n+          if (isChannelHealthy(status, { now, staleEventThresholdMs, channelStartupGraceMs })) {\n             continue;\n           }\n "
+    },
+    {
+      "sha": "d2db2a60b2d2e571ea0c52b6f1e151f8159cb904",
+      "filename": "src/infra/outbound/message-action-runner.test.ts",
+      "status": "modified",
+      "additions": 31,
+      "deletions": 0,
+      "changes": 31,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/71cd3371372763e1f6c3d1fa7c11cb302285f619/src%2Finfra%2Foutbound%2Fmessage-action-runner.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/71cd3371372763e1f6c3d1fa7c11cb302285f619/src%2Finfra%2Foutbound%2Fmessage-action-runner.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Foutbound%2Fmessage-action-runner.test.ts?ref=71cd3371372763e1f6c3d1fa7c11cb302285f619",
+      "patch": "@@ -349,6 +349,37 @@ describe(\"runMessageAction context isolation\", () => {\n     expect(result.channel).toBe(\"slack\");\n   });\n \n+  it(\"falls back to tool-context provider when channel param is an id\", async () => {\n+    const result = await runDrySend({\n+      cfg: slackConfig,\n+      actionParams: {\n+        channel: \"C12345678\",\n+        target: \"#C12345678\",\n+        message: \"hi\",\n+      },\n+      toolContext: { currentChannelId: \"C12345678\", currentChannelProvider: \"slack\" },\n+    });\n+\n+    expect(result.kind).toBe(\"send\");\n+    expect(result.channel).toBe(\"slack\");\n+  });\n+\n+  it(\"falls back to tool-context provider for broadcast channel ids\", async () => {\n+    const result = await runDryAction({\n+      cfg: slackConfig,\n+      action: \"broadcast\",\n+      actionParams: {\n+        targets: [\"channel:C12345678\"],\n+        channel: \"C12345678\",\n+        message: \"hi\",\n+      },\n+      toolContext: { currentChannelProvider: \"slack\" },\n+    });\n+\n+    expect(result.kind).toBe(\"broadcast\");\n+    expect(result.channel).toBe(\"slack\");\n+  });\n+\n   it(\"blocks cross-provider sends by default\", async () => {\n     await expect(\n       runDrySend({"
+    },
+    {
+      "sha": "0336db6f2339de72612744e06364821725d75702",
+      "filename": "src/infra/outbound/message-action-runner.ts",
+      "status": "modified",
+      "additions": 23,
+      "deletions": 8,
+      "changes": 31,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/71cd3371372763e1f6c3d1fa7c11cb302285f619/src%2Finfra%2Foutbound%2Fmessage-action-runner.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/71cd3371372763e1f6c3d1fa7c11cb302285f619/src%2Finfra%2Foutbound%2Fmessage-action-runner.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Foutbound%2Fmessage-action-runner.ts?ref=71cd3371372763e1f6c3d1fa7c11cb302285f619",
+      "patch": "@@ -217,13 +217,28 @@ async function maybeApplyCrossContextMarker(params: {\n   });\n }\n \n-async function resolveChannel(cfg: OpenClawConfig, params: Record<string, unknown>) {\n+async function resolveChannel(\n+  cfg: OpenClawConfig,\n+  params: Record<string, unknown>,\n+  toolContext?: { currentChannelProvider?: string },\n+) {\n   const channelHint = readStringParam(params, \"channel\");\n-  const selection = await resolveMessageChannelSelection({\n-    cfg,\n-    channel: channelHint,\n-  });\n-  return selection.channel;\n+  try {\n+    const selection = await resolveMessageChannelSelection({\n+      cfg,\n+      channel: channelHint,\n+    });\n+    return selection.channel;\n+  } catch (error) {\n+    if (channelHint && toolContext?.currentChannelProvider) {\n+      const fallback = normalizeMessageChannel(toolContext.currentChannelProvider);\n+      if (fallback && isDeliverableMessageChannel(fallback)) {\n+        params.channel = fallback;\n+        return fallback;\n+      }\n+    }\n+    throw error;\n+  }\n }\n \n async function resolveActionTarget(params: {\n@@ -317,7 +332,7 @@ async function handleBroadcastAction(\n   }\n   const targetChannels =\n     channelHint && channelHint.trim().toLowerCase() !== \"all\"\n-      ? [await resolveChannel(input.cfg, { channel: channelHint })]\n+      ? [await resolveChannel(input.cfg, { channel: channelHint }, input.toolContext)]\n       : configured;\n   const results: Array<{\n     channel: ChannelId;\n@@ -754,7 +769,7 @@ export async function runMessageAction(\n     }\n   }\n \n-  const channel = await resolveChannel(cfg, params);\n+  const channel = await resolveChannel(cfg, params, input.toolContext);\n   let accountId = readStringParam(params, \"accountId\") ?? input.defaultAccountId;\n   if (!accountId && resolvedAgentId) {\n     const byAgent = buildChannelAccountBindings(cfg).get(channel);"
+    }
+  ]
+}

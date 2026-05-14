@@ -1,0 +1,29 @@
+{
+  "message": "perf(fusion,index): compute in_both_sources inline during RRF insertion and pre-screen WAL hashes in search\n\n- Compute in_both_sources flag inline when lexical/semantic results are\n  inserted into the RRF scratch map, eliminating the separate post-pass\n- Pre-build AHashSet of WAL doc_id hashes for O(1) pre-screening in\n  resolve_sorted_entries, falling back to string verification only on\n  hash match \u2014 avoids O(W) linear scan per main-index winner\n- Read pre-computed doc_id_hash from record table instead of recomputing\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "009b2eb9d93cfba7ab79f45e9b79bc3a12079595",
+      "filename": "crates/frankensearch-fusion/src/rrf.rs",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 3,
+      "changes": 12,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensearch/blob/a840c572d9b7e723fcdb97479797d336e45b5466/crates%2Ffrankensearch-fusion%2Fsrc%2Frrf.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensearch/raw/a840c572d9b7e723fcdb97479797d336e45b5466/crates%2Ffrankensearch-fusion%2Fsrc%2Frrf.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensearch/contents/crates%2Ffrankensearch-fusion%2Fsrc%2Frrf.rs?ref=a840c572d9b7e723fcdb97479797d336e45b5466",
+      "patch": "@@ -215,6 +215,10 @@ pub fn rrf_fuse_with_graph(\n                 hit.rrf_score += rrf_contribution;\n                 hit.lexical_rank = Some(rank);\n                 hit.lexical_score = Some(result.score);\n+                // Compute in_both_sources inline: if semantic was already seen.\n+                if hit.semantic_rank.is_some() {\n+                    hit.in_both_sources = true;\n+                }\n             })\n             .or_insert_with(|| FusedHitScratch {\n                 doc_id: result.doc_id.as_str(),\n@@ -247,6 +251,10 @@ pub fn rrf_fuse_with_graph(\n                 fh.semantic_rank = Some(rank);\n                 fh.semantic_score = Some(hit.score);\n                 fh.semantic_index = Some(hit.index);\n+                // Compute in_both_sources inline: if lexical was already seen.\n+                if fh.lexical_rank.is_some() {\n+                    fh.in_both_sources = true;\n+                }\n             })\n             .or_insert_with(|| FusedHitScratch {\n                 doc_id: hit.doc_id.as_str(),\n@@ -293,10 +301,8 @@ pub fn rrf_fuse_with_graph(\n         }\n     }\n \n+    // in_both_sources was computed inline during insertion \u2014 no separate pass needed.\n     let mut results: Vec<FusedHitScratch<'_>> = hits.into_values().collect();\n-    for hit in &mut results {\n-        hit.in_both_sources = hit.lexical_rank.is_some() && hit.semantic_rank.is_some();\n-    }\n \n     let overlap_count = tracing::enabled!(target: \"frankensearch.rrf\", Level::DEBUG)\n         .then(|| results.iter().filter(|h| h.in_both_sources).count());"
+    },
+    {
+      "sha": "643178a9702d3740f1e2abdac34c9156b776e834",
+      "filename": "crates/frankensearch-index/src/search.rs",
+      "status": "modified",
+      "additions": 18,
+      "deletions": 9,
+      "changes": 27,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensearch/blob/a840c572d9b7e723fcdb97479797d336e45b5466/crates%2Ffrankensearch-index%2Fsrc%2Fsearch.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensearch/raw/a840c572d9b7e723fcdb97479797d336e45b5466/crates%2Ffrankensearch-index%2Fsrc%2Fsearch.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensearch/contents/crates%2Ffrankensearch-index%2Fsrc%2Fsearch.rs?ref=a840c572d9b7e723fcdb97479797d336e45b5466",
+      "patch": "@@ -563,6 +563,11 @@ impl VectorIndex {\n     }\n \n     fn resolve_sorted_entries(&self, winners: Vec<HeapEntry>) -> SearchResult<Vec<VectorHit>> {\n+        // Pre-build a hash set of WAL doc_id hashes for O(1) pre-screening\n+        // instead of O(W) linear scan per main-index winner. On hash match,\n+        // falls back to string verification for correctness.\n+        let wal_hashes: AHashSet<u64> = self.wal_entries.iter().map(|e| e.doc_id_hash).collect();\n+\n         let mut seen: AHashSet<String> = AHashSet::with_capacity(winners.len());\n         let mut hits = Vec::with_capacity(winners.len());\n         for winner in winners {\n@@ -580,16 +585,20 @@ impl VectorIndex {\n                     continue;\n                 }\n                 let doc_id = self.doc_id_at(winner.index)?.to_owned();\n-                // Skip if a WAL entry for the same doc exists (WAL is newer).\n-                let doc_id_hash = crate::fnv1a_hash(doc_id.as_bytes());\n-                let has_wal_entry = self\n-                    .wal_entries\n-                    .iter()\n-                    .any(|e| e.doc_id_hash == doc_id_hash && e.doc_id == doc_id);\n-                if has_wal_entry {\n-                    continue;\n+                // Read pre-computed hash from record table instead of recomputing.\n+                let record = self.record_at(winner.index)?;\n+                let doc_id_hash = record.doc_id_hash;\n+                // O(1) hash pre-screen; only linear-scan on hash match.\n+                if wal_hashes.contains(&doc_id_hash) {\n+                    let has_wal_entry = self\n+                        .wal_entries\n+                        .iter()\n+                        .any(|e| e.doc_id_hash == doc_id_hash && e.doc_id == doc_id);\n+                    if has_wal_entry {\n+                        continue;\n+                    }\n                 }\n-                // Skip main-vs-main duplicates.\n+                // Skip main-vs-main duplicates (String-based for correctness).\n                 if !seen.insert(doc_id.clone()) {\n                     continue;\n                 }"
+    }
+  ]
+}

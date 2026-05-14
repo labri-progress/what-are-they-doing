@@ -1,0 +1,41 @@
+{
+  "message": "fix: canonicalize malformed assistant replay content",
+  "files": [
+    {
+      "sha": "ec4daff0af23cd48beda541f07329f3547ef4f48",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/ce75f60ae99c63dea32bb8211054723d1e281883/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/ce75f60ae99c63dea32bb8211054723d1e281883/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=ce75f60ae99c63dea32bb8211054723d1e281883",
+      "patch": "@@ -19,6 +19,7 @@ Docs: https://docs.openclaw.ai\n - Diagnostics/cache trace: strip credential fields from cache-trace JSONL output while preserving non-sensitive diagnostic fields and image redaction metadata.\n - Docs/Feishu: replace `botName` with `name` in the channel config examples so the docs match the strict account schema for per-account display names. (#52753) Thanks @haroldfabla2-hue.\n - Doctor/plugins: make `openclaw doctor --fix` remove stale `plugins.allow` and `plugins.entries` refs left behind after plugin removal. Thanks @sallyom\n+- Agents/replay: canonicalize malformed assistant transcript content before session-history sanitization so legacy or corrupted assistant turns stop crashing Pi replay and subagent recovery paths.\n \n ## 2026.3.23\n "
+    },
+    {
+      "sha": "7ddaac87df4bcb9ce97c153492aa41e04485de0d",
+      "filename": "src/agents/pi-embedded-runner.sanitize-session-history.test.ts",
+      "status": "modified",
+      "additions": 28,
+      "deletions": 0,
+      "changes": 28,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/ce75f60ae99c63dea32bb8211054723d1e281883/src%2Fagents%2Fpi-embedded-runner.sanitize-session-history.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/ce75f60ae99c63dea32bb8211054723d1e281883/src%2Fagents%2Fpi-embedded-runner.sanitize-session-history.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fagents%2Fpi-embedded-runner.sanitize-session-history.test.ts?ref=ce75f60ae99c63dea32bb8211054723d1e281883",
+      "patch": "@@ -308,6 +308,34 @@ describe(\"sanitizeSessionHistory\", () => {\n     ).toBe(false);\n   });\n \n+  it(\"canonicalizes malformed assistant history content before replay sanitization\", async () => {\n+    setNonGoogleModelApi();\n+\n+    const messages = castAgentMessages([\n+      { role: \"user\", content: \"Question\" },\n+      { role: \"assistant\", content: \"legacy-content\" },\n+      { role: \"assistant\", content: { unexpected: true } },\n+    ]);\n+\n+    const result = await sanitizeSessionHistory({\n+      messages,\n+      modelApi: \"openai-responses\",\n+      provider: \"openai\",\n+      sessionManager: mockSessionManager,\n+      sessionId: TEST_SESSION_ID,\n+    });\n+\n+    expect(result[0]).toEqual(messages[0]);\n+    expect(result[1]).toMatchObject({\n+      role: \"assistant\",\n+      content: [{ type: \"text\", text: \"legacy-content\" }],\n+    });\n+    expect(result[2]).toMatchObject({\n+      role: \"assistant\",\n+      content: [{ type: \"text\", text: \"\" }],\n+    });\n+  });\n+\n   it(\"annotates inter-session user messages before context sanitization\", async () => {\n     setNonGoogleModelApi();\n "
+    },
+    {
+      "sha": "811b2fa4387c0da8effa27ebea6d0d2a80787e63",
+      "filename": "src/agents/pi-embedded-runner/google.ts",
+      "status": "modified",
+      "additions": 62,
+      "deletions": 1,
+      "changes": 63,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/ce75f60ae99c63dea32bb8211054723d1e281883/src%2Fagents%2Fpi-embedded-runner%2Fgoogle.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/ce75f60ae99c63dea32bb8211054723d1e281883/src%2Fagents%2Fpi-embedded-runner%2Fgoogle.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fagents%2Fpi-embedded-runner%2Fgoogle.ts?ref=ce75f60ae99c63dea32bb8211054723d1e281883",
+      "patch": "@@ -60,6 +60,8 @@ const GOOGLE_SCHEMA_UNSUPPORTED_KEYWORDS = new Set([\n ]);\n \n const INTER_SESSION_PREFIX_BASE = \"[Inter-session message]\";\n+type AssistantHistoryMessage = Extract<AgentMessage, { role: \"assistant\" }>;\n+type RawAssistantHistoryMessage = Omit<AssistantHistoryMessage, \"content\"> & { content?: unknown };\n \n function buildInterSessionPrefix(message: AgentMessage): string {\n   const provenance = normalizeInputProvenance((message as { provenance?: unknown }).provenance);\n@@ -140,6 +142,61 @@ function annotateInterSessionUserMessages(messages: AgentMessage[]): AgentMessag\n   return touched ? out : messages;\n }\n \n+function describeAssistantContentKind(content: unknown): string {\n+  if (Array.isArray(content)) {\n+    return \"array\";\n+  }\n+  if (content === null) {\n+    return \"null\";\n+  }\n+  return typeof content;\n+}\n+\n+function canonicalizeAssistantHistoryMessages(params: {\n+  messages: AgentMessage[];\n+  sessionId: string;\n+}): AgentMessage[] {\n+  let touched = false;\n+  let repairedCount = 0;\n+  const repairedKinds = new Set<string>();\n+  const out: AgentMessage[] = [];\n+\n+  for (const msg of params.messages) {\n+    if (!msg || typeof msg !== \"object\" || msg.role !== \"assistant\") {\n+      out.push(msg);\n+      continue;\n+    }\n+\n+    const assistant = msg as RawAssistantHistoryMessage;\n+    if (Array.isArray(assistant.content)) {\n+      out.push(msg);\n+      continue;\n+    }\n+\n+    // Session transcripts and custom stream boundaries have historically leaked\n+    // malformed assistant payloads. Repair them here so Pi replay only sees the\n+    // canonical array-based assistant content contract.\n+    const repairedText = typeof assistant.content === \"string\" ? assistant.content : \"\";\n+    out.push({\n+      ...(assistant as unknown as Record<string, unknown>),\n+      content: [{ type: \"text\", text: repairedText }],\n+    } as AgentMessage);\n+    touched = true;\n+    repairedCount += 1;\n+    repairedKinds.add(describeAssistantContentKind(assistant.content));\n+  }\n+\n+  if (!touched) {\n+    return params.messages;\n+  }\n+\n+  log.warn(\n+    `sanitizeSessionHistory: canonicalized ${repairedCount} malformed assistant message(s) before replay ` +\n+      `session=${params.sessionId} contentKinds=${Array.from(repairedKinds).join(\",\")}`,\n+  );\n+  return out;\n+}\n+\n function parseMessageTimestamp(value: unknown): number | null {\n   if (typeof value === \"number\" && Number.isFinite(value)) {\n     return value;\n@@ -537,8 +594,12 @@ export async function sanitizeSessionHistory(params: {\n       modelId: params.modelId,\n     });\n   const withInterSessionMarkers = annotateInterSessionUserMessages(params.messages);\n+  const canonicalizedAssistantHistory = canonicalizeAssistantHistoryMessages({\n+    messages: withInterSessionMarkers,\n+    sessionId: params.sessionId,\n+  });\n   const sanitizedImages = await sanitizeSessionMessagesImages(\n-    withInterSessionMarkers,\n+    canonicalizedAssistantHistory,\n     \"session:history\",\n     {\n       sanitizeMode: policy.sanitizeMode,"
+    }
+  ]
+}

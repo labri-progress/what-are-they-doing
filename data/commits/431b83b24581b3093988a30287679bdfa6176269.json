@@ -1,0 +1,113 @@
+{
+  "message": "fix: case-insensitive WebSocket URL schemes, worker runtime contexts, tokio-compat cancel semantics\n\nWebSocket URL normalization (asupersync-browser-core/src/lib.rs):\n\n  normalize_websocket_url() now accepts mixed-case schemes (WSS://,\n  Ws://, etc.) by splitting on :// and comparing the scheme with\n  eq_ignore_ascii_case. The output lowercases the scheme to ensure\n  consistent downstream matching. Previously only exact \"ws://\" and\n  \"wss://\" prefixes were accepted.\n\n  Test added (abi_exports.rs): websocket_url_validation_accepts_mixed_\n  case_ws_schemes verifies WSS:// and Ws:// both open successfully and\n  pass diagnostics.\n\nBrowser runtime contexts (packages/browser/src/index.ts):\n\n  Add \"service_worker\" and \"shared_worker\" to BrowserRuntimeContext\n  union type. browserRuntimeContext() now checks for these host roles\n  before falling through to the generic detection path.\n\n  detectBrowserSharedWorkerCoordinatorSupport() now uses a dedicated\n  directRuntimeReason constant (\"shared_worker_not_yet_shipped\") instead\n  of reusing runtimeSupport.reason, ensuring the fail-closed reason code\n  is correctly attributed to the shared-worker host path.\n\nTokio-compat cancel semantics (asupersync-tokio-compat/src/runtime.rs):\n\n  with_tokio_context() now returns None whenever cancellation was\n  observed, even if the wrapped future reports Ready on the same poll\n  where cancellation becomes visible. Previously CancellationIgnored\n  returned Some(value), which violated the contract that cancellation\n  observation implies None. CancellationIgnored is now treated the same\n  as Cancelled.\n\n  Test added: test_with_tokio_context_returns_none_when_cancel_observed_\n  before_ready verifies that a future that cancels itself and then\n  becomes ready on the next poll still returns None.\n\nValidation script + contract tests:\n\n  - validate_rust_browser_consumer.sh: mirror browser_run fields into\n    summary.json including service_worker_fail_closed_reason_code,\n    shared_worker_fail_closed_reason_code, and downgrade_reason_code\n  - README.md: document the summary.json mirroring\n  - wasm_rust_browser_example_contract.rs: assert new markers\n  - wasm_service_worker_broker_contract.rs: assert hostRole guard\n  - wasm_shared_worker_tenancy_lifecycle_contract.rs: assert hostRole\n    guard, directRuntimeReason constant, shared_worker_not_yet_shipped\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "605921b032599945e563d7aa6df4626de58dbdf4",
+      "filename": "asupersync-browser-core/src/lib.rs",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 2,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/431b83b24581b3093988a30287679bdfa6176269/asupersync-browser-core%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/431b83b24581b3093988a30287679bdfa6176269/asupersync-browser-core%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/asupersync-browser-core%2Fsrc%2Flib.rs?ref=431b83b24581b3093988a30287679bdfa6176269",
+      "patch": "@@ -245,12 +245,15 @@ fn normalize_websocket_url(url: &str) -> Result<String, String> {\n     if normalized.is_empty() {\n         return Err(\"websocket URL must not be empty\".to_string());\n     }\n-    if !(normalized.starts_with(\"ws://\") || normalized.starts_with(\"wss://\")) {\n+    let (scheme, rest) = normalized\n+        .split_once(\"://\")\n+        .ok_or_else(|| format!(\"websocket URL must start with ws:// or wss://: {normalized}\"))?;\n+    if !(scheme.eq_ignore_ascii_case(\"ws\") || scheme.eq_ignore_ascii_case(\"wss\")) {\n         return Err(format!(\n             \"websocket URL must start with ws:// or wss://: {normalized}\"\n         ));\n     }\n-    Ok(normalized.to_string())\n+    Ok(format!(\"{}://{rest}\", scheme.to_ascii_lowercase()))\n }\n \n const fn websocket_pending_outcome(handle: WasmHandleRef) -> WasmAbiOutcomeEnvelope {"
+    },
+    {
+      "sha": "cff1f336dc987f4ce724a04d8682511d4751b730",
+      "filename": "asupersync-browser-core/tests/abi_exports.rs",
+      "status": "modified",
+      "additions": 49,
+      "deletions": 0,
+      "changes": 49,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/431b83b24581b3093988a30287679bdfa6176269/asupersync-browser-core%2Ftests%2Fabi_exports.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/431b83b24581b3093988a30287679bdfa6176269/asupersync-browser-core%2Ftests%2Fabi_exports.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/asupersync-browser-core%2Ftests%2Fabi_exports.rs?ref=431b83b24581b3093988a30287679bdfa6176269",
+      "patch": "@@ -869,6 +869,55 @@ fn websocket_url_validation_rejects_empty_and_bad_schemes() {\n     runtime_close(runtime_json, None).expect(\"runtime_close\");\n }\n \n+#[test]\n+fn websocket_url_validation_accepts_mixed_case_ws_schemes() {\n+    reset_dispatcher_for_tests();\n+\n+    let runtime_json = runtime_create(None).expect(\"runtime_create succeeds\");\n+    let runtime: WasmHandleRef = parse_json(&runtime_json);\n+    let scope_req = WasmScopeEnterRequest {\n+        parent: runtime,\n+        label: Some(\"ws-case-insensitive\".to_string()),\n+    };\n+    let scope_json = scope_enter(to_json(&scope_req), None).expect(\"scope_enter succeeds\");\n+    let scope: WasmHandleRef = parse_json(&scope_json);\n+\n+    for url in [\"WSS://example.com/ws\", \"Ws://example.com/ws\"] {\n+        let open_json = websocket_open(\n+            serde_json::json!({\"scope\": scope, \"url\": url}).to_string(),\n+            None,\n+        )\n+        .expect(\"mixed-case websocket scheme should succeed\");\n+        let open_outcome: WasmAbiOutcomeEnvelope = parse_json(&open_json);\n+        let socket = match open_outcome {\n+            WasmAbiOutcomeEnvelope::Ok {\n+                value: WasmAbiValue::Handle(handle),\n+            } => handle,\n+            other => panic!(\"expected handle outcome for {url}, got {other:?}\"),\n+        };\n+\n+        websocket_cancel(\n+            serde_json::json!({\n+                \"socket\": socket,\n+                \"kind\": \"cleanup\",\n+                \"message\": format!(\"closing {url}\")\n+            })\n+            .to_string(),\n+            None,\n+        )\n+        .expect(\"cleanup cancel succeeds\");\n+    }\n+\n+    scope_close(scope_json, None).expect(\"scope_close\");\n+    runtime_close(runtime_json, None).expect(\"runtime_close\");\n+\n+    let diagnostics = dispatcher_diagnostics_for_tests();\n+    assert!(\n+        diagnostics.is_clean(),\n+        \"expected clean diagnostics after mixed-case websocket validation: {diagnostics:?}\"\n+    );\n+}\n+\n #[test]\n fn runtime_close_drains_open_scope_task_and_fetch_handles() {\n     reset_dispatcher_for_tests();"
+    },
+    {
+      "sha": "0dce49f75f5d886507b563f40356f0af0a85a520",
+      "filename": "asupersync-tokio-compat/src/runtime.rs",
+      "status": "modified",
+      "additions": 50,
+      "deletions": 5,
+      "changes": 55,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/431b83b24581b3093988a30287679bdfa6176269/asupersync-tokio-compat%2Fsrc%2Fruntime.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/431b83b24581b3093988a30287679bdfa6176269/asupersync-tokio-compat%2Fsrc%2Fruntime.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/asupersync-tokio-compat%2Fsrc%2Fruntime.rs?ref=431b83b24581b3093988a30287679bdfa6176269",
+      "patch": "@@ -59,7 +59,9 @@ impl AsupersyncRuntime {\n \n /// Run an async future factory with `Cx` installed on every poll.\n ///\n-/// Returns `None` when cancellation is observed before the future completes.\n+/// Returns `None` once cancellation is observed before the future completes,\n+/// even if the wrapped future reports `Ready` on the first poll after that\n+/// cancellation becomes visible to the adapter.\n pub async fn with_tokio_context<F, Fut, T>(cx: &Cx, f: F) -> Option<T>\n where\n     F: FnOnce() -> Fut,\n@@ -75,14 +77,24 @@ where\n \n     poll_fn(move |poll_cx| {\n         runtime.enter(|| {\n-            if cx.is_cancel_requested() {\n+            let cancellation_observed = cx.is_cancel_requested();\n+            if cancellation_observed {\n                 future.as_mut().request_cancel();\n             }\n \n             match future.as_mut().poll(poll_cx) {\n-                Poll::Ready(\n-                    CancelResult::Completed(value) | CancelResult::CancellationIgnored(value),\n-                ) => Poll::Ready(Some(value)),\n+                Poll::Ready(CancelResult::Completed(value)) => {\n+                    if cancellation_observed {\n+                        let _ = value;\n+                        Poll::Ready(None)\n+                    } else {\n+                        Poll::Ready(Some(value))\n+                    }\n+                }\n+                Poll::Ready(CancelResult::CancellationIgnored(value)) => {\n+                    let _ = value;\n+                    Poll::Ready(None)\n+                }\n                 Poll::Ready(CancelResult::Cancelled) => Poll::Ready(None),\n                 Poll::Pending => Poll::Pending,\n             }\n@@ -108,6 +120,8 @@ mod tests {\n     use super::*;\n     use asupersync::types::CancelKind;\n     use futures_lite::future::block_on;\n+    use std::pin::Pin;\n+    use std::task::{Context, Poll};\n \n     #[test]\n     fn test_asupersync_runtime_creation() {\n@@ -142,6 +156,37 @@ mod tests {\n         assert_eq!(result, None);\n     }\n \n+    #[test]\n+    fn test_with_tokio_context_returns_none_when_cancel_observed_before_ready() {\n+        struct CancelThenReady {\n+            cx: Cx,\n+            polled_once: bool,\n+        }\n+\n+        impl Future for CancelThenReady {\n+            type Output = u8;\n+\n+            fn poll(mut self: Pin<&mut Self>, poll_cx: &mut Context<'_>) -> Poll<Self::Output> {\n+                if self.polled_once {\n+                    Poll::Ready(42)\n+                } else {\n+                    self.polled_once = true;\n+                    self.cx.cancel_fast(CancelKind::User);\n+                    poll_cx.waker().wake_by_ref();\n+                    Poll::Pending\n+                }\n+            }\n+        }\n+\n+        let cx = Cx::for_testing();\n+        let future_cx = cx.clone();\n+        let result = block_on(with_tokio_context(&cx, move || CancelThenReady {\n+            cx: future_cx,\n+            polled_once: false,\n+        }));\n+        assert_eq!(result, None);\n+    }\n+\n     #[test]\n     fn test_with_tokio_context_sync_preserves_current_cx() {\n         let cx = Cx::for_testing();"
+    },
+    {
+      "sha": "22fb43678f5b33648480adacd09661274aa0ab3e",
+      "filename": "packages/browser/src/index.ts",
+      "status": "modified",
+      "additions": 12,
+      "deletions": 2,
+      "changes": 14,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/431b83b24581b3093988a30287679bdfa6176269/packages%2Fbrowser%2Fsrc%2Findex.ts",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/431b83b24581b3093988a30287679bdfa6176269/packages%2Fbrowser%2Fsrc%2Findex.ts",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/packages%2Fbrowser%2Fsrc%2Findex.ts?ref=431b83b24581b3093988a30287679bdfa6176269",
+      "patch": "@@ -182,6 +182,8 @@ export type BrowserRuntimeSupportClass =\n export type BrowserRuntimeContext =\n   | \"browser_main_thread\"\n   | \"dedicated_worker\"\n+  | \"service_worker\"\n+  | \"shared_worker\"\n   | \"unknown\";\n \n export type BrowserRuntimeSupportReason =\n@@ -1191,6 +1193,12 @@ function browserRuntimeContext(\n   capabilities: BrowserCapabilitySnapshot,\n ): BrowserRuntimeContext {\n   const hostRole = browserExecutionHostRole(globalObject, capabilities);\n+  if (hostRole === \"service_worker\") {\n+    return \"service_worker\";\n+  }\n+  if (hostRole === \"shared_worker\") {\n+    return \"shared_worker\";\n+  }\n   if (hostRole === \"dedicated_worker\") {\n     return \"dedicated_worker\";\n   }\n@@ -3063,8 +3071,10 @@ export function detectBrowserSharedWorkerCoordinatorSupport(\n     reason,\n     fallbackTarget,\n   );\n+  const directRuntimeReason: BrowserRuntimeSupportReason =\n+    \"shared_worker_not_yet_shipped\";\n   const directExecutionReasonCode = browserExecutionReasonCodeFromRuntimeSupport(\n-    runtimeSupport.reason,\n+    directRuntimeReason,\n   );\n   const message =\n     reason === \"supported\"\n@@ -3091,7 +3101,7 @@ export function detectBrowserSharedWorkerCoordinatorSupport(\n     runProfile,\n     scriptUrl,\n     workerName,\n-    directRuntimeReason: runtimeSupport.reason,\n+    directRuntimeReason,\n     directExecutionReasonCode,\n     runtimeSupport,\n     capabilities: runtimeSupport.capabilities,"
+    },
+    {
+      "sha": "5dd549a4b5aac34dc1261f0b33001c5ead20c363",
+      "filename": "scripts/validate_rust_browser_consumer.sh",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 1,
+      "changes": 16,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/431b83b24581b3093988a30287679bdfa6176269/scripts%2Fvalidate_rust_browser_consumer.sh",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/431b83b24581b3093988a30287679bdfa6176269/scripts%2Fvalidate_rust_browser_consumer.sh",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/scripts%2Fvalidate_rust_browser_consumer.sh?ref=431b83b24581b3093988a30287679bdfa6176269",
+      "patch": "@@ -1,7 +1,7 @@\n #!/usr/bin/env bash\n set -euo pipefail\n \n-# beads: asupersync-4l9iw.2, asupersync-4l9iw.8\n+# beads: asupersync-4l9iw.2, asupersync-4l9iw.8, asupersync-4l9iw.11\n \n SCRIPT_DIR=\"$(cd -- \"$(dirname -- \"${BASH_SOURCE[0]}\")\" && pwd)\"\n REPO_ROOT=\"$(cd -- \"${SCRIPT_DIR}/..\" && pwd)\"\n@@ -93,6 +93,20 @@ summary = {\n     \"timestamp\": timestamp,\n     \"fixture\": \"tests/fixtures/rust-browser-consumer\",\n     \"status\": \"pass\",\n+    \"browser_run\": {\n+        \"status\": browser_run[\"status\"],\n+        \"scenario_id\": browser_run[\"scenario_id\"],\n+        \"support_lane\": browser_run[\"support_lane\"],\n+        \"main_thread_selected_lane\": browser_run[\"main_thread_selected_lane\"],\n+        \"main_thread_browser_selection_lane\": browser_run[\"main_thread_browser_selection_lane\"],\n+        \"service_worker_fail_closed_reason_code\": browser_run[\"service_worker_fail_closed_reason_code\"],\n+        \"shared_worker_fail_closed_reason_code\": browser_run[\"shared_worker_fail_closed_reason_code\"],\n+        \"downgrade_selected_lane\": browser_run[\"downgrade_selected_lane\"],\n+        \"downgrade_browser_selection_lane\": browser_run[\"downgrade_browser_selection_lane\"],\n+        \"downgrade_reason_code\": browser_run[\"downgrade_reason_code\"],\n+        \"dedicated_worker_selected_lane\": browser_run[\"dedicated_worker_selected_lane\"],\n+        \"dedicated_worker_browser_selection_lane\": browser_run[\"dedicated_worker_browser_selection_lane\"],\n+    },\n     \"checks\": {\n         \"dist_exists\": dist.exists(),\n         \"index_html_exists\": (dist / \"index.html\").exists(),"
+    },
+    {
+      "sha": "9399f304c8d5cdcd7eb3ec00cd6687d6f2225a88",
+      "filename": "tests/fixtures/rust-browser-consumer/README.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/431b83b24581b3093988a30287679bdfa6176269/tests%2Ffixtures%2Frust-browser-consumer%2FREADME.md",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/431b83b24581b3093988a30287679bdfa6176269/tests%2Ffixtures%2Frust-browser-consumer%2FREADME.md",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/tests%2Ffixtures%2Frust-browser-consumer%2FREADME.md?ref=431b83b24581b3093988a30287679bdfa6176269",
+      "patch": "@@ -15,6 +15,7 @@ The validation script:\n - builds the nested Rust crate with `rch exec -- wasm-pack build ...`\n - stages the generated `pkg/` output next to the copied frontend consumer\n - runs a Vite bundle check against the resulting browser artifacts\n+- mirrors `browser-run.json` into `summary.json`, including `service_worker_fail_closed_reason_code`, `shared_worker_fail_closed_reason_code`, and `downgrade_reason_code`, so the synthetic unsupported-worker evidence stays visible in the top-level QA artifact\n - runs a real browser matrix that proves:\n   - browser main-thread lifecycle + execution-ladder diagnostics\n   - dedicated-worker lifecycle + execution-ladder diagnostics"
+    },
+    {
+      "sha": "b5ed8554ce0b8f8ad7bb32e7563bec0d4f44f771",
+      "filename": "tests/wasm_rust_browser_example_contract.rs",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/431b83b24581b3093988a30287679bdfa6176269/tests%2Fwasm_rust_browser_example_contract.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/431b83b24581b3093988a30287679bdfa6176269/tests%2Fwasm_rust_browser_example_contract.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/tests%2Fwasm_rust_browser_example_contract.rs?ref=431b83b24581b3093988a30287679bdfa6176269",
+      "patch": "@@ -119,6 +119,7 @@ fn rust_browser_fixture_readme_documents_synthetic_unsupported_worker_evidence()\n         \"synthetic service-worker and shared-worker fail-closed ladder snapshots\",\n         \"guarded advanced-capability snapshots such as `localStorage`, `indexedDB`, and `WebTransport`\",\n         \"Service-worker and shared-worker snapshots in this fixture are synthetic ladder inspections\",\n+        \"`service_worker_fail_closed_reason_code`, `shared_worker_fail_closed_reason_code`, and `downgrade_reason_code`\",\n     ] {\n         assert!(\n             content.contains(marker),\n@@ -149,6 +150,9 @@ fn rust_browser_validation_script_exists_and_offloads_wasm_builds_via_rch() {\n         \"npm run build\",\n         \"npm run check:bundle\",\n         \"npm run check:browser -- \\\"${BROWSER_RUN_FILE}\\\"\",\n+        \"\\\"browser_run\\\": {\",\n+        \"\\\"status\\\": browser_run[\\\"status\\\"]\",\n+        \"\\\"support_lane\\\": browser_run[\\\"support_lane\\\"]\",\n         \"\\\"real_browser_run_ok\\\": browser_run[\\\"status\\\"] == \\\"ok\\\"\",\n         \"\\\"ready_phase_is_ready\\\": browser_run[\\\"ready_phase\\\"] == \\\"ready\\\"\",\n         \"\\\"disposed_phase_is_disposed\\\": browser_run[\\\"disposed_phase\\\"] == \\\"disposed\\\"\",\n@@ -167,6 +171,7 @@ fn rust_browser_validation_script_exists_and_offloads_wasm_builds_via_rch() {\n         \"\\\"capabilities_has_webassembly\\\": browser_run[\\\"capabilities\\\"][\\\"has_webassembly\\\"] is True\",\n         \"L6-RUST-BROWSER-CONSUMER\",\n         \"asupersync-4l9iw.8\",\n+        \"asupersync-4l9iw.11\",\n     ] {\n         assert!(\n             content.contains(needle),"
+    },
+    {
+      "sha": "63ec419c1fecab517fbe6bcfc5bc5128f5d3a8d4",
+      "filename": "tests/wasm_service_worker_broker_contract.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/431b83b24581b3093988a30287679bdfa6176269/tests%2Fwasm_service_worker_broker_contract.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/431b83b24581b3093988a30287679bdfa6176269/tests%2Fwasm_service_worker_broker_contract.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/tests%2Fwasm_service_worker_broker_contract.rs?ref=431b83b24581b3093988a30287679bdfa6176269",
+      "patch": "@@ -677,6 +677,7 @@ fn browser_package_and_runtime_builder_preserve_service_worker_fail_closed_marke\n         \"reason: \\\"service_worker_not_yet_shipped\\\"\",\n         \"@asupersync/browser does not yet ship direct runtime APIs for service-worker hosts.\",\n         \"Keep service-worker orchestration at the application boundary until this host is promoted.\",\n+        \"if (hostRole === \\\"service_worker\\\") {\",\n         \"return \\\"service_worker\\\";\",\n     ] {\n         assert!("
+    },
+    {
+      "sha": "1791ccc7bea8178d59c80e3234471e6cf950e9f3",
+      "filename": "tests/wasm_shared_worker_tenancy_lifecycle_contract.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/431b83b24581b3093988a30287679bdfa6176269/tests%2Fwasm_shared_worker_tenancy_lifecycle_contract.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/431b83b24581b3093988a30287679bdfa6176269/tests%2Fwasm_shared_worker_tenancy_lifecycle_contract.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/tests%2Fwasm_shared_worker_tenancy_lifecycle_contract.rs?ref=431b83b24581b3093988a30287679bdfa6176269",
+      "patch": "@@ -145,6 +145,10 @@ fn browser_package_support_surface_pins_admission_and_recovery_guards() {\n         \"\\\"registration_schema_mismatch\\\"\",\n         \"\\\"coordinator_crash_or_browser_reclaim\\\"\",\n         \"\\\"lane_health_demoted\\\"\",\n+        \"if (hostRole === \\\"shared_worker\\\") {\",\n+        \"return \\\"shared_worker\\\";\",\n+        \"const directRuntimeReason: BrowserRuntimeSupportReason =\",\n+        \"\\\"shared_worker_not_yet_shipped\\\"\",\n         \"runProfile !== \\\"ephemeral\\\"\",\n         \"scriptOrigin !== null && scriptOrigin !== origin\",\n         \"@asupersync/browser shared-worker coordinator prerequisites are available; direct BrowserRuntime creation remains fail-closed inside the shared-worker host and attach must downgrade explicitly on denial or loss.\","
+    }
+  ]
+}

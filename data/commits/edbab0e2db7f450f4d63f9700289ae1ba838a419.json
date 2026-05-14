@@ -1,0 +1,41 @@
+{
+  "message": "fix: harden Google Live tool responses (#72426) (thanks @BsnizND)",
+  "files": [
+    {
+      "sha": "6d706788edf9dd4b8d0e7fdff92c7cc0879452cf",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/edbab0e2db7f450f4d63f9700289ae1ba838a419/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/edbab0e2db7f450f4d63f9700289ae1ba838a419/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=edbab0e2db7f450f4d63f9700289ae1ba838a419",
+      "patch": "@@ -67,6 +67,7 @@ Docs: https://docs.openclaw.ai\n - Google Meet: clear queued Gemini Live playback when realtime interruptions arrive, restart Chrome command-pair audio output after clears, and expose Google Live interruption/VAD config knobs for Meet and Voice Call realtime bridges. Fixes #72523. (#72524) Thanks @BsnizND.\n - Google Meet: add `realtime.agentId` so live meeting consults can target a named OpenClaw agent instead of always using `main`. (#72381) Thanks @BsnizND.\n - Google Meet: route stateful `google_meet` tool actions through the gateway-owned runtime so created or joined realtime sessions remain visible to status, speak, and leave after the agent turn ends. Fixes #72440. (#72441) Thanks @BsnizND.\n+- Google Meet: preserve Gemini Live function names when replying to realtime tool calls so Google SDK validation accepts the `FunctionResponse` payload. Fixes #72425. (#72426) Thanks @BsnizND.\n - Matrix/E2EE: stabilize recovery and broken-device QA flows while avoiding Matrix device-cleanup sync races that could leave shutdown-time crypto work running. Thanks @gumadeiras.\n - Cron: apply `cron.maxConcurrentRuns` to a dedicated `cron-nested` isolated agent-turn lane as well as cron dispatch, so parallel cron jobs no longer serialize on inner LLM execution while non-cron nested flows keep their existing lane behavior. Fixes #72707. Thanks @kagura-agent.\n - Cron: treat isolated run-level agent failures as job errors even when no reply payload is produced, synthesizing a safe error payload so model/provider failures increment error counters and trigger failure notifications instead of clearing as successful. Fixes #43604; carries forward #43631. Thanks @SPFAdvisors."
+    },
+    {
+      "sha": "1ffba7d1153dcecbdaffc42a8fb80117ea0de9dc",
+      "filename": "extensions/google/realtime-voice-provider.test.ts",
+      "status": "modified",
+      "additions": 40,
+      "deletions": 0,
+      "changes": 40,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/edbab0e2db7f450f4d63f9700289ae1ba838a419/extensions%2Fgoogle%2Frealtime-voice-provider.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/edbab0e2db7f450f4d63f9700289ae1ba838a419/extensions%2Fgoogle%2Frealtime-voice-provider.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fgoogle%2Frealtime-voice-provider.test.ts?ref=edbab0e2db7f450f4d63f9700289ae1ba838a419",
+      "patch": "@@ -414,4 +414,44 @@ describe(\"buildGoogleRealtimeVoiceProvider\", () => {\n       }),\n     );\n   });\n+\n+  it(\"reports Google Live tool response send failures without losing the call name\", async () => {\n+    const provider = buildGoogleRealtimeVoiceProvider();\n+    const onError = vi.fn();\n+    const bridge = provider.createBridge({\n+      providerConfig: { apiKey: \"gemini-key\" },\n+      onAudio: vi.fn(),\n+      onClearAudio: vi.fn(),\n+      onError,\n+    });\n+\n+    await bridge.connect();\n+    lastConnectParams().callbacks.onmessage({\n+      setupComplete: { sessionId: \"session-1\" },\n+      toolCall: {\n+        functionCalls: [{ id: \"call-1\", name: \"lookup\", args: { query: \"hi\" } }],\n+      },\n+    });\n+\n+    const sendError = new Error(\"SDK send failed\");\n+    session.sendToolResponse.mockImplementationOnce(() => {\n+      throw sendError;\n+    });\n+\n+    bridge.submitToolResult(\"call-1\", [\"retryable\"]);\n+\n+    expect(onError).toHaveBeenCalledWith(sendError);\n+\n+    bridge.submitToolResult(\"call-1\", { result: \"ok\" });\n+\n+    expect(session.sendToolResponse).toHaveBeenLastCalledWith({\n+      functionResponses: [\n+        {\n+          id: \"call-1\",\n+          name: \"lookup\",\n+          response: { result: \"ok\" },\n+        },\n+      ],\n+    });\n+  });\n });"
+    },
+    {
+      "sha": "feb73835570443b35b463cc59375bcb27ebc60df",
+      "filename": "extensions/google/realtime-voice-provider.ts",
+      "status": "modified",
+      "additions": 19,
+      "deletions": 13,
+      "changes": 32,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/edbab0e2db7f450f4d63f9700289ae1ba838a419/extensions%2Fgoogle%2Frealtime-voice-provider.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/edbab0e2db7f450f4d63f9700289ae1ba838a419/extensions%2Fgoogle%2Frealtime-voice-provider.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fgoogle%2Frealtime-voice-provider.ts?ref=edbab0e2db7f450f4d63f9700289ae1ba838a419",
+      "patch": "@@ -461,19 +461,25 @@ class GoogleRealtimeVoiceBridge implements RealtimeVoiceBridge {\n       );\n       return;\n     }\n-    this.pendingFunctionNames.delete(callId);\n-    this.session.sendToolResponse({\n-      functionResponses: [\n-        {\n-          id: callId,\n-          name,\n-          response:\n-            result && typeof result === \"object\"\n-              ? (result as Record<string, unknown>)\n-              : { output: result },\n-        },\n-      ],\n-    });\n+    try {\n+      this.session.sendToolResponse({\n+        functionResponses: [\n+          {\n+            id: callId,\n+            name,\n+            response:\n+              result && typeof result === \"object\" && !Array.isArray(result)\n+                ? (result as Record<string, unknown>)\n+                : { output: result },\n+          },\n+        ],\n+      });\n+      this.pendingFunctionNames.delete(callId);\n+    } catch (error) {\n+      this.config.onError?.(\n+        error instanceof Error ? error : new Error(\"Failed to send Google Live function response\"),\n+      );\n+    }\n   }\n \n   acknowledgeMark(): void {}"
+    }
+  ]
+}

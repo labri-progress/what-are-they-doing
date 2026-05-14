@@ -1,0 +1,65 @@
+{
+  "message": "fix(grpc,ws,http): 6 audit bugs \u2014 timeout overflow, pong order, EOF reuse\n\n- grpc/server: prevent Instant+Duration panic on malicious grpc-timeout\n  via checked_add; add ASCII guard in parse_grpc_timeout\n- grpc/server: rewrite format_grpc_timeout with unit escalation (n/u/m/S/M/H)\n  to respect 8-digit gRPC spec limit\n- websocket server/client/split: fix pong LIFO\u2192FIFO ordering via reverse()\n  before pop() loop (RFC 6455 compliance)\n- websocket split: add missing mark_response_sent() after close response\n- http/h1 client: reject EOF-delimited bodies from connection reuse per\n  RFC 9112 \u00a76.3 (no Content-Length + no Transfer-Encoding = close-framed)\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "2862664ce9712c338a16638f86a22d153e0c5e61",
+      "filename": "src/grpc/server.rs",
+      "status": "modified",
+      "additions": 31,
+      "deletions": 3,
+      "changes": 34,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/d7183c7e35c07de8283a3e7cda1688f8f09d11d9/src%2Fgrpc%2Fserver.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/d7183c7e35c07de8283a3e7cda1688f8f09d11d9/src%2Fgrpc%2Fserver.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fgrpc%2Fserver.rs?ref=d7183c7e35c07de8283a3e7cda1688f8f09d11d9",
+      "patch": "@@ -316,6 +316,11 @@ pub fn parse_grpc_timeout(header: &str) -> Option<Duration> {\n     if header.is_empty() {\n         return None;\n     }\n+    // Prevent panic on non-ASCII characters by checking if it's purely ASCII.\n+    // The gRPC spec requires digits followed by an ASCII unit character.\n+    if !header.is_ascii() {\n+        return None;\n+    }\n     let (digits, unit) = header.split_at(header.len() - 1);\n     let value: u64 = digits.parse().ok()?;\n     match unit {\n@@ -331,11 +336,34 @@ pub fn parse_grpc_timeout(header: &str) -> Option<Duration> {\n \n /// Format a [`Duration`] as a gRPC timeout header value.\n ///\n-/// Uses milliseconds as the unit for practical precision.\n+/// Selects the most appropriate unit to preserve precision while\n+/// staying within the gRPC 8-digit limit.\n #[must_use]\n pub fn format_grpc_timeout(duration: Duration) -> String {\n+    const MAX_VALUE: u128 = 99_999_999;\n+    let ns = duration.as_nanos();\n+    if ns == 0 {\n+        return \"0n\".to_string();\n+    }\n+    let us = duration.as_micros();\n+    if us <= MAX_VALUE {\n+        return format!(\"{us}u\");\n+    }\n     let ms = duration.as_millis();\n-    format!(\"{ms}m\")\n+    if ms <= MAX_VALUE {\n+        return format!(\"{ms}m\");\n+    }\n+    let secs = u128::from(duration.as_secs());\n+    if secs <= MAX_VALUE {\n+        return format!(\"{secs}S\");\n+    }\n+    let mins = secs / 60;\n+    if mins <= MAX_VALUE {\n+        return format!(\"{mins}M\");\n+    }\n+    let hours = mins / 60;\n+    let hours = hours.min(MAX_VALUE);\n+    format!(\"{hours}H\")\n }\n \n /// A gRPC call context.\n@@ -390,7 +418,7 @@ impl CallContext {\n                 super::streaming::MetadataValue::Binary(_) => None,\n             })\n             .or(default_timeout);\n-        let deadline = timeout.map(|t| now + t);\n+        let deadline = timeout.and_then(|t| now.checked_add(t));\n         Self {\n             metadata,\n             deadline,"
+    },
+    {
+      "sha": "7e45a0f9c43918358ad49e022124412c3d593603",
+      "filename": "src/http/h1/http_client.rs",
+      "status": "modified",
+      "additions": 59,
+      "deletions": 3,
+      "changes": 62,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/d7183c7e35c07de8283a3e7cda1688f8f09d11d9/src%2Fhttp%2Fh1%2Fhttp_client.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/d7183c7e35c07de8283a3e7cda1688f8f09d11d9/src%2Fhttp%2Fh1%2Fhttp_client.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fhttp%2Fh1%2Fhttp_client.rs?ref=d7183c7e35c07de8283a3e7cda1688f8f09d11d9",
+      "patch": "@@ -1007,6 +1007,23 @@ fn redirect_method(status: u16, original: &Method) -> Method {\n }\n \n fn connection_can_be_reused(response: &Response) -> bool {\n+    // RFC 9112 \u00a76.3: when a response has no Content-Length and no\n+    // Transfer-Encoding, the body is delimited by connection close (EOF).\n+    // Such connections must not be reused.\n+    let has_content_length = response\n+        .headers\n+        .iter()\n+        .any(|(n, _)| n.eq_ignore_ascii_case(\"content-length\"));\n+    let has_transfer_encoding = response\n+        .headers\n+        .iter()\n+        .any(|(n, _)| n.eq_ignore_ascii_case(\"transfer-encoding\"));\n+    let is_bodyless = matches!(response.status, 100..=199 | 204 | 304);\n+\n+    if !has_content_length && !has_transfer_encoding && !is_bodyless {\n+        return false;\n+    }\n+\n     match response.version {\n         Version::Http11 => !header_has_token(&response.headers, \"connection\", \"close\"),\n         Version::Http10 => header_has_token(&response.headers, \"connection\", \"keep-alive\"),\n@@ -1774,14 +1791,20 @@ mod tests {\n             version: Version::Http11,\n             status: 200,\n             reason: \"OK\".into(),\n-            headers: vec![(\"Connection\".into(), \"keep-alive\".into())],\n+            headers: vec![\n+                (\"Content-Length\".into(), \"0\".into()),\n+                (\"Connection\".into(), \"keep-alive\".into()),\n+            ],\n             body: Vec::new(),\n             trailers: Vec::new(),\n         };\n         assert!(connection_can_be_reused(&response));\n \n         let close_response = Response {\n-            headers: vec![(\"Connection\".into(), \"close\".into())],\n+            headers: vec![\n+                (\"Content-Length\".into(), \"0\".into()),\n+                (\"Connection\".into(), \"close\".into()),\n+            ],\n             ..response\n         };\n         assert!(!connection_can_be_reused(&close_response));\n@@ -1793,7 +1816,10 @@ mod tests {\n             version: Version::Http10,\n             status: 200,\n             reason: \"OK\".into(),\n-            headers: vec![(\"Connection\".into(), \"keep-alive\".into())],\n+            headers: vec![\n+                (\"Content-Length\".into(), \"0\".into()),\n+                (\"Connection\".into(), \"keep-alive\".into()),\n+            ],\n             body: Vec::new(),\n             trailers: Vec::new(),\n         };\n@@ -1805,4 +1831,34 @@ mod tests {\n         };\n         assert!(!connection_can_be_reused(&no_header));\n     }\n+\n+    #[test]\n+    fn connection_not_reused_for_eof_delimited_body() {\n+        // RFC 9112 \u00a76.3: no Content-Length and no Transfer-Encoding means\n+        // the body is delimited by connection close (EOF-framed).\n+        let response = Response {\n+            version: Version::Http11,\n+            status: 200,\n+            reason: \"OK\".into(),\n+            headers: vec![],\n+            body: Vec::new(),\n+            trailers: Vec::new(),\n+        };\n+        assert!(!connection_can_be_reused(&response));\n+\n+        // Bodyless status codes (204, 304) are exempt.\n+        let no_content = Response {\n+            status: 204,\n+            reason: \"No Content\".into(),\n+            ..response.clone()\n+        };\n+        assert!(connection_can_be_reused(&no_content));\n+\n+        // Transfer-Encoding present: body is chunk-framed, reuse is ok.\n+        let chunked = Response {\n+            headers: vec![(\"Transfer-Encoding\".into(), \"chunked\".into())],\n+            ..response\n+        };\n+        assert!(connection_can_be_reused(&chunked));\n+    }\n }"
+    },
+    {
+      "sha": "ff2652493e66f70740ea115b86dadc2ef4e73f80",
+      "filename": "src/net/websocket/client.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 1,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/d7183c7e35c07de8283a3e7cda1688f8f09d11d9/src%2Fnet%2Fwebsocket%2Fclient.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/d7183c7e35c07de8283a3e7cda1688f8f09d11d9/src%2Fnet%2Fwebsocket%2Fclient.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fnet%2Fwebsocket%2Fclient.rs?ref=d7183c7e35c07de8283a3e7cda1688f8f09d11d9",
+      "patch": "@@ -430,7 +430,9 @@ where\n                 )));\n             }\n \n-            // Send any pending pongs (cancel-safe)\n+            // Send any pending pongs in FIFO order (cancel-safe: pop removes\n+            // one at a time; reverse ensures oldest-first dispatch).\n+            self.pending_pongs.reverse();\n             while let Some(payload) = self.pending_pongs.pop() {\n                 let pong = Frame::pong(payload);\n                 self.send_frame(pong).await?;"
+    },
+    {
+      "sha": "3a3043299478dda5c64bf7c7bdc0ace6cca4c1e2",
+      "filename": "src/net/websocket/server.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 1,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/d7183c7e35c07de8283a3e7cda1688f8f09d11d9/src%2Fnet%2Fwebsocket%2Fserver.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/d7183c7e35c07de8283a3e7cda1688f8f09d11d9/src%2Fnet%2Fwebsocket%2Fserver.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fnet%2Fwebsocket%2Fserver.rs?ref=d7183c7e35c07de8283a3e7cda1688f8f09d11d9",
+      "patch": "@@ -329,7 +329,9 @@ where\n                 )));\n             }\n \n-            // Send any pending pongs (cancel-safe)\n+            // Send any pending pongs in FIFO order (cancel-safe: pop removes\n+            // one at a time; reverse ensures oldest-first dispatch).\n+            self.pending_pongs.reverse();\n             while let Some(payload) = self.pending_pongs.pop() {\n                 let pong = Frame::pong(payload);\n                 self.send_frame(pong).await?;"
+    },
+    {
+      "sha": "8034638eaf0f358cce053931981093fdf464542d",
+      "filename": "src/net/websocket/split.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 1,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/d7183c7e35c07de8283a3e7cda1688f8f09d11d9/src%2Fnet%2Fwebsocket%2Fsplit.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/d7183c7e35c07de8283a3e7cda1688f8f09d11d9/src%2Fnet%2Fwebsocket%2Fsplit.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fnet%2Fwebsocket%2Fsplit.rs?ref=d7183c7e35c07de8283a3e7cda1688f8f09d11d9",
+      "patch": "@@ -271,7 +271,8 @@ where\n             // Send any pending pongs (under lock)\n             {\n                 let shared = &mut *self.shared.lock();\n-                // cancel-safe: do not clear write_buf, pop pongs instead of draining\n+                // cancel-safe: pop removes one at a time; reverse ensures FIFO order\n+                shared.pending_pongs.reverse();\n                 while let Some(payload) = shared.pending_pongs.pop() {\n                     let pong = Frame::pong(payload);\n                     let shared = &mut *shared;\n@@ -306,6 +307,7 @@ where\n \n                         if let Some(response_frame) = response {\n                             self.send_frame_internal(response_frame).await?;\n+                            self.shared.lock().close_handshake.mark_response_sent();\n                         }\n \n                         let reason = CloseReason::parse(&frame.payload).ok();"
+    }
+  ]
+}

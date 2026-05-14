@@ -1,0 +1,53 @@
+{
+  "message": "feat(mvcc): flush committed MVCC block versions to device on fsync and destroy\n\nAdd `MvccStore::flush_to_device()` which iterates all committed block\nversions and writes the latest snapshot-visible data to the underlying\nblock device, ensuring in-memory MVCC writes become durable.\n\nWire the new flush into three call sites:\n\n- `OpenFs::flush_mvcc_to_device()` \u2013 public convenience wrapper that\n  flushes then syncs the device, returning the block count.\n- ext4 and btrfs `fsync` paths \u2013 flush MVCC blocks before the existing\n  `dev.sync()` call so that fsync actually persists MVCC-buffered data.\n  The flushed-block count is included in the structured trace/info logs.\n- `FsOps::flush_on_destroy()` trait method (default no-op) implemented\n  on `OpenFs` and called from `FrankenFuse::destroy()`, guaranteeing\n  all pending writes are materialised when the FUSE filesystem is\n  unmounted.\n\nWithout this change, data written through the MVCC store could be lost\non unmount because the in-memory versions were never written back to the\nimage file.\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "6aafb0d71f6277593755341712ef60e32b7de97a",
+      "filename": "crates/ffs-core/src/lib.rs",
+      "status": "modified",
+      "additions": 52,
+      "deletions": 0,
+      "changes": 52,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/11c75dd55c25fb2fa3897f9f6809bc14f52f02a9/crates%2Fffs-core%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/11c75dd55c25fb2fa3897f9f6809bc14f52f02a9/crates%2Fffs-core%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/crates%2Fffs-core%2Fsrc%2Flib.rs?ref=11c75dd55c25fb2fa3897f9f6809bc14f52f02a9",
+      "patch": "@@ -3479,6 +3479,21 @@ impl OpenFs {\n         self.ext4_alloc_state.is_some() || self.btrfs_alloc_state.is_some()\n     }\n \n+    /// Flush all committed MVCC block versions to the underlying image.\n+    ///\n+    /// This materialises in-memory writes to durable storage.  Call this\n+    /// before unmounting to ensure data written through the FUSE interface\n+    /// survives across remounts.  Returns the number of blocks flushed.\n+    pub fn flush_mvcc_to_device(&self, cx: &Cx) -> ffs_error::Result<usize> {\n+        let base_dev = self.direct_block_device_adapter();\n+        let flushed = self.mvcc_store.read().flush_to_device(cx, &base_dev)?;\n+        if flushed > 0 {\n+            self.dev.sync(cx)?;\n+            info!(flushed_blocks = flushed, \"flush_mvcc_to_device\");\n+        }\n+        Ok(flushed)\n+    }\n+\n     /// Enable write operations by loading allocation state for the detected\n     /// filesystem type (ext4 or btrfs).\n     ///\n@@ -10585,6 +10600,19 @@ impl OpenFs {\n             return Err(FfsError::ReadOnly);\n         }\n \n+        // Flush committed MVCC block versions to the underlying device so\n+        // that data written through the MVCC store becomes durable on disk.\n+        let base_dev = self.direct_block_device_adapter();\n+        let flushed = self.mvcc_store.read().flush_to_device(cx, &base_dev)?;\n+        if flushed > 0 {\n+            trace!(\n+                target: \"ffs::ext4::rw\",\n+                operation_id = %operation_id,\n+                flushed_blocks = flushed,\n+                \"mvcc_flush_before_sync\"\n+            );\n+        }\n+\n         let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);\n         match self.dev.sync(cx) {\n             Ok(()) => {\n@@ -10596,6 +10624,7 @@ impl OpenFs {\n                     ino = ino.0,\n                     datasync,\n                     duration_us,\n+                    flushed_blocks = flushed,\n                     \"ext4_sync_applied\"\n                 );\n                 Ok(())\n@@ -10651,6 +10680,18 @@ impl OpenFs {\n             return Err(FfsError::ReadOnly);\n         }\n \n+        // Flush committed MVCC block versions to the underlying device.\n+        let base_dev = self.direct_block_device_adapter();\n+        let flushed = self.mvcc_store.read().flush_to_device(cx, &base_dev)?;\n+        if flushed > 0 {\n+            trace!(\n+                target: \"ffs::btrfs::rw\",\n+                operation_id = %operation_id,\n+                flushed_blocks = flushed,\n+                \"mvcc_flush_before_sync\"\n+            );\n+        }\n+\n         match self.dev.sync(cx) {\n             Ok(()) => {\n                 info!(\n@@ -10660,6 +10701,7 @@ impl OpenFs {\n                     outcome = \"applied\",\n                     ino = ino.0,\n                     datasync,\n+                    flushed_blocks = flushed,\n                     \"btrfs_sync_applied\"\n                 );\n                 Ok(())\n@@ -13837,6 +13879,16 @@ impl FsOps for OpenFs {\n     fn commit_request_scope(&self, scope: &mut RequestScope) -> ffs_error::Result<CommitSeq> {\n         scope.commit_if_write(&self.mvcc_store)\n     }\n+\n+    fn flush_on_destroy(&self, cx: &Cx) -> ffs_error::Result<()> {\n+        if self.is_writable() {\n+            let flushed = self.flush_mvcc_to_device(cx)?;\n+            if flushed > 0 {\n+                info!(flushed_blocks = flushed, \"flush_on_destroy\");\n+            }\n+        }\n+        Ok(())\n+    }\n }\n \n // \u2500\u2500 Bayesian Filesystem Integrity Scanner \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
+    },
+    {
+      "sha": "d81f0aa50dcbea5e5c9450a7e6c8fe09ac0e30bd",
+      "filename": "crates/ffs-core/src/vfs.rs",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 0,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/11c75dd55c25fb2fa3897f9f6809bc14f52f02a9/crates%2Fffs-core%2Fsrc%2Fvfs.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/11c75dd55c25fb2fa3897f9f6809bc14f52f02a9/crates%2Fffs-core%2Fsrc%2Fvfs.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/crates%2Fffs-core%2Fsrc%2Fvfs.rs?ref=11c75dd55c25fb2fa3897f9f6809bc14f52f02a9",
+      "patch": "@@ -651,4 +651,13 @@ pub trait FsOps: Send + Sync {\n     fn commit_request_scope(&self, _scope: &mut RequestScope) -> ffs_error::Result<CommitSeq> {\n         Ok(CommitSeq(0))\n     }\n+\n+    /// Flush all pending writes to durable storage before unmount.\n+    ///\n+    /// Called by the FUSE `destroy` callback to ensure in-memory MVCC\n+    /// data is materialised to the underlying image.  The default\n+    /// implementation is a no-op.\n+    fn flush_on_destroy(&self, _cx: &Cx) -> ffs_error::Result<()> {\n+        Ok(())\n+    }\n }"
+    },
+    {
+      "sha": "39ebb6e862c44db3f0a49fe9e74e3ef4326bb8c2",
+      "filename": "crates/ffs-fuse/src/lib.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 1,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/11c75dd55c25fb2fa3897f9f6809bc14f52f02a9/crates%2Fffs-fuse%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/11c75dd55c25fb2fa3897f9f6809bc14f52f02a9/crates%2Fffs-fuse%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/crates%2Fffs-fuse%2Fsrc%2Flib.rs?ref=11c75dd55c25fb2fa3897f9f6809bc14f52f02a9",
+      "patch": "@@ -982,7 +982,12 @@ impl Filesystem for FrankenFuse {\n         Ok(())\n     }\n \n-    fn destroy(&mut self) {}\n+    fn destroy(&mut self) {\n+        let cx = Self::cx_for_request();\n+        if let Err(e) = self.inner.ops.flush_on_destroy(&cx) {\n+            warn!(\"flush_on_destroy failed during FUSE destroy: {e}\");\n+        }\n+    }\n \n     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {\n         let cx = Self::cx_for_request();"
+    },
+    {
+      "sha": "62fb2393dc58e3df1df4033ad40dda4c15ee7514",
+      "filename": "crates/ffs-mvcc/src/lib.rs",
+      "status": "modified",
+      "additions": 34,
+      "deletions": 0,
+      "changes": 34,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/11c75dd55c25fb2fa3897f9f6809bc14f52f02a9/crates%2Fffs-mvcc%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/11c75dd55c25fb2fa3897f9f6809bc14f52f02a9/crates%2Fffs-mvcc%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/crates%2Fffs-mvcc%2Fsrc%2Flib.rs?ref=11c75dd55c25fb2fa3897f9f6809bc14f52f02a9",
+      "patch": "@@ -2552,6 +2552,40 @@ impl MvccStore {\n         freed\n     }\n \n+    /// Flush all committed block versions to the underlying device.\n+    ///\n+    /// For each block that has committed versions in the MVCC store, this\n+    /// writes the latest version visible at the current snapshot to the\n+    /// base device.  This materialises in-memory MVCC data to persistent\n+    /// storage, which is required for write durability (e.g. `fsync`,\n+    /// unmount).\n+    ///\n+    /// Returns the number of blocks flushed.\n+    pub fn flush_to_device<D: BlockDevice>(\n+        &self,\n+        cx: &Cx,\n+        device: &D,\n+    ) -> FfsResult<usize> {\n+        let snapshot = self.current_snapshot();\n+        let mut flushed = 0usize;\n+        for (block, versions) in &self.versions {\n+            if let Some(idx) = versions\n+                .iter()\n+                .rposition(|v| v.commit_seq <= snapshot.high)\n+            {\n+                if let Some(data) = compression::resolve_data_with(versions, idx, |v| &v.data) {\n+                    device.write_block(cx, *block, &data)?;\n+                    flushed += 1;\n+                }\n+            }\n+        }\n+        if flushed > 0 {\n+            device.sync(cx)?;\n+            debug!(flushed_blocks = flushed, \"mvcc_flush_to_device\");\n+        }\n+        Ok(flushed)\n+    }\n+\n     pub fn prune_versions_older_than(&mut self, watermark: CommitSeq) {\n         let mut retired_versions = Vec::new();\n         let active_snapshot_count = self.active_snapshot_count();"
+    }
+  ]
+}

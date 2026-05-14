@@ -1,0 +1,65 @@
+{
+  "message": "fix(mysql,scaffold): correct error mappings, truthful health, introspect test\n\nMySQL connector fixes:\n- Auth errors now map to FcpError::Unauthorized (was FcpError::External/401)\n- Rate limits now map to FcpError::RateLimited (was FcpError::External/429)\n- handle_health now actually probes the database instead of just checking\n  config presence (V3 contract: \"never report healthy when unreachable\")\n- handle_response extracts Retry-After header for rate limit delay\n  instead of hardcoding 1000ms\n- Added tests: auth_error_maps_to_unauthorized, rate_limited_maps_to_fcp_rate_limited\n- 54 tests pass (up from 52)\n\nScaffold generator fix (fwc new_cmd.rs):\n- Replaced generated test_introspection_has_operations (called\n  connector.introspect() as raw JSON \u2014 wrong API) with\n  test_operations_info_nonempty that calls placeholder_operation()\n  directly and validates typed OperationInfo fields\n\nV3 Acceptance Contract fix:\n- Idempotency rule for Dangerous ops now explicitly forbids BestEffort\n  in addition to None, matching the taxonomy document\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "6c078add70422ac4889067ee9d9822e4ec569fa2",
+      "filename": "connectors/mysql/src/client.rs",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 1,
+      "changes": 16,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/7b466c108583ab34726033dad91cfb51773806eb/connectors%2Fmysql%2Fsrc%2Fclient.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/7b466c108583ab34726033dad91cfb51773806eb/connectors%2Fmysql%2Fsrc%2Fclient.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/connectors%2Fmysql%2Fsrc%2Fclient.rs?ref=7b466c108583ab34726033dad91cfb51773806eb",
+      "patch": "@@ -231,6 +231,15 @@ impl MysqlClient {\n             return Ok(body);\n         }\n \n+        // Extract Retry-After header before consuming the body\n+        let retry_after_ms = resp\n+            .headers()\n+            .get(\"retry-after\")\n+            .and_then(|v| v.to_str().ok())\n+            .and_then(|v| v.parse::<u64>().ok())\n+            .map(|secs| secs * 1000)\n+            .unwrap_or(1000);\n+\n         // Try to parse error body\n         let body_text = resp.text().await.unwrap_or_default();\n         if let Ok(api_err) = serde_json::from_str::<ApiErrorResponse>(&body_text) {\n@@ -242,7 +251,7 @@ impl MysqlClient {\n                 StatusCode::UNAUTHORIZED => Err(MysqlError::Auth(message)),\n                 StatusCode::FORBIDDEN => Err(MysqlError::PermissionDenied(message)),\n                 StatusCode::TOO_MANY_REQUESTS => {\n-                    Err(MysqlError::RateLimited { retry_after_ms: 1000 })\n+                    Err(MysqlError::RateLimited { retry_after_ms })\n                 }\n                 StatusCode::CONFLICT => Err(MysqlError::ConstraintViolation(message)),\n                 _ => Err(MysqlError::Api {\n@@ -252,6 +261,11 @@ impl MysqlClient {\n             };\n         }\n \n+        // Fallback: no parseable error body\n+        if status == StatusCode::TOO_MANY_REQUESTS {\n+            return Err(MysqlError::RateLimited { retry_after_ms });\n+        }\n+\n         Err(MysqlError::Api {\n             status_code: status.as_u16(),\n             message: if body_text.is_empty() {"
+    },
+    {
+      "sha": "355e60e8baae5e5c468979417c4defdaa9cdd2cf",
+      "filename": "connectors/mysql/src/connector.rs",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 1,
+      "changes": 14,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/7b466c108583ab34726033dad91cfb51773806eb/connectors%2Fmysql%2Fsrc%2Fconnector.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/7b466c108583ab34726033dad91cfb51773806eb/connectors%2Fmysql%2Fsrc%2Fconnector.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/connectors%2Fmysql%2Fsrc%2Fconnector.rs?ref=7b466c108583ab34726033dad91cfb51773806eb",
+      "patch": "@@ -176,9 +176,21 @@ impl MysqlConnector {\n     }\n \n     /// Handle health check.\n+    ///\n+    /// Reports truthful health: actually probes the database when configured\n+    /// rather than merely reporting config presence.\n     pub async fn handle_health(&self) -> FcpResult<serde_json::Value> {\n         let configured = self.config.is_some();\n-        let status = if configured { \"healthy\" } else { \"not_configured\" };\n+\n+        let status = if let Some(ref client) = self.client {\n+            match client.health_check().await {\n+                Ok(true) => \"healthy\",\n+                Ok(false) => \"degraded\",\n+                Err(_) => \"degraded\",\n+            }\n+        } else {\n+            \"not_configured\"\n+        };\n \n         Ok(json!({\n             \"status\": status,"
+    },
+    {
+      "sha": "35bd2b528bae659ff5ea2daa4203c6da53c6a571",
+      "filename": "connectors/mysql/src/error.rs",
+      "status": "modified",
+      "additions": 24,
+      "deletions": 11,
+      "changes": 35,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/7b466c108583ab34726033dad91cfb51773806eb/connectors%2Fmysql%2Fsrc%2Ferror.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/7b466c108583ab34726033dad91cfb51773806eb/connectors%2Fmysql%2Fsrc%2Ferror.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/connectors%2Fmysql%2Fsrc%2Ferror.rs?ref=7b466c108583ab34726033dad91cfb51773806eb",
+      "patch": "@@ -102,12 +102,9 @@ impl MysqlError {\n                 retryable: true,\n                 retry_after: None,\n             },\n-            Self::Auth(msg) => FcpError::External {\n-                service: \"mysql\".into(),\n+            Self::Auth(msg) => FcpError::Unauthorized {\n+                code: 2001,\n                 message: msg.clone(),\n-                status_code: Some(401),\n-                retryable: false,\n-                retry_after: None,\n             },\n             Self::Query(msg) => FcpError::External {\n                 service: \"mysql\".into(),\n@@ -151,12 +148,9 @@ impl MysqlError {\n                 retryable: false,\n                 retry_after: None,\n             },\n-            Self::RateLimited { retry_after_ms } => FcpError::External {\n-                service: \"mysql\".into(),\n-                message: format!(\"Rate limited, retry after {retry_after_ms}ms\"),\n-                status_code: Some(429),\n-                retryable: true,\n-                retry_after: self.retry_after(),\n+            Self::RateLimited { retry_after_ms } => FcpError::RateLimited {\n+                retry_after_ms: *retry_after_ms,\n+                violation: None,\n             },\n             Self::Api {\n                 status_code,\n@@ -270,6 +264,13 @@ mod tests {\n         }\n     }\n \n+    #[test]\n+    fn auth_error_maps_to_unauthorized() {\n+        let err = MysqlError::Auth(\"access denied\".into());\n+        let fcp = err.to_fcp_error();\n+        assert!(matches!(fcp, FcpError::Unauthorized { .. }));\n+    }\n+\n     #[test]\n     fn permission_denied_maps_to_403() {\n         let err = MysqlError::PermissionDenied(\"SELECT command denied\".into());\n@@ -282,6 +283,18 @@ mod tests {\n         }\n     }\n \n+    #[test]\n+    fn rate_limited_maps_to_fcp_rate_limited() {\n+        let err = MysqlError::RateLimited { retry_after_ms: 2000 };\n+        let fcp = err.to_fcp_error();\n+        match fcp {\n+            FcpError::RateLimited { retry_after_ms, .. } => {\n+                assert_eq!(retry_after_ms, 2000);\n+            }\n+            _ => panic!(\"expected RateLimited error, got {fcp:?}\"),\n+        }\n+    }\n+\n     #[test]\n     fn json_error_maps_to_internal() {\n         let raw_err = serde_json::from_str::<serde_json::Value>(\"invalid\").unwrap_err();"
+    },
+    {
+      "sha": "41327dee13fba0ca5ac5884f6bedd7bbb6a60730",
+      "filename": "crates/fwc/src/new_cmd.rs",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 12,
+      "changes": 22,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/7b466c108583ab34726033dad91cfb51773806eb/crates%2Ffwc%2Fsrc%2Fnew_cmd.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/7b466c108583ab34726033dad91cfb51773806eb/crates%2Ffwc%2Fsrc%2Fnew_cmd.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffwc%2Fsrc%2Fnew_cmd.rs?ref=7b466c108583ab34726033dad91cfb51773806eb",
+      "patch": "@@ -2536,20 +2536,18 @@ async fn test_self_check_ok_after_configure() {{\n }}\n \n // \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n-// Introspection completeness tests (V3 contract)\n+// OperationInfo completeness test (V3 contract)\n // \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n \n-#[fcp_async_core::runtime::test]\n-async fn test_introspection_has_operations() {{\n-    let mut connector = {struct_name}Connector::new();\n-    connector.configure(serde_json::json!({{}})).await.expect(\"configure\");\n-    connector.handshake(base_handshake()).await.expect(\"handshake\");\n-\n-    let introspection = connector.introspect().await.expect(\"introspect\");\n-    let ops = introspection.get(\"operations\")\n-        .and_then(|v| v.as_array())\n-        .expect(\"introspection should have operations array\");\n-    assert!(!ops.is_empty(), \"introspection must declare at least one operation\");\n+#[test]\n+fn test_operations_info_nonempty() {{\n+    // Verify the connector declares at least one operation with typed metadata.\n+    let connector = {struct_name}Connector::new();\n+    let op = connector.placeholder_operation();\n+    assert!(!op.id.as_str().is_empty(), \"operation must have an ID\");\n+    assert!(!op.summary.is_empty(), \"operation must have a summary\");\n+    assert!(op.input_schema.is_object(), \"operation must have an input schema\");\n+    assert!(op.output_schema.is_object(), \"operation must have an output schema\");\n }}\n \n #[fcp_async_core::runtime::test]"
+    },
+    {
+      "sha": "bfa28e9a9dff128c3abe695960d7bf3725c04b9c",
+      "filename": "docs/V3_Connector_Acceptance_Contract.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/7b466c108583ab34726033dad91cfb51773806eb/docs%2FV3_Connector_Acceptance_Contract.md",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/7b466c108583ab34726033dad91cfb51773806eb/docs%2FV3_Connector_Acceptance_Contract.md",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/docs%2FV3_Connector_Acceptance_Contract.md?ref=7b466c108583ab34726033dad91cfb51773806eb",
+      "patch": "@@ -131,7 +131,7 @@ The contract answers two questions:\n | `BestEffort` | Deduplication attempted but not guaranteed | Permitted for `Safe` and `Risky` operations |\n | `Strict` | Exactly-once via idempotency key + receipt tracking | Required for `Dangerous` operations; recommended for `Risky` |\n \n-**Hard rule**: `Dangerous` + `IdempotencyClass::None` is a conformance violation.\n+**Hard rule**: `Dangerous` + `IdempotencyClass::None` or `Dangerous` + `IdempotencyClass::BestEffort` is a conformance violation. Dangerous operations MUST use `Strict`.\n \n ---\n "
+    }
+  ]
+}

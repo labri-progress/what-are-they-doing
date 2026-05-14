@@ -1,0 +1,137 @@
+{
+  "message": "feat(macros): add scope! state binding; re-export join!/race! proc macros from crate root\n\nscope! macro (asupersync-macros/src/scope.rs, lib.rs, spawn.rs):\n\n  Add an optional state: expr parameter to scope! that binds a __state\n  variable visible to nested spawn! calls. Previously spawn! required an\n  ambient __state binding that callers had to create manually. The new\n  syntax is:\n\n    scope!(cx, state: &mut state, { spawn!(async { work() }); })\n\n  The parser now loops over keyword options (budget:, state:) instead of\n  checking for budget: once, allowing them to appear in any order after\n  the optional name. Duplicate detection rejects repeated budget: or\n  state: with a clear error message.\n\n  spawn.rs doc updated to document that __state can come from either\n  scope! state: or a manual let binding.\n\n  Tests added: parse_state_scope, parse_named_state_budget_scope,\n  error_duplicate_state, generate_scope_with_state_binding.\n\n  macro_spawn_closure.rs: replaced dummy test with a real compile-time\n  verification that scope! + spawn! compose correctly through a minimal\n  MiniCx/MiniScope/MiniState mock.\n\njoin!/race! proc-macro re-exports (src/lib.rs, src/combinator/join.rs,\nsrc/combinator/race.rs):\n\n  Re-export join! and race! proc macros from the crate root alongside\n  scope!, spawn!, and join_all! when the proc-macros feature is enabled.\n  The fallback compile_error! macro_rules! placeholders now have\n  #[cfg(not(feature = \"proc-macros\"))] gates so they don't conflict with\n  the proc macro re-exports. Doc comments on the placeholders updated to\n  point users to the proc-macro versions.\n\nExamples updated:\n  - Import path changed from asupersync::proc_macros:: to asupersync::\n  - let _ = replaced with std::mem::drop() to silence unused-result\n  - Clippy allows added for trivially_copy_pass_by_ref, unused_self,\n    unnecessary_wraps\n  - macros_race.rs: added named-branch + timeout race variant demo\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "72ae2189b1a942627e2aa6bb6cc0535a57653412",
+      "filename": "asupersync-macros/src/lib.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 3,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/1cc1ac42187a8ec02248a0a795c8538fa80b0b15/asupersync-macros%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/1cc1ac42187a8ec02248a0a795c8538fa80b0b15/asupersync-macros%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/asupersync-macros%2Fsrc%2Flib.rs?ref=1cc1ac42187a8ec02248a0a795c8538fa80b0b15",
+      "patch": "@@ -16,8 +16,8 @@\n //! ```ignore\n //! use asupersync_macros::{scope, spawn, join, race};\n //!\n-//! async fn example(cx: &mut Cx) {\n-//!     scope!(cx, {\n+//! async fn example(cx: &Cx, state: &mut RuntimeState) {\n+//!     scope!(cx, state: state, {\n //!         let handle1 = spawn!(async { compute_a().await });\n //!         let handle2 = spawn!(async { compute_b().await });\n //!\n@@ -48,12 +48,16 @@ use proc_macro::TokenStream;\n /// scope!(cx, {\n ///     // body with spawned tasks\n /// })\n+/// scope!(cx, state: &mut state, {\n+///     let _child = spawn!(async { work().await });\n+/// })\n /// ```\n ///\n /// # Arguments\n ///\n /// - `cx` - The capability context (`&mut Cx`)\n /// - `body` - A block containing the scope's work\n+/// - `state` - Optional runtime state binding used by nested `spawn!` calls\n ///\n /// # Returns\n ///\n@@ -62,7 +66,7 @@ use proc_macro::TokenStream;\n /// # Example\n ///\n /// ```ignore\n-/// scope!(cx, {\n+/// scope!(cx, state: &mut state, {\n ///     spawn!(async { work_a().await });\n ///     spawn!(async { work_b().await });\n ///     // Both tasks are awaited before scope exits"
+    },
+    {
+      "sha": "c55aa6dca5e63e1fa9aa5f932b741bdf56efae1a",
+      "filename": "asupersync-macros/src/scope.rs",
+      "status": "modified",
+      "additions": 103,
+      "deletions": 11,
+      "changes": 114,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/1cc1ac42187a8ec02248a0a795c8538fa80b0b15/asupersync-macros%2Fsrc%2Fscope.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/1cc1ac42187a8ec02248a0a795c8538fa80b0b15/asupersync-macros%2Fsrc%2Fscope.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/asupersync-macros%2Fsrc%2Fscope.rs?ref=1cc1ac42187a8ec02248a0a795c8538fa80b0b15",
+      "patch": "@@ -11,6 +11,11 @@\n //!     // body - `scope` variable is available here\n //! })\n //!\n+//! // With explicit runtime state for nested spawn! calls\n+//! scope!(cx, state: &mut state, {\n+//!     let _child = spawn!(async { 42 });\n+//! })\n+//!\n //! // With explicit name (for debugging)\n //! scope!(cx, \"http_handler\", {\n //!     // body\n@@ -25,6 +30,11 @@\n //! scope!(cx, \"handler\", budget: Budget::deadline(Duration::from_secs(5)), {\n //!     // body\n //! })\n+//!\n+//! // Options can be combined\n+//! scope!(cx, \"handler\", state: &mut state, budget: Budget::deadline(Duration::from_secs(5)), {\n+//!     let _child = spawn!(async { 42 });\n+//! })\n //! ```\n \n use proc_macro::TokenStream;\n@@ -45,20 +55,27 @@ struct ScopeName(LitStr);\n #[derive(Clone)]\n struct ScopeBudget(Expr);\n \n+/// Optional runtime state binding for nested `spawn!` calls.\n+#[derive(Clone)]\n+struct ScopeState(Expr);\n+\n /// Input to the scope! macro with all variants supported.\n ///\n /// Supports:\n /// - `scope!(cx, { body })`\n+/// - `scope!(cx, state: expr, { body })`\n /// - `scope!(cx, \"name\", { body })`\n /// - `scope!(cx, budget: expr, { body })`\n-/// - `scope!(cx, \"name\", budget: expr, { body })`\n+/// - `scope!(cx, \"name\", state: expr, budget: expr, { body })`\n struct ScopeInput {\n     /// The capability context expression.\n     cx: Expr,\n     /// Optional scope name for debugging.\n     name: Option<ScopeName>,\n     /// Optional budget override.\n     budget: Option<ScopeBudget>,\n+    /// Optional runtime state for nested spawn! calls.\n+    state: Option<ScopeState>,\n     /// The body block.\n     body: syn::Block,\n }\n@@ -87,6 +104,7 @@ impl Parse for ScopeInput {\n \n         let mut name = None;\n         let mut budget = None;\n+        let mut state = None;\n \n         // Check for optional name (string literal)\n         if input.peek(LitStr) {\n@@ -101,27 +119,50 @@ impl Parse for ScopeInput {\n             })?;\n         }\n \n-        // Check for optional budget specification\n-        if input.peek(Ident) {\n+        loop {\n+            if !input.peek(Ident) {\n+                break;\n+            }\n+\n             let ident: Ident = input.fork().parse()?;\n             if ident == \"budget\" {\n-                // Consume the ident\n+                if budget.is_some() {\n+                    return Err(syn::Error::new(\n+                        ident.span(),\n+                        \"duplicate budget: scope! accepts at most one budget: expr option\",\n+                    ));\n+                }\n+\n                 let _: Ident = input.parse()?;\n-                // Expect colon\n                 let _colon: Token![:] = input.parse().map_err(|_| {\n                     syn::Error::new(input.span(), \"expected colon after 'budget': budget: expr\")\n                 })?;\n-                // Parse the budget expression\n                 let budget_expr: Expr = input.parse()?;\n                 budget = Some(ScopeBudget(budget_expr));\n+            } else if ident == \"state\" {\n+                if state.is_some() {\n+                    return Err(syn::Error::new(\n+                        ident.span(),\n+                        \"duplicate state: scope! accepts at most one state: expr option\",\n+                    ));\n+                }\n \n-                let _comma: Token![,] = input.parse().map_err(|_| {\n-                    syn::Error::new(\n-                        input.span(),\n-                        \"expected comma after budget: scope!(cx, budget: expr, { body })\",\n-                    )\n+                let _: Ident = input.parse()?;\n+                let _colon: Token![:] = input.parse().map_err(|_| {\n+                    syn::Error::new(input.span(), \"expected colon after 'state': state: expr\")\n                 })?;\n+                let state_expr: Expr = input.parse()?;\n+                state = Some(ScopeState(state_expr));\n+            } else {\n+                break;\n             }\n+\n+            let _comma: Token![,] = input.parse().map_err(|_| {\n+                syn::Error::new(\n+                    input.span(),\n+                    \"expected comma after scope option before body block\",\n+                )\n+            })?;\n         }\n \n         // Parse the body block\n@@ -151,6 +192,7 @@ impl Parse for ScopeInput {\n             cx,\n             name,\n             budget,\n+            state,\n             body,\n         })\n     }\n@@ -207,6 +249,17 @@ fn generate_scope(input: &ScopeInput) -> TokenStream2 {\n         }\n     };\n \n+    let state_binding = match &input.state {\n+        Some(ScopeState(state_expr)) => {\n+            quote! {\n+                let __state = #state_expr;\n+            }\n+        }\n+        None => {\n+            quote! {}\n+        }\n+    };\n+\n     // Extract just the statements from the body block\n     let body_stmts = &body.stmts;\n \n@@ -216,6 +269,7 @@ fn generate_scope(input: &ScopeInput) -> TokenStream2 {\n             let __cx = &#cx;\n             #scope_creation\n             #trace_name\n+            #state_binding\n             async move {\n                 let scope = __scope;\n                 #(#body_stmts)*\n@@ -299,6 +353,15 @@ mod tests {\n         assert!(parsed.budget.is_some());\n     }\n \n+    #[test]\n+    fn test_parse_state_scope() {\n+        let input: proc_macro2::TokenStream = quote! { cx, state: &mut state, { let x = 1; } };\n+        let parsed: ScopeInput = syn::parse2(input).unwrap();\n+        assert!(parsed.name.is_none());\n+        assert!(parsed.budget.is_none());\n+        assert!(parsed.state.is_some());\n+    }\n+\n     #[test]\n     fn test_parse_named_budget_scope() {\n         let input: proc_macro2::TokenStream =\n@@ -309,6 +372,17 @@ mod tests {\n         assert!(parsed.budget.is_some());\n     }\n \n+    #[test]\n+    fn test_parse_named_state_budget_scope() {\n+        let input: proc_macro2::TokenStream =\n+            quote! { cx, \"handler\", state: &mut state, budget: Budget::INFINITE, { let x = 1; } };\n+        let parsed: ScopeInput = syn::parse2(input).unwrap();\n+        assert!(parsed.name.is_some());\n+        assert_eq!(parsed.name.unwrap().0.value(), \"handler\");\n+        assert!(parsed.budget.is_some());\n+        assert!(parsed.state.is_some());\n+    }\n+\n     #[test]\n     fn test_parse_complex_cx_expression() {\n         let input: proc_macro2::TokenStream = quote! { &context.cx, { do_work(); } };\n@@ -345,6 +419,14 @@ mod tests {\n         assert!(result.is_err());\n     }\n \n+    #[test]\n+    fn test_error_duplicate_state() {\n+        let input: proc_macro2::TokenStream =\n+            quote! { cx, state: &mut a, state: &mut b, { let x = 1; } };\n+        let result: Result<ScopeInput, _> = syn::parse2(input);\n+        assert!(result.is_err());\n+    }\n+\n     #[test]\n     fn test_generate_basic_scope() {\n         let input: proc_macro2::TokenStream = quote! { cx, { 42 } };\n@@ -373,6 +455,16 @@ mod tests {\n         assert!(generated_str.contains(\"scope_with_budget\"));\n     }\n \n+    #[test]\n+    fn test_generate_scope_with_state_binding() {\n+        let input: proc_macro2::TokenStream = quote! { cx, state: &mut state, { 42 } };\n+        let parsed: ScopeInput = syn::parse2(input).unwrap();\n+        let generated = generate_scope(&parsed);\n+\n+        let generated_str = generated.to_string();\n+        assert!(generated_str.contains(\"let __state =\"));\n+    }\n+\n     #[test]\n     fn test_scope_variable_available() {\n         // Test that the generated code makes `scope` available"
+    },
+    {
+      "sha": "5015eb98baab4142eb9d6202acd68b19bf851e73",
+      "filename": "asupersync-macros/src/spawn.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 1,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/1cc1ac42187a8ec02248a0a795c8538fa80b0b15/asupersync-macros%2Fsrc%2Fspawn.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/1cc1ac42187a8ec02248a0a795c8538fa80b0b15/asupersync-macros%2Fsrc%2Fspawn.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/asupersync-macros%2Fsrc%2Fspawn.rs?ref=1cc1ac42187a8ec02248a0a795c8538fa80b0b15",
+      "patch": "@@ -9,7 +9,9 @@\n //! - `__state: &mut RuntimeState` - The runtime state for task registration\n //! - `__cx: &Cx` - The capability context for creating child contexts\n //!\n-//! These are typically provided by the `scope!` macro.\n+//! `__cx` is provided by the `scope!` macro. `__state` can be introduced either\n+//! by `scope!(..., state: expr, { ... })` or by an explicit ambient\n+//! `let __state = ...;` binding when you are using `spawn!` outside that helper.\n //!\n //! # Usage\n //!"
+    },
+    {
+      "sha": "918abcf6caf3e1262003441f94c9fd1df6afb2d0",
+      "filename": "asupersync-macros/tests/macro_spawn_closure.rs",
+      "status": "modified",
+      "additions": 57,
+      "deletions": 2,
+      "changes": 59,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/1cc1ac42187a8ec02248a0a795c8538fa80b0b15/asupersync-macros%2Ftests%2Fmacro_spawn_closure.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/1cc1ac42187a8ec02248a0a795c8538fa80b0b15/asupersync-macros%2Ftests%2Fmacro_spawn_closure.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/asupersync-macros%2Ftests%2Fmacro_spawn_closure.rs?ref=1cc1ac42187a8ec02248a0a795c8538fa80b0b15",
+      "patch": "@@ -1,4 +1,59 @@\n-//! Tests for `spawn_closure` macro.\n+#![allow(missing_docs)]\n+#![allow(clippy::missing_const_for_fn)]\n+#![allow(clippy::trivially_copy_pass_by_ref)]\n+#![allow(clippy::unnecessary_wraps)]\n+#![allow(clippy::unused_self)]\n+\n+use asupersync_macros::{scope, spawn};\n+use std::future::Future;\n+use std::marker::PhantomData;\n+\n+#[derive(Clone, Copy)]\n+struct MiniCx;\n+\n+struct MiniScope;\n+struct MiniState;\n+\n+#[derive(Debug)]\n+struct MiniError;\n+\n+struct MiniHandle<T>(PhantomData<T>);\n+\n+impl MiniCx {\n+    fn scope(&self) -> MiniScope {\n+        MiniScope\n+    }\n+}\n+\n+impl MiniScope {\n+    fn spawn_registered<F, Fut>(\n+        &self,\n+        _state: &mut MiniState,\n+        _cx: &MiniCx,\n+        f: F,\n+    ) -> Result<MiniHandle<Fut::Output>, MiniError>\n+    where\n+        F: FnOnce(MiniCx) -> Fut,\n+        Fut: Future,\n+    {\n+        std::mem::drop(f(MiniCx));\n+        Ok(MiniHandle(PhantomData))\n+    }\n+}\n \n #[test]\n-fn dummy() {}\n+fn scope_state_binding_supports_spawn_macro() {\n+    let future = async {\n+        let cx = MiniCx;\n+        let mut state = MiniState;\n+\n+        let value = scope!(cx, state: &mut state, {\n+            let _handle = spawn!(async { 42 });\n+            7\n+        });\n+\n+        assert_eq!(value, 7);\n+    };\n+\n+    std::mem::drop(future);\n+}"
+    },
+    {
+      "sha": "3186346d5244004cc7274c5059fbdbf67dccca80",
+      "filename": "examples/macros_basic.rs",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 3,
+      "changes": 12,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/1cc1ac42187a8ec02248a0a795c8538fa80b0b15/examples%2Fmacros_basic.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/1cc1ac42187a8ec02248a0a795c8538fa80b0b15/examples%2Fmacros_basic.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/examples%2Fmacros_basic.rs?ref=1cc1ac42187a8ec02248a0a795c8538fa80b0b15",
+      "patch": "@@ -1,8 +1,13 @@\n #![allow(missing_docs)]\n+#![allow(\n+    clippy::trivially_copy_pass_by_ref,\n+    clippy::unnecessary_wraps,\n+    clippy::unused_self\n+)]\n \n #[cfg(feature = \"proc-macros\")]\n mod demo {\n-    use asupersync::proc_macros::{join, scope, spawn};\n+    use asupersync::{join, scope, spawn};\n     use std::future::Future;\n     use std::marker::PhantomData;\n \n@@ -22,6 +27,7 @@ mod demo {\n             MiniScope\n         }\n \n+        #[allow(dead_code)]\n         fn scope_with_budget(&self, _budget: asupersync::Budget) -> MiniScope {\n             MiniScope\n         }\n@@ -38,7 +44,7 @@ mod demo {\n             F: FnOnce(MiniCx) -> Fut,\n             Fut: Future,\n         {\n-            let _ = f(MiniCx);\n+            std::mem::drop(f(MiniCx));\n             Ok(MiniHandle(PhantomData))\n         }\n     }\n@@ -59,7 +65,7 @@ mod demo {\n \n #[cfg(feature = \"proc-macros\")]\n fn main() {\n-    let _ = demo::demo();\n+    std::mem::drop(demo::demo());\n }\n \n #[cfg(not(feature = \"proc-macros\"))]"
+    },
+    {
+      "sha": "8aa0fbe9f1d3ede126c31c23a49703bd9b5c4be4",
+      "filename": "examples/macros_error_handling.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/1cc1ac42187a8ec02248a0a795c8538fa80b0b15/examples%2Fmacros_error_handling.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/1cc1ac42187a8ec02248a0a795c8538fa80b0b15/examples%2Fmacros_error_handling.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/examples%2Fmacros_error_handling.rs?ref=1cc1ac42187a8ec02248a0a795c8538fa80b0b15",
+      "patch": "@@ -2,7 +2,7 @@\n \n #[cfg(feature = \"proc-macros\")]\n mod demo {\n-    use asupersync::proc_macros::join;\n+    use asupersync::join;\n \n     pub async fn demo() {\n         let (a, b): (Result<i32, &'static str>, Result<i32, &'static str>) =\n@@ -17,7 +17,7 @@ mod demo {\n \n #[cfg(feature = \"proc-macros\")]\n fn main() {\n-    let _ = demo::demo();\n+    std::mem::drop(demo::demo());\n }\n \n #[cfg(not(feature = \"proc-macros\"))]"
+    },
+    {
+      "sha": "b464a0f11fc4b1e8284c96d886a8ae921b8e9654",
+      "filename": "examples/macros_nested.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 2,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/1cc1ac42187a8ec02248a0a795c8538fa80b0b15/examples%2Fmacros_nested.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/1cc1ac42187a8ec02248a0a795c8538fa80b0b15/examples%2Fmacros_nested.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/examples%2Fmacros_nested.rs?ref=1cc1ac42187a8ec02248a0a795c8538fa80b0b15",
+      "patch": "@@ -1,4 +1,9 @@\n #![allow(missing_docs)]\n+#![allow(\n+    clippy::trivially_copy_pass_by_ref,\n+    clippy::unnecessary_wraps,\n+    clippy::unused_self\n+)]\n \n #[cfg(feature = \"proc-macros\")]\n mod demo {\n@@ -39,7 +44,7 @@ mod demo {\n             F: FnOnce(MiniCx) -> Fut,\n             Fut: Future,\n         {\n-            let _ = f(MiniCx);\n+            std::mem::drop(f(MiniCx));\n             Ok(MiniHandle(PhantomData))\n         }\n     }\n@@ -62,7 +67,7 @@ mod demo {\n \n #[cfg(feature = \"proc-macros\")]\n fn main() {\n-    let _ = demo::demo();\n+    std::mem::drop(demo::demo());\n }\n \n #[cfg(not(feature = \"proc-macros\"))]"
+    },
+    {
+      "sha": "bf11ecf73391fe198922b9089fb0c4940da19b50",
+      "filename": "examples/macros_race.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 2,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/1cc1ac42187a8ec02248a0a795c8538fa80b0b15/examples%2Fmacros_race.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/1cc1ac42187a8ec02248a0a795c8538fa80b0b15/examples%2Fmacros_race.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/examples%2Fmacros_race.rs?ref=1cc1ac42187a8ec02248a0a795c8538fa80b0b15",
+      "patch": "@@ -1,8 +1,9 @@\n #![allow(missing_docs)]\n+#![allow(clippy::trivially_copy_pass_by_ref, clippy::unused_self)]\n \n #[cfg(feature = \"proc-macros\")]\n mod demo {\n-    use asupersync::proc_macros::race;\n+    use asupersync::race;\n     use std::future::Future;\n     use std::pin::Pin;\n     use std::time::Duration;\n@@ -46,12 +47,16 @@ mod demo {\n         let _ = race!(cx, { async { 1 }, async { 2 } });\n         let _ = race!(cx, { \"fast\" => async { 10 }, \"slow\" => async { 20 } });\n         let _ = race!(cx, timeout: Duration::from_secs(1), { async { 3 }, async { 4 } });\n+        let _ = race!(cx, timeout: Duration::from_secs(1), {\n+            \"fast\" => async { 30 },\n+            \"slow\" => async { 40 },\n+        });\n     }\n }\n \n #[cfg(feature = \"proc-macros\")]\n fn main() {\n-    let _ = demo::demo();\n+    std::mem::drop(demo::demo());\n }\n \n #[cfg(not(feature = \"proc-macros\"))]"
+    },
+    {
+      "sha": "973227a45bab99aa6b05094397387dc912c9795e",
+      "filename": "src/combinator/join.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 2,
+      "changes": 8,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/1cc1ac42187a8ec02248a0a795c8538fa80b0b15/src%2Fcombinator%2Fjoin.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/1cc1ac42187a8ec02248a0a795c8538fa80b0b15/src%2Fcombinator%2Fjoin.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fcombinator%2Fjoin.rs?ref=1cc1ac42187a8ec02248a0a795c8538fa80b0b15",
+      "patch": "@@ -552,9 +552,12 @@ pub fn join2_to_result<T1, T2, E>(\n     }\n }\n \n-/// Macro for joining multiple futures.\n+/// Placeholder macro for builds without the `proc-macros` feature.\n ///\n-/// **Not yet implemented as a macro.** Use the functional API instead:\n+/// Enable the `proc-macros` feature to use the real `join!` proc macro from\n+/// the crate root (`use asupersync::join;`).\n+///\n+/// Without that feature, use the functional API instead:\n ///\n /// - [`Scope::join`] for two futures\n /// - [`Scope::join_all`] for N futures\n@@ -574,6 +577,7 @@ pub fn join2_to_result<T1, T2, E>(\n /// them \u2014 a correctness hazard. This `compile_error!` ensures callers migrate\n /// to the functional API, which properly spawns into a child region, waits for\n /// all branches to complete, and aggregates outcomes via the severity lattice.\n+#[cfg(not(feature = \"proc-macros\"))]\n #[macro_export]\n macro_rules! join {\n     ($($future:expr),+ $(,)?) => {"
+    },
+    {
+      "sha": "0ef8863adb5d47fbe1ae7ec0919da059d25fcff5",
+      "filename": "src/combinator/race.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 5,
+      "changes": 11,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/1cc1ac42187a8ec02248a0a795c8538fa80b0b15/src%2Fcombinator%2Frace.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/1cc1ac42187a8ec02248a0a795c8538fa80b0b15/src%2Fcombinator%2Frace.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fcombinator%2Frace.rs?ref=1cc1ac42187a8ec02248a0a795c8538fa80b0b15",
+      "patch": "@@ -686,13 +686,13 @@ pub fn make_race_all_result<T, E>(\n     race_all_to_result(result)\n }\n \n-/// Macro for racing multiple futures.\n+/// Placeholder macro for builds without the `proc-macros` feature.\n ///\n-/// The first future to complete wins.\n+/// Enable the `proc-macros` feature to use the real `race!` proc macro from\n+/// the crate root (`use asupersync::race;`).\n ///\n-/// Note: this macro is currently a placeholder and does **not** implement the\n-/// full asupersync race semantics (cancel + drain losers). Use the `Scope`\n-/// APIs (`Scope::race`, `Scope::race_all`) when racing spawned tasks.\n+/// Without that feature, use the `Scope` APIs (`Scope::race`,\n+/// `Scope::race_all`) when racing spawned tasks.\n ///\n /// # Basic Usage\n ///\n@@ -718,6 +718,7 @@ pub fn make_race_all_result<T, E>(\n /// 2. All non-winning futures go through the cancellation protocol\n /// 3. `race!` waits for all losers to complete before returning\n /// 4. Losers complete with `Outcome::Cancelled(RaceLost)`\n+#[cfg(not(feature = \"proc-macros\"))]\n #[macro_export]\n macro_rules! race {\n     // Biased mode"
+    },
+    {
+      "sha": "d73be5806c449c0b916fac8d438dd76bd34713e2",
+      "filename": "src/lib.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 5,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/1cc1ac42187a8ec02248a0a795c8538fa80b0b15/src%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/1cc1ac42187a8ec02248a0a795c8538fa80b0b15/src%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Flib.rs?ref=1cc1ac42187a8ec02248a0a795c8538fa80b0b15",
+      "patch": "@@ -281,12 +281,11 @@ pub use types::{\n     wasm_boundary_state_for_cancel_phase,\n };\n \n-// Re-export proc macros when the proc-macros feature is enabled\n-// Note: join! and race! are not re-exported because they conflict with the\n-// existing macro_rules! definitions in combinator/. The proc macro versions\n-// will replace those in future tasks (asupersync-mwff, asupersync-hcpl).\n+// Re-export proc macros from the crate root when the proc-macros feature is\n+// enabled. The fallback compile_error! macro_rules! placeholders in\n+// combinator/ are only exported when this feature is disabled.\n #[cfg(feature = \"proc-macros\")]\n-pub use asupersync_macros::{join_all, scope, spawn};\n+pub use asupersync_macros::{join, join_all, race, scope, spawn};\n \n // Proc macro versions available with explicit path when needed\n #[cfg(feature = \"proc-macros\")]"
+    }
+  ]
+}

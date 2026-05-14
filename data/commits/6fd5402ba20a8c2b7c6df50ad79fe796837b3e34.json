@@ -1,0 +1,53 @@
+{
+  "message": "fix: Lance 0 rows, bounds checks, memory safety\n\nLance query fix:\n- Fall back to meta.totalRows when protobuf doesn't encode row count\n  (Lance v0.3 stores row count in manifest, not in column page metadata)\n- Fix dataSize calculation for int32/float32 types (4 bytes, not 8)\n- Replace Math.max spread with loop (stack overflow on large arrays)\n\nMemory safety:\n- decodePage: bounds check before creating null bitmap Uint8Array\n- decompressSnappy: bounds checks on literal reads, copy offsets\n- vectorSearch: guard against negative dimensions (dim <= 0)\n\nRobustness:\n- Stream buffer: cap at 10MB to prevent unbounded growth\n- Local caches: evict oldest entries (metaCache@1000, datasetCache@100)\n- stat() error: only swallow ENOENT, re-throw permission/IO errors",
+  "files": [
+    {
+      "sha": "d5a735fd0f192b97d0bead087bbeb7fe217aa37e",
+      "filename": "src/decode.ts",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/teamchong/querymode/blob/6fd5402ba20a8c2b7c6df50ad79fe796837b3e34/src%2Fdecode.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/6fd5402ba20a8c2b7c6df50ad79fe796837b3e34/src%2Fdecode.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fdecode.ts?ref=6fd5402ba20a8c2b7c6df50ad79fe796837b3e34",
+      "patch": "@@ -123,6 +123,7 @@ export function decodePage(\n   let nulls: Set<number> | null = null;\n   if (nullCount > 0 && rowCount > 0) {\n     const bitmapBytes = Math.ceil(rowCount / 8);\n+    if (buf.byteLength < bitmapBytes) return [];\n     const bytes = new Uint8Array(buf, 0, bitmapBytes);\n     nulls = new Set<number>();\n     let idx = 0;\n@@ -245,7 +246,7 @@ function vectorSearch(\n   if (!embCol || embCol.dtype !== \"fixed_size_list\") return [];\n \n   const dim = embCol.listDimension ?? vs.queryVector.length;\n-  if (dim === 0) return [];\n+  if (dim <= 0) return [];\n \n   const embPages = columnData.get(vs.column);\n   if (!embPages?.length) return [];"
+    },
+    {
+      "sha": "f157907e49c679b2d9164b8627cc981a90b193dc",
+      "filename": "src/index.ts",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 7,
+      "changes": 29,
+      "blob_url": "https://github.com/teamchong/querymode/blob/6fd5402ba20a8c2b7c6df50ad79fe796837b3e34/src%2Findex.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/6fd5402ba20a8c2b7c6df50ad79fe796837b3e34/src%2Findex.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Findex.ts?ref=6fd5402ba20a8c2b7c6df50ad79fe796837b3e34",
+      "patch": "@@ -173,6 +173,7 @@ class RemoteExecutor implements QueryExecutor {\n     if (!response.body) throw new Error(\"No response body for stream\");\n \n     const decoder = new TextDecoder();\n+    const MAX_STREAM_BUFFER = 10 * 1024 * 1024; // 10MB\n     let buffer = \"\";\n \n     return new ReadableStream<Row>({\n@@ -183,6 +184,11 @@ class RemoteExecutor implements QueryExecutor {\n             const { done, value } = await reader.read();\n             if (done) break;\n             buffer += decoder.decode(value, { stream: true });\n+            if (buffer.length > MAX_STREAM_BUFFER) {\n+              controller.error(new Error(\"Stream buffer exceeded 10MB\"));\n+              reader.cancel();\n+              return;\n+            }\n             const lines = buffer.split(\"\\n\");\n             buffer = lines.pop()!;\n             for (const line of lines) {\n@@ -321,13 +327,14 @@ class LocalExecutor implements QueryExecutor {\n \n     // Check if this is a Lance dataset directory (has _versions/ subdir)\n     if (!isUrl) {\n-      try {\n-        const fs = await import(\"node:fs/promises\");\n-        const stat = await fs.stat(query.table).catch(() => null);\n-        if (stat?.isDirectory()) {\n-          return this.executeDatasetQuery(query, startTime);\n-        }\n-      } catch { /* stat failed \u2014 not a directory, fall through to single-file path */ }\n+      const fs = await import(\"node:fs/promises\");\n+      const stat = await fs.stat(query.table).catch((err: NodeJS.ErrnoException) => {\n+        if (err.code === 'ENOENT') return null;\n+        throw err;\n+      });\n+      if (stat?.isDirectory()) {\n+        return this.executeDatasetQuery(query, startTime);\n+      }\n     }\n \n     // Step 1: Get or cache table metadata (footer + column meta)\n@@ -337,6 +344,10 @@ class LocalExecutor implements QueryExecutor {\n         ? await this.loadMetaFromUrl(query.table)\n         : await this.loadMetaFromFile(query.table);\n       this.metaCache.set(query.table, cached);\n+      if (this.metaCache.size > 1000) {\n+        const firstKey = this.metaCache.keys().next().value;\n+        if (firstKey) this.metaCache.delete(firstKey);\n+      }\n     }\n \n     const { columns, fileSize } = cached;\n@@ -483,6 +494,10 @@ class LocalExecutor implements QueryExecutor {\n         updatedAt: Date.now(),\n       };\n       this.datasetCache.set(query.table, dataset);\n+      if (this.datasetCache.size > 100) {\n+        const firstKey = this.datasetCache.keys().next().value;\n+        if (firstKey) this.datasetCache.delete(firstKey);\n+      }\n     }\n \n     // Execute query across all fragments"
+    },
+    {
+      "sha": "79ef43ab958f07b02168976260677dfa4f291b3a",
+      "filename": "src/parquet-decode.ts",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/teamchong/querymode/blob/6fd5402ba20a8c2b7c6df50ad79fe796837b3e34/src%2Fparquet-decode.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/6fd5402ba20a8c2b7c6df50ad79fe796837b3e34/src%2Fparquet-decode.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fparquet-decode.ts?ref=6fd5402ba20a8c2b7c6df50ad79fe796837b3e34",
+      "patch": "@@ -37,19 +37,22 @@ export function decompressSnappy(input: Uint8Array): Uint8Array {\n         length += 1;\n       } else {\n         const extraBytes = length - 59;\n+        if (pos + extraBytes > input.length) break; // malformed\n         length = 0;\n         for (let i = 0; i < extraBytes; i++) {\n           length |= input[pos++] << (i * 8);\n         }\n         length = (length >>> 0) + 1; // unsigned + 1\n       }\n+      if (pos + length > input.length || outPos + length > output.length) break;\n       output.set(input.subarray(pos, pos + length), outPos);\n       pos += length;\n       outPos += length;\n     } else if (tagType === 1) {\n       // Copy with 1-byte offset\n       const length = ((tag >> 2) & 0x07) + 4;\n       const offset = ((tag & 0xe0) << 3) | input[pos++];\n+      if (offset === 0 || offset > outPos) break; // invalid offset\n       let srcPos = outPos - offset;\n       for (let i = 0; i < length; i++) {\n         output[outPos++] = output[srcPos++];\n@@ -59,6 +62,7 @@ export function decompressSnappy(input: Uint8Array): Uint8Array {\n       const length = ((tag >> 2) & 0x3f) + 1;\n       const offset = input[pos] | (input[pos + 1] << 8);\n       pos += 2;\n+      if (offset === 0 || offset > outPos) break; // invalid offset\n       let srcPos = outPos - offset;\n       for (let i = 0; i < length; i++) {\n         output[outPos++] = output[srcPos++];\n@@ -68,6 +72,7 @@ export function decompressSnappy(input: Uint8Array): Uint8Array {\n       const length = ((tag >> 2) & 0x3f) + 1;\n       const offset = (input[pos] | (input[pos + 1] << 8) | (input[pos + 2] << 16) | (input[pos + 3] << 24)) >>> 0;\n       pos += 4;\n+      if (offset === 0 || offset > outPos) break; // invalid offset\n       let srcPos = outPos - offset;\n       for (let i = 0; i < length; i++) {\n         output[outPos++] = output[srcPos++];"
+    },
+    {
+      "sha": "b898012714f23c969acc5d9efcd011b555d5a053",
+      "filename": "src/query-do.ts",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 2,
+      "changes": 11,
+      "blob_url": "https://github.com/teamchong/querymode/blob/6fd5402ba20a8c2b7c6df50ad79fe796837b3e34/src%2Fquery-do.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/6fd5402ba20a8c2b7c6df50ad79fe796837b3e34/src%2Fquery-do.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fquery-do.ts?ref=6fd5402ba20a8c2b7c6df50ad79fe796837b3e34",
+      "patch": "@@ -390,6 +390,11 @@ export class QueryDO implements DurableObject {\n         }\n       }\n \n+      // Fall back to manifest totalRows if protobuf didn't encode row count\n+      if (rowCount === 0 && meta.totalRows > 0) {\n+        rowCount = meta.totalRows;\n+      }\n+\n       // Column name/type from footer-level metadata or manifest schema\n       const colMeta = meta.columns[col];\n       let colName = colMeta?.name ?? `column_${col}`;\n@@ -406,7 +411,8 @@ export class QueryDO implements DurableObject {\n         }\n       }\n \n-      colInfos.push({ name: colName, dtype, rowCount, dataOffset: 0, dataSize: rowCount * 8 });\n+      const bytesPerValue = (dtype === \"int32\" || dtype === \"float32\") ? 4 : 8;\n+      colInfos.push({ name: colName, dtype, rowCount, dataOffset: 0, dataSize: rowCount * bytesPerValue });\n     }\n \n     this.log(\"info\", \"lance_fragment_parsed\", {\n@@ -445,7 +451,8 @@ export class QueryDO implements DurableObject {\n \n     // Assemble rows\n     const colNames = [...decodedColumns.keys()];\n-    const numRows = Math.max(...[...decodedColumns.values()].map(v => v.length), 0);\n+    let numRows = 0;\n+    for (const v of decodedColumns.values()) if (v.length > numRows) numRows = v.length;\n     let rows: Row[] = [];\n     for (let i = 0; i < numRows; i++) {\n       const row: Row = {};"
+    }
+  ]
+}

@@ -1,0 +1,53 @@
+{
+  "message": "Retry timed out speech model loads",
+  "files": [
+    {
+      "sha": "5beb4cca9158e34e601e36a738bb39be4331eaa3",
+      "filename": "GhostPepper/AppState.swift",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 1,
+      "changes": 4,
+      "blob_url": "https://github.com/matthartman/ghost-pepper/blob/14da8fa36dd7278f176da2c272015b171e1edb1d/GhostPepper%2FAppState.swift",
+      "raw_url": "https://github.com/matthartman/ghost-pepper/raw/14da8fa36dd7278f176da2c272015b171e1edb1d/GhostPepper%2FAppState.swift",
+      "contents_url": "https://api.github.com/repos/matthartman/ghost-pepper/contents/GhostPepper%2FAppState.swift?ref=14da8fa36dd7278f176da2c272015b171e1edb1d",
+      "patch": "@@ -1108,9 +1108,11 @@ class AppState: ObservableObject {\n     ) -> (status: AppStatus, errorMessage: String?) {\n         switch managerState {\n         case .error:\n+            let shouldClearSpeechModelError = currentErrorMessage?.hasPrefix(speechModelErrorPrefix) == true\n+            let preservedErrorMessage = shouldClearSpeechModelError ? nil : currentErrorMessage\n             return (\n                 .error,\n-                \"\\(speechModelErrorPrefix)\\(managerError?.localizedDescription ?? \"unknown error\")\"\n+                preservedErrorMessage\n             )\n         case .ready:\n             let shouldClearSpeechModelError = currentErrorMessage?.hasPrefix(speechModelErrorPrefix) == true"
+    },
+    {
+      "sha": "53d741b742202514bd2734333f8e12b8886a0ec0",
+      "filename": "GhostPepper/Transcription/ModelManager.swift",
+      "status": "modified",
+      "additions": 71,
+      "deletions": 7,
+      "changes": 78,
+      "blob_url": "https://github.com/matthartman/ghost-pepper/blob/14da8fa36dd7278f176da2c272015b171e1edb1d/GhostPepper%2FTranscription%2FModelManager.swift",
+      "raw_url": "https://github.com/matthartman/ghost-pepper/raw/14da8fa36dd7278f176da2c272015b171e1edb1d/GhostPepper%2FTranscription%2FModelManager.swift",
+      "contents_url": "https://api.github.com/repos/matthartman/ghost-pepper/contents/GhostPepper%2FTranscription%2FModelManager.swift?ref=14da8fa36dd7278f176da2c272015b171e1edb1d",
+      "patch": "@@ -5,6 +5,9 @@ import WhisperKit\n /// Manages local speech model lifecycle: download, load, and readiness state.\n @MainActor\n final class ModelManager: ObservableObject {\n+    typealias ModelLoadOverride = @MainActor (SpeechModelDescriptor) async throws -> Void\n+    typealias RetryDelayOverride = @MainActor () async -> Void\n+\n     private(set) var whisperKit: WhisperKit?\n     private var fluidAudioManager: AsrManager?\n     private var sortformerModels: SortformerModels?\n@@ -20,6 +23,7 @@ final class ModelManager: ObservableObject {\n     }\n \n     static let availableModels = SpeechModelCatalog.availableModels\n+    private static let retryDelayNanoseconds: UInt64 = 500_000_000\n \n     var cachedModelNames: Set<String> {\n         Self.availableModels.reduce(into: Set<String>()) { names, model in\n@@ -29,8 +33,17 @@ final class ModelManager: ObservableObject {\n         }\n     }\n \n-    init(modelName: String = SpeechModelCatalog.defaultModelID) {\n+    private let modelLoadOverride: ModelLoadOverride?\n+    private let loadRetryDelayOverride: RetryDelayOverride?\n+\n+    init(\n+        modelName: String = SpeechModelCatalog.defaultModelID,\n+        modelLoadOverride: ModelLoadOverride? = nil,\n+        loadRetryDelayOverride: RetryDelayOverride? = nil\n+    ) {\n         self.modelName = modelName\n+        self.modelLoadOverride = modelLoadOverride\n+        self.loadRetryDelayOverride = loadRetryDelayOverride\n     }\n \n     func loadModel(name: String? = nil) async {\n@@ -60,11 +73,17 @@ final class ModelManager: ObservableObject {\n         debugLogger?(.model, \"Loading speech model \\(modelName).\")\n \n         do {\n-            switch requestedModel.backend {\n-            case .whisperKit:\n-                try await loadWhisperModel(named: requestedModel.name)\n-            case .fluidAudio:\n-                try await loadFluidAudioModel(requestedModel)\n+            do {\n+                try await loadRequestedModel(requestedModel)\n+            } catch {\n+                guard Self.isRetryableLoadError(error) else {\n+                    throw error\n+                }\n+\n+                debugLogger?(.model, \"Speech model \\(modelName) load timed out. Retrying once.\")\n+                clearLoadedModelInstances()\n+                await retryLoadDelay()\n+                try await loadRequestedModel(requestedModel)\n             }\n             self.state = .ready\n             debugLogger?(.model, \"Speech model \\(modelName) loaded successfully.\")\n@@ -75,6 +94,20 @@ final class ModelManager: ObservableObject {\n         }\n     }\n \n+    private func loadRequestedModel(_ requestedModel: SpeechModelDescriptor) async throws {\n+        if let modelLoadOverride {\n+            try await modelLoadOverride(requestedModel)\n+            return\n+        }\n+\n+        switch requestedModel.backend {\n+        case .whisperKit:\n+            try await loadWhisperModel(named: requestedModel.name)\n+        case .fluidAudio:\n+            try await loadFluidAudioModel(requestedModel)\n+        }\n+    }\n+\n     func transcribe(audioBuffer: [Float]) async -> String? {\n         guard !audioBuffer.isEmpty else { return nil }\n         guard let model = SpeechModelCatalog.model(named: modelName) else { return nil }\n@@ -181,10 +214,23 @@ final class ModelManager: ObservableObject {\n     }\n \n     private func resetLoadedModels() {\n+        clearLoadedModelInstances()\n+        state = .idle\n+    }\n+\n+    private func clearLoadedModelInstances() {\n         whisperKit = nil\n         fluidAudioManager = nil\n         sortformerModels = nil\n-        state = .idle\n+    }\n+\n+    private func retryLoadDelay() async {\n+        if let loadRetryDelayOverride {\n+            await loadRetryDelayOverride()\n+            return\n+        }\n+\n+        try? await Task.sleep(nanoseconds: Self.retryDelayNanoseconds)\n     }\n \n     private func loadSortformerModels() async throws -> SortformerModels {\n@@ -217,6 +263,24 @@ final class ModelManager: ObservableObject {\n             }\n     }\n \n+    private static func isRetryableLoadError(_ error: Error) -> Bool {\n+        let nsError = error as NSError\n+        if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorTimedOut {\n+            return true\n+        }\n+\n+        if nsError.localizedDescription.localizedCaseInsensitiveContains(\"timed out\") {\n+            return true\n+        }\n+\n+        if let underlyingError = nsError.userInfo[NSUnderlyingErrorKey] as? Error,\n+           isRetryableLoadError(underlyingError) {\n+            return true\n+        }\n+\n+        return false\n+    }\n+\n     private static func modelIsCached(_ model: SpeechModelDescriptor) -> Bool {\n         switch model.backend {\n         case .whisperKit:"
+    },
+    {
+      "sha": "e1636b18b2940f2aeed95deb53188124b6912230",
+      "filename": "GhostPepperTests/GhostPepperTests.swift",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 5,
+      "changes": 7,
+      "blob_url": "https://github.com/matthartman/ghost-pepper/blob/14da8fa36dd7278f176da2c272015b171e1edb1d/GhostPepperTests%2FGhostPepperTests.swift",
+      "raw_url": "https://github.com/matthartman/ghost-pepper/raw/14da8fa36dd7278f176da2c272015b171e1edb1d/GhostPepperTests%2FGhostPepperTests.swift",
+      "contents_url": "https://api.github.com/repos/matthartman/ghost-pepper/contents/GhostPepperTests%2FGhostPepperTests.swift?ref=14da8fa36dd7278f176da2c272015b171e1edb1d",
+      "patch": "@@ -227,7 +227,7 @@ final class GhostPepperTests: XCTestCase {\n         XCTAssertEqual(appState.cleanupBackend, .localModels)\n     }\n \n-    func testSpeechModelPresentationShowsManagerLoadFailure() {\n+    func testSpeechModelPresentationDoesNotExposeManagerLoadFailureInMenuErrorMessage() {\n         let loadError = NSError(\n             domain: NSURLErrorDomain,\n             code: -1001,\n@@ -242,10 +242,7 @@ final class GhostPepperTests: XCTestCase {\n         )\n \n         XCTAssertEqual(next.status, .error)\n-        XCTAssertEqual(\n-            next.errorMessage,\n-            \"Failed to load speech model: The request timed out.\"\n-        )\n+        XCTAssertNil(next.errorMessage)\n     }\n \n     func testSpeechModelPresentationClearsStaleSpeechModelErrorAfterSuccessfulLoad() {"
+    },
+    {
+      "sha": "63f22c587e14330bc8a8b8c406f39ef4ee800f28",
+      "filename": "GhostPepperTests/ModelManagerTests.swift",
+      "status": "added",
+      "additions": 30,
+      "deletions": 0,
+      "changes": 30,
+      "blob_url": "https://github.com/matthartman/ghost-pepper/blob/14da8fa36dd7278f176da2c272015b171e1edb1d/GhostPepperTests%2FModelManagerTests.swift",
+      "raw_url": "https://github.com/matthartman/ghost-pepper/raw/14da8fa36dd7278f176da2c272015b171e1edb1d/GhostPepperTests%2FModelManagerTests.swift",
+      "contents_url": "https://api.github.com/repos/matthartman/ghost-pepper/contents/GhostPepperTests%2FModelManagerTests.swift?ref=14da8fa36dd7278f176da2c272015b171e1edb1d",
+      "patch": "@@ -0,0 +1,30 @@\n+import XCTest\n+@testable import GhostPepper\n+\n+@MainActor\n+final class ModelManagerTests: XCTestCase {\n+    func testModelManagerRetriesTimedOutSpeechModelLoadOnce() async {\n+        let timeoutError = NSError(\n+            domain: NSURLErrorDomain,\n+            code: NSURLErrorTimedOut,\n+            userInfo: [NSLocalizedDescriptionKey: \"The request timed out.\"]\n+        )\n+        var attempts = 0\n+        let manager = ModelManager(\n+            modelName: \"openai_whisper-small.en\",\n+            modelLoadOverride: { _ in\n+                attempts += 1\n+                if attempts == 1 {\n+                    throw timeoutError\n+                }\n+            },\n+            loadRetryDelayOverride: {}\n+        )\n+\n+        await manager.loadModel(name: \"openai_whisper-small.en\")\n+\n+        XCTAssertEqual(attempts, 2)\n+        XCTAssertEqual(manager.state, .ready)\n+        XCTAssertNil(manager.error)\n+    }\n+}"
+    }
+  ]
+}

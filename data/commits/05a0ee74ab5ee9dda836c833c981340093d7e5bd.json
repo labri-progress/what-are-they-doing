@@ -1,0 +1,29 @@
+{
+  "message": "perf(http2,discover): O(1) HPACK static table lookup + dedup single-clone\n\nReplace linear O(61) scans in find_static/find_static_name with\nLazyLock HashMap lookups. Eliminate double-clone in dedup_preserve_order\nby using reference-based HashSet.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "df5de1837bdc74ecc5feef61119b9cc25994b499",
+      "filename": "src/http/h2/hpack.rs",
+      "status": "modified",
+      "additions": 53,
+      "deletions": 15,
+      "changes": 68,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/05a0ee74ab5ee9dda836c833c981340093d7e5bd/src%2Fhttp%2Fh2%2Fhpack.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/05a0ee74ab5ee9dda836c833c981340093d7e5bd/src%2Fhttp%2Fh2%2Fhpack.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fhttp%2Fh2%2Fhpack.rs?ref=05a0ee74ab5ee9dda836c833c981340093d7e5bd",
+      "patch": "@@ -2,12 +2,32 @@\n //!\n //! Implements RFC 7541: HPACK - Header Compression for HTTP/2.\n \n-use std::collections::VecDeque;\n+use std::collections::{HashMap, VecDeque};\n+use std::sync::LazyLock;\n \n use crate::bytes::{Bytes, BytesMut};\n \n use super::error::H2Error;\n \n+/// Pre-built index for exact (name, value) \u2192 1-based static table index lookups.\n+static STATIC_EXACT_INDEX: LazyLock<HashMap<(&'static str, &'static str), usize>> =\n+    LazyLock::new(|| {\n+        STATIC_TABLE\n+            .iter()\n+            .enumerate()\n+            .map(|(i, &(n, v))| ((n, v), i + 1))\n+            .collect()\n+    });\n+\n+/// Pre-built index for name-only \u2192 first 1-based static table index lookups.\n+static STATIC_NAME_INDEX: LazyLock<HashMap<&'static str, usize>> = LazyLock::new(|| {\n+    let mut map = HashMap::with_capacity(STATIC_TABLE.len());\n+    for (i, &(name, _)) in STATIC_TABLE.iter().enumerate() {\n+        map.entry(name).or_insert(i + 1);\n+    }\n+    map\n+});\n+\n /// Maximum size of the dynamic table (default: 4096 bytes).\n pub const DEFAULT_MAX_TABLE_SIZE: usize = 4096;\n \n@@ -219,24 +239,14 @@ impl Default for DynamicTable {\n     }\n }\n \n-/// Find entry in static table by name and value.\n+/// Find entry in static table by name and value (O(1) via pre-built index).\n fn find_static(name: &str, value: &str) -> Option<usize> {\n-    for (i, (n, v)) in STATIC_TABLE.iter().enumerate() {\n-        if *n == name && *v == value {\n-            return Some(i + 1);\n-        }\n-    }\n-    None\n+    STATIC_EXACT_INDEX.get(&(name, value)).copied()\n }\n \n-/// Find entry in static table by name only.\n+/// Find entry in static table by name only (O(1) via pre-built index).\n fn find_static_name(name: &str) -> Option<usize> {\n-    for (i, (n, _)) in STATIC_TABLE.iter().enumerate() {\n-        if *n == name {\n-            return Some(i + 1);\n-        }\n-    }\n-    None\n+    STATIC_NAME_INDEX.get(name).copied()\n }\n \n /// Get entry from static table by index.\n@@ -2419,4 +2429,32 @@ mod tests {\n         let h3 = Header::new(\"accept\", \"*/*\");\n         assert_ne!(h, h3);\n     }\n+\n+    #[test]\n+    fn static_index_exact_matches_linear_scan() {\n+        // Verify HashMap index returns identical results to linear scan\n+        for (i, &(name, value)) in STATIC_TABLE.iter().enumerate() {\n+            let expected = i + 1;\n+            assert_eq!(\n+                find_static(name, value),\n+                Some(expected),\n+                \"exact match failed for ({name}, {value}) at index {expected}\"\n+            );\n+        }\n+        // Non-existent exact match\n+        assert_eq!(find_static(\"x-custom\", \"foo\"), None);\n+        // Name exists but value doesn't match\n+        assert_eq!(find_static(\":method\", \"DELETE\"), None);\n+    }\n+\n+    #[test]\n+    fn static_name_index_matches_first_occurrence() {\n+        // Verify name-only index returns the first occurrence\n+        assert_eq!(find_static_name(\":method\"), Some(2)); // first :method\n+        assert_eq!(find_static_name(\":path\"), Some(4)); // first :path\n+        assert_eq!(find_static_name(\":status\"), Some(8)); // first :status\n+        assert_eq!(find_static_name(\":scheme\"), Some(6)); // first :scheme\n+        assert_eq!(find_static_name(\"content-type\"), Some(31));\n+        assert_eq!(find_static_name(\"x-nonexistent\"), None);\n+    }\n }"
+    },
+    {
+      "sha": "f31f843820dc0b5b1bbcca615166cd6cf8e9adcb",
+      "filename": "src/service/discover.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/05a0ee74ab5ee9dda836c833c981340093d7e5bd/src%2Fservice%2Fdiscover.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/05a0ee74ab5ee9dda836c833c981340093d7e5bd/src%2Fservice%2Fdiscover.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fservice%2Fdiscover.rs?ref=05a0ee74ab5ee9dda836c833c981340093d7e5bd",
+      "patch": "@@ -90,7 +90,7 @@ where\n     let mut seen = HashSet::with_capacity(items.len());\n     let mut deduped = Vec::with_capacity(items.len());\n     for item in items {\n-        if seen.insert(item.clone()) {\n+        if seen.insert(item) {\n             deduped.push(item.clone());\n         }\n     }"
+    }
+  ]
+}

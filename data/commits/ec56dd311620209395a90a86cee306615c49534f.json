@@ -1,0 +1,125 @@
+{
+  "message": "fix(pairing): preserve corrupt pairing stores",
+  "files": [
+    {
+      "sha": "2c407f84add91e7eac93133276e49a3beed53d57",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/ec56dd311620209395a90a86cee306615c49534f/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/ec56dd311620209395a90a86cee306615c49534f/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=ec56dd311620209395a90a86cee306615c49534f",
+      "patch": "@@ -75,6 +75,9 @@ Docs: https://docs.openclaw.ai\n - Diagnostics/OTEL: treat normal early model stream cleanup as a completed\n   model call instead of exporting a misleading `StreamAbandoned` error span.\n   Thanks @vincentkoc.\n+- Gateway/pairing: stop corrupt or unreadable device/node pairing stores from\n+  being treated as empty state, preserving `paired.json` for repair instead of\n+  overwriting approved pairings. Fixes #71873. Thanks @iret77.\n - ACP: wait for the configured runtime backend to become healthy before startup\n   identity reconciliation, avoiding transient acpx warnings during Gateway boot.\n   Fixes #40566."
+    },
+    {
+      "sha": "92ade27fcfe88dcc938a4b650fcacb72f31a5cce",
+      "filename": "src/commands/doctor-device-pairing.test.ts",
+      "status": "modified",
+      "additions": 28,
+      "deletions": 0,
+      "changes": 28,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/ec56dd311620209395a90a86cee306615c49534f/src%2Fcommands%2Fdoctor-device-pairing.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/ec56dd311620209395a90a86cee306615c49534f/src%2Fcommands%2Fdoctor-device-pairing.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fcommands%2Fdoctor-device-pairing.test.ts?ref=ec56dd311620209395a90a86cee306615c49534f",
+      "patch": "@@ -104,6 +104,34 @@ describe(\"noteDevicePairingHealth\", () => {\n     });\n   });\n \n+  it(\"warns when local pairing state is corrupt instead of treating it as empty\", async () => {\n+    await withTempDir(\"openclaw-doctor-device-pairing-\", async (stateDir) => {\n+      await withEnvAsync(\n+        {\n+          OPENCLAW_STATE_DIR: stateDir,\n+          OPENCLAW_TEST_FAST: \"1\",\n+        },\n+        async () => {\n+          const pairedPath = path.join(stateDir, \"devices\", \"paired.json\");\n+          await fs.mkdir(path.dirname(pairedPath), { recursive: true });\n+          await fs.writeFile(pairedPath, \"{not-json}\", \"utf8\");\n+\n+          await noteDevicePairingHealth({\n+            cfg: { gateway: { mode: \"local\" } },\n+            healthOk: false,\n+          });\n+\n+          expect(noteMock).toHaveBeenCalledTimes(1);\n+          const message = String(noteMock.mock.calls[0]?.[0] ?? \"\");\n+          expect(noteMock.mock.calls[0]?.[1]).toBe(\"Device pairing\");\n+          expect(message).toContain(\"paired.json\");\n+          expect(message).toContain(\"refused to treat it as empty\");\n+          expect(await fs.readFile(pairedPath, \"utf8\")).toBe(\"{not-json}\");\n+        },\n+      );\n+    });\n+  });\n+\n   it(\"warns when the local cached device token predates the gateway rotation\", async () => {\n     await withApprovedOperatorPairing(async ({ stateDir, identity }) => {\n       storeDeviceAuthToken({"
+    },
+    {
+      "sha": "ecf5607b7f4b5ccc7cd5dd8b5cb6922fb8d78648",
+      "filename": "src/commands/doctor-device-pairing.ts",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 1,
+      "changes": 17,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/ec56dd311620209395a90a86cee306615c49534f/src%2Fcommands%2Fdoctor-device-pairing.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/ec56dd311620209395a90a86cee306615c49534f/src%2Fcommands%2Fdoctor-device-pairing.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fcommands%2Fdoctor-device-pairing.ts?ref=ec56dd311620209395a90a86cee306615c49534f",
+      "patch": "@@ -12,6 +12,7 @@ import {\n   type DevicePairingPendingRequest,\n   type PairedDevice,\n } from \"../infra/device-pairing.js\";\n+import { JsonFileReadError } from \"../infra/json-files.js\";\n import type { DeviceAuthStore } from \"../shared/device-auth.js\";\n import { normalizeDeviceAuthScopes } from \"../shared/device-auth.js\";\n import { roleScopesAllow } from \"../shared/operator-scope-compat.js\";\n@@ -510,11 +511,25 @@ function collectLocalDeviceAuthIssues(snapshot: DoctorPairingSnapshot): string[]\n   return lines;\n }\n \n+function formatPairingStoreReadIssue(error: JsonFileReadError): string {\n+  const problem = error.reason === \"parse\" ? \"contains invalid JSON\" : \"could not be read\";\n+  return `- Device pairing store ${error.filePath} ${problem}. OpenClaw refused to treat it as empty to avoid overwriting approved pairings. Fix the JSON or file permissions, or move it aside and re-pair devices.`;\n+}\n+\n export async function noteDevicePairingHealth(params: {\n   cfg: OpenClawConfig;\n   healthOk: boolean;\n }): Promise<void> {\n-  const snapshot = await loadDoctorPairingSnapshot(params);\n+  let snapshot: DoctorPairingSnapshot | null;\n+  try {\n+    snapshot = await loadDoctorPairingSnapshot(params);\n+  } catch (error) {\n+    if (error instanceof JsonFileReadError) {\n+      note(formatPairingStoreReadIssue(error), \"Device pairing\");\n+      return;\n+    }\n+    throw error;\n+  }\n   if (!snapshot) {\n     return;\n   }"
+    },
+    {
+      "sha": "27359dde0fb4560905b8253d532ec68576c18f7f",
+      "filename": "src/infra/device-pairing.test.ts",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 0,
+      "changes": 20,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/ec56dd311620209395a90a86cee306615c49534f/src%2Finfra%2Fdevice-pairing.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/ec56dd311620209395a90a86cee306615c49534f/src%2Finfra%2Fdevice-pairing.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Fdevice-pairing.test.ts?ref=ec56dd311620209395a90a86cee306615c49534f",
+      "patch": "@@ -1053,6 +1053,26 @@ describe(\"device pairing tokens\", () => {\n     await expect(getPairedDevice(\"device-1\", baseDir)).resolves.toBeNull();\n   });\n \n+  test(\"refuses to overwrite corrupt paired device state\", async () => {\n+    const baseDir = await makeDevicePairingDir();\n+    const request = await requestDevicePairing(\n+      {\n+        deviceId: \"device-1\",\n+        publicKey: \"public-key-1\",\n+        role: \"node\",\n+        scopes: [],\n+      },\n+      baseDir,\n+    );\n+    const { pairedPath } = resolvePairingPaths(baseDir, \"devices\");\n+    await writeFile(pairedPath, \"{not-json}\", \"utf8\");\n+\n+    await expect(\n+      approveDevicePairing(request.request.requestId, { callerScopes: [] }, baseDir),\n+    ).rejects.toThrow(/paired\\.json/);\n+    await expect(readFile(pairedPath, \"utf8\")).resolves.toBe(\"{not-json}\");\n+  });\n+\n   test(\"clears paired device state by device id\", async () => {\n     const baseDir = await makeDevicePairingDir();\n     await setupPairedOperatorDevice(baseDir, [\"operator.read\"]);"
+    },
+    {
+      "sha": "00a0816b844dffd53747857b8da218a0e823a471",
+      "filename": "src/infra/device-pairing.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 3,
+      "changes": 6,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/ec56dd311620209395a90a86cee306615c49534f/src%2Finfra%2Fdevice-pairing.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/ec56dd311620209395a90a86cee306615c49534f/src%2Finfra%2Fdevice-pairing.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Fdevice-pairing.ts?ref=ec56dd311620209395a90a86cee306615c49534f",
+      "patch": "@@ -12,7 +12,7 @@ import {\n import {\n   createAsyncLock,\n   pruneExpiredPending,\n-  readJsonFile,\n+  readDurableJsonFile,\n   reconcilePendingPairingRequests,\n   resolvePairingPaths,\n   writeJsonAtomic,\n@@ -143,8 +143,8 @@ export function formatDevicePairingForbiddenMessage(result: DevicePairingForbidd\n async function loadState(baseDir?: string): Promise<DevicePairingStateFile> {\n   const { pendingPath, pairedPath } = resolvePairingPaths(baseDir, \"devices\");\n   const [pending, paired] = await Promise.all([\n-    readJsonFile<Record<string, DevicePairingPendingRequest>>(pendingPath),\n-    readJsonFile<Record<string, PairedDevice>>(pairedPath),\n+    readDurableJsonFile<Record<string, DevicePairingPendingRequest>>(pendingPath),\n+    readDurableJsonFile<Record<string, PairedDevice>>(pairedPath),\n   ]);\n   const state: DevicePairingStateFile = {\n     pendingById: pending ?? {},"
+    },
+    {
+      "sha": "50ea62541f46788368ad9493d05a95b058e0160f",
+      "filename": "src/infra/json-files.test.ts",
+      "status": "modified",
+      "additions": 25,
+      "deletions": 1,
+      "changes": 26,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/ec56dd311620209395a90a86cee306615c49534f/src%2Finfra%2Fjson-files.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/ec56dd311620209395a90a86cee306615c49534f/src%2Finfra%2Fjson-files.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Fjson-files.test.ts?ref=ec56dd311620209395a90a86cee306615c49534f",
+      "patch": "@@ -3,7 +3,14 @@ import path from \"node:path\";\n import { setTimeout as sleep } from \"node:timers/promises\";\n import { afterEach, describe, expect, it, vi } from \"vitest\";\n import { withTempDir } from \"../test-helpers/temp-dir.js\";\n-import { createAsyncLock, readJsonFile, writeJsonAtomic, writeTextAtomic } from \"./json-files.js\";\n+import {\n+  JsonFileReadError,\n+  createAsyncLock,\n+  readDurableJsonFile,\n+  readJsonFile,\n+  writeJsonAtomic,\n+  writeTextAtomic,\n+} from \"./json-files.js\";\n \n const originalPlatformDescriptor = Object.getOwnPropertyDescriptor(process, \"platform\");\n \n@@ -45,6 +52,23 @@ describe(\"json file helpers\", () => {\n     });\n   });\n \n+  it(\"reads durable json strictly while allowing missing files\", async () => {\n+    await withTempDir({ prefix: \"openclaw-json-files-\" }, async (base) => {\n+      const validPath = path.join(base, \"valid.json\");\n+      const invalidPath = path.join(base, \"invalid.json\");\n+      const missingPath = path.join(base, \"missing.json\");\n+      await fs.writeFile(validPath, '{\"ok\":true}', \"utf8\");\n+      await fs.writeFile(invalidPath, \"{not-json}\", \"utf8\");\n+\n+      await expect(readDurableJsonFile(validPath)).resolves.toEqual({ ok: true });\n+      await expect(readDurableJsonFile(missingPath)).resolves.toBeNull();\n+      await expect(readDurableJsonFile(invalidPath)).rejects.toMatchObject({\n+        filePath: invalidPath,\n+        reason: \"parse\",\n+      } satisfies Partial<JsonFileReadError>);\n+    });\n+  });\n+\n   it(\"writes json atomically with pretty formatting and optional trailing newline\", async () => {\n     await withTempDir({ prefix: \"openclaw-json-files-\" }, async (base) => {\n       const filePath = path.join(base, \"nested\", \"config.json\");"
+    },
+    {
+      "sha": "8ca5802eee0fa3bc4ee872005250fd49d42270f5",
+      "filename": "src/infra/json-files.ts",
+      "status": "modified",
+      "additions": 29,
+      "deletions": 0,
+      "changes": 29,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/ec56dd311620209395a90a86cee306615c49534f/src%2Finfra%2Fjson-files.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/ec56dd311620209395a90a86cee306615c49534f/src%2Finfra%2Fjson-files.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Fjson-files.ts?ref=ec56dd311620209395a90a86cee306615c49534f",
+      "patch": "@@ -7,6 +7,18 @@ function getErrorCode(err: unknown): string | undefined {\n   return err instanceof Error ? (err as NodeJS.ErrnoException).code : undefined;\n }\n \n+export class JsonFileReadError extends Error {\n+  readonly filePath: string;\n+  readonly reason: \"read\" | \"parse\";\n+\n+  constructor(filePath: string, reason: \"read\" | \"parse\", cause: unknown) {\n+    super(`Failed to ${reason} JSON file: ${filePath}`, { cause });\n+    this.name = \"JsonFileReadError\";\n+    this.filePath = filePath;\n+    this.reason = reason;\n+  }\n+}\n+\n async function replaceFileWithWindowsFallback(tempPath: string, filePath: string, mode: number) {\n   try {\n     await fs.rename(tempPath, filePath);\n@@ -43,6 +55,23 @@ export async function readJsonFile<T>(filePath: string): Promise<T | null> {\n   }\n }\n \n+export async function readDurableJsonFile<T>(filePath: string): Promise<T | null> {\n+  let raw: string;\n+  try {\n+    raw = await fs.readFile(filePath, \"utf8\");\n+  } catch (err) {\n+    if (getErrorCode(err) === \"ENOENT\") {\n+      return null;\n+    }\n+    throw new JsonFileReadError(filePath, \"read\", err);\n+  }\n+  try {\n+    return JSON.parse(raw) as T;\n+  } catch (err) {\n+    throw new JsonFileReadError(filePath, \"parse\", err);\n+  }\n+}\n+\n export function readJsonFileSync(filePath: string): unknown {\n   try {\n     const raw = readFileSync(filePath, \"utf8\");"
+    },
+    {
+      "sha": "062cd8bf1d6bb27779762ea5ada3064c89e25fa1",
+      "filename": "src/infra/node-pairing.test.ts",
+      "status": "modified",
+      "additions": 21,
+      "deletions": 0,
+      "changes": 21,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/ec56dd311620209395a90a86cee306615c49534f/src%2Finfra%2Fnode-pairing.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/ec56dd311620209395a90a86cee306615c49534f/src%2Finfra%2Fnode-pairing.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Fnode-pairing.test.ts?ref=ec56dd311620209395a90a86cee306615c49534f",
+      "patch": "@@ -1,3 +1,4 @@\n+import fs from \"node:fs/promises\";\n import { afterAll, beforeAll, describe, expect, test } from \"vitest\";\n import { createSuiteTempRootTracker } from \"../test-helpers/temp-dir.js\";\n import {\n@@ -7,6 +8,7 @@ import {\n   requestNodePairing,\n   verifyNodeToken,\n } from \"./node-pairing.js\";\n+import { resolvePairingPaths } from \"./pairing-files.js\";\n \n async function setupPairedNode(baseDir: string): Promise<string> {\n   const request = await requestNodePairing(\n@@ -202,4 +204,23 @@ describe(\"node pairing tokens\", () => {\n       });\n     });\n   });\n+\n+  test(\"refuses to overwrite corrupt paired node state when requesting pairing\", async () => {\n+    await withNodePairingDir(async (baseDir) => {\n+      const { dir, pairedPath } = resolvePairingPaths(baseDir, \"nodes\");\n+      await fs.mkdir(dir, { recursive: true });\n+      await fs.writeFile(pairedPath, \"{not-json}\", \"utf8\");\n+\n+      await expect(\n+        requestNodePairing(\n+          {\n+            nodeId: \"node-1\",\n+            platform: \"darwin\",\n+          },\n+          baseDir,\n+        ),\n+      ).rejects.toThrow(/paired\\.json/);\n+      await expect(fs.readFile(pairedPath, \"utf8\")).resolves.toBe(\"{not-json}\");\n+    });\n+  });\n });"
+    },
+    {
+      "sha": "ceb956f4913658d96a7e39b561448cb70c24f378",
+      "filename": "src/infra/node-pairing.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 3,
+      "changes": 6,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/ec56dd311620209395a90a86cee306615c49534f/src%2Finfra%2Fnode-pairing.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/ec56dd311620209395a90a86cee306615c49534f/src%2Finfra%2Fnode-pairing.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Fnode-pairing.ts?ref=ec56dd311620209395a90a86cee306615c49534f",
+      "patch": "@@ -5,7 +5,7 @@ import { type NodeApprovalScope, resolveNodePairApprovalScopes } from \"./node-pa\n import {\n   createAsyncLock,\n   pruneExpiredPending,\n-  readJsonFile,\n+  readDurableJsonFile,\n   reconcilePendingPairingRequests,\n   resolvePairingPaths,\n   writeJsonAtomic,\n@@ -134,8 +134,8 @@ type ApproveNodePairingResult = ApprovedNodePairingResult | ForbiddenNodePairing\n async function loadState(baseDir?: string): Promise<NodePairingStateFile> {\n   const { pendingPath, pairedPath } = resolvePairingPaths(baseDir, \"nodes\");\n   const [pending, paired] = await Promise.all([\n-    readJsonFile<Record<string, NodePairingPendingRequest>>(pendingPath),\n-    readJsonFile<Record<string, NodePairingPairedNode>>(pairedPath),\n+    readDurableJsonFile<Record<string, NodePairingPendingRequest>>(pendingPath),\n+    readDurableJsonFile<Record<string, NodePairingPairedNode>>(pairedPath),\n   ]);\n   const state: NodePairingStateFile = {\n     pendingById: pending ?? {},"
+    },
+    {
+      "sha": "a7f38b435171194822072d3501e8bef6213da7dc",
+      "filename": "src/infra/pairing-files.ts",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 1,
+      "changes": 7,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/ec56dd311620209395a90a86cee306615c49534f/src%2Finfra%2Fpairing-files.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/ec56dd311620209395a90a86cee306615c49534f/src%2Finfra%2Fpairing-files.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Fpairing-files.ts?ref=ec56dd311620209395a90a86cee306615c49534f",
+      "patch": "@@ -1,7 +1,12 @@\n import path from \"node:path\";\n import { resolveStateDir } from \"../config/paths.js\";\n \n-export { createAsyncLock, readJsonFile, writeJsonAtomic } from \"./json-files.js\";\n+export {\n+  createAsyncLock,\n+  readDurableJsonFile,\n+  readJsonFile,\n+  writeJsonAtomic,\n+} from \"./json-files.js\";\n \n export function resolvePairingPaths(baseDir: string | undefined, subdir: string) {\n   const root = baseDir ?? resolveStateDir();"
+    }
+  ]
+}

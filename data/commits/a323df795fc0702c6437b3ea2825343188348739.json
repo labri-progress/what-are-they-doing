@@ -1,0 +1,41 @@
+{
+  "message": "fix: agent pattern false positives, nested redaction, conflict ID collisions\n\nAgent patterns:\n- Claude idle: ^>\\s* \u2192 ^>\\s*$ (require bare prompt line, not any > prefix)\n- Gemini memory: (\\d+\\.?\\d*)\\s*MB \u2192 /model\\s*\\|\\s*(\\d+\\.?\\d*)\\s*MB\n  (require Gemini status line context)\n- Guard getLastNLines against n<=0\n\nEvent redaction (security):\n- redactDataMap now recursively redacts nested map/slice/string structures\n  via redactValue(). Previously only top-level strings were redacted.\n\nConflict IDs:\n- Replace UnixNano()%10000 with monotonic counter appended to nanos\n  (conflict-NANOS-COUNTER-pattern) to prevent duplicate IDs in same\n  10-microsecond window.\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "7324893783991b93fec3ba45b09eb75fd0264bc4",
+      "filename": "internal/agent/patterns.go",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 2,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/a323df795fc0702c6437b3ea2825343188348739/internal%2Fagent%2Fpatterns.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/a323df795fc0702c6437b3ea2825343188348739/internal%2Fagent%2Fpatterns.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fagent%2Fpatterns.go?ref=a323df795fc0702c6437b3ea2825343188348739",
+      "patch": "@@ -68,7 +68,7 @@ var (\n \t// causing agents to always appear idle even while actively working.\n \tccIdlePatterns = []*regexp.Regexp{\n \t\tregexp.MustCompile(`>\\s*$`),      // Prompt waiting for input\n-\t\tregexp.MustCompile(`(?m)^>\\s*`),  // Prompt start (handles user typing)\n+\t\tregexp.MustCompile(`(?m)^>\\s*$`), // Prompt line (empty prompt waiting for input)\n \t\tregexp.MustCompile(`Human:\\s*$`), // Conversation mode prompt\n \t\tregexp.MustCompile(`waiting for input`),\n \t\tregexp.MustCompile(`\\?\\s*$`), // Question prompt\n@@ -170,7 +170,7 @@ var (\n \t// gmiMemoryPattern extracts memory usage.\n \t// Less precise than Codex percentage but still useful.\n \t// Example: \"gemini-3-pro-preview /model | 396.8 MB\"\n-\tgmiMemoryPattern = regexp.MustCompile(`(\\d+\\.?\\d*)\\s*MB`)\n+\tgmiMemoryPattern = regexp.MustCompile(`/model\\s*\\|\\s*(\\d+\\.?\\d*)\\s*MB`)\n \n \t// gmiYoloPattern detects YOLO mode status.\n \t// YOLO mode affects execution behavior (auto-approve commands).\n@@ -424,6 +424,9 @@ func extractInt(pattern *regexp.Regexp, text string) *int64 {\n // getLastNLines returns the last n lines of text.\n // If the text has fewer than n lines, returns the entire text.\n func getLastNLines(text string, n int) string {\n+\tif n <= 0 {\n+\t\treturn \"\"\n+\t}\n \tlines := strings.Split(text, \"\\n\")\n \tif len(lines) <= n {\n \t\treturn text"
+    },
+    {
+      "sha": "e4615463972bb1fd941b11d9208e8ed2d9c4b15f",
+      "filename": "internal/coordinator/conflicts.go",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 1,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/a323df795fc0702c6437b3ea2825343188348739/internal%2Fcoordinator%2Fconflicts.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/a323df795fc0702c6437b3ea2825343188348739/internal%2Fcoordinator%2Fconflicts.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fcoordinator%2Fconflicts.go?ref=a323df795fc0702c6437b3ea2825343188348739",
+      "patch": "@@ -367,9 +367,14 @@ func (c *SessionCoordinator) formatConflictNotification(conflict *Conflict) stri\n \treturn sb.String()\n }\n \n+// conflictIDCounter provides monotonically increasing IDs to avoid collisions\n+// when multiple conflicts are generated in the same nanosecond.\n+var conflictIDCounter uint64\n+\n // generateConflictID generates a unique ID for a conflict.\n func generateConflictID(pattern string) string {\n-\treturn fmt.Sprintf(\"conflict-%d-%s\", time.Now().UnixNano()%10000, sanitizeForID(pattern))\n+\tconflictIDCounter++\n+\treturn fmt.Sprintf(\"conflict-%d-%d-%s\", time.Now().UnixNano(), conflictIDCounter, sanitizeForID(pattern))\n }\n \n // sanitizeForID creates a safe ID component from a string."
+    },
+    {
+      "sha": "8ca59142988c46930ab05da9630371d1c9708c7b",
+      "filename": "internal/events/redact.go",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 7,
+      "changes": 29,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/a323df795fc0702c6437b3ea2825343188348739/internal%2Fevents%2Fredact.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/a323df795fc0702c6437b3ea2825343188348739/internal%2Fevents%2Fredact.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fevents%2Fredact.go?ref=a323df795fc0702c6437b3ea2825343188348739",
+      "patch": "@@ -86,24 +86,39 @@ func RedactEvent(event *Event) *Event {\n \treturn &redacted\n }\n \n-// redactDataMap redacts string values in a data map.\n-// It redacts all string values (safe strings remain unchanged unless they match a redaction pattern).\n+// redactDataMap recursively redacts string values in a data map.\n+// Handles nested maps and slices to ensure secrets in deeply-nested\n+// JSON-derived structures are caught.\n func redactDataMap(data map[string]interface{}) map[string]interface{} {\n \tif data == nil {\n \t\treturn nil\n \t}\n \n \tresult := make(map[string]interface{}, len(data))\n \tfor k, v := range data {\n-\t\tif s, ok := v.(string); ok {\n-\t\t\tresult[k] = redactString(s)\n-\t\t} else {\n-\t\t\tresult[k] = v\n-\t\t}\n+\t\tresult[k] = redactValue(v)\n \t}\n \treturn result\n }\n \n+// redactValue recursively redacts a single value (string, map, or slice).\n+func redactValue(v interface{}) interface{} {\n+\tswitch val := v.(type) {\n+\tcase string:\n+\t\treturn redactString(val)\n+\tcase map[string]interface{}:\n+\t\treturn redactDataMap(val)\n+\tcase []interface{}:\n+\t\tout := make([]interface{}, len(val))\n+\t\tfor i, elem := range val {\n+\t\t\tout[i] = redactValue(elem)\n+\t\t}\n+\t\treturn out\n+\tdefault:\n+\t\treturn v\n+\t}\n+}\n+\n // RedactionSummary represents a summary of redaction findings for event logging.\n // Use this instead of logging raw secrets.\n type RedactionSummary struct {"
+    }
+  ]
+}

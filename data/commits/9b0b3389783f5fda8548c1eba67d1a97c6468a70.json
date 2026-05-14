@@ -1,0 +1,41 @@
+{
+  "message": "fix(config): replace NODE_OPTIONS with cgroup memory limits for native binaries\n\nClaude Code (v2.1.69+) is a native ELF binary compiled with bun, not\na Node.js process. NODE_OPTIONS=\"--max-old-space-size=...\" was silently\nignored, leaving agents with no memory limit and causing frequent OOM\nkills (up to 60GB per agent on 64GB machines).\n\nNew approach:\n- memLimitPrefix template func returns \"systemd-run --user --scope -q\n  -p MemoryMax=XM\" on Linux (real cgroup v2 enforcement)\n- Falls back to empty string on macOS/other (no OS-level limit available)\n- memLimitMB computes 25% of system RAM, clamped 2048-16384 MB\n- nodeHeapMB kept as deprecated alias for backward compatibility with\n  user-customized templates\n\nCloses #84\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "bd2ff5136c9838da7880dbb227a4d61ce17a04eb",
+      "filename": "README.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/9b0b3389783f5fda8548c1eba67d1a97c6468a70/README.md",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/9b0b3389783f5fda8548c1eba67d1a97c6468a70/README.md",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/README.md?ref=9b0b3389783f5fda8548c1eba67d1a97c6468a70",
+      "patch": "@@ -1027,7 +1027,7 @@ projects_base = \"~/Developer\"\n \n [agents]\n # Commands used to launch each agent type\n-claude = 'NODE_OPTIONS=\"--max-old-space-size=32768\" claude --dangerously-skip-permissions'\n+claude = '{{memLimitPrefix}} claude --dangerously-skip-permissions'\n codex = \"codex --dangerously-bypass-approvals-and-sandbox -m gpt-5.1-codex-max\"\n gemini = \"gemini --yolo\"\n "
+    },
+    {
+      "sha": "2653f0163f6472249f41ecb8d1ffa77b8a408ad6",
+      "filename": "internal/config/templates.go",
+      "status": "modified",
+      "additions": 31,
+      "deletions": 7,
+      "changes": 38,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/9b0b3389783f5fda8548c1eba67d1a97c6468a70/internal%2Fconfig%2Ftemplates.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/9b0b3389783f5fda8548c1eba67d1a97c6468a70/internal%2Fconfig%2Ftemplates.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fconfig%2Ftemplates.go?ref=9b0b3389783f5fda8548c1eba67d1a97c6468a70",
+      "patch": "@@ -69,19 +69,37 @@ func systemMemoryMB() uint64 {\n \n // nodeHeapMB computes a safe Node.js heap size based on system RAM.\n // Uses 25% of total RAM, clamped between 2048 MB and 16384 MB.\n+// Deprecated: Claude Code is a native binary; NODE_OPTIONS has no effect.\n+// Kept for backward compatibility with user-customized templates.\n func nodeHeapMB() string {\n+\treturn memLimitMB()\n+}\n+\n+// memLimitMB computes a per-agent memory limit based on system RAM.\n+// Uses 25% of total RAM, clamped between 2048 MB and 16384 MB.\n+func memLimitMB() string {\n \ttotalMB := systemMemoryMB()\n \tif totalMB == 0 {\n \t\treturn \"8192\" // safe default for unknown systems\n \t}\n-\theapMB := totalMB / 4\n-\tif heapMB < 2048 {\n-\t\theapMB = 2048\n+\tlimitMB := totalMB / 4\n+\tif limitMB < 2048 {\n+\t\tlimitMB = 2048\n \t}\n-\tif heapMB > 16384 {\n-\t\theapMB = 16384\n+\tif limitMB > 16384 {\n+\t\tlimitMB = 16384\n+\t}\n+\treturn fmt.Sprintf(\"%d\", limitMB)\n+}\n+\n+// memLimitPrefix returns a command prefix that enforces a real memory limit.\n+// On Linux, uses systemd-run --user --scope -p MemoryMax= (cgroup v2).\n+// On other platforms, returns an empty string (no OS-level limiting available).\n+func memLimitPrefix() string {\n+\tif runtime.GOOS == \"linux\" {\n+\t\treturn fmt.Sprintf(\"systemd-run --user --scope -q -p MemoryMax=%sM\", memLimitMB())\n \t}\n-\treturn fmt.Sprintf(\"%d\", heapMB)\n+\treturn \"\"\n }\n \n // templateFuncs contains custom functions available in templates\n@@ -125,7 +143,13 @@ var templateFuncs = template.FuncMap{\n \t// Use this when inserting untrusted values into shell commands\n \t\"shellQuote\": ShellQuote,\n \t// nodeHeapMB returns a safe Node.js heap size based on system RAM\n+\t// Deprecated: kept for backward compat, use memLimitMB instead\n \t\"nodeHeapMB\": nodeHeapMB,\n+\t// memLimitMB returns a per-agent memory limit in MB based on system RAM\n+\t\"memLimitMB\": memLimitMB,\n+\t// memLimitPrefix returns an OS-appropriate command prefix that enforces\n+\t// a real memory limit (systemd-run on Linux, empty on other platforms)\n+\t\"memLimitPrefix\": memLimitPrefix,\n }\n \n // GenerateAgentCommand renders an agent command template with the given variables.\n@@ -172,7 +196,7 @@ func IsTemplateCommand(cmd string) bool {\n // System prompt injection is supported via SystemPromptFile for persona agents.\n func DefaultAgentTemplates() AgentConfig {\n \treturn AgentConfig{\n-\t\tClaude:   `NODE_OPTIONS=\"--max-old-space-size={{nodeHeapMB}}\" claude --dangerously-skip-permissions{{if .Model}} --model {{shellQuote .Model}}{{end}}{{if .SystemPromptFile}} --system-prompt-file {{shellQuote .SystemPromptFile}}{{end}}`,\n+\t\tClaude:   `{{memLimitPrefix}} claude --dangerously-skip-permissions{{if .Model}} --model {{shellQuote .Model}}{{end}}{{if .SystemPromptFile}} --system-prompt-file {{shellQuote .SystemPromptFile}}{{end}}`,\n \t\tCodex:    `{{if .SystemPromptFile}}CODEX_SYSTEM_PROMPT=\"$(cat {{shellQuote .SystemPromptFile}})\" {{end}}codex --dangerously-bypass-approvals-and-sandbox -m {{shellQuote (.Model | default \"gpt-5.3-codex\")}} -c model_reasoning_effort=\"xhigh\" -c model_reasoning_summary_format=experimental --search`,\n \t\tGemini:   `gemini{{if .Model}} --model {{shellQuote .Model}}{{end}} --yolo`,\n \t\tOllama:   `ollama run {{shellQuote (.Model | default \"codellama:latest\")}}`,"
+    },
+    {
+      "sha": "cdc5c0d26b4c115eff39a776d31ed98d52250eb9",
+      "filename": "internal/config/templates_test.go",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/9b0b3389783f5fda8548c1eba67d1a97c6468a70/internal%2Fconfig%2Ftemplates_test.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/9b0b3389783f5fda8548c1eba67d1a97c6468a70/internal%2Fconfig%2Ftemplates_test.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fconfig%2Ftemplates_test.go?ref=9b0b3389783f5fda8548c1eba67d1a97c6468a70",
+      "patch": "@@ -155,7 +155,7 @@ func TestGenerateAgentCommand_TemplateMode(t *testing.T) {\n \t\t\twant: \"agent --model claude-opus-4 --session test --pane 2\",\n \t\t},\n \t\t{\n-\t\t\tname:     \"complex template\",\n+\t\t\tname:     \"legacy NODE_OPTIONS template (backward compat)\",\n \t\t\ttemplate: `NODE_OPTIONS=\"--max-old-space-size=32768\" claude --dangerously-skip-permissions{{if .Model}} --model {{.Model}}{{end}}`,\n \t\t\tvars:     AgentTemplateVars{Model: \"claude-opus-4-20250514\"},\n \t\t\twant:     `NODE_OPTIONS=\"--max-old-space-size=32768\" claude --dangerously-skip-permissions --model claude-opus-4-20250514`,"
+    }
+  ]
+}

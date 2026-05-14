@@ -1,0 +1,161 @@
+{
+  "message": "feat: embed memory writes",
+  "files": [
+    {
+      "sha": "da3b15d0a216264f6547e2f3bea3194d3d523ac5",
+      "filename": "docs/plans/2026-04-25-mira-memory-port-status.md",
+      "status": "modified",
+      "additions": 12,
+      "deletions": 2,
+      "changes": 14,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/aaabcf5c277d6ec1280b3c9a5e504faab3fc4145/docs%2Fplans%2F2026-04-25-mira-memory-port-status.md",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/aaabcf5c277d6ec1280b3c9a5e504faab3fc4145/docs%2Fplans%2F2026-04-25-mira-memory-port-status.md",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/docs%2Fplans%2F2026-04-25-mira-memory-port-status.md?ref=aaabcf5c277d6ec1280b3c9a5e504faab3fc4145",
+      "patch": "@@ -29,6 +29,9 @@ Phase 1 \u2014 Foundation (in progress)\n   extension loading is disabled. The vector lane now stores 768-dimensional\n   embedding BLOBs in SQLite and performs cosine ranking in TypeScript as the\n   production path.\n+- There are no legacy users for this port. The one-shot migration script is\n+  removed from scope; Phase 1 now embeds new memory writes directly and keeps\n+  schema normalization only as a tolerant parser/test convenience.\n \n ## Verification\n \n@@ -62,13 +65,17 @@ Phase 1 \u2014 Foundation (in progress)\n - 2026-04-26: `bun test` ran 2545 tests: 2543 passed, 2 failed in unrelated\n   existing/environment checks because `test/tools/harbor/harbor-runner.test.ts`\n   expects missing `inspo/harbor-runner/launch.sh` and `userdata.sh.tpl`\n+- 2026-04-26: `bun test test/llm/embeddings.test.ts test/genome/memory-embedding.test.ts test/genome/index-builder.test.ts test/genome/memory-index.test.ts test/genome/memory-schema.test.ts test/genome/jsonl-store.test.ts test/genome/memory-store.test.ts test/genome/genome.test.ts test/genome/recall.test.ts test/genome/pruning.test.ts test/bus/genome-service.test.ts test/learn/learn-process.test.ts`\n+  passed after routing new memory writes through required embeddings\n+- 2026-04-26: `bun run check` passed after embedded memory write changes\n+- 2026-04-26: `bun run typecheck` passed after embedded memory write changes\n \n ## Completed in current slice\n \n-- Added legacy memory fixture for migration coverage\n+- Added memory fixture coverage for schema normalization\n - Added extended memory schema normalization helpers\n - Added generic JSONL store primitive with append/rewrite/load behavior\n-- Updated `MemoryStore` to normalize legacy and extended records on load/add\n+- Updated `MemoryStore` to normalize minimal and extended records on load/add\n - Added SQLite/FTS5 memory index skeleton with JSONL rebuild tests\n - Added index-builder helper that rebuilds `genome/.cache/index.db` from JSONL\n - Added `.cache/` genome initialization and gitignore coverage\n@@ -78,3 +85,6 @@ Phase 1 \u2014 Foundation (in progress)\n   tests\n - Added SQLite-backed embedding vector storage and vector/hybrid search helpers\n   with fail-fast behavior when vector-required search has no indexed embeddings\n+- Added required embedding generation to `Genome.addMemory`; new memory writes\n+  now persist ready local embedding metadata/vectors and rebuild the derived\n+  SQLite index after memory mutations"
+    },
+    {
+      "sha": "74d08215b455105408fb06e204c8d099d72b9205",
+      "filename": "src/genome/genome.ts",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 3,
+      "changes": 19,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/aaabcf5c277d6ec1280b3c9a5e504faab3fc4145/src%2Fgenome%2Fgenome.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/aaabcf5c277d6ec1280b3c9a5e504faab3fc4145/src%2Fgenome%2Fgenome.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/src%2Fgenome%2Fgenome.ts?ref=aaabcf5c277d6ec1280b3c9a5e504faab3fc4145",
+      "patch": "@@ -9,7 +9,10 @@ import {\n } from \"../agents/loader.ts\";\n import { parseAgentMarkdown, serializeAgentMarkdown } from \"../agents/markdown-loader.ts\";\n import type { AgentSpec, Memory, RoutingRule } from \"../kernel/types.ts\";\n+import { type EmbeddingProvider, LocalEmbeddingProvider } from \"../llm/embeddings.ts\";\n import { getToolDisplayName } from \"../shared/tool-display.ts\";\n+import { rebuildMemoryIndexFromJsonl } from \"./index-builder.ts\";\n+import { attachReadyMemoryEmbedding } from \"./memory-embedding.ts\";\n import { MemoryStore } from \"./memory-store.ts\";\n import { buildManifestFromSpecs, loadManifest, saveManifest } from \"./root-manifest.ts\";\n \n@@ -18,6 +21,10 @@ export interface SyncRootResult {\n \tconflicts: string[];\n }\n \n+export interface GenomeOptions {\n+\tembeddingProvider?: EmbeddingProvider;\n+}\n+\n const GIT_REPO_SELECTION_ENV_VARS = [\n \t\"GIT_DIR\",\n \t\"GIT_WORK_TREE\",\n@@ -77,16 +84,18 @@ const DIRS = [\n export class Genome {\n \tprivate readonly rootPath: string;\n \tprivate readonly rootDir?: string;\n+\tprivate readonly embeddingProvider: EmbeddingProvider;\n \tprivate readonly agents = new Map<string, AgentSpec>();\n \tprivate readonly rootAgents = new Map<string, AgentSpec>();\n \treadonly memories: MemoryStore;\n \tprivate routingRules: RoutingRule[] = [];\n \tprivate _generation = 0;\n \tprivate _knownAgentFiles: Set<string> = new Set();\n \n-\tconstructor(rootPath: string, rootDir?: string) {\n+\tconstructor(rootPath: string, rootDir?: string, options: GenomeOptions = {}) {\n \t\tthis.rootPath = rootPath;\n \t\tthis.rootDir = rootDir;\n+\t\tthis.embeddingProvider = options.embeddingProvider ?? new LocalEmbeddingProvider();\n \t\tthis.memories = new MemoryStore(join(rootPath, \"memories\", \"memories.jsonl\"));\n \t}\n \n@@ -279,9 +288,11 @@ export class Genome {\n \n \t/** Add a memory, committing the JSONL file. */\n \tasync addMemory(memory: Memory): Promise<void> {\n-\t\tawait this.memories.add(memory);\n+\t\tconst embeddedMemory = await attachReadyMemoryEmbedding(memory, this.embeddingProvider);\n+\t\tawait this.memories.add(embeddedMemory);\n \t\tawait git(this.rootPath, \"add\", join(this.rootPath, \"memories\", \"memories.jsonl\"));\n-\t\tawait git(this.rootPath, \"commit\", \"-m\", `genome: add memory '${memory.id}'`);\n+\t\tawait git(this.rootPath, \"commit\", \"-m\", `genome: add memory '${embeddedMemory.id}'`);\n+\t\tawait rebuildMemoryIndexFromJsonl(this.rootPath);\n \t}\n \n \t/** Mark memories as used by id, saving to disk. No git commit \u2014 this is operational metadata. */\n@@ -291,6 +302,7 @@ export class Genome {\n \t\t\tthis.memories.markUsed(id);\n \t\t}\n \t\tawait this.memories.save();\n+\t\tawait rebuildMemoryIndexFromJsonl(this.rootPath);\n \t}\n \n \t// --- Pruning ---\n@@ -307,6 +319,7 @@ export class Genome {\n \t\t\t\t\"-m\",\n \t\t\t\t`genome: prune ${pruned.length} low-confidence memories`,\n \t\t\t);\n+\t\t\tawait rebuildMemoryIndexFromJsonl(this.rootPath);\n \t\t}\n \t\treturn pruned;\n \t}"
+    },
+    {
+      "sha": "883907c7c3c236c976c13fec6329aa73b383fa53",
+      "filename": "src/genome/memory-embedding.ts",
+      "status": "added",
+      "additions": 45,
+      "deletions": 0,
+      "changes": 45,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/aaabcf5c277d6ec1280b3c9a5e504faab3fc4145/src%2Fgenome%2Fmemory-embedding.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/aaabcf5c277d6ec1280b3c9a5e504faab3fc4145/src%2Fgenome%2Fmemory-embedding.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/src%2Fgenome%2Fmemory-embedding.ts?ref=aaabcf5c277d6ec1280b3c9a5e504faab3fc4145",
+      "patch": "@@ -0,0 +1,45 @@\n+import type { Memory } from \"../kernel/types.ts\";\n+import type { EmbeddingProvider } from \"../llm/embeddings.ts\";\n+import { normalizeMemory } from \"./memory-schema.ts\";\n+\n+export async function attachReadyMemoryEmbedding(\n+\tmemory: Memory,\n+\tprovider: EmbeddingProvider,\n+\toptions: { now?: number } = {},\n+): Promise<Memory> {\n+\tconst now = options.now ?? Date.now();\n+\tconst normalized = normalizeMemory(memory, { now });\n+\tconst [embedding] = await provider.embedBatch([normalized.content], { kind: \"document\" });\n+\tif (!embedding) {\n+\t\tthrow new Error(`Embedding provider '${provider.provider}' returned no vector`);\n+\t}\n+\tif (embedding.dimensions !== provider.dimensions) {\n+\t\tthrow new Error(\n+\t\t\t`Embedding provider '${provider.provider}' returned dimensions ${embedding.dimensions}, expected ${provider.dimensions}`,\n+\t\t);\n+\t}\n+\tvalidateEmbeddingVector(embedding.vector, provider.dimensions);\n+\n+\treturn {\n+\t\t...normalized,\n+\t\tembedding: {\n+\t\t\tprovider: embedding.provider,\n+\t\t\tmodel: embedding.model,\n+\t\t\tdimensions: embedding.dimensions,\n+\t\t\tstatus: \"ready\",\n+\t\t\tvector: Array.from(embedding.vector),\n+\t\t\tembedded_at: now,\n+\t\t},\n+\t};\n+}\n+\n+function validateEmbeddingVector(vector: Float32Array, dimensions: number): void {\n+\tif (vector.length !== dimensions) {\n+\t\tthrow new Error(`Embedding vector dimensions ${vector.length} do not match ${dimensions}`);\n+\t}\n+\tfor (const value of vector) {\n+\t\tif (!Number.isFinite(value)) {\n+\t\t\tthrow new Error(\"Embedding vector contains a non-finite value\");\n+\t\t}\n+\t}\n+}"
+    },
+    {
+      "sha": "03490973a128a9c5fa0fbb3faba824682eb74f4c",
+      "filename": "src/genome/memory-index.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/aaabcf5c277d6ec1280b3c9a5e504faab3fc4145/src%2Fgenome%2Fmemory-index.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/aaabcf5c277d6ec1280b3c9a5e504faab3fc4145/src%2Fgenome%2Fmemory-index.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/src%2Fgenome%2Fmemory-index.ts?ref=aaabcf5c277d6ec1280b3c9a5e504faab3fc4145",
+      "patch": "@@ -275,7 +275,7 @@ export class MemoryIndex {\n \t\t\t)\n \t\t\t.all();\n \t\tif (rows.length === 0) {\n-\t\t\tthrow new Error(\"Memory index has no embeddings; run the memory migration first\");\n+\t\t\tthrow new Error(\"Memory index has no embeddings; memory writes must create ready vectors\");\n \t\t}\n \t\tconst memoryCount = this.count(\"memories\");\n \t\tif (rows.length !== memoryCount) {"
+    },
+    {
+      "sha": "ca263430a76d6bcd100f11a22645b3dd4449f9b3",
+      "filename": "test/agents/agent.integration.test.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 2,
+      "changes": 5,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/aaabcf5c277d6ec1280b3c9a5e504faab3fc4145/test%2Fagents%2Fagent.integration.test.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/aaabcf5c277d6ec1280b3c9a5e504faab3fc4145/test%2Fagents%2Fagent.integration.test.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/test%2Fagents%2Fagent.integration.test.ts?ref=aaabcf5c277d6ec1280b3c9a5e504faab3fc4145",
+      "patch": "@@ -5,14 +5,15 @@ import { join } from \"node:path\";\n import { Agent } from \"../../src/agents/agent.ts\";\n import { AgentEventEmitter } from \"../../src/agents/events.ts\";\n import { loadRootAgents, scanAgentTree } from \"../../src/agents/loader.ts\";\n-import { Genome } from \"../../src/genome/genome.ts\";\n+import type { Genome } from \"../../src/genome/genome.ts\";\n import { LocalExecutionEnvironment } from \"../../src/kernel/execution-env.ts\";\n import { createPrimitiveRegistry } from \"../../src/kernel/primitives.ts\";\n import type { AgentSpec } from \"../../src/kernel/types.ts\";\n import { Client } from \"../../src/llm/client.ts\";\n import { ContentKind, type Message, Msg, type Response } from \"../../src/llm/types.ts\";\n import \"../helpers/test-env.ts\";\n import { buildTestResolverContext } from \"../helpers/resolver-context.ts\";\n+import { createTestGenome } from \"../helpers/test-genome.ts\";\n import { createVcr } from \"../helpers/vcr.ts\";\n \n const VCR_FIXTURE_DIR = join(import.meta.dir, \"../fixtures/vcr/agent-integration\");\n@@ -219,7 +220,7 @@ describe(\"Agent with Genome Integration\", () => {\n \t\t}\n \n \t\t// Create fresh genome with bootstrap agents\n-\t\tgenome = new Genome(genomeDir, join(import.meta.dir, \"../../root\"));\n+\t\tgenome = createTestGenome(genomeDir, join(import.meta.dir, \"../../root\"));\n \t\tawait genome.init();\n \t\tawait genome.initFromRoot();\n \t});"
+    },
+    {
+      "sha": "12a3ae823e167265cdae364332135480161a8d90",
+      "filename": "test/bus/genome-service.test.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 2,
+      "changes": 5,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/aaabcf5c277d6ec1280b3c9a5e504faab3fc4145/test%2Fbus%2Fgenome-service.test.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/aaabcf5c277d6ec1280b3c9a5e504faab3fc4145/test%2Fbus%2Fgenome-service.test.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/test%2Fbus%2Fgenome-service.test.ts?ref=aaabcf5c277d6ec1280b3c9a5e504faab3fc4145",
+      "patch": "@@ -8,8 +8,9 @@ import { createMutationLearnRequest } from \"../../src/bus/learn-contract.ts\";\n import { BusLearnForwarder } from \"../../src/bus/learn-forwarder.ts\";\n import { BusServer } from \"../../src/bus/server.ts\";\n import { genomeEvents, genomeMutations } from \"../../src/bus/topics.ts\";\n-import { Genome } from \"../../src/genome/genome.ts\";\n+import type { Genome } from \"../../src/genome/genome.ts\";\n import type { LearnMutation } from \"../../src/learn/learn-process.ts\";\n+import { createTestGenome } from \"../helpers/test-genome.ts\";\n \n describe(\"GenomeMutationService\", () => {\n \tlet server: BusServer;\n@@ -23,7 +24,7 @@ describe(\"GenomeMutationService\", () => {\n \n \tbeforeEach(async () => {\n \t\ttempDir = await mkdtemp(join(tmpdir(), \"sprout-genome-svc-\"));\n-\t\tgenome = new Genome(tempDir);\n+\t\tgenome = createTestGenome(tempDir);\n \t\tawait genome.init();\n \n \t\t// Add a bootstrap agent so we can test update_agent"
+    },
+    {
+      "sha": "47338cf6f58eb4b469beed2f2d5cedbde89957f4",
+      "filename": "test/genome/genome.test.ts",
+      "status": "modified",
+      "additions": 37,
+      "deletions": 1,
+      "changes": 38,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/aaabcf5c277d6ec1280b3c9a5e504faab3fc4145/test%2Fgenome%2Fgenome.test.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/aaabcf5c277d6ec1280b3c9a5e504faab3fc4145/test%2Fgenome%2Fgenome.test.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/test%2Fgenome%2Fgenome.test.ts?ref=aaabcf5c277d6ec1280b3c9a5e504faab3fc4145",
+      "patch": "@@ -5,9 +5,13 @@ import { join } from \"node:path\";\n import { parse } from \"yaml\";\n import { parseAgentMarkdown, serializeAgentMarkdown } from \"../../src/agents/markdown-loader.ts\";\n import { Genome, git, sanitizeGitEnv } from \"../../src/genome/genome.ts\";\n+import { memoryIndexPath } from \"../../src/genome/index-builder.ts\";\n+import { MemoryIndex } from \"../../src/genome/memory-index.ts\";\n import { loadManifest } from \"../../src/genome/root-manifest.ts\";\n import type { AgentSpec, Memory, RoutingRule } from \"../../src/kernel/types.ts\";\n+import type { EmbeddingProvider } from \"../../src/llm/embeddings.ts\";\n import { makeSpec } from \"../helpers/make-spec.ts\";\n+import { createTestGenome } from \"../helpers/test-genome.ts\";\n \n function makeMemory(overrides: Partial<Memory> = {}): Memory {\n \treturn {\n@@ -49,7 +53,7 @@ describe(\"Genome\", () => {\n \n \tasync function createInitializedGenome(rootPath: string, rootDir?: string): Promise<Genome> {\n \t\tawait cp(initTemplateDir, rootPath, { recursive: true });\n-\t\treturn new Genome(rootPath, rootDir);\n+\t\treturn createTestGenome(rootPath, rootDir);\n \t}\n \n \t// --- Init tests ---\n@@ -447,10 +451,42 @@ describe(\"Genome\", () => {\n \t\t\t// Verify file exists\n \t\t\tconst content = await readFile(join(root, \"memories\", \"memories.jsonl\"), \"utf-8\");\n \t\t\texpect(content).toContain(\"genome-mem-1\");\n+\t\t\tconst parsed = JSON.parse(content.trim()) as Memory;\n+\t\t\texpect(parsed.embedding?.status).toBe(\"ready\");\n+\t\t\texpect(parsed.embedding?.provider).toBe(\"fake\");\n+\t\t\texpect(parsed.embedding?.vector).toHaveLength(768);\n \n \t\t\t// Git log\n \t\t\tconst log = await git(root, \"log\", \"--oneline\");\n \t\t\texpect(log).toContain(\"genome: add memory 'genome-mem-1'\");\n+\n+\t\t\tconst index = MemoryIndex.open(memoryIndexPath(root));\n+\t\t\ttry {\n+\t\t\t\texpect(index.stats()).toMatchObject({ memoryCount: 1, embeddingCount: 1 });\n+\t\t\t} finally {\n+\t\t\t\tindex.close();\n+\t\t\t}\n+\t\t});\n+\n+\t\ttest(\"addMemory fails before writing when embedding generation fails\", async () => {\n+\t\t\tconst root = join(tempDir, \"mem-add-embedding-fails\");\n+\t\t\tawait cp(initTemplateDir, root, { recursive: true });\n+\t\t\tconst brokenProvider: EmbeddingProvider = {\n+\t\t\t\tprovider: \"broken\",\n+\t\t\t\tmodel: \"broken\",\n+\t\t\t\tdimensions: 768,\n+\t\t\t\tembedBatch: async () => {\n+\t\t\t\t\tthrow new Error(\"embedding model unavailable\");\n+\t\t\t\t},\n+\t\t\t};\n+\t\t\tconst genome = new Genome(root, undefined, { embeddingProvider: brokenProvider });\n+\n+\t\t\tawait expect(\n+\t\t\t\tgenome.addMemory(makeMemory({ id: \"bad-memory\", content: \"will not persist\" })),\n+\t\t\t).rejects.toThrow(\"embedding model unavailable\");\n+\n+\t\t\texpect(genome.memories.all()).toEqual([]);\n+\t\t\tawait expect(readFile(join(root, \"memories\", \"memories.jsonl\"), \"utf-8\")).rejects.toThrow();\n \t\t});\n \n \t\ttest(\"markMemoriesUsed updates use_count and persists to disk\", async () => {"
+    },
+    {
+      "sha": "75a910f8ff0400bb0e437287d62f0cb59b4fbac7",
+      "filename": "test/genome/memory-embedding.test.ts",
+      "status": "added",
+      "additions": 53,
+      "deletions": 0,
+      "changes": 53,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/aaabcf5c277d6ec1280b3c9a5e504faab3fc4145/test%2Fgenome%2Fmemory-embedding.test.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/aaabcf5c277d6ec1280b3c9a5e504faab3fc4145/test%2Fgenome%2Fmemory-embedding.test.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/test%2Fgenome%2Fmemory-embedding.test.ts?ref=aaabcf5c277d6ec1280b3c9a5e504faab3fc4145",
+      "patch": "@@ -0,0 +1,53 @@\n+import { describe, expect, test } from \"bun:test\";\n+import { attachReadyMemoryEmbedding } from \"../../src/genome/memory-embedding.ts\";\n+import type { Memory } from \"../../src/kernel/types.ts\";\n+import { type EmbeddingProvider, FakeEmbeddingProvider } from \"../../src/llm/embeddings.ts\";\n+\n+function makeMemory(overrides: Partial<Memory> = {}): Memory {\n+\treturn {\n+\t\tid: overrides.id ?? \"mem-1\",\n+\t\tcontent: overrides.content ?? \"store this fact\",\n+\t\ttags: overrides.tags ?? [\"test\"],\n+\t\tsource: overrides.source ?? \"test\",\n+\t\tcreated: overrides.created ?? 100,\n+\t\tlast_used: overrides.last_used ?? 100,\n+\t\tuse_count: overrides.use_count ?? 0,\n+\t\tconfidence: overrides.confidence ?? 1,\n+\t};\n+}\n+\n+describe(\"attachReadyMemoryEmbedding\", () => {\n+\ttest(\"attaches ready document embedding metadata and vector\", async () => {\n+\t\tconst embedded = await attachReadyMemoryEmbedding(makeMemory(), new FakeEmbeddingProvider(), {\n+\t\t\tnow: 123,\n+\t\t});\n+\n+\t\texpect(embedded.embedding?.status).toBe(\"ready\");\n+\t\texpect(embedded.embedding?.provider).toBe(\"fake\");\n+\t\texpect(embedded.embedding?.model).toBe(\"fake-deterministic\");\n+\t\texpect(embedded.embedding?.dimensions).toBe(768);\n+\t\texpect(embedded.embedding?.embedded_at).toBe(123);\n+\t\texpect(embedded.embedding?.vector).toHaveLength(768);\n+\t});\n+\n+\ttest(\"throws when provider returns the wrong dimensions\", async () => {\n+\t\tconst provider: EmbeddingProvider = {\n+\t\t\tprovider: \"bad\",\n+\t\t\tmodel: \"bad\",\n+\t\t\tdimensions: 768,\n+\t\t\tembedBatch: async () => [\n+\t\t\t\t{\n+\t\t\t\t\ttext: \"store this fact\",\n+\t\t\t\t\tvector: new Float32Array(2),\n+\t\t\t\t\tprovider: \"bad\",\n+\t\t\t\t\tmodel: \"bad\",\n+\t\t\t\t\tdimensions: 2,\n+\t\t\t\t},\n+\t\t\t],\n+\t\t};\n+\n+\t\tawait expect(attachReadyMemoryEmbedding(makeMemory(), provider)).rejects.toThrow(\n+\t\t\t\"returned dimensions 2, expected 768\",\n+\t\t);\n+\t});\n+});"
+    },
+    {
+      "sha": "89ec14ec2584a83a46c03cde39bd0536b0bcfd7b",
+      "filename": "test/genome/pruning.test.ts",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 4,
+      "changes": 9,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/aaabcf5c277d6ec1280b3c9a5e504faab3fc4145/test%2Fgenome%2Fpruning.test.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/aaabcf5c277d6ec1280b3c9a5e504faab3fc4145/test%2Fgenome%2Fpruning.test.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/test%2Fgenome%2Fpruning.test.ts?ref=aaabcf5c277d6ec1280b3c9a5e504faab3fc4145",
+      "patch": "@@ -4,6 +4,7 @@ import { tmpdir } from \"node:os\";\n import { join } from \"node:path\";\n import { Genome, git } from \"../../src/genome/genome.ts\";\n import type { Memory, RoutingRule } from \"../../src/kernel/types.ts\";\n+import { createTestGenome } from \"../helpers/test-genome.ts\";\n \n function makeMemory(overrides: Partial<Memory> = {}): Memory {\n \treturn {\n@@ -42,7 +43,7 @@ describe(\"Genome pruning\", () => {\n \tdescribe(\"pruneMemories\", () => {\n \t\ttest(\"removes memories below effective confidence threshold\", async () => {\n \t\t\tconst root = join(tempDir, \"prune-confidence\");\n-\t\t\tconst genome = new Genome(root);\n+\t\t\tconst genome = createTestGenome(root);\n \t\t\tawait genome.init();\n \n \t\t\tconst ninetyDaysAgo = Date.now() - 90 * 86400000;\n@@ -77,7 +78,7 @@ describe(\"Genome pruning\", () => {\n \n \t\ttest(\"commits when memories are pruned\", async () => {\n \t\t\tconst root = join(tempDir, \"prune-commit\");\n-\t\t\tconst genome = new Genome(root);\n+\t\t\tconst genome = createTestGenome(root);\n \t\t\tawait genome.init();\n \n \t\t\tconst ninetyDaysAgo = Date.now() - 90 * 86400000;\n@@ -104,7 +105,7 @@ describe(\"Genome pruning\", () => {\n \n \t\ttest(\"returns empty array and does not commit when nothing to prune\", async () => {\n \t\t\tconst root = join(tempDir, \"prune-nothing\");\n-\t\t\tconst genome = new Genome(root);\n+\t\t\tconst genome = createTestGenome(root);\n \t\t\tawait genome.init();\n \n \t\t\tawait genome.addMemory(\n@@ -126,7 +127,7 @@ describe(\"Genome pruning\", () => {\n \n \t\ttest(\"uses default threshold of 0.2 when no argument provided\", async () => {\n \t\t\tconst root = join(tempDir, \"prune-default\");\n-\t\t\tconst genome = new Genome(root);\n+\t\t\tconst genome = createTestGenome(root);\n \t\t\tawait genome.init();\n \n \t\t\tconst ninetyDaysAgo = Date.now() - 90 * 86400000;"
+    },
+    {
+      "sha": "0873609dbb173f4b294fab70e7bfcfd6e35e6e5e",
+      "filename": "test/genome/recall.test.ts",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 3,
+      "changes": 7,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/aaabcf5c277d6ec1280b3c9a5e504faab3fc4145/test%2Fgenome%2Frecall.test.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/aaabcf5c277d6ec1280b3c9a5e504faab3fc4145/test%2Fgenome%2Frecall.test.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/test%2Fgenome%2Frecall.test.ts?ref=aaabcf5c277d6ec1280b3c9a5e504faab3fc4145",
+      "patch": "@@ -5,6 +5,7 @@ import { join } from \"node:path\";\n import { Genome } from \"../../src/genome/genome.ts\";\n import { recall, renderMemories, renderRoutingHints } from \"../../src/genome/recall.ts\";\n import { type AgentSpec, DEFAULT_CONSTRAINTS, type Memory } from \"../../src/kernel/types.ts\";\n+import { createTestGenome } from \"../helpers/test-genome.ts\";\n \n function makeSpec(name: string): AgentSpec {\n \treturn {\n@@ -59,7 +60,7 @@ describe(\"recall\", () => {\n \n \ttest(\"returns matching memories by keyword\", async () => {\n \t\tconst root = join(tempDir, \"recall-memories\");\n-\t\tconst genome = new Genome(root);\n+\t\tconst genome = createTestGenome(root);\n \t\tawait genome.init();\n \t\tawait genome.addMemory(makeMemory(\"m1\", \"this project uses pytest for testing\"));\n \t\tawait genome.addMemory(makeMemory(\"m2\", \"the auth module is at src/auth\"));\n@@ -90,7 +91,7 @@ describe(\"recall\", () => {\n \n \ttest(\"marks used memories\", async () => {\n \t\tconst root = join(tempDir, \"recall-mark\");\n-\t\tconst genome = new Genome(root);\n+\t\tconst genome = createTestGenome(root);\n \t\tawait genome.init();\n \t\tawait genome.addMemory(makeMemory(\"m1\", \"testing fact\", []));\n \n@@ -103,7 +104,7 @@ describe(\"recall\", () => {\n \n \ttest(\"returns empty memories and routing when none match\", async () => {\n \t\tconst root = join(tempDir, \"recall-empty\");\n-\t\tconst genome = new Genome(root);\n+\t\tconst genome = createTestGenome(root);\n \t\tawait genome.init();\n \t\tawait genome.addMemory(makeMemory(\"m1\", \"unrelated topic\"));\n "
+    },
+    {
+      "sha": "d0a1785bfe5b373e5040125506c6e2319ec8108e",
+      "filename": "test/helpers/test-genome.ts",
+      "status": "added",
+      "additions": 13,
+      "deletions": 0,
+      "changes": 13,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/aaabcf5c277d6ec1280b3c9a5e504faab3fc4145/test%2Fhelpers%2Ftest-genome.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/aaabcf5c277d6ec1280b3c9a5e504faab3fc4145/test%2Fhelpers%2Ftest-genome.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/test%2Fhelpers%2Ftest-genome.ts?ref=aaabcf5c277d6ec1280b3c9a5e504faab3fc4145",
+      "patch": "@@ -0,0 +1,13 @@\n+import { Genome, type GenomeOptions } from \"../../src/genome/genome.ts\";\n+import { FakeEmbeddingProvider } from \"../../src/llm/embeddings.ts\";\n+\n+export function createTestGenome(\n+\trootPath: string,\n+\trootDir?: string,\n+\toptions: GenomeOptions = {},\n+): Genome {\n+\treturn new Genome(rootPath, rootDir, {\n+\t\tembeddingProvider: new FakeEmbeddingProvider(),\n+\t\t...options,\n+\t});\n+}"
+    },
+    {
+      "sha": "3180c0308c9ad14be22a8c0f2e832fa716d0e6e5",
+      "filename": "test/learn/learn-process.test.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 2,
+      "changes": 5,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/aaabcf5c277d6ec1280b3c9a5e504faab3fc4145/test%2Flearn%2Flearn-process.test.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/aaabcf5c277d6ec1280b3c9a5e504faab3fc4145/test%2Flearn%2Flearn-process.test.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/test%2Flearn%2Flearn-process.test.ts?ref=aaabcf5c277d6ec1280b3c9a5e504faab3fc4145",
+      "patch": "@@ -12,6 +12,7 @@ import { MetricsStore } from \"../../src/learn/metrics-store.ts\";\n import type { Client } from \"../../src/llm/client.ts\";\n import type { ProviderModel, Request, Response } from \"../../src/llm/types.ts\";\n import { buildTestResolverContext } from \"../helpers/resolver-context.ts\";\n+import { createTestGenome } from \"../helpers/test-genome.ts\";\n \n function makeSignal(overrides: Partial<LearnSignal> = {}): LearnSignal {\n \treturn {\n@@ -82,7 +83,7 @@ let genomeTemplateDir: string;\n async function setupGenome(tempDir: string, name: string) {\n \tconst genomeDir = join(tempDir, name);\n \tawait cp(genomeTemplateDir, genomeDir, { recursive: true });\n-\tconst genome = new Genome(genomeDir, ROOT_DIR);\n+\tconst genome = createTestGenome(genomeDir, ROOT_DIR);\n \tawait genome.loadFromDisk();\n \tconst metrics = new MetricsStore(join(genomeDir, \"metrics\", \"metrics.jsonl\"));\n \tawait metrics.load();\n@@ -95,7 +96,7 @@ async function setupGenome(tempDir: string, name: string) {\n async function setupGenomeWithClient(tempDir: string, name: string, client: Client) {\n \tconst genomeDir = join(tempDir, name);\n \tawait cp(genomeTemplateDir, genomeDir, { recursive: true });\n-\tconst genome = new Genome(genomeDir, ROOT_DIR);\n+\tconst genome = createTestGenome(genomeDir, ROOT_DIR);\n \tawait genome.loadFromDisk();\n \tconst metrics = new MetricsStore(join(genomeDir, \"metrics\", \"metrics.jsonl\"));\n \tawait metrics.load();"
+    },
+    {
+      "sha": "d7d6fce9d8b1828e9149916403a894bed3328234",
+      "filename": "test/learn/learn.integration.test.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 3,
+      "changes": 6,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/aaabcf5c277d6ec1280b3c9a5e504faab3fc4145/test%2Flearn%2Flearn.integration.test.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/aaabcf5c277d6ec1280b3c9a5e504faab3fc4145/test%2Flearn%2Flearn.integration.test.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/test%2Flearn%2Flearn.integration.test.ts?ref=aaabcf5c277d6ec1280b3c9a5e504faab3fc4145",
+      "patch": "@@ -3,13 +3,13 @@ import { mkdtemp, rm } from \"node:fs/promises\";\n import { tmpdir } from \"node:os\";\n import { join } from \"node:path\";\n import { AgentEventEmitter } from \"../../src/agents/events.ts\";\n-import { Genome } from \"../../src/genome/genome.ts\";\n import type { LearnSignal } from \"../../src/kernel/types.ts\";\n import { LearnProcess } from \"../../src/learn/learn-process.ts\";\n import { MetricsStore } from \"../../src/learn/metrics-store.ts\";\n import { Client } from \"../../src/llm/client.ts\";\n import { buildTestResolverContext } from \"../helpers/resolver-context.ts\";\n import \"../helpers/test-env.ts\";\n+import { createTestGenome } from \"../helpers/test-genome.ts\";\n import { createVcr } from \"../helpers/vcr.ts\";\n \n const FIXTURE_DIR = join(import.meta.dir, \"../fixtures/vcr/learn\");\n@@ -47,7 +47,7 @@ describe(\"Learn Integration\", () => {\n \n \t\tconst genomeDir = join(tempDir, \"genome-failure\");\n \t\tconst rootDir = join(import.meta.dir, \"../../root\");\n-\t\tconst genome = new Genome(genomeDir, rootDir);\n+\t\tconst genome = createTestGenome(genomeDir, rootDir);\n \t\tawait genome.init();\n \t\tawait genome.initFromRoot();\n \n@@ -118,7 +118,7 @@ describe(\"Learn Integration\", () => {\n \n \t\tconst genomeDir = join(tempDir, \"genome-skip\");\n \t\tconst rootDir = join(import.meta.dir, \"../../root\");\n-\t\tconst genome = new Genome(genomeDir, rootDir);\n+\t\tconst genome = createTestGenome(genomeDir, rootDir);\n \t\tawait genome.init();\n \t\tawait genome.initFromRoot();\n "
+    }
+  ]
+}

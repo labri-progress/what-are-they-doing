@@ -1,0 +1,41 @@
+{
+  "message": "feat(string_abi,libc.map): route explicit_memset through ABI memset + add memset_explicit alias + export missing BSD/Linux stragglers\n\n* string_abi.rs::explicit_memset \u2014 instead of calling host `libc::memset` directly, route through our own `memset` ABI entry. This gives the explicit-zeroing path the same membrane accounting, null-pointer guard (return null when n>0 and dest is null instead of crashing in host memset), and volatile byte-fill semantics that all other writes through our libc see. The `std::hint::black_box(s)` barrier is preserved so dead-store elimination still can't optimize the fill out, since `memset`'s return value is what we propagate now.\n\n* string_abi.rs::memset_explicit \u2014 new C23 entry, defined as a thin alias of `explicit_memset`. NetBSD ships this as a synonym; C23 standardized the spelling.\n\n* string_abi_test.rs:\n  - `bd_jt6vm_explicit_memset_null_nonzero_uses_memset_null_guard` \u2014 pin the new behavior: `explicit_memset(NULL, 0xAB, 4)` must return NULL (the memset null guard), not crash. Previously this would have tried to memset host memory at address 0.\n  - `bd_jt6vm_memset_explicit_alias_writes_byte_value` \u2014 confirm the C23 alias writes the pattern byte across the buffer and returns the same destination pointer.\n\n* version_scripts/libc.map \u2014 export the symbols that already exist in source but were missing from the version script (so external tooling can resolve them via versioned dlsym):\n  - `explicit_memset`, `memset_explicit` (this commit), `consttime_bcmp`, `consttime_memequal` (already in string_abi.rs since the early BSD-parity port) \u2014 added in the BSD/timing-safe block alongside `timingsafe_bcmp`/`timingsafe_memcmp`\n  - `reallocarr` \u2014 already in stdlib_abi.rs, missing from the BSD-utility block\n  - `pidfile_signal` \u2014 already in stdlib_abi.rs (now correctness-fixed in the previous commit), missing from the pidfile block\n  - `futex_waitv`, `futex_wake`, `futex_wait`, `futex_requeue` \u2014 already in unistd_abi.rs, missing from the syscall-veneer block\n\nThese libc.map additions don't change runtime behavior \u2014 they just make the existing exports visible through versioned symbol lookup.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "b3f4946b3d81b15e9c32a67fbcb5075f5287b33f",
+      "filename": "crates/frankenlibc-abi/src/string_abi.rs",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 6,
+      "changes": 22,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/c8ae5bf5523e28c20352982195eb0bb5e317429f/crates%2Ffrankenlibc-abi%2Fsrc%2Fstring_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/c8ae5bf5523e28c20352982195eb0bb5e317429f/crates%2Ffrankenlibc-abi%2Fsrc%2Fstring_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Fstring_abi.rs?ref=c8ae5bf5523e28c20352982195eb0bb5e317429f",
+      "patch": "@@ -4231,16 +4231,26 @@ pub unsafe extern \"C\" fn explicit_bzero(s: *mut c_void, n: usize) {\n /// char` and replicated across the buffer.\n #[cfg_attr(not(debug_assertions), unsafe(no_mangle))]\n pub unsafe extern \"C\" fn explicit_memset(s: *mut c_void, c: c_int, n: usize) -> *mut c_void {\n-    if n == 0 {\n-        return s;\n-    }\n-    // SAFETY: caller-supplied writable region of length n.\n-    unsafe { libc::memset(s, c, n) };\n+    // Route through our ABI memset so explicit_memset gets the same\n+    // null handling, membrane accounting, and volatile byte path as memset.\n+    let out = unsafe { memset(s, c, n) };\n     // Defeat dead-store elimination: ensure the compiler can't prove\n     // the write is unused. black_box pins the address through an\n     // optimization barrier.\n     std::hint::black_box(s);\n-    s\n+    out\n+}\n+\n+/// C23 `memset_explicit(b, c, len) -> *b` \u2014 guaranteed non-elidable\n+/// byte fill. NetBSD exposes this as an alias of [`explicit_memset`].\n+///\n+/// # Safety\n+///\n+/// `b` must be valid for `len` bytes; `c` is interpreted as `unsigned\n+/// char` and replicated across the buffer.\n+#[cfg_attr(not(debug_assertions), unsafe(no_mangle))]\n+pub unsafe extern \"C\" fn memset_explicit(b: *mut c_void, c: c_int, len: usize) -> *mut c_void {\n+    unsafe { explicit_memset(b, c, len) }\n }\n \n // ---------------------------------------------------------------------------"
+    },
+    {
+      "sha": "8fb95245d60e73ae63e1a13707c20436ab089b5d",
+      "filename": "crates/frankenlibc-abi/tests/string_abi_test.rs",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 0,
+      "changes": 16,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/c8ae5bf5523e28c20352982195eb0bb5e317429f/crates%2Ffrankenlibc-abi%2Ftests%2Fstring_abi_test.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/c8ae5bf5523e28c20352982195eb0bb5e317429f/crates%2Ffrankenlibc-abi%2Ftests%2Fstring_abi_test.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Ftests%2Fstring_abi_test.rs?ref=c8ae5bf5523e28c20352982195eb0bb5e317429f",
+      "patch": "@@ -2574,6 +2574,22 @@ fn bd_jt6vm_explicit_memset_writes_byte_value_and_returns_buffer() {\n     assert!(buf.iter().all(|b| *b == 0xAB));\n }\n \n+#[test]\n+fn bd_jt6vm_explicit_memset_null_nonzero_uses_memset_null_guard() {\n+    use frankenlibc_abi::string_abi::explicit_memset;\n+    let p = unsafe { explicit_memset(std::ptr::null_mut(), 0xAB, 4) };\n+    assert!(p.is_null());\n+}\n+\n+#[test]\n+fn bd_jt6vm_memset_explicit_alias_writes_byte_value() {\n+    use frankenlibc_abi::string_abi::memset_explicit;\n+    let mut buf = [0u8; 16];\n+    let p = unsafe { memset_explicit(buf.as_mut_ptr() as *mut std::ffi::c_void, 0x5A, buf.len()) };\n+    assert_eq!(p, buf.as_mut_ptr() as *mut std::ffi::c_void);\n+    assert!(buf.iter().all(|b| *b == 0x5A));\n+}\n+\n #[test]\n fn bd_jt6vm_explicit_memset_zero_length_is_noop() {\n     use frankenlibc_abi::string_abi::explicit_memset;"
+    },
+    {
+      "sha": "60f6a5e6cac69d0d4496b826eec2f6a829323e5e",
+      "filename": "crates/frankenlibc-abi/version_scripts/libc.map",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 0,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/c8ae5bf5523e28c20352982195eb0bb5e317429f/crates%2Ffrankenlibc-abi%2Fversion_scripts%2Flibc.map",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/c8ae5bf5523e28c20352982195eb0bb5e317429f/crates%2Ffrankenlibc-abi%2Fversion_scripts%2Flibc.map",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fversion_scripts%2Flibc.map?ref=c8ae5bf5523e28c20352982195eb0bb5e317429f",
+      "patch": "@@ -115,6 +115,10 @@ GLIBC_2.2.5 {\n         bcopy;\n         bzero;\n         explicit_bzero;\n+        explicit_memset;\n+        memset_explicit;\n+        consttime_bcmp;\n+        consttime_memequal;\n         timingsafe_bcmp;\n         timingsafe_memcmp;\n \n@@ -345,6 +349,7 @@ GLIBC_2.2.5 {\n         gnu_get_libc_release;\n         confstr;\n         getbsize;\n+        reallocarr;\n         strtonum;\n         dehumanize_number;\n         expand_number;\n@@ -356,6 +361,7 @@ GLIBC_2.2.5 {\n         pidfile_close;\n         pidfile_remove;\n         pidfile_fileno;\n+        pidfile_signal;\n \n         /* ctype internal */\n         __ctype_b_loc;\n@@ -1735,6 +1741,10 @@ GLIBC_2.2.5 {\n         capget;\n         capset;\n         futex;\n+        futex_waitv;\n+        futex_wake;\n+        futex_wait;\n+        futex_requeue;\n         membarrier;\n         ioprio_set;\n         ioprio_get;"
+    }
+  ]
+}

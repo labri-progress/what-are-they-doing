@@ -1,0 +1,29 @@
+{
+  "message": "fix(abi,malloc): add RuntimeReadyGuard for test isolation and replace raw alloc with safe Box-backed test allocator\n\nruntime_policy.rs: Introduce RuntimeReadyGuard RAII struct that\nsaves/restores RUNTIME_READY and MODE_LOG_READY atomics, ensuring\ntests that need the runtime kernel enabled don't leak state to\nother tests running concurrently. Applied to\ndrive_runtime_evidence_sampling and the snapshot wrapper test.\n\nallocator.rs: Replace unsafe std::alloc::{alloc,dealloc} test helpers\nwith a safe HashMap<usize, Box<[u8]>> registry behind a OnceLock<Mutex>.\ntest_alloc() creates a boxed slice and registers it by pointer address;\ntest_free() removes the entry and asserts it was known. This eliminates\nundefined behavior from mismatched Layout parameters and makes test\nallocations fully deterministic and leak-detectable.\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "e054f74853ae055636bcde2155db6bb710d9c5b0",
+      "filename": "crates/frankenlibc-abi/src/runtime_policy.rs",
+      "status": "modified",
+      "additions": 23,
+      "deletions": 0,
+      "changes": 23,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/eba84e6526235a6a01b3991e793a8fc5060bf599/crates%2Ffrankenlibc-abi%2Fsrc%2Fruntime_policy.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/eba84e6526235a6a01b3991e793a8fc5060bf599/crates%2Ffrankenlibc-abi%2Fsrc%2Fruntime_policy.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Fruntime_policy.rs?ref=eba84e6526235a6a01b3991e793a8fc5060bf599",
+      "patch": "@@ -1217,6 +1217,27 @@ mod tests {\n             .expect(\"env lock should not be poisoned\")\n     }\n \n+    struct RuntimeReadyGuard {\n+        previous_ready: u8,\n+        previous_mode_log_ready: u8,\n+    }\n+\n+    impl Drop for RuntimeReadyGuard {\n+        fn drop(&mut self) {\n+            RUNTIME_READY.store(self.previous_ready, AtomicOrdering::SeqCst);\n+            MODE_LOG_READY.store(self.previous_mode_log_ready, AtomicOrdering::SeqCst);\n+        }\n+    }\n+\n+    fn enable_runtime_kernel_for_tests() -> RuntimeReadyGuard {\n+        let previous_ready = RUNTIME_READY.swap(1, AtomicOrdering::SeqCst);\n+        let previous_mode_log_ready = MODE_LOG_READY.swap(1, AtomicOrdering::SeqCst);\n+        RuntimeReadyGuard {\n+            previous_ready,\n+            previous_mode_log_ready,\n+        }\n+    }\n+\n     fn reset_decision_contract_machine_for_tests() {\n         let _ = DECISION_CONTRACT_MACHINE.try_with(|slot| {\n             *slot.borrow_mut() = DecisionContractMachine::new(DECISION_CONTRACT_CLEAR_THRESHOLD);\n@@ -1228,6 +1249,7 @@ mod tests {\n         base_addr: usize,\n         requested_bytes: usize,\n     ) -> u64 {\n+        let _runtime_ready = enable_runtime_kernel_for_tests();\n         // Runtime evidence sampling is cadence-gated in both strict and hardened modes.\n         // Drive a bounded deterministic sequence until at least one sampled decision appears.\n         const MAX_ATTEMPTS: usize = 20_000;\n@@ -1655,6 +1677,7 @@ mod tests {\n \n     #[test]\n     fn runtime_kernel_snapshot_wrapper_exposes_live_decision_state() {\n+        let _runtime_ready = enable_runtime_kernel_for_tests();\n         let baseline_decisions = runtime_kernel_snapshot(mode())\n             .map(|snapshot| snapshot.decisions)\n             .unwrap_or(0);"
+    },
+    {
+      "sha": "d7b4af08a969a3e0a313a4ea6109f804df0fc14e",
+      "filename": "crates/frankenlibc-core/src/malloc/allocator.rs",
+      "status": "modified",
+      "additions": 21,
+      "deletions": 12,
+      "changes": 33,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/eba84e6526235a6a01b3991e793a8fc5060bf599/crates%2Ffrankenlibc-core%2Fsrc%2Fmalloc%2Fallocator.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/eba84e6526235a6a01b3991e793a8fc5060bf599/crates%2Ffrankenlibc-core%2Fsrc%2Fmalloc%2Fallocator.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-core%2Fsrc%2Fmalloc%2Fallocator.rs?ref=eba84e6526235a6a01b3991e793a8fc5060bf599",
+      "patch": "@@ -389,22 +389,31 @@ impl Default for MallocState {\n #[cfg(test)]\n mod tests {\n     use super::*;\n-    use crate::malloc::size_class::MAX_SMALL_SIZE;\n-    use std::alloc::{Layout, alloc, dealloc};\n+    use std::collections::HashMap;\n+    use std::sync::{Mutex, OnceLock};\n+\n+    fn test_alloc_registry() -> &'static Mutex<HashMap<usize, Box<[u8]>>> {\n+        static REGISTRY: OnceLock<Mutex<HashMap<usize, Box<[u8]>>>> = OnceLock::new();\n+        REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))\n+    }\n \n     fn test_alloc(size: usize) -> Option<usize> {\n-        let layout = Layout::from_size_align(size, 16).ok()?;\n-        let ptr = unsafe { alloc(layout) };\n-        if ptr.is_null() {\n-            None\n-        } else {\n-            Some(ptr as usize)\n-        }\n+        let alloc_size = size.max(1);\n+        let mut backing = vec![0u8; alloc_size].into_boxed_slice();\n+        let ptr = backing.as_mut_ptr() as usize;\n+        test_alloc_registry()\n+            .lock()\n+            .unwrap_or_else(|e| e.into_inner())\n+            .insert(ptr, backing);\n+        Some(ptr)\n     }\n \n-    fn test_free(ptr: usize, size: usize) {\n-        let layout = Layout::from_size_align(size, 16).expect(\"valid layout for free\");\n-        unsafe { dealloc(ptr as *mut u8, layout) };\n+    fn test_free(ptr: usize, _size: usize) {\n+        let removed = test_alloc_registry()\n+            .lock()\n+            .unwrap_or_else(|e| e.into_inner())\n+            .remove(&ptr);\n+        assert!(removed.is_some(), \"test_free must release a known test allocation\");\n     }\n \n     #[test]"
+    }
+  ]
+}

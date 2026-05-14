@@ -1,0 +1,41 @@
+{
+  "message": "fix(combinator): prevent barging in bulkhead/rate-limiter, clamp circuit breaker threshold\n\nBulkhead:\n- try_acquire() now checks pending_queue_count before and inside the CAS\n  loop to prevent fast-path callers from barging ahead of queued waiters,\n  preserving FIFO fairness under contention\n\nRate limiter:\n- try_acquire() now holds a read lock on wait_queue and rejects if\n  non-empty, preventing barging past queued operations. The queue lock\n  is properly dropped after token acquisition.\n\nCircuit breaker:\n- Clamp success_threshold to 0xFFFF (16 bits) during construction since\n  it is packed into 16 bits in State::HalfOpen. Values exceeding 0xFFFF\n  would wrap around and trap the breaker in HalfOpen permanently.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "830f3dd852b1f25c03c55baef2f51a6b44cc84e3",
+      "filename": "src/combinator/bulkhead.rs",
+      "status": "modified",
+      "additions": 12,
+      "deletions": 0,
+      "changes": 12,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/1d0ceba82c1f3ee78e1b9d4d2936dd1679981d4b/src%2Fcombinator%2Fbulkhead.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/1d0ceba82c1f3ee78e1b9d4d2936dd1679981d4b/src%2Fcombinator%2Fbulkhead.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fcombinator%2Fbulkhead.rs?ref=1d0ceba82c1f3ee78e1b9d4d2936dd1679981d4b",
+      "patch": "@@ -288,11 +288,23 @@ impl Bulkhead {\n     /// Returns `Some(permit)` if acquired immediately, `None` if bulkhead is full.\n     #[must_use]\n     pub fn try_acquire(&self, weight: u32) -> Option<BulkheadPermit<'_>> {\n+        // Prevent barging if there are queued operations\n+        if self.pending_queue_count.load(Ordering::Relaxed) > 0 {\n+            return None;\n+        }\n+\n         let mut available = self.available_permits.load(Ordering::Acquire);\n         loop {\n             if available < weight {\n                 return None;\n             }\n+            \n+            // Re-check pending count inside the CAS loop to prevent TOCTOU races\n+            // where an enqueue happens right after our initial check.\n+            if self.pending_queue_count.load(Ordering::Relaxed) > 0 {\n+                return None;\n+            }\n+\n             match self.available_permits.compare_exchange_weak(\n                 available,\n                 available - weight,"
+    },
+    {
+      "sha": "e7318698340ff2313ed1ac37013f8d1541ae70cc",
+      "filename": "src/combinator/circuit_breaker.rs",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/1d0ceba82c1f3ee78e1b9d4d2936dd1679981d4b/src%2Fcombinator%2Fcircuit_breaker.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/1d0ceba82c1f3ee78e1b9d4d2936dd1679981d4b/src%2Fcombinator%2Fcircuit_breaker.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fcombinator%2Fcircuit_breaker.rs?ref=1d0ceba82c1f3ee78e1b9d4d2936dd1679981d4b",
+      "patch": "@@ -407,6 +407,11 @@ impl CircuitBreaker {\n         // Clamp probes to supported range so half-open accounting cannot violate\n         // caller policy by allowing zero or overflowing values.\n         policy.half_open_max_probes = normalize_half_open_max_probes(policy.half_open_max_probes);\n+        \n+        // Clamp success_threshold to 0xFFFF (16 bits) because it is packed into 16 bits\n+        // in State::HalfOpen. If it exceeds 0xFFFF, it would wrap around and trap the\n+        // breaker in HalfOpen permanently.\n+        policy.success_threshold = policy.success_threshold.min(0xFFFF);\n \n         let sliding_window = policy\n             .sliding_window"
+    },
+    {
+      "sha": "5425bcf138be71e92e0897859b9472f931169a7a",
+      "filename": "src/combinator/rate_limit.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 0,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/1d0ceba82c1f3ee78e1b9d4d2936dd1679981d4b/src%2Fcombinator%2Frate_limit.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/1d0ceba82c1f3ee78e1b9d4d2936dd1679981d4b/src%2Fcombinator%2Frate_limit.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fcombinator%2Frate_limit.rs?ref=1d0ceba82c1f3ee78e1b9d4d2936dd1679981d4b",
+      "patch": "@@ -352,6 +352,12 @@ impl RateLimiter {\n     #[must_use]\n     #[allow(clippy::cast_precision_loss)]\n     pub fn try_acquire(&self, cost: u32, now: Time) -> bool {\n+        // Prevent barging if there are queued operations to preserve FIFO fairness\n+        let queue = self.wait_queue.read();\n+        if !queue.is_empty() {\n+            return false;\n+        }\n+\n         let mut state = self.state.lock();\n         let now_millis = now.as_millis();\n \n@@ -362,6 +368,7 @@ impl RateLimiter {\n         if state.tokens >= cost_f {\n             state.tokens -= cost_f;\n             drop(state); // Release bucket lock immediately\n+            drop(queue); // Release queue lock\n \n             self.total_allowed.fetch_add(1, Ordering::Relaxed);\n             true"
+    }
+  ]
+}

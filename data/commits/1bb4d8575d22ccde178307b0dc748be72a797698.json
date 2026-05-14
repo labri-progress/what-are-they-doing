@@ -1,0 +1,64 @@
+{
+  "message": "Fix libdeflate clone regression: correct deflate buffer sizing, add fallbacks\n\nRoot cause: libdeflate level 0 uses 5000-byte blocks (vs old code's 16383),\nso the output buffer formula underestimated overhead for files >65KB.\nObjects silently failed to compress, were skipped from packfiles.\n\nFixes:\n- Size deflate output buffer using libdeflate's actual block size (5000 bytes)\n- Add node:zlib fallback in readObject when WASM decompression fails\n- Add null check for WASM alloc in zlibInflate\n- Reuse libdeflate compressor/decompressor (singleton pattern, no per-call malloc)\n- Wrap zlibDeflate in try/catch in packfile-builder\n\nTested: all stress tests pass (100-10K synthetic + 16K node_modules)",
+  "files": [
+    {
+      "sha": "a8ca271c7692ba42b3adb603c925ed075c6995ed",
+      "filename": "src/git-engine.ts",
+      "status": "modified",
+      "additions": 33,
+      "deletions": 10,
+      "changes": 43,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/1bb4d8575d22ccde178307b0dc748be72a797698/src%2Fgit-engine.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/1bb4d8575d22ccde178307b0dc748be72a797698/src%2Fgit-engine.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Fgit-engine.ts?ref=1bb4d8575d22ccde178307b0dc748be72a797698",
+      "patch": "@@ -114,19 +114,42 @@ export class GitEngine {\n     // Decompress with retry \u2014 compression ratios can exceed 100x for repetitive data.\n     // Try increasing buffer sizes until decompression succeeds.\n     // Cap at 32MB to stay within WASM arena (64MB total minus input).\n+    // Decompress: try WASM (libdeflate), fallback to node:zlib\n     let raw: Uint8Array | null = null;\n-    for (const multiplier of [4, 16, 64, 256]) {\n-      const maxSize = Math.min(\n-        Math.max(compressed.length * multiplier, 65536),\n-        32 * 1024 * 1024\n-      );\n-      const result = wasm.zlibInflate(compressed, maxSize);\n-      if (result.length > 0) {\n-        raw = result;\n-        break;\n+    try {\n+      // libdeflate needs exact or larger output buffer \u2014 try increasing sizes\n+      for (const multiplier of [4, 16, 64, 256]) {\n+        const maxSize = Math.min(\n+          Math.max(compressed.length * multiplier, 65536),\n+          32 * 1024 * 1024\n+        );\n+        const result = wasm.zlibInflate(compressed, maxSize);\n+        if (result.length > 0) {\n+          raw = result;\n+          break;\n+        }\n       }\n+    } catch {\n+      // WASM trap \u2014 fall through to node:zlib\n+    }\n+    if (!raw || raw.length === 0) {\n+      // WASM decompression failed \u2014 fallback to node:zlib\n+      const { createInflate } = await import(\"node:zlib\");\n+      raw = await new Promise<Uint8Array>((resolve, reject) => {\n+        const inflate = createInflate();\n+        const chunks: Buffer[] = [];\n+        inflate.on(\"data\", (chunk: Buffer) => chunks.push(chunk));\n+        inflate.on(\"end\", () => {\n+          const totalLen = chunks.reduce((sum, c) => sum + c.length, 0);\n+          const data = new Uint8Array(totalLen);\n+          let pos = 0;\n+          for (const c of chunks) { data.set(c, pos); pos += c.length; }\n+          resolve(data);\n+        });\n+        inflate.on(\"error\", reject);\n+        inflate.end(Buffer.from(compressed));\n+      });\n     }\n-    if (!raw || raw.length === 0) return null;\n \n     // Parse header to extract type and content\n     const spaceIdx = raw.indexOf(0x20); // space"
+    },
+    {
+      "sha": "a6fc1ccafa0c4cb9550d0153ce6594eeada48ca6",
+      "filename": "src/packfile-builder.ts",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 1,
+      "changes": 8,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/1bb4d8575d22ccde178307b0dc748be72a797698/src%2Fpackfile-builder.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/1bb4d8575d22ccde178307b0dc748be72a797698/src%2Fpackfile-builder.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Fpackfile-builder.ts?ref=1bb4d8575d22ccde178307b0dc748be72a797698",
+      "patch": "@@ -34,7 +34,13 @@ export async function buildPackfile(\n       continue;\n     }\n \n-    const compressed = wasm.zlibDeflate(obj.content);\n+    let compressed: Uint8Array;\n+    try {\n+      compressed = wasm.zlibDeflate(obj.content);\n+    } catch {\n+      console.error(`buildPackfile: deflate crashed for ${sha1} (${obj.content.length} bytes)`);\n+      continue;\n+    }\n     if (compressed.length === 0) {\n       console.error(`buildPackfile: deflate returned 0 bytes for ${sha1} (${obj.content.length} bytes)`);\n       continue;"
+    },
+    {
+      "sha": "99fe686885d0f569774f92056847382a770db2bf",
+      "filename": "src/wasm-engine.ts",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 2,
+      "changes": 6,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/1bb4d8575d22ccde178307b0dc748be72a797698/src%2Fwasm-engine.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/1bb4d8575d22ccde178307b0dc748be72a797698/src%2Fwasm-engine.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Fwasm-engine.ts?ref=1bb4d8575d22ccde178307b0dc748be72a797698",
+      "patch": "@@ -366,6 +366,7 @@ export class WasmEngine {\n     this.exports.resetHeap();\n     const inPtr = this.writeBytes(compressed);\n     const outPtr = this.exports.alloc(maxSize);\n+    if (outPtr === 0) return new Uint8Array(0); // arena full\n     const written = this.exports.zlib_inflate(\n       inPtr,\n       compressed.length,\n@@ -394,8 +395,9 @@ export class WasmEngine {\n   zlibDeflate(data: Uint8Array): Uint8Array {\n     this.exports.resetHeap();\n     const inPtr = this.writeBytes(data);\n-    // Worst case: stored blocks add 5 bytes per 16KB + zlib header/checksum\n-    const outCap = data.length + Math.ceil(data.length / 16383) * 5 + 64;\n+    // libdeflate level 0 uses 5000-byte blocks with 5 bytes overhead each + 6 bytes zlib framing\n+    const maxBlocks = Math.max(Math.ceil(data.length / 5000), 1);\n+    const outCap = data.length + maxBlocks * 5 + 6 + 64;\n     const outPtr = this.exports.alloc(outCap);\n     const written = this.exports.zlib_deflate(\n       inPtr,"
+    },
+    {
+      "sha": "58dc3963af71e5626c63a02318bac02ebcad554c",
+      "filename": "src/wasm/gitmode.wasm",
+      "status": "modified",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/1bb4d8575d22ccde178307b0dc748be72a797698/src%2Fwasm%2Fgitmode.wasm",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/1bb4d8575d22ccde178307b0dc748be72a797698/src%2Fwasm%2Fgitmode.wasm",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Fwasm%2Fgitmode.wasm?ref=1bb4d8575d22ccde178307b0dc748be72a797698"
+    },
+    {
+      "sha": "614e7e2a0b93d94e58e2d44e7c20fa23d1363285",
+      "filename": "wasm/src/zlib.zig",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 6,
+      "changes": 28,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/1bb4d8575d22ccde178307b0dc748be72a797698/wasm%2Fsrc%2Fzlib.zig",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/1bb4d8575d22ccde178307b0dc748be72a797698/wasm%2Fsrc%2Fzlib.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/wasm%2Fsrc%2Fzlib.zig?ref=1bb4d8575d22ccde178307b0dc748be72a797698",
+      "patch": "@@ -3,6 +3,9 @@\n // Replaces Zig's std.compress.flate which crashes on ~0.01% of deflate streams.\n // libdeflate is battle-tested (used by termweb/metal0) and 2-3x faster.\n //\n+// Decompressor and compressor are allocated once at init time and reused\n+// across all calls, avoiding per-call malloc/free overhead in WASM.\n+//\n // Deflate uses compression level 0 (stored blocks) \u2014 fastest possible.\n // For a serverless git host, network bandwidth is cheap (Cloudflare egress is free)\n // and CPU time is expensive (billed per ms), so level 0 is optimal.\n@@ -12,10 +15,25 @@ const c = @cImport({\n     @cInclude(\"libdeflate.h\");\n });\n \n+// Persistent decompressor/compressor \u2014 allocated once, reused across calls\n+var global_decompressor: ?*c.libdeflate_decompressor = null;\n+var global_compressor: ?*c.libdeflate_compressor = null;\n+\n+fn getDecompressor() !*c.libdeflate_decompressor {\n+    if (global_decompressor) |d| return d;\n+    global_decompressor = c.libdeflate_alloc_decompressor() orelse return error.OutOfMemory;\n+    return global_decompressor.?;\n+}\n+\n+fn getCompressor() !*c.libdeflate_compressor {\n+    if (global_compressor) |comp| return comp;\n+    global_compressor = c.libdeflate_alloc_compressor(0) orelse return error.OutOfMemory;\n+    return global_compressor.?;\n+}\n+\n /// Decompress zlib data. Returns number of bytes written to out.\n pub fn inflate(input: []const u8, out: []u8) !usize {\n-    const decompressor = c.libdeflate_alloc_decompressor() orelse return error.OutOfMemory;\n-    defer c.libdeflate_free_decompressor(decompressor);\n+    const decompressor = try getDecompressor();\n \n     var actual_out: usize = 0;\n     const result = c.libdeflate_zlib_decompress(\n@@ -42,8 +60,7 @@ pub const InflateResult = struct {\n /// Decompress zlib data, returning both output size and input bytes consumed.\n /// This is used by the packfile reader to know where the next entry starts.\n pub fn inflateWithConsumed(input: []const u8, out: []u8) !InflateResult {\n-    const decompressor = c.libdeflate_alloc_decompressor() orelse return error.OutOfMemory;\n-    defer c.libdeflate_free_decompressor(decompressor);\n+    const decompressor = try getDecompressor();\n \n     var actual_in: usize = 0;\n     var actual_out: usize = 0;\n@@ -69,8 +86,7 @@ pub fn inflateWithConsumed(input: []const u8, out: []u8) !InflateResult {\n /// Compress data with zlib using deflate stored blocks (compression level 0).\n /// Produces valid RFC 1950 (zlib) wrapping RFC 1951 (deflate) stored blocks.\n pub fn deflate(input: []const u8, out: []u8) !usize {\n-    const compressor = c.libdeflate_alloc_compressor(0) orelse return error.OutOfMemory;\n-    defer c.libdeflate_free_compressor(compressor);\n+    const compressor = try getCompressor();\n \n     const bound = c.libdeflate_zlib_compress_bound(compressor, input.len);\n     if (bound > out.len) {"
+    }
+  ]
+}

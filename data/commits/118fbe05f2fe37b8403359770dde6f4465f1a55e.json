@@ -1,0 +1,53 @@
+{
+  "message": "fix(sync): correct notify ordering, pool fairness, rwlock starvation, and deadline safety\n\nNotify (notify.rs):\n- Reorder poll_init fast paths to check broadcast generation BEFORE\n  consuming stored notification tokens. Previously, a waiter created\n  before a broadcast would consume a notify_one token via the stored\n  notification path, even though the broadcast generation bump alone\n  should have satisfied it. This caused lost wakeups: a subsequent\n  waiter that should have received the notify_one token found it\n  already consumed. The fix ensures broadcast-era waiters prefer the\n  generation check, leaving stored tokens for post-broadcast waiters.\n- Apply the same reordering under the waiter lock to close the race\n  window between the lock-free check and the locked re-check.\n\nPool (pool.rs):\n- Add FIFO fairness enforcement to try_acquire_idle and\n  should_create_resource. Previously, a late-arriving waiter could\n  steal an idle resource or trigger creation ahead of earlier waiters\n  in the queue. Now both paths check is_next_in_line before proceeding,\n  ensuring waiters are served in registration order.\n\nRwLock (rwlock.rs):\n- Add writer_waiters > 0 check to try_write, preventing a try_write\n  caller from jumping ahead of queued writers. This closes a subtle\n  writer starvation window where repeated try_write calls could\n  indefinitely postpone pending write waiters.\n\nDeadline Monitor (deadline_monitor.rs):\n- Replace four .unwrap() calls on Instant::checked_sub with\n  unwrap_or_else(Instant::now) fallback. On platforms where the\n  monotonic clock epoch is recent, subtracting 5\u201330 seconds from\n  Instant::now() can return None, causing test panics.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "9854b2a29a2cd384de9e5ea2374fa464ac88a538",
+      "filename": "src/runtime/deadline_monitor.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 4,
+      "changes": 8,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/118fbe05f2fe37b8403359770dde6f4465f1a55e/src%2Fruntime%2Fdeadline_monitor.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/118fbe05f2fe37b8403359770dde6f4465f1a55e/src%2Fruntime%2Fdeadline_monitor.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Fdeadline_monitor.rs?ref=118fbe05f2fe37b8403359770dde6f4465f1a55e",
+      "patch": "@@ -635,7 +635,7 @@ mod tests {\n             warnings_ref.lock().push(warning.reason);\n         });\n \n-        let stale = Instant::now().checked_sub(Duration::from_secs(30)).unwrap();\n+        let stale = Instant::now().checked_sub(Duration::from_secs(30)).unwrap_or_else(Instant::now);\n         let task = make_task(\n             TaskId::new_for_test(2, 0),\n             RegionId::new_for_test(1, 0),\n@@ -853,7 +853,7 @@ mod tests {\n             warnings_ref.lock().push(warning.reason);\n         });\n \n-        let stale = Instant::now().checked_sub(Duration::from_secs(20)).unwrap();\n+        let stale = Instant::now().checked_sub(Duration::from_secs(20)).unwrap_or_else(Instant::now);\n         let task = make_task(\n             TaskId::new_for_test(4, 0),\n             RegionId::new_for_test(1, 0),\n@@ -1149,7 +1149,7 @@ mod tests {\n         let metrics = Arc::new(TestMetrics::default());\n         monitor.set_metrics_provider(metrics.clone());\n \n-        let stale = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();\n+        let stale = Instant::now().checked_sub(Duration::from_secs(10)).unwrap_or_else(Instant::now);\n         let task = make_task(\n             TaskId::new_for_test(9, 0),\n             RegionId::new_for_test(1, 0),\n@@ -1197,7 +1197,7 @@ mod tests {\n         let metrics = Arc::new(TestMetrics::default());\n         monitor.set_metrics_provider(metrics.clone());\n \n-        let first = Instant::now().checked_sub(Duration::from_secs(5)).unwrap();\n+        let first = Instant::now().checked_sub(Duration::from_secs(5)).unwrap_or_else(Instant::now);\n         let second = Instant::now();\n         let task = make_task(\n             TaskId::new_for_test(10, 0),"
+    },
+    {
+      "sha": "222d97b0d743b8b8039d69136302a39a2ef94216",
+      "filename": "src/sync/notify.rs",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 8,
+      "changes": 16,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/118fbe05f2fe37b8403359770dde6f4465f1a55e/src%2Fsync%2Fnotify.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/118fbe05f2fe37b8403359770dde6f4465f1a55e/src%2Fsync%2Fnotify.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fsync%2Fnotify.rs?ref=118fbe05f2fe37b8403359770dde6f4465f1a55e",
+      "patch": "@@ -311,28 +311,28 @@ impl Notified<'_> {\n     }\n \n     fn poll_init(&mut self, cx: &Context<'_>) -> Poll<()> {\n-        // Lock-free fast path: consume a stored notify token.\n-        if self.try_consume_stored_notification() {\n-            return self.mark_done();\n-        }\n-\n         // Lock-free fast path: observe broadcast generation bump.\n         let current_gen = self.notify.generation.load(Ordering::Acquire);\n         if current_gen != self.initial_generation {\n             return self.mark_done();\n         }\n \n+        // Lock-free fast path: consume a stored notify token.\n+        if self.try_consume_stored_notification() {\n+            return self.mark_done();\n+        }\n+\n         // Register as a waiter.\n         let mut waiters = self.notify.waiters.lock();\n \n         // Re-check conditions under waiter lock to close races with concurrent notifiers.\n-        if self.try_consume_stored_notification() {\n+        let current_gen = self.notify.generation.load(Ordering::Acquire);\n+        if current_gen != self.initial_generation {\n             drop(waiters);\n             return self.mark_done();\n         }\n \n-        let current_gen = self.notify.generation.load(Ordering::Acquire);\n-        if current_gen != self.initial_generation {\n+        if self.try_consume_stored_notification() {\n             drop(waiters);\n             return self.mark_done();\n         }"
+    },
+    {
+      "sha": "bfd8d9cb7433d95a7bbcbc24021905c8a28c88ce",
+      "filename": "src/sync/pool.rs",
+      "status": "modified",
+      "additions": 18,
+      "deletions": 6,
+      "changes": 24,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/118fbe05f2fe37b8403359770dde6f4465f1a55e/src%2Fsync%2Fpool.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/118fbe05f2fe37b8403359770dde6f4465f1a55e/src%2Fsync%2Fpool.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fsync%2Fpool.rs?ref=118fbe05f2fe37b8403359770dde6f4465f1a55e",
+      "patch": "@@ -1285,13 +1285,19 @@ where\n             }\n         }\n \n-        let result = if let Some(idle) = state.idle.pop_front() {\n-            state.active += 1;\n-            state.total_acquisitions += 1;\n-            if let Some(id) = waiter_id {\n-                state.waiters.retain(|w| w.id != id);\n+        let is_next_in_line = state.waiters.front().is_none_or(|w| Some(w.id) == waiter_id);\n+\n+        let result = if is_next_in_line {\n+            if let Some(idle) = state.idle.pop_front() {\n+                state.active += 1;\n+                state.total_acquisitions += 1;\n+                if let Some(id) = waiter_id {\n+                    state.waiters.retain(|w| w.id != id);\n+                }\n+                Some((idle.resource, idle.created_at))\n+            } else {\n+                None\n             }\n-            Some((idle.resource, idle.created_at))\n         } else {\n             None\n         };\n@@ -1313,6 +1319,12 @@ where\n         if state.closed || total >= self.config.max_size {\n             return false;\n         }\n+\n+        let is_next_in_line = state.waiters.front().is_none_or(|w| Some(w.id) == waiter_id);\n+        if !is_next_in_line {\n+            return false;\n+        }\n+\n         state.creating += 1;\n         if let Some(id) = waiter_id {\n             state.waiters.retain(|w| w.id != id);"
+    },
+    {
+      "sha": "153187ba9ac09294af9dc6c133b86eff349bc7c9",
+      "filename": "src/sync/rwlock.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/118fbe05f2fe37b8403359770dde6f4465f1a55e/src%2Fsync%2Frwlock.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/118fbe05f2fe37b8403359770dde6f4465f1a55e/src%2Fsync%2Frwlock.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fsync%2Frwlock.rs?ref=118fbe05f2fe37b8403359770dde6f4465f1a55e",
+      "patch": "@@ -284,7 +284,7 @@ impl<T> RwLock<T> {\n             return Err(TryWriteError::Poisoned);\n         }\n \n-        if state.writer_active || state.readers > 0 {\n+        if state.writer_active || state.readers > 0 || state.writer_waiters > 0 {\n             return Err(TryWriteError::Locked);\n         }\n "
+    }
+  ]
+}

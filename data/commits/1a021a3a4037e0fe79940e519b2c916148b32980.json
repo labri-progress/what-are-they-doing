@@ -1,0 +1,41 @@
+{
+  "message": "Fix BrowserReadableStream double-copy, happy_eyeballs test runtime, and loss recovery epoch\n\nbrowser_stream.rs: Eliminate intermediate allocation in the\nrate-limited read path by slicing directly into the caller's ReadBuf\nunfilled region instead of allocating a temporary vec and copying\nthrough put_slice. Uses buf.advance() for proper ReadBuf bookkeeping.\n\nhappy_eyeballs.rs: Replace futures_lite::future::block_on with the\ncrate's own runtime Builder in the dual-stack fallback test, ensuring\nthe async connect runs on the project's executor rather than a bare\nblock_on that may lack required runtime context.\n\ntransport.rs: Fix RFC 9002 congestion recovery epoch tracking \u2014\non_loss_congestion now receives the current timestamp (now_micros)\nand uses it for congestion_recovery_start_time instead of the lost\npacket's sent time. This correctly marks the start of the recovery\nepoch at detection time, not send time, preventing premature cwnd\nreductions for packets sent before the epoch but detected after.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "f9ad3ef8e8c484e50249c176ae46e6532a914a00",
+      "filename": "src/io/browser_stream.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 8,
+      "changes": 12,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/1a021a3a4037e0fe79940e519b2c916148b32980/src%2Fio%2Fbrowser_stream.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/1a021a3a4037e0fe79940e519b2c916148b32980/src%2Fio%2Fbrowser_stream.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fio%2Fbrowser_stream.rs?ref=1a021a3a4037e0fe79940e519b2c916148b32980",
+      "patch": "@@ -392,17 +392,13 @@ impl<R: AsyncRead + Unpin> AsyncRead for BrowserReadableStream<R> {\n         // taken when we are near the total-byte budget or when max_read_chunk\n         // is smaller than the caller's buffer \u2014 the common case goes direct.\n         if effective_max < remaining {\n-            let mut tmp = vec![0u8; effective_max];\n-            let mut tmp_buf = ReadBuf::new(&mut tmp);\n+            let mut tmp_buf = ReadBuf::new(&mut buf.unfilled()[..effective_max]);\n             let result = Pin::new(&mut this.source).poll_read(cx, &mut tmp_buf);\n             match &result {\n                 Poll::Ready(Ok(())) => {\n-                    let filled = tmp_buf.filled();\n-                    let n = filled.len() as u64;\n-                    if !filled.is_empty() {\n-                        buf.put_slice(filled);\n-                    }\n-                    this.total_read = this.total_read.saturating_add(n);\n+                    let n = tmp_buf.filled().len();\n+                    buf.advance(n);\n+                    this.total_read = this.total_read.saturating_add(n as u64);\n                     if n == 0 {\n                         this.state = BrowserStreamState::Closed;\n                     }"
+    },
+    {
+      "sha": "1e391465217bac86b69e4efcd4fdfac230bc619a",
+      "filename": "src/net/happy_eyeballs.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/1a021a3a4037e0fe79940e519b2c916148b32980/src%2Fnet%2Fhappy_eyeballs.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/1a021a3a4037e0fe79940e519b2c916148b32980/src%2Fnet%2Fhappy_eyeballs.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fnet%2Fhappy_eyeballs.rs?ref=1a021a3a4037e0fe79940e519b2c916148b32980",
+      "patch": "@@ -719,7 +719,8 @@ mod tests {\n             overall_timeout: Duration::from_secs(2),\n         };\n \n-        let result = futures_lite::future::block_on(connect(&addrs, &config));\n+        let runtime = crate::runtime::Builder::new().build().unwrap();\n+        let result = runtime.block_on(connect(&addrs, &config));\n         assert!(\n             result.is_ok(),\n             \"connect should succeed via second address with distinct port: {result:?}\""
+    },
+    {
+      "sha": "e09d7d8af4e4184e44fa4480ff52de2f53903ad2",
+      "filename": "src/net/quic_native/transport.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 3,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/1a021a3a4037e0fe79940e519b2c916148b32980/src%2Fnet%2Fquic_native%2Ftransport.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/1a021a3a4037e0fe79940e519b2c916148b32980/src%2Fnet%2Fquic_native%2Ftransport.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fnet%2Fquic_native%2Ftransport.rs?ref=1a021a3a4037e0fe79940e519b2c916148b32980",
+      "patch": "@@ -326,7 +326,7 @@ impl LossRecovery {\n             }\n         }\n         if let Some(lost_packet_sent_time) = newest_lost_packet_sent_micros {\n-            self.on_loss_congestion(lost_packet_sent_time);\n+            self.on_loss_congestion(lost_packet_sent_time, now_micros);\n         }\n         event\n     }\n@@ -351,14 +351,14 @@ impl LossRecovery {\n         }\n     }\n \n-    fn on_loss_congestion(&mut self, newest_lost_packet_sent_micros: u64) {\n+    fn on_loss_congestion(&mut self, newest_lost_packet_sent_micros: u64, now_micros: u64) {\n         // RFC 9002 Appendix B.6: Only reduce cwnd once per recovery epoch.\n         if let Some(recovery_start) = self.congestion_recovery_start_time {\n             if newest_lost_packet_sent_micros <= recovery_start {\n                 return;\n             }\n         }\n-        self.congestion_recovery_start_time = Some(newest_lost_packet_sent_micros);\n+        self.congestion_recovery_start_time = Some(now_micros);\n         let min_cwnd = self.max_datagram_size.saturating_mul(2);\n         let reduced = (self.congestion_window_bytes / 2).max(min_cwnd);\n         self.ssthresh_bytes = reduced;"
+    }
+  ]
+}

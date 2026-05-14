@@ -1,0 +1,29 @@
+{
+  "message": "fix: doctor detects expired vault tokens + ActiveProfile prefers named profiles\n\nTwo fixes for issue #14:\n\n1. doctor: checkAuthFiles() now inspects vault profile token expiry\n   using buildProfileHealth(). Reports expired tokens as 'fail' and\n   tokens expiring within 15min as 'warn'. System profiles (_backup_*,\n   _original) are skipped.\n\n2. authfile: ActiveProfile() now prefers user-named profiles over\n   system profiles when multiple profiles share the same identity hash.\n   Previously, _backup_* profiles sorted first alphabetically and\n   shadowed the active named profile.\n\nNote: The root cause of refresh_token_reused drift (OpenAI's single-use\nrefresh token rotation conflicting with multi-copy storage) is an\narchitectural issue requiring deeper token synchronization work.\n\nCloses #14\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "3bc4f9b761d1e163cfc45bbd2187abd8fca074cb",
+      "filename": "cmd/caam/cmd/doctor.go",
+      "status": "modified",
+      "additions": 32,
+      "deletions": 0,
+      "changes": 32,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_account_manager/blob/ca45da40e5f9b5e4edb402d525e09ba09c9b2728/cmd%2Fcaam%2Fcmd%2Fdoctor.go",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_account_manager/raw/ca45da40e5f9b5e4edb402d525e09ba09c9b2728/cmd%2Fcaam%2Fcmd%2Fdoctor.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_account_manager/contents/cmd%2Fcaam%2Fcmd%2Fdoctor.go?ref=ca45da40e5f9b5e4edb402d525e09ba09c9b2728",
+      "patch": "@@ -937,6 +937,38 @@ func checkAuthFiles() []CheckResult {\n \t\t\t\tDetails: \"Login with the tool first, then use 'caam backup' to save\",\n \t\t\t})\n \t\t}\n+\n+\t\t// Check vault profile token expiry for all non-system profiles.\n+\t\t// This catches profiles that have drifted into expired/unusable state\n+\t\t// (e.g., refresh_token_reused) which the basic auth file check misses.\n+\t\tvaultProfiles, err := vault.List(tool)\n+\t\tif err == nil {\n+\t\t\tfor _, profileName := range vaultProfiles {\n+\t\t\t\tif authfile.IsSystemProfile(profileName) {\n+\t\t\t\t\tcontinue\n+\t\t\t\t}\n+\t\t\t\tph := buildProfileHealth(tool, profileName)\n+\t\t\t\tif ph == nil || ph.TokenExpiresAt.IsZero() {\n+\t\t\t\t\tcontinue // Unknown expiry, skip\n+\t\t\t\t}\n+\t\t\t\tname := fmt.Sprintf(\"%s/%s token\", tool, profileName)\n+\t\t\t\tif ph.TokenExpiresAt.Before(time.Now()) {\n+\t\t\t\t\tresults = append(results, CheckResult{\n+\t\t\t\t\t\tName:    name,\n+\t\t\t\t\t\tStatus:  \"fail\",\n+\t\t\t\t\t\tMessage: \"token expired\",\n+\t\t\t\t\t\tDetails: fmt.Sprintf(\"Expired at %s; re-login with 'caam login %s %s'\", ph.TokenExpiresAt.Format(time.RFC3339), tool, profileName),\n+\t\t\t\t\t})\n+\t\t\t\t} else if time.Until(ph.TokenExpiresAt) < 15*time.Minute {\n+\t\t\t\t\tresults = append(results, CheckResult{\n+\t\t\t\t\t\tName:    name,\n+\t\t\t\t\t\tStatus:  \"warn\",\n+\t\t\t\t\t\tMessage: fmt.Sprintf(\"token expiring soon (%s remaining)\", formatExpiryDuration(ph.TokenExpiresAt)),\n+\t\t\t\t\t\tDetails: fmt.Sprintf(\"Consider refreshing: 'caam refresh %s %s'\", tool, profileName),\n+\t\t\t\t\t})\n+\t\t\t\t}\n+\t\t\t}\n+\t\t}\n \t}\n \n \treturn results"
+    },
+    {
+      "sha": "ac7a3700209da050ed06556ad147f43b3ee7e0a1",
+      "filename": "internal/authfile/authfile.go",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 3,
+      "changes": 17,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_account_manager/blob/ca45da40e5f9b5e4edb402d525e09ba09c9b2728/internal%2Fauthfile%2Fauthfile.go",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_account_manager/raw/ca45da40e5f9b5e4edb402d525e09ba09c9b2728/internal%2Fauthfile%2Fauthfile.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_account_manager/contents/internal%2Fauthfile%2Fauthfile.go?ref=ca45da40e5f9b5e4edb402d525e09ba09c9b2728",
+      "patch": "@@ -811,7 +811,13 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {\n \t\treturn \"\", nil // No relevant auth files present\n \t}\n \n-\t// Compare with each profile\n+\t// Compare with each profile.\n+\t// Prefer user-named profiles over system profiles (_backup_*, _original,\n+\t// _auto_backup_*). System profiles can share the same identity as a named\n+\t// profile (same account re-authenticated), and because they sort\n+\t// alphabetically before most user names (underscore < lowercase letters),\n+\t// they would otherwise shadow the intended named profile.\n+\tvar systemMatch string\n \tfor _, profile := range profiles {\n \t\tprofileDir := v.ProfilePath(fileSet.Tool, profile)\n \t\tmatches := true\n@@ -830,11 +836,16 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {\n \t\t}\n \n \t\tif matches {\n-\t\t\treturn profile, nil\n+\t\t\tif !IsSystemProfile(profile) {\n+\t\t\t\treturn profile, nil // Prefer user-named profiles\n+\t\t\t}\n+\t\t\tif systemMatch == \"\" {\n+\t\t\t\tsystemMatch = profile // Remember first system match as fallback\n+\t\t\t}\n \t\t}\n \t}\n \n-\treturn \"\", nil // No matching profile found\n+\treturn systemMatch, nil // Fall back to system profile, or \"\" if no match\n }\n \n // HasAuthFiles checks if the tool currently has auth files present."
+    }
+  ]
+}

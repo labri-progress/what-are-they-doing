@@ -1,0 +1,161 @@
+{
+  "message": "fix: nil guards, deterministic map trimming, safe watcher stop, and multiple robustness fixes\n\ncmd/bv:\n- Make map trimming deterministic: sort by value descending then key\n  ascending before truncating, instead of non-deterministic Go map\n  iteration order.\n- Add nil guard for dependency pointers in depGraph construction.\n- Fix copyFile to close dst before returning so write errors are caught.\n- Populate beads_closed during history export deduplication pass.\n\ninternal/datasource:\n- Fix validate.go: allow MaxJSONLErrorRate of 0.0 (was being overwritten\n  with default 0.10 due to zero-value check).\n- Make SourceWatcher.Stop() safe to call multiple times via sync.Once.\n\npkg/analysis:\n- Add default branch to Snapshot.computeCounts so non-closed statuses\n  (deferred, draft, etc.) count as open.\n- Guard ComputeHistoricalVelocity against numWeeks <= 0 (default to 8).\n- Fix GetVelocityTrend to use len(WeeklyVelocity) instead of\n  WeeksAnalyzed field for half-point calculation.\n\npkg/correlation:\n- Use map existence checks in buildHistories before assigning events\n  and commits to avoid nil map assignment.\n- Clamp normalized confidence to [0,1] in ExplainConfidence scorer.\n- Populate BeadID in TemporalCorrelator FindCommitsInWindow results.\n\npkg/testutil:\n- Add nil guards for dependency pointers in AssertDependencyExists,\n  AssertNoCycles, and AssertHasCycle.\n\npkg/ui:\n- Add bounds check for selectedIdx in GraphModel.SelectedIssue/View.\n- Add nil guard for comment pointers in model.go viewport rendering.\n- Use UTF-8-safe rune truncation in velocity_comparison label display.\n\ncmd/bv/search_output.go:\n- Use shared newRobotEncoder helper for consistent JSON output formatting.\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "de599e0979d9a04c6f1d176c5dc6a92b0accc284",
+      "filename": "cmd/bv/main.go",
+      "status": "modified",
+      "additions": 35,
+      "deletions": 8,
+      "changes": 43,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_viewer/blob/3e8516cb754acd015373c5e4b80336b091774a17/cmd%2Fbv%2Fmain.go",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_viewer/raw/3e8516cb754acd015373c5e4b80336b091774a17/cmd%2Fbv%2Fmain.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_viewer/contents/cmd%2Fbv%2Fmain.go?ref=3e8516cb754acd015373c5e4b80336b091774a17",
+      "patch": "@@ -308,6 +308,11 @@ func main() {\n \t\t*robotBlockerChain != \"\" ||\n \t\t*robotImpactNetwork != \"\" ||\n \t\t*robotCausality != \"\" ||\n+\t\t*robotOrphans ||\n+\t\t*robotExplainCorrelation != \"\" ||\n+\t\t*robotConfirmCorrelation != \"\" ||\n+\t\t*robotRejectCorrelation != \"\" ||\n+\t\t*robotCorrelationStats ||\n \t\t*robotSprintList ||\n \t\t*robotSprintShow != \"\" ||\n \t\t*robotForecast != \"\" ||\n@@ -2604,14 +2609,23 @@ func main() {\n \t\t\tif limit <= 0 || len(m) <= limit {\n \t\t\t\treturn m\n \t\t\t}\n-\t\t\ttrim := make(map[string]int, limit)\n-\t\t\tcount := 0\n+\t\t\ttype kv struct {\n+\t\t\t\tk string\n+\t\t\t\tv int\n+\t\t\t}\n+\t\t\tvar items []kv\n \t\t\tfor k, v := range m {\n-\t\t\t\ttrim[k] = v\n-\t\t\t\tcount++\n-\t\t\t\tif count >= limit {\n-\t\t\t\t\tbreak\n+\t\t\t\titems = append(items, kv{k, v})\n+\t\t\t}\n+\t\t\tsort.Slice(items, func(i, j int) bool {\n+\t\t\t\tif items[i].v == items[j].v {\n+\t\t\t\t\treturn items[i].k < items[j].k\n \t\t\t\t}\n+\t\t\t\treturn items[i].v > items[j].v\n+\t\t\t})\n+\t\t\ttrim := make(map[string]int, limit)\n+\t\t\tfor i := 0; i < limit; i++ {\n+\t\t\t\ttrim[items[i].k] = items[i].v\n \t\t\t}\n \t\t\treturn trim\n \t\t}\n@@ -4014,6 +4028,9 @@ func main() {\n \t\tdepGraph := make(map[string][]string)\n \t\tfor _, issue := range issues {\n \t\t\tfor _, dep := range issue.Dependencies {\n+\t\t\t\tif dep == nil {\n+\t\t\t\t\tcontinue\n+\t\t\t\t}\n \t\t\t\tdepGraph[issue.ID] = append(depGraph[issue.ID], dep.DependsOnID)\n \t\t\t}\n \t\t}\n@@ -4108,6 +4125,11 @@ func main() {\n \t\t\tos.Exit(1)\n \t\t}\n \n+\t\tif err := correlation.ValidateRepository(cwd); err != nil {\n+\t\t\tfmt.Fprintf(os.Stderr, \"Error: %v\\n\", err)\n+\t\t\tos.Exit(1)\n+\t\t}\n+\n \t\t// Find beads path\n \t\tbeadsDir, err := loader.GetBeadsDir(\"\")\n \t\tif err != nil {\n@@ -5939,9 +5961,11 @@ func copyFile(src, dst string) error {\n \tif err != nil {\n \t\treturn err\n \t}\n-\tdefer dstFile.Close()\n \n \t_, err = io.Copy(dstFile, srcFile)\n+\tif closeErr := dstFile.Close(); err == nil {\n+\t\terr = closeErr\n+\t}\n \treturn err\n }\n \n@@ -7415,13 +7439,16 @@ func generateHistoryForExport(issues []model.Issue) (*TimeTravelHistory, error)\n \t// Convert map to sorted slice\n \tvar commits []TimeTravelCommit\n \tfor _, commit := range commitMap {\n-\t\t// Deduplicate beads_added\n+\t\t// Deduplicate beads_added and populate beads_closed\n \t\tseen := make(map[string]bool)\n \t\tvar dedupedAdded []string\n \t\tfor _, id := range commit.BeadsAdded {\n \t\t\tif !seen[id] {\n \t\t\t\tseen[id] = true\n \t\t\t\tdedupedAdded = append(dedupedAdded, id)\n+\t\t\t\tif issueStatusMap[id] {\n+\t\t\t\t\tcommit.BeadsClosed = append(commit.BeadsClosed, id)\n+\t\t\t\t}\n \t\t\t}\n \t\t}\n \t\tcommit.BeadsAdded = dedupedAdded"
+    },
+    {
+      "sha": "51592736a76fc34f29a9d01542238b59901c8d03",
+      "filename": "cmd/bv/search_output.go",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 3,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_viewer/blob/3e8516cb754acd015373c5e4b80336b091774a17/cmd%2Fbv%2Fsearch_output.go",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_viewer/raw/3e8516cb754acd015373c5e4b80336b091774a17/cmd%2Fbv%2Fsearch_output.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_viewer/contents/cmd%2Fbv%2Fsearch_output.go?ref=3e8516cb754acd015373c5e4b80336b091774a17",
+      "patch": "@@ -1,7 +1,6 @@\n package main\n \n import (\n-\t\"encoding/json\"\n \t\"fmt\"\n \t\"io\"\n \t\"regexp\"\n@@ -38,8 +37,7 @@ type robotSearchOutput struct {\n }\n \n func writeRobotSearchOutput(w io.Writer, out robotSearchOutput) error {\n-\tenc := json.NewEncoder(w)\n-\tenc.SetIndent(\"\", \"  \")\n+\tenc := newRobotEncoder(w)\n \treturn enc.Encode(out)\n }\n "
+    },
+    {
+      "sha": "dc2f7f1a2cd1ea75e8f54df52c8fc8e7e70e0d8f",
+      "filename": "internal/datasource/validate.go",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_viewer/blob/3e8516cb754acd015373c5e4b80336b091774a17/internal%2Fdatasource%2Fvalidate.go",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_viewer/raw/3e8516cb754acd015373c5e4b80336b091774a17/internal%2Fdatasource%2Fvalidate.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_viewer/contents/internal%2Fdatasource%2Fvalidate.go?ref=3e8516cb754acd015373c5e4b80336b091774a17",
+      "patch": "@@ -50,7 +50,7 @@ func ValidateSourceWithOptions(source *DataSource, opts ValidationOptions) error\n \tif opts.Logger == nil {\n \t\topts.Logger = func(string) {}\n \t}\n-\tif opts.MaxJSONLErrorRate == 0 {\n+\tif opts.MaxJSONLErrorRate < 0 {\n \t\topts.MaxJSONLErrorRate = 0.10\n \t}\n \tif len(opts.RequiredFields) == 0 {"
+    },
+    {
+      "sha": "e430ad1f394649bd935a825c174225c46787b39f",
+      "filename": "internal/datasource/watch.go",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 3,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_viewer/blob/3e8516cb754acd015373c5e4b80336b091774a17/internal%2Fdatasource%2Fwatch.go",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_viewer/raw/3e8516cb754acd015373c5e4b80336b091774a17/internal%2Fdatasource%2Fwatch.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_viewer/contents/internal%2Fdatasource%2Fwatch.go?ref=3e8516cb754acd015373c5e4b80336b091774a17",
+      "patch": "@@ -17,6 +17,7 @@ type SourceWatcher struct {\n \tlastChange  map[string]time.Time\n \tmu          sync.Mutex\n \tdone        chan struct{}\n+\tstopOnce    sync.Once\n \tverbose     bool\n \tlogger      func(msg string)\n }\n@@ -86,10 +87,12 @@ func (sw *SourceWatcher) Start() {\n \tgo sw.run()\n }\n \n-// Stop stops watching for file changes\n+// Stop stops watching for file changes. Safe to call multiple times.\n func (sw *SourceWatcher) Stop() {\n-\tclose(sw.done)\n-\tsw.watcher.Close()\n+\tsw.stopOnce.Do(func() {\n+\t\tclose(sw.done)\n+\t\tsw.watcher.Close()\n+\t})\n }\n \n // run is the main event loop for the watcher"
+    },
+    {
+      "sha": "4d2569b4b2f32269cff40e3365e7d042905902f6",
+      "filename": "pkg/analysis/diff.go",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_viewer/blob/3e8516cb754acd015373c5e4b80336b091774a17/pkg%2Fanalysis%2Fdiff.go",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_viewer/raw/3e8516cb754acd015373c5e4b80336b091774a17/pkg%2Fanalysis%2Fdiff.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_viewer/contents/pkg%2Fanalysis%2Fdiff.go?ref=3e8516cb754acd015373c5e4b80336b091774a17",
+      "patch": "@@ -63,6 +63,10 @@ func (s *Snapshot) computeCounts() {\n \t\t\ts.OpenCount++ // Blocked is a type of open\n \t\tcase model.StatusOpen, model.StatusInProgress:\n \t\t\ts.OpenCount++\n+\t\tdefault:\n+\t\t\t// Other non-closed statuses (deferred, draft, pinned, hooked, review)\n+\t\t\t// are still open work items\n+\t\t\ts.OpenCount++\n \t\t}\n \t}\n }"
+    },
+    {
+      "sha": "1c61e3a05b3193cbf02f9adaf0a50d9a77ab5c17",
+      "filename": "pkg/analysis/label_health.go",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 3,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_viewer/blob/3e8516cb754acd015373c5e4b80336b091774a17/pkg%2Fanalysis%2Flabel_health.go",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_viewer/raw/3e8516cb754acd015373c5e4b80336b091774a17/pkg%2Fanalysis%2Flabel_health.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_viewer/contents/pkg%2Fanalysis%2Flabel_health.go?ref=3e8516cb754acd015373c5e4b80336b091774a17",
+      "patch": "@@ -2081,6 +2081,9 @@ func (r *LabelAttentionResult) GetLabelAttention(label string) *LabelAttentionSc\n // This enables trend analysis, anomaly detection, and forecasting.\n // Uses ClosedAt timestamps from issues to bucket closures into weeks.\n func ComputeHistoricalVelocity(issues []model.Issue, label string, numWeeks int, now time.Time) HistoricalVelocity {\n+\tif numWeeks <= 0 {\n+\t\tnumWeeks = 8\n+\t}\n \tresult := HistoricalVelocity{\n \t\tLabel:          label,\n \t\tWeeklyVelocity: make([]WeeklySnapshot, numWeeks),\n@@ -2237,18 +2240,19 @@ func ComputeAllHistoricalVelocity(issues []model.Issue, numWeeks int, now time.T\n // GetVelocityTrend analyzes the historical velocity to detect trends\n // Returns \"accelerating\", \"decelerating\", \"stable\", or \"erratic\"\n func (hv *HistoricalVelocity) GetVelocityTrend() string {\n-\tif hv.WeeksAnalyzed < 4 {\n+\tn := len(hv.WeeklyVelocity)\n+\tif n < 4 {\n \t\treturn \"insufficient_data\"\n \t}\n \n \t// Compare first half vs second half of the period\n-\thalfPoint := hv.WeeksAnalyzed / 2\n+\thalfPoint := n / 2\n \tvar recentSum, olderSum int\n \n \tfor i := 0; i < halfPoint; i++ {\n \t\trecentSum += hv.WeeklyVelocity[i].Closed\n \t}\n-\tfor i := halfPoint; i < hv.WeeksAnalyzed; i++ {\n+\tfor i := halfPoint; i < n; i++ {\n \t\tolderSum += hv.WeeklyVelocity[i].Closed\n \t}\n "
+    },
+    {
+      "sha": "27fbdb55f14e4b91aa9ea974d2fff1913a8408b7",
+      "filename": "pkg/correlation/correlator.go",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 2,
+      "changes": 8,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_viewer/blob/3e8516cb754acd015373c5e4b80336b091774a17/pkg%2Fcorrelation%2Fcorrelator.go",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_viewer/raw/3e8516cb754acd015373c5e4b80336b091774a17/pkg%2Fcorrelation%2Fcorrelator.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_viewer/contents/pkg%2Fcorrelation%2Fcorrelator.go?ref=3e8516cb754acd015373c5e4b80336b091774a17",
+      "patch": "@@ -159,8 +159,12 @@ func (c *Correlator) buildHistories(beads []BeadInfo, events []BeadEvent, commit\n \n \t// Build complete histories\n \tfor beadID, history := range histories {\n-\t\thistory.Events = eventsByBead[beadID]\n-\t\thistory.Commits = dedupCommits(commitsByBead[beadID])\n+\t\tif events, ok := eventsByBead[beadID]; ok {\n+\t\t\thistory.Events = events\n+\t\t}\n+\t\tif commits, ok := commitsByBead[beadID]; ok {\n+\t\t\thistory.Commits = dedupCommits(commits)\n+\t\t}\n \n \t\t// Calculate milestones\n \t\thistory.Milestones = GetBeadMilestones(history.Events)"
+    },
+    {
+      "sha": "a00e7dc2233ab07e1e3e901f17afc76c250fb72a",
+      "filename": "pkg/correlation/scorer.go",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_viewer/blob/3e8516cb754acd015373c5e4b80336b091774a17/pkg%2Fcorrelation%2Fscorer.go",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_viewer/raw/3e8516cb754acd015373c5e4b80336b091774a17/pkg%2Fcorrelation%2Fscorer.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_viewer/contents/pkg%2Fcorrelation%2Fscorer.go?ref=3e8516cb754acd015373c5e4b80336b091774a17",
+      "patch": "@@ -144,6 +144,12 @@ func (s *Scorer) ExplainConfidence(method CorrelationMethod, confidence float64,\n \t\trange_ = 1.0 // Avoid division by zero\n \t}\n \tnormalized := (confidence - r.Min) / range_\n+\tif normalized < 0 {\n+\t\tnormalized = 0\n+\t}\n+\tif normalized > 1 {\n+\t\tnormalized = 1\n+\t}\n \n \tswitch {\n \tcase normalized >= 0.8:"
+    },
+    {
+      "sha": "8ac031d555174fd2659492e07e6770c51ab31dbc",
+      "filename": "pkg/correlation/temporal.go",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_viewer/blob/3e8516cb754acd015373c5e4b80336b091774a17/pkg%2Fcorrelation%2Ftemporal.go",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_viewer/raw/3e8516cb754acd015373c5e4b80336b091774a17/pkg%2Fcorrelation%2Ftemporal.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_viewer/contents/pkg%2Fcorrelation%2Ftemporal.go?ref=3e8516cb754acd015373c5e4b80336b091774a17",
+      "patch": "@@ -122,6 +122,7 @@ func (t *TemporalCorrelator) FindCommitsInWindow(window TemporalWindow) ([]Corre\n \t\treason := t.generateTemporalReason(window, files, pathHints)\n \n \t\tcommits = append(commits, CorrelatedCommit{\n+\t\t\tBeadID:      window.BeadID,\n \t\t\tSHA:         sha,\n \t\t\tShortSHA:    shortSHA(sha),\n \t\t\tMessage:     info.Message,"
+    },
+    {
+      "sha": "57c96ca109f9228d79a20a09410a6942bdddeb0b",
+      "filename": "pkg/testutil/assertions.go",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 1,
+      "changes": 8,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_viewer/blob/3e8516cb754acd015373c5e4b80336b091774a17/pkg%2Ftestutil%2Fassertions.go",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_viewer/raw/3e8516cb754acd015373c5e4b80336b091774a17/pkg%2Ftestutil%2Fassertions.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_viewer/contents/pkg%2Ftestutil%2Fassertions.go?ref=3e8516cb754acd015373c5e4b80336b091774a17",
+      "patch": "@@ -47,7 +47,7 @@ func AssertDependencyExists(t *testing.T, issues []model.Issue, fromID, toID str\n \tfor _, issue := range issues {\n \t\tif issue.ID == fromID {\n \t\t\tfor _, dep := range issue.Dependencies {\n-\t\t\t\tif dep.DependsOnID == toID {\n+\t\t\t\tif dep != nil && dep.DependsOnID == toID {\n \t\t\t\t\treturn\n \t\t\t\t}\n \t\t\t}\n@@ -67,6 +67,9 @@ func AssertNoCycles(t *testing.T, issues []model.Issue) {\n \tadj := make(map[string][]string)\n \tfor _, issue := range issues {\n \t\tfor _, dep := range issue.Dependencies {\n+\t\t\tif dep == nil {\n+\t\t\t\tcontinue\n+\t\t\t}\n \t\t\tadj[issue.ID] = append(adj[issue.ID], dep.DependsOnID)\n \t\t}\n \t}\n@@ -110,6 +113,9 @@ func AssertHasCycle(t *testing.T, issues []model.Issue) {\n \tadj := make(map[string][]string)\n \tfor _, issue := range issues {\n \t\tfor _, dep := range issue.Dependencies {\n+\t\t\tif dep == nil {\n+\t\t\t\tcontinue\n+\t\t\t}\n \t\t\tadj[issue.ID] = append(adj[issue.ID], dep.DependsOnID)\n \t\t}\n \t}"
+    },
+    {
+      "sha": "95310559e5aced3437ef761586965df3a5850091",
+      "filename": "pkg/ui/graph.go",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_viewer/blob/3e8516cb754acd015373c5e4b80336b091774a17/pkg%2Fui%2Fgraph.go",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_viewer/raw/3e8516cb754acd015373c5e4b80336b091774a17/pkg%2Fui%2Fgraph.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_viewer/contents/pkg%2Fui%2Fgraph.go?ref=3e8516cb754acd015373c5e4b80336b091774a17",
+      "patch": "@@ -261,7 +261,7 @@ func (g *GraphModel) ScrollRight() {}\n func (g *GraphModel) ensureVisible() {}\n \n func (g *GraphModel) SelectedIssue() *model.Issue {\n-\tif len(g.sortedIDs) == 0 {\n+\tif len(g.sortedIDs) == 0 || g.selectedIdx < 0 || g.selectedIdx >= len(g.sortedIDs) {\n \t\treturn nil\n \t}\n \tid := g.sortedIDs[g.selectedIdx]\n@@ -290,7 +290,7 @@ func (g *GraphModel) View(width, height int) string {\n \tg.height = height\n \tt := g.theme\n \n-\tif len(g.sortedIDs) == 0 {\n+\tif len(g.sortedIDs) == 0 || g.selectedIdx < 0 || g.selectedIdx >= len(g.sortedIDs) {\n \t\treturn t.Renderer.NewStyle().\n \t\t\tWidth(width).\n \t\t\tHeight(height)."
+    },
+    {
+      "sha": "17db85869e62bfc7b0037448a34a7cd27f07f8eb",
+      "filename": "pkg/ui/model.go",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_viewer/blob/3e8516cb754acd015373c5e4b80336b091774a17/pkg%2Fui%2Fmodel.go",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_viewer/raw/3e8516cb754acd015373c5e4b80336b091774a17/pkg%2Fui%2Fmodel.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_viewer/contents/pkg%2Fui%2Fmodel.go?ref=3e8516cb754acd015373c5e4b80336b091774a17",
+      "patch": "@@ -6915,6 +6915,9 @@ func (m *Model) updateViewportContent() {\n \tif len(item.Comments) > 0 {\n \t\tsb.WriteString(fmt.Sprintf(\"### Comments (%d)\\n\", len(item.Comments)))\n \t\tfor _, comment := range item.Comments {\n+\t\t\tif comment == nil {\n+\t\t\t\tcontinue\n+\t\t\t}\n \t\t\tsb.WriteString(fmt.Sprintf(\"> **%s** (%s)\\n> \\n> %s\\n\\n\",\n \t\t\t\tcomment.Author,\n \t\t\t\tFormatTimeRel(comment.CreatedAt),"
+    },
+    {
+      "sha": "c1eec80a5065cae393432a60dfc9c105cb1ad50f",
+      "filename": "pkg/ui/velocity_comparison.go",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 5,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_viewer/blob/3e8516cb754acd015373c5e4b80336b091774a17/pkg%2Fui%2Fvelocity_comparison.go",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_viewer/raw/3e8516cb754acd015373c5e4b80336b091774a17/pkg%2Fui%2Fvelocity_comparison.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_viewer/contents/pkg%2Fui%2Fvelocity_comparison.go?ref=3e8516cb754acd015373c5e4b80336b091774a17",
+      "patch": "@@ -256,11 +256,8 @@ func (m *VelocityComparisonModel) View() string {\n \t\t\t\t\tBackground(ThemeBg(\"#333\"))\n \t\t\t}\n \n-\t\t\t// Truncate label if needed\n-\t\t\tdisplayLabel := row.Label\n-\t\t\tif len(displayLabel) > labelWidth {\n-\t\t\t\tdisplayLabel = displayLabel[:labelWidth-1] + \"\u2026\"\n-\t\t\t}\n+\t\t\t// Truncate label if needed (UTF-8 safe)\n+\t\t\tdisplayLabel := truncateRunesHelper(row.Label, labelWidth, \"\u2026\")\n \n \t\t\t// Format trend with color\n \t\t\ttrendStyle := t.Renderer.NewStyle()"
+    }
+  ]
+}

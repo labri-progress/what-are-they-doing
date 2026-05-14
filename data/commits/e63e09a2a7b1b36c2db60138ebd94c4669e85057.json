@@ -1,0 +1,89 @@
+{
+  "message": "fix(runtime): session channel send fallibility, IO flush-before-shutdown, NATS sync close, timer wheel modulo\n\nFour independent correctness fixes across runtime subsystems:\n\n1. TrackedPermit::send() now returns Result<CommittedProof, SendError>\n   instead of infallibly consuming the permit. If the receiver was dropped\n   between reserve() and send(), the obligation is properly aborted rather\n   than committed for a delivery that never happened. Tests updated to\n   unwrap the new Result.\n\n2. Bidirectional IO copy (copy.rs) now flushes the write side before\n   initiating shutdown, in both A\u2192B and B\u2192A transfer directions. Without\n   this, buffered data could be lost when the write side has pending bytes\n   at the time poll_shutdown is called.\n\n3. HTTP/1.1 server (server.rs) now gracefully shuts down the connection\n   via AsyncWriteExt::shutdown() after the request loop completes, ensuring\n   TLS close_notify is sent and the peer observes clean connection closure.\n\n4. NatsClient::close() converted from async to sync (the body was already\n   synchronous, evidenced by the clippy::unused_async allow). Now also\n   calls stream.shutdown(Both) to close the TCP socket immediately rather\n   than relying on drop ordering.\n\n5. Timer wheel modulo fix (intrusive_wheel.rs + wheel.rs): slot index\n   computation now applies modulo before casting to usize, preventing\n   truncation on 32-bit targets where large tick values would wrap\n   incorrectly. Changed from `(tick as usize) % SLOTS` to\n   `(tick % (SLOTS as u128/u64)) as usize`.\n\n6. src/types/cancel.rs: rustfmt on severity test assertions.\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "fc999e027d62819e6991c783c75e96a63c31fff9",
+      "filename": "src/channel/session.rs",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 7,
+      "changes": 22,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/e63e09a2a7b1b36c2db60138ebd94c4669e85057/src%2Fchannel%2Fsession.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/e63e09a2a7b1b36c2db60138ebd94c4669e85057/src%2Fchannel%2Fsession.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fchannel%2Fsession.rs?ref=e63e09a2a7b1b36c2db60138ebd94c4669e85057",
+      "patch": "@@ -147,11 +147,19 @@ pub struct TrackedPermit<'a, T> {\n \n impl<T> TrackedPermit<'_, T> {\n     /// Sends a value, consuming the permit and returning a [`CommittedProof`].\n-    #[must_use]\n-    pub fn send(self, value: T) -> CommittedProof<SendPermit> {\n+    ///\n+    /// # Errors\n+    ///\n+    /// Returns an error if the receiver was dropped before the value could be sent.\n+    pub fn send(self, value: T) -> Result<CommittedProof<SendPermit>, mpsc::SendError<T>> {\n         let Self { permit, obligation } = self;\n-        permit.send(value);\n-        obligation.commit()\n+        match permit.try_send(value) {\n+            Ok(()) => Ok(obligation.commit()),\n+            Err(e) => {\n+                let _aborted = obligation.abort();\n+                Err(e)\n+            }\n+        }\n     }\n \n     /// Sends a value, returning an error if the receiver was dropped.\n@@ -372,7 +380,7 @@ mod tests {\n         let (tx, mut rx) = tracked_channel::<i32>(10);\n \n         let permit = block_on(tx.reserve(&cx)).expect(\"reserve failed\");\n-        let proof = permit.send(42);\n+        let proof = permit.send(42).unwrap();\n \n         crate::assert_with_log!(\n             proof.kind() == crate::record::ObligationKind::SendPermit,\n@@ -406,7 +414,7 @@ mod tests {\n \n         // Slot was released \u2014 we can reserve again.\n         let permit2 = block_on(tx.reserve(&cx)).expect(\"second reserve failed\");\n-        let _ = permit2.send(99);\n+        let _ = permit2.send(99).unwrap();\n \n         let value = block_on(rx.recv(&cx)).expect(\"recv failed\");\n         crate::assert_with_log!(value == 99, \"recv value after abort\", 99, value);\n@@ -434,7 +442,7 @@ mod tests {\n         let (tx, mut rx) = tracked_channel::<i32>(10);\n \n         let permit = tx.try_reserve().expect(\"try_reserve failed\");\n-        let proof = permit.send(7);\n+        let proof = permit.send(7).unwrap();\n \n         crate::assert_with_log!(\n             proof.kind() == crate::record::ObligationKind::SendPermit,"
+    },
+    {
+      "sha": "4dd5d1ebcba33f95348f93ec401c33f7bcaca596",
+      "filename": "src/http/h1/server.rs",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 1,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/e63e09a2a7b1b36c2db60138ebd94c4669e85057/src%2Fhttp%2Fh1%2Fserver.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/e63e09a2a7b1b36c2db60138ebd94c4669e85057/src%2Fhttp%2Fh1%2Fserver.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fhttp%2Fh1%2Fserver.rs?ref=e63e09a2a7b1b36c2db60138ebd94c4669e85057",
+      "patch": "@@ -9,7 +9,7 @@ use crate::codec::Framed;\n use crate::cx::Cx;\n use crate::http::h1::codec::{Http1Codec, HttpError};\n use crate::http::h1::types::{Request, Response, Version};\n-use crate::io::{AsyncRead, AsyncWrite};\n+use crate::io::{AsyncRead, AsyncWrite, AsyncWriteExt};\n use crate::server::shutdown::ShutdownSignal;\n use crate::stream::Stream;\n use crate::time::{timeout, wall_now};\n@@ -370,6 +370,10 @@ where\n             }\n         }\n \n+        // Gracefully shutdown the connection\n+        let mut io = framed.into_inner();\n+        let _ = io.shutdown().await;\n+\n         Ok(state)\n     }\n }"
+    },
+    {
+      "sha": "b64ca2f61087c3ab7916c83d49f88909b57545e5",
+      "filename": "src/io/copy.rs",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 2,
+      "changes": 24,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/e63e09a2a7b1b36c2db60138ebd94c4669e85057/src%2Fio%2Fcopy.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/e63e09a2a7b1b36c2db60138ebd94c4669e85057/src%2Fio%2Fcopy.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fio%2Fcopy.rs?ref=e63e09a2a7b1b36c2db60138ebd94c4669e85057",
+      "patch": "@@ -503,8 +503,18 @@ where\n             }\n         }\n \n-        // 2. If read from A is done and buffer is empty, shutdown B and finish\n+        // 2. If read from A is done and buffer is empty, flush B, shutdown B and finish\n         if state.read_done {\n+            if state.need_flush {\n+                match Pin::new(&mut *self.b).poll_flush(cx) {\n+                    Poll::Pending => return TransferResult::Pending,\n+                    Poll::Ready(Err(err)) => return TransferResult::Error(err),\n+                    Poll::Ready(Ok(())) => {\n+                        state.need_flush = false;\n+                        return TransferResult::Progress;\n+                    }\n+                }\n+            }\n             if !state.shutdown_done {\n                 match Pin::new(&mut *self.b).poll_shutdown(cx) {\n                     Poll::Pending => return TransferResult::Pending,\n@@ -574,8 +584,18 @@ where\n             }\n         }\n \n-        // 2. If read from B is done and buffer is empty, shutdown A and finish\n+        // 2. If read from B is done and buffer is empty, flush A, shutdown A and finish\n         if state.read_done {\n+            if state.need_flush {\n+                match Pin::new(&mut *self.a).poll_flush(cx) {\n+                    Poll::Pending => return TransferResult::Pending,\n+                    Poll::Ready(Err(err)) => return TransferResult::Error(err),\n+                    Poll::Ready(Ok(())) => {\n+                        state.need_flush = false;\n+                        return TransferResult::Progress;\n+                    }\n+                }\n+            }\n             if !state.shutdown_done {\n                 match Pin::new(&mut *self.a).poll_shutdown(cx) {\n                     Poll::Pending => return TransferResult::Pending,"
+    },
+    {
+      "sha": "b2ce12195de1af8326bed9a1255196ffca304a08",
+      "filename": "src/messaging/nats.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 2,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/e63e09a2a7b1b36c2db60138ebd94c4669e85057/src%2Fmessaging%2Fnats.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/e63e09a2a7b1b36c2db60138ebd94c4669e85057/src%2Fmessaging%2Fnats.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fmessaging%2Fnats.rs?ref=e63e09a2a7b1b36c2db60138ebd94c4669e85057",
+      "patch": "@@ -1096,8 +1096,7 @@ impl NatsClient {\n     }\n \n     /// Close the connection.\n-    #[allow(clippy::unused_async)]\n-    pub async fn close(&mut self, cx: &Cx) -> Result<(), NatsError> {\n+    pub fn close(&mut self, cx: &Cx) -> Result<(), NatsError> {\n         cx.checkpoint().map_err(|_| NatsError::Cancelled)?;\n \n         self.state.closed.store(true, Ordering::Release);\n@@ -1108,6 +1107,9 @@ impl NatsClient {\n             subs.clear();\n         }\n \n+        if self.connected {\n+            let _ = self.stream.shutdown(std::net::Shutdown::Both);\n+        }\n         self.connected = false;\n         Ok(())\n     }"
+    },
+    {
+      "sha": "3312a62f17d1acda47a7e9efe9531d72ea9e28e9",
+      "filename": "src/time/intrusive_wheel.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 3,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/e63e09a2a7b1b36c2db60138ebd94c4669e85057/src%2Ftime%2Fintrusive_wheel.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/e63e09a2a7b1b36c2db60138ebd94c4669e85057/src%2Ftime%2Fintrusive_wheel.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Ftime%2Fintrusive_wheel.rs?ref=e63e09a2a7b1b36c2db60138ebd94c4669e85057",
+      "patch": "@@ -395,7 +395,7 @@ impl<const SLOTS: usize> TimerWheel<SLOTS> {\n         let elapsed = deadline.saturating_duration_since(self.base_time);\n         let ticks = elapsed.as_nanos() / self.resolution.as_nanos().max(1);\n         let safe_ticks = ticks.max(u128::from(self.current_tick));\n-        (safe_ticks as usize) % SLOTS\n+        (safe_ticks % (SLOTS as u128)) as usize\n     }\n \n     /// Inserts a timer node with the given deadline.\n@@ -485,9 +485,9 @@ impl<const SLOTS: usize> TimerWheel<SLOTS> {\n                 self.count = self.count.saturating_sub(wakers.len());\n                 all_wakers.extend(wakers);\n             }\n-            self.current = (target_tick_u64 as usize) % SLOTS;\n+            self.current = (target_tick_u64 % (SLOTS as u64)) as usize;\n         } else {\n-            let target_slot = (target_tick_u64 as usize) % SLOTS;\n+            let target_slot = (target_tick_u64 % (SLOTS as u64)) as usize;\n \n             // Process slots until we reach target (handling wrap-around)\n             while self.current != target_slot {"
+    },
+    {
+      "sha": "bb6484a9841d5b39e939edf599cab4be2e9d6f9e",
+      "filename": "src/time/wheel.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 3,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/e63e09a2a7b1b36c2db60138ebd94c4669e85057/src%2Ftime%2Fwheel.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/e63e09a2a7b1b36c2db60138ebd94c4669e85057/src%2Ftime%2Fwheel.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Ftime%2Fwheel.rs?ref=e63e09a2a7b1b36c2db60138ebd94c4669e85057",
+      "patch": "@@ -535,7 +535,7 @@ impl TimerWheel {\n         for (idx, level) in self.levels.iter().enumerate() {\n             let shift = idx * 8;\n             let level_tick = self.current_tick >> shift;\n-            let current_slot = (level_tick as usize) % SLOTS_PER_LEVEL;\n+            let current_slot = (level_tick % (SLOTS_PER_LEVEL as u64)) as usize;\n \n             for i in 0..SLOTS_PER_LEVEL {\n                 let slot = (current_slot + i) % SLOTS_PER_LEVEL;\n@@ -612,7 +612,7 @@ impl TimerWheel {\n                     }\n                 }\n \n-                let slot = (tick as usize) % SLOTS_PER_LEVEL;\n+                let slot = (tick % (SLOTS_PER_LEVEL as u64)) as usize;\n                 level.slots[slot].push(entry);\n                 level.set_occupied(slot);\n                 return;\n@@ -774,7 +774,7 @@ impl TimerWheel {\n                 continue;\n             }\n \n-            let current_slot = (level_tick_current as usize) % SLOTS_PER_LEVEL;\n+            let current_slot = (level_tick_current % (SLOTS_PER_LEVEL as u64)) as usize;\n             let mut diff = (level_tick_boundary - level_tick_current) as usize;\n             if diff >= SLOTS_PER_LEVEL {\n                 diff = SLOTS_PER_LEVEL - 1;"
+    },
+    {
+      "sha": "0a8cad31e9ce261a840fd6bfc3fde03c738b4958",
+      "filename": "src/types/cancel.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 5,
+      "changes": 11,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/e63e09a2a7b1b36c2db60138ebd94c4669e85057/src%2Ftypes%2Fcancel.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/e63e09a2a7b1b36c2db60138ebd94c4669e85057/src%2Ftypes%2Fcancel.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Ftypes%2Fcancel.rs?ref=e63e09a2a7b1b36c2db60138ebd94c4669e85057",
+      "patch": "@@ -2486,18 +2486,19 @@ mod tests {\n         // Note: RT severity mapping differs from contract (RT groups by operational category).\n         // The contract requires each extension maps to {0..5}; the canonical 5 anchor the scale.\n         assert_eq!(CancelKind::User.severity(), 0, \"User must be severity 0\");\n-        assert_eq!(CancelKind::Shutdown.severity(), 5, \"Shutdown must be severity 5\");\n+        assert_eq!(\n+            CancelKind::Shutdown.severity(),\n+            5,\n+            \"Shutdown must be severity 5\"\n+        );\n \n         // Verify no duplicate severity holes \u2014 every level 0..=5 has at least one kind\n         let mut covered = [false; 6];\n         for kind in &all_kinds {\n             covered[kind.severity() as usize] = true;\n         }\n         for (level, &has_kind) in covered.iter().enumerate() {\n-            assert!(\n-                has_kind,\n-                \"Severity level {level} has no CancelKind mapping\"\n-            );\n+            assert!(has_kind, \"Severity level {level} has no CancelKind mapping\");\n         }\n \n         // Verify strengthen monotonicity: strengthening always produces >= severity"
+    }
+  ]
+}

@@ -1,0 +1,65 @@
+{
+  "message": "fix(dashboard): prefetch panes before TUI init, remove eager session check, seed initial state\n\nDashboard startup (cli/dashboard.go):\n- Replaced the eager tmux.SessionExists() check with a prefetch call\n  to tmux.GetPanesWithActivityContext() using a 500ms timeout. This\n  serves dual purpose: validating the session exists (by checking the\n  error message for \"can't find session\") AND collecting initial pane\n  data that can be seeded into the model, eliminating the blank-screen\n  flash on first render.\n- The prefetch result ([]tmux.PaneActivity) is passed to RunWithOptions\n  via the new InitialPanes field.\n\nDashboard model (dashboard.go, model.go, run.go):\n- Added seedInitialPanes() method that populates m.panes from the\n  prefetched PaneActivity slice, marks initialPaneSnapshotDone=true,\n  updates stats, and rebuilds the pane list \u2014 all before the first\n  frame renders, so the user sees agent status immediately.\n- Added InitialPanes field to RunOptions so the CLI layer can pass\n  prefetched data to the TUI model.\n- Removed mouseWarmupPending field from model (mouse enable now\n  handled via the renderer init path instead of a separate flag).\n- Adjusted warmup sequence: moved startRendererInit and startConfigWatcher\n  calls into the post-startup warmup phase where they belong, removing\n  duplicate calls from the first-frame path.\n\nBenchmark (bench_test.go):\n- Added BenchmarkDashboardNew measuring allocation cost of New() +\n  cleanup(), useful for tracking startup regression.\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "ec811a8bda5330c4c40ba03b39652db0191094fa",
+      "filename": "internal/cli/dashboard.go",
+      "status": "modified",
+      "additions": 23,
+      "deletions": 4,
+      "changes": 27,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/b7c515994803b87269eff43e0c8c269ae13d4f75/internal%2Fcli%2Fdashboard.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/b7c515994803b87269eff43e0c8c269ae13d4f75/internal%2Fcli%2Fdashboard.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Fcli%2Fdashboard.go?ref=b7c515994803b87269eff43e0c8c269ae13d4f75",
+      "patch": "@@ -115,6 +115,16 @@ func popupEnvEnabled() bool {\n \treturn value != \"\" && value != \"0\"\n }\n \n+func isSessionMissingError(err error) bool {\n+\tif err == nil {\n+\t\treturn false\n+\t}\n+\tmsg := strings.ToLower(err.Error())\n+\treturn strings.Contains(msg, \"can't find session\") ||\n+\t\tstrings.Contains(msg, \"session not found\") ||\n+\t\tstrings.Contains(msg, \"has-session\")\n+}\n+\n func startDashboardReservationWatcher(session, projectDir string) func() {\n \tif cfg == nil || !cfg.FileReservation.Enabled || !cfg.AgentMail.Enabled {\n \t\treturn nil\n@@ -349,10 +359,6 @@ func runDashboard(w io.Writer, errW io.Writer, session string, debug bool, popup\n \tres.ExplainIfInferred(errW)\n \tsession = res.Session\n \n-\tif !tmux.SessionExists(session) {\n-\t\treturn fmt.Errorf(\"session '%s' not found\", session)\n-\t}\n-\n \t// Auto-popup: if we're inside tmux AND inside the same session we're\n \t// monitoring, launch as an overlay popup instead of consuming a pane.\n \t// Skip if already in popup mode (--popup flag or NTM_POPUP env) to\n@@ -364,6 +370,18 @@ func runDashboard(w io.Writer, errW io.Writer, session string, debug bool, popup\n \t\t}\n \t}\n \n+\tprefetchCtx, cancelPrefetch := context.WithTimeout(context.Background(), 500*time.Millisecond)\n+\tinitialPanes, err := tmux.GetPanesWithActivityContext(prefetchCtx, session)\n+\tcancelPrefetch()\n+\tif err != nil {\n+\t\tif isSessionMissingError(err) {\n+\t\t\treturn fmt.Errorf(\"session '%s' not found\", session)\n+\t\t}\n+\t\t// Fall back to the original lazy dashboard fetch path for transient tmux\n+\t\t// errors or slow prefetches so startup optimization never changes results.\n+\t\tinitialPanes = nil\n+\t}\n+\n \tprojectDir := \"\"\n \tif cfg != nil {\n \t\tprojectDir = cfg.GetProjectDir(session)\n@@ -386,6 +404,7 @@ func runDashboard(w io.Writer, errW io.Writer, session string, debug bool, popup\n \taction, err := dashboard.RunWithOptions(session, projectDir, dashboard.RunOptions{\n \t\tPopupMode:       popup,\n \t\tAttentionCursor: attentionCursor,\n+\t\tInitialPanes:    initialPanes,\n \t})\n \tif err != nil {\n \t\treturn err"
+    },
+    {
+      "sha": "59aee67d92289460dbb0d19d0de45d34b72364ca",
+      "filename": "internal/tui/dashboard/bench_test.go",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 0,
+      "changes": 11,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/b7c515994803b87269eff43e0c8c269ae13d4f75/internal%2Ftui%2Fdashboard%2Fbench_test.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/b7c515994803b87269eff43e0c8c269ae13d4f75/internal%2Ftui%2Fdashboard%2Fbench_test.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Ftui%2Fdashboard%2Fbench_test.go?ref=b7c515994803b87269eff43e0c8c269ae13d4f75",
+      "patch": "@@ -173,6 +173,17 @@ func BenchmarkDashboardUpdate(b *testing.B) {\n \t}\n }\n \n+func BenchmarkDashboardNew(b *testing.B) {\n+\tconfigureDashboardPerfEnv(b)\n+\n+\tb.ReportAllocs()\n+\tb.ResetTimer()\n+\tfor i := 0; i < b.N; i++ {\n+\t\tm := New(\"bench\", \"\")\n+\t\tm.cleanup()\n+\t}\n+}\n+\n // TestViewRenderTime verifies View() stays under 16ms for 60fps.\n func TestViewRenderTime(t *testing.T) {\n \tif testing.Short() {"
+    },
+    {
+      "sha": "913c0edd4d38597b1723bbb143653439ef134241",
+      "filename": "internal/tui/dashboard/dashboard.go",
+      "status": "modified",
+      "additions": 26,
+      "deletions": 4,
+      "changes": 30,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/b7c515994803b87269eff43e0c8c269ae13d4f75/internal%2Ftui%2Fdashboard%2Fdashboard.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/b7c515994803b87269eff43e0c8c269ae13d4f75/internal%2Ftui%2Fdashboard%2Fdashboard.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Ftui%2Fdashboard%2Fdashboard.go?ref=b7c515994803b87269eff43e0c8c269ae13d4f75",
+      "patch": "@@ -2023,10 +2023,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {\n \t\t\tif cmd := m.startConfigWatcher(); cmd != nil {\n \t\t\t\twarmupCmds = append(warmupCmds, cmd)\n \t\t\t}\n-\t\t\tif m.mouseWarmupPending {\n-\t\t\t\tm.mouseWarmupPending = false\n-\t\t\t\twarmupCmds = append(warmupCmds, tea.EnableMouseCellMotion)\n-\t\t\t}\n \t\t\treturn m, tea.Batch(warmupCmds...)\n \t\t}\n \n@@ -2042,6 +2038,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {\n \t\t}\n \t\tm.startupWarmupDone = true\n \n+\t\tif cmd := m.startRendererInit(); cmd != nil {\n+\t\t\twarmupCmds = append(warmupCmds, cmd)\n+\t\t}\n+\t\tif cmd := m.startConfigWatcher(); cmd != nil {\n+\t\t\twarmupCmds = append(warmupCmds, cmd)\n+\t\t}\n \t\tif cmd := m.requestStatusesFetch(); cmd != nil {\n \t\t\twarmupCmds = append(warmupCmds, cmd)\n \t\t}\n@@ -2893,6 +2895,26 @@ func (m *Model) updateStats() {\n \t}\n }\n \n+func (m *Model) seedInitialPanes(panesWithActivity []tmux.PaneActivity) {\n+\tif len(panesWithActivity) == 0 {\n+\t\treturn\n+\t}\n+\n+\tseeded := make([]tmux.Pane, 0, len(panesWithActivity))\n+\tfor _, pane := range panesWithActivity {\n+\t\tseeded = append(seeded, pane.Pane)\n+\t}\n+\tsort.Slice(seeded, func(i, j int) bool {\n+\t\treturn seeded[i].Index < seeded[j].Index\n+\t})\n+\n+\tm.panes = seeded\n+\tm.initialPaneSnapshotDone = true\n+\tm.updateStats()\n+\t_ = m.rebuildPaneList()\n+\tm.lastRefresh = time.Now()\n+}\n+\n // updateTickerData updates the ticker panel with current dashboard data\n func (m *Model) updateTickerData() {\n \t// Count active agents (those with any known status, not just \"working\")"
+    },
+    {
+      "sha": "d7e7ca271aafbba80d3676b3868b5b71bd3c21b4",
+      "filename": "internal/tui/dashboard/model.go",
+      "status": "modified",
+      "additions": 0,
+      "deletions": 1,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/b7c515994803b87269eff43e0c8c269ae13d4f75/internal%2Ftui%2Fdashboard%2Fmodel.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/b7c515994803b87269eff43e0c8c269ae13d4f75/internal%2Ftui%2Fdashboard%2Fmodel.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Ftui%2Fdashboard%2Fmodel.go?ref=b7c515994803b87269eff43e0c8c269ae13d4f75",
+      "patch": "@@ -181,7 +181,6 @@ type Model struct {\n \tspawnActive         bool // Whether a spawn is currently active (for adaptive polling)\n \tfetchingPTHealth    bool // Whether we're currently fetching process_triage health states\n \tstartupWarmupDone   bool // Ensures post-startup background warmup only runs once\n-\tmouseWarmupPending  bool // Enable mouse support after the first painted frame\n \n \t// Coalescing/cancellation for user-triggered refreshes\n \tsessionFetchPending bool"
+    },
+    {
+      "sha": "2031cf97bd87332c92d84703ad3ad134c1157846",
+      "filename": "internal/tui/dashboard/run.go",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/ntm/blob/b7c515994803b87269eff43e0c8c269ae13d4f75/internal%2Ftui%2Fdashboard%2Frun.go",
+      "raw_url": "https://github.com/Dicklesworthstone/ntm/raw/b7c515994803b87269eff43e0c8c269ae13d4f75/internal%2Ftui%2Fdashboard%2Frun.go",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/ntm/contents/internal%2Ftui%2Fdashboard%2Frun.go?ref=b7c515994803b87269eff43e0c8c269ae13d4f75",
+      "patch": "@@ -6,6 +6,8 @@ import (\n \t\"os\"\n \n \ttea \"github.com/charmbracelet/bubbletea\"\n+\n+\t\"github.com/Dicklesworthstone/ntm/internal/tmux\"\n )\n \n // Run starts the dashboard.\n@@ -32,11 +34,15 @@ func mouseEnabled() bool {\n type RunOptions struct {\n \tPopupMode       bool\n \tAttentionCursor int64\n+\tInitialPanes    []tmux.PaneActivity\n }\n \n // RunWithOptions starts the dashboard with configurable options.\n func RunWithOptions(session, projectDir string, opts RunOptions) (*PostQuitAction, error) {\n \tmodel := New(session, projectDir)\n+\tif len(opts.InitialPanes) > 0 {\n+\t\tmodel.seedInitialPanes(opts.InitialPanes)\n+\t}\n \tif opts.AttentionCursor > 0 {\n \t\tmodel.requestAttentionCursor(opts.AttentionCursor)\n \t}"
+    }
+  ]
+}

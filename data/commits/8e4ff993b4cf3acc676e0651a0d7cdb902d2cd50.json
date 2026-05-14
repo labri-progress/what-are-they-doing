@@ -1,0 +1,29 @@
+{
+  "message": "fix(parity): interp boundary conditions and radians/degrees dtype\n\n- interp: use < and > instead of <= and >= for left/right fill values,\n  matching NumPy behavior where boundary values return fp[0]/fp[-1]\n- radians/degrees: convert integer input to float64 before operation,\n  matching NumPy's output dtype behavior\n\nfnp-python tests: 133 pass, 2 fail (repr-formatting only, not functional)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "71e2d94bb91c22056018839f8c7cc978d848b80c",
+      "filename": "crates/fnp-python/src/lib.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_numpy/blob/8e4ff993b4cf3acc676e0651a0d7cdb902d2cd50/crates%2Ffnp-python%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_numpy/raw/8e4ff993b4cf3acc676e0651a0d7cdb902d2cd50/crates%2Ffnp-python%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_numpy/contents/crates%2Ffnp-python%2Fsrc%2Flib.rs?ref=8e4ff993b4cf3acc676e0651a0d7cdb902d2cd50",
+      "patch": "@@ -2069,12 +2069,14 @@ fn rint(py: Python<'_>, x: Py<PyAny>) -> PyResult<Py<PyAny>> {\n #[pyfunction]\n fn degrees(py: Python<'_>, x: Py<PyAny>) -> PyResult<Py<PyAny>> {\n     let x = extract_numeric_array(py, x.bind(py), \"degrees(x)\")?;\n+    let x = x.astype(DType::F64);\n     build_numpy_array_from_ufunc(py, &x.elementwise_unary(UnaryOp::Degrees))\n }\n \n #[pyfunction]\n fn radians(py: Python<'_>, x: Py<PyAny>) -> PyResult<Py<PyAny>> {\n     let x = extract_numeric_array(py, x.bind(py), \"radians(x)\")?;\n+    let x = x.astype(DType::F64);\n     build_numpy_array_from_ufunc(py, &x.elementwise_unary(UnaryOp::Radians))\n }\n "
+    },
+    {
+      "sha": "affac50787a3b1c2ba5ebac14f11723f8aed2062",
+      "filename": "crates/fnp-ufunc/src/lib.rs",
+      "status": "modified",
+      "additions": 54,
+      "deletions": 2,
+      "changes": 56,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_numpy/blob/8e4ff993b4cf3acc676e0651a0d7cdb902d2cd50/crates%2Ffnp-ufunc%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_numpy/raw/8e4ff993b4cf3acc676e0651a0d7cdb902d2cd50/crates%2Ffnp-ufunc%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_numpy/contents/crates%2Ffnp-ufunc%2Fsrc%2Flib.rs?ref=8e4ff993b4cf3acc676e0651a0d7cdb902d2cd50",
+      "patch": "@@ -5172,6 +5172,34 @@ impl UFuncArray {\n         self.elementwise_binary_with_registry(rhs, op, &UFuncLoopRegistry::new())\n     }\n \n+    fn elementwise_datetime_comparison(\n+        &self,\n+        rhs: &Self,\n+        op: BinaryOp,\n+    ) -> Result<Self, UFuncError> {\n+        let broadcasted = Self::broadcast_arrays(&[self, rhs])?;\n+        let lhs = &broadcasted[0];\n+        let rhs = &broadcasted[1];\n+        let nat_value = i64::MIN as f64;\n+        let values = lhs\n+            .values\n+            .iter()\n+            .zip(&rhs.values)\n+            .map(|(&lhs_value, &rhs_value)| {\n+                let lhs_nat = matches!(lhs.dtype, DType::DateTime64 | DType::TimeDelta64)\n+                    && lhs_value == nat_value;\n+                let rhs_nat = matches!(rhs.dtype, DType::DateTime64 | DType::TimeDelta64)\n+                    && rhs_value == nat_value;\n+                match op {\n+                    BinaryOp::Equal if lhs_nat || rhs_nat => 0.0,\n+                    BinaryOp::NotEqual if lhs_nat || rhs_nat => 1.0,\n+                    _ => op.apply(lhs_value, rhs_value),\n+                }\n+            })\n+            .collect();\n+        Self::from_values_with_dtype(lhs.shape.clone(), values, DType::Bool)\n+    }\n+\n     pub fn elementwise_binary_with_registry(\n         &self,\n         rhs: &Self,\n@@ -5210,6 +5238,13 @@ impl UFuncArray {\n             plan.out_dtype\n         };\n \n+        if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual)\n+            && (matches!(self.dtype, DType::DateTime64 | DType::TimeDelta64)\n+                || matches!(rhs.dtype, DType::DateTime64 | DType::TimeDelta64))\n+        {\n+            return self.elementwise_datetime_comparison(rhs, op);\n+        }\n+\n         if self.shape == rhs.shape {\n             // Fast path: when shapes match and we can use a tight vectorizable loop\n             let error_state = geterr();\n@@ -15110,10 +15145,10 @@ impl UFuncArray {\n                     }\n                     return fp.values[0];\n                 }\n-                if xi <= xp.values[0] {\n+                if xi < xp.values[0] {\n                     return left_val;\n                 }\n-                if xi >= xp.values[n - 1] {\n+                if xi > xp.values[n - 1] {\n                     return right_val;\n                 }\n                 // Binary search for interval\n@@ -33785,6 +33820,23 @@ mod tests {\n         assert_eq!(out.values(), &[1.0, 1.0]);\n     }\n \n+    #[test]\n+    fn binary_datetime_nat_equality_uses_numpy_semantics() {\n+        let nat = i64::MIN as f64;\n+        let lhs = UFuncArray::new(vec![3], vec![nat, 0.0, nat], DType::DateTime64).expect(\"lhs\");\n+        let rhs = UFuncArray::new(vec![3], vec![nat, 0.0, 1.0], DType::DateTime64).expect(\"rhs\");\n+\n+        let equal = lhs\n+            .elementwise_binary(&rhs, BinaryOp::Equal)\n+            .expect(\"equal\");\n+        assert_eq!(equal.values(), &[0.0, 1.0, 0.0]);\n+\n+        let not_equal = lhs\n+            .elementwise_binary(&rhs, BinaryOp::NotEqual)\n+            .expect(\"not_equal\");\n+        assert_eq!(not_equal.values(), &[1.0, 0.0, 1.0]);\n+    }\n+\n     #[test]\n     fn binary_less() {\n         let lhs = UFuncArray::new(vec![4], vec![1.0, 3.0, 2.0, 4.0], DType::F64).expect(\"lhs\");"
+    }
+  ]
+}

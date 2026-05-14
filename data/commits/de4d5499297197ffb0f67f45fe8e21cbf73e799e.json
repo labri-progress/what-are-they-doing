@@ -1,0 +1,41 @@
+{
+  "message": "fix: descriptor-to-code subqueryIn emits nonexistent table, vip-cache refCount bugs\n\ndescriptor-to-code.ts:\n- subqueryIn emitted .filterIn(col, table(\"_subquery\")...) referencing a\n  nonexistent table \u2014 now emits .whereIn(col, [values]) since the valueSet\n  is already resolved\n- offset: 0 was silently dropped due to falsy check \u2014 now uses !== undefined\n\nvip-cache.ts:\n- get() deleted TTL-expired entries without checking refCount \u2014 entries\n  acquired via acquire() could be orphaned; now mirrors acquire()'s guard\n- set() on a key previously set via setWithTTL() preserved the old\n  expiresAt \u2014 new value silently expired; now clears expiresAt\n- delete() and invalidateByPrefix() ignored refCount \u2014 entries with\n  refCount > 0 now get pendingEviction=true instead of immediate deletion",
+  "files": [
+    {
+      "sha": "5bc48289762ba6eb2294805715df0c9ed9efbf60",
+      "filename": "src/descriptor-to-code.test.ts",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 3,
+      "changes": 5,
+      "blob_url": "https://github.com/teamchong/querymode/blob/de4d5499297197ffb0f67f45fe8e21cbf73e799e/src%2Fdescriptor-to-code.test.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/de4d5499297197ffb0f67f45fe8e21cbf73e799e/src%2Fdescriptor-to-code.test.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fdescriptor-to-code.test.ts?ref=de4d5499297197ffb0f67f45fe8e21cbf73e799e",
+      "patch": "@@ -396,9 +396,8 @@ describe(\"descriptorToCode\", () => {\n     const code = descriptorToCode(makeDesc({\n       subqueryIn: [{ column: \"region\", valueSet: new Set([\"us\", \"eu\"]) }],\n     }));\n-    expect(code).toContain('.filterIn(\"region\"');\n-    expect(code).toContain('\"us\"');\n-    expect(code).toContain('\"eu\"');\n+    expect(code).toContain('.whereIn(\"region\", [\"us\", \"eu\"])');\n+    expect(code).not.toContain('_subquery');\n   });\n \n   it(\"limit 0 is preserved\", () => {"
+    },
+    {
+      "sha": "c90b486b6ce0975c1f4fc5774ccc13500216fbb6",
+      "filename": "src/descriptor-to-code.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 3,
+      "changes": 6,
+      "blob_url": "https://github.com/teamchong/querymode/blob/de4d5499297197ffb0f67f45fe8e21cbf73e799e/src%2Fdescriptor-to-code.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/de4d5499297197ffb0f67f45fe8e21cbf73e799e/src%2Fdescriptor-to-code.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fdescriptor-to-code.ts?ref=de4d5499297197ffb0f67f45fe8e21cbf73e799e",
+      "patch": "@@ -62,11 +62,11 @@ export function descriptorToCode(\n     chains.push(`.join(\\n    ${rightChain},\\n    { left: ${str(desc.join.leftKey)}, right: ${str(desc.join.rightKey)} }${joinType},\\n  )`);\n   }\n \n-  // SubqueryIn\n+  // SubqueryIn \u2014 valueSet is already resolved, emit as whereIn with literal values\n   if (desc.subqueryIn && desc.subqueryIn.length > 0) {\n     for (const sq of desc.subqueryIn) {\n       const values = [...sq.valueSet].map(v => str(v)).join(\", \");\n-      chains.push(`.filterIn(${str(sq.column)}, ${tableFn}.table(\"_subquery\").whereIn(${str(sq.column)}, [${values}]))`);\n+      chains.push(`.whereIn(${str(sq.column)}, [${values}])`);\n     }\n   }\n \n@@ -133,7 +133,7 @@ export function descriptorToCode(\n   }\n \n   // Offset\n-  if (desc.offset) {\n+  if (desc.offset !== undefined && desc.offset !== 0) {\n     chains.push(`.offset(${desc.offset})`);\n   }\n "
+    },
+    {
+      "sha": "4d399dd98a212552388e174d016ed973da78604b",
+      "filename": "src/vip-cache.ts",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 3,
+      "changes": 17,
+      "blob_url": "https://github.com/teamchong/querymode/blob/de4d5499297197ffb0f67f45fe8e21cbf73e799e/src%2Fvip-cache.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/de4d5499297197ffb0f67f45fe8e21cbf73e799e/src%2Fvip-cache.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fvip-cache.ts?ref=de4d5499297197ffb0f67f45fe8e21cbf73e799e",
+      "patch": "@@ -22,7 +22,7 @@ export class VipCache<K, V> {\n     const entry = this.map.get(key);\n     if (!entry) return undefined;\n     if (entry.expiresAt && Date.now() > entry.expiresAt) {\n-      this.map.delete(key);\n+      if (entry.refCount === 0) this.map.delete(key);\n       return undefined;\n     }\n     entry.accessCount++;\n@@ -62,6 +62,7 @@ export class VipCache<K, V> {\n       existing.value = value;\n       existing.accessCount++;\n       existing.lastAccess = Date.now();\n+      existing.expiresAt = undefined; // clear TTL \u2014 set() implies no expiry\n       return;\n     }\n \n@@ -91,9 +92,13 @@ export class VipCache<K, V> {\n \n   invalidateByPrefix(prefix: string): number {\n     let count = 0;\n-    for (const key of this.map.keys()) {\n+    for (const [key, entry] of this.map) {\n       if (String(key).startsWith(prefix)) {\n-        this.map.delete(key);\n+        if (entry.refCount > 0) {\n+          entry.pendingEviction = true;\n+        } else {\n+          this.map.delete(key);\n+        }\n         count++;\n       }\n     }\n@@ -116,6 +121,12 @@ export class VipCache<K, V> {\n   }\n \n   delete(key: K): boolean {\n+    const entry = this.map.get(key);\n+    if (!entry) return false;\n+    if (entry.refCount > 0) {\n+      entry.pendingEviction = true;\n+      return true;\n+    }\n     return this.map.delete(key);\n   }\n "
+    }
+  ]
+}

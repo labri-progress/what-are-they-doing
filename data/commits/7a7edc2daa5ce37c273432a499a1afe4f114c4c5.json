@@ -1,0 +1,41 @@
+{
+  "message": "fix(capacity): add hard capacity limits to key-role registry, dedupe store, and evidence endpoint\n\nThree unbounded-growth data structures now have hard caps to prevent\nresource exhaustion:\n\n- key_role_separation: MAX_ACTIVE_BINDINGS=4096, returns new\n  RegistryFull error variant (KRS_REGISTRY_FULL) when exceeded;\n  duplicate-check still runs first\n- idempotency_store: MAX_DEDUPE_ENTRIES=65536 with two-phase guard \u2014\n  sweep_expired first, then return DedupeResult::Conflict if still at\n  capacity (reuses existing conflict path, no new error type)\n- sdk_integration: MAX_EVIDENCE_RECORDS=8192, returns\n  VsiError::submission_rejected with current count and max\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "f78ddc42caeaa6be6cb765c12a4b430f2a16f8dc",
+      "filename": "crates/franken-node/src/control_plane/key_role_separation.rs",
+      "status": "modified",
+      "additions": 18,
+      "deletions": 0,
+      "changes": 18,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/7a7edc2daa5ce37c273432a499a1afe4f114c4c5/crates%2Ffranken-node%2Fsrc%2Fcontrol_plane%2Fkey_role_separation.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/7a7edc2daa5ce37c273432a499a1afe4f114c4c5/crates%2Ffranken-node%2Fsrc%2Fcontrol_plane%2Fkey_role_separation.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fcontrol_plane%2Fkey_role_separation.rs?ref=7a7edc2daa5ce37c273432a499a1afe4f114c4c5",
+      "patch": "@@ -154,6 +154,8 @@ pub enum KeyRoleSeparationError {\n     KeyMaterialMismatch { key_id: String, role: KeyRole },\n     /// Key binding has exceeded its max_validity_seconds window.\n     KeyExpired { key_id: String, role: KeyRole },\n+    /// Active binding registry is at capacity.\n+    RegistryFull { capacity: usize },\n }\n \n impl KeyRoleSeparationError {\n@@ -166,6 +168,7 @@ impl KeyRoleSeparationError {\n             Self::RotationFailed { .. } => \"KRS_ROTATION_FAILED\",\n             Self::KeyMaterialMismatch { .. } => \"KRS_KEY_MATERIAL_MISMATCH\",\n             Self::KeyExpired { .. } => \"KRS_KEY_EXPIRED\",\n+            Self::RegistryFull { .. } => \"KRS_REGISTRY_FULL\",\n         }\n     }\n }\n@@ -214,6 +217,12 @@ impl fmt::Display for KeyRoleSeparationError {\n                      its max_validity_seconds window\"\n                 )\n             }\n+            Self::RegistryFull { capacity } => {\n+                write!(\n+                    f,\n+                    \"KRS_REGISTRY_FULL: active binding registry at capacity ({capacity})\"\n+                )\n+            }\n         }\n     }\n }\n@@ -302,6 +311,8 @@ impl KeyRoleEvent {\n ///\n /// Maximum revoked bindings before oldest-first eviction.\n const MAX_REVOKED_ENTRIES: usize = 4096;\n+/// Maximum active key-role bindings before new binds are rejected.\n+const MAX_ACTIVE_BINDINGS: usize = 4096;\n /// Maximum events before oldest-first eviction.\n const MAX_KEY_ROLE_EVENTS: usize = 4096;\n \n@@ -398,6 +409,13 @@ impl KeyRoleRegistry {\n                 });\n         }\n \n+        // Capacity guard: prevent unbounded active-binding growth.\n+        if self.active.len() >= MAX_ACTIVE_BINDINGS {\n+            return Err(KeyRoleSeparationError::RegistryFull {\n+                capacity: MAX_ACTIVE_BINDINGS,\n+            });\n+        }\n+\n         let binding = KeyRoleBinding {\n             key_id: key_id.to_string(),\n             role,"
+    },
+    {
+      "sha": "4f0f92fc2474f5986af1af9849e819b0a944a72e",
+      "filename": "crates/franken-node/src/remote/idempotency_store.rs",
+      "status": "modified",
+      "additions": 25,
+      "deletions": 0,
+      "changes": 25,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/7a7edc2daa5ce37c273432a499a1afe4f114c4c5/crates%2Ffranken-node%2Fsrc%2Fremote%2Fidempotency_store.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/7a7edc2daa5ce37c273432a499a1afe4f114c4c5/crates%2Ffranken-node%2Fsrc%2Fremote%2Fidempotency_store.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fremote%2Fidempotency_store.rs?ref=7a7edc2daa5ce37c273432a499a1afe4f114c4c5",
+      "patch": "@@ -19,6 +19,10 @@\n use std::collections::BTreeMap;\n use std::fmt;\n \n+/// Maximum dedupe entries before new inserts trigger an automatic expired-entry\n+/// sweep.  If still at capacity after sweeping, the insert is rejected.\n+const MAX_DEDUPE_ENTRIES: usize = 65_536;\n+\n use crate::security::constant_time::ct_eq;\n \n use serde::{Deserialize, Serialize};\n@@ -397,6 +401,27 @@ impl IdempotencyDedupeStore {\n             }\n         }\n \n+        // Capacity guard: sweep expired entries first, then reject if still full.\n+        if self.entries.len() >= MAX_DEDUPE_ENTRIES {\n+            self.sweep_expired(now_secs, trace_id);\n+        }\n+        if self.entries.len() >= MAX_DEDUPE_ENTRIES {\n+            self.log(\n+                event_codes::ID_ENTRY_CONFLICT,\n+                trace_id,\n+                serde_json::json!({\n+                    \"key_hex\": &key_hex,\n+                    \"reason\": \"dedupe store at capacity\",\n+                    \"capacity\": MAX_DEDUPE_ENTRIES,\n+                }),\n+            );\n+            return DedupeResult::Conflict {\n+                key_hex: key_hex.clone(),\n+                expected_hash: String::new(),\n+                actual_hash: payload_hash.clone(),\n+            };\n+        }\n+\n         let entry = DedupeEntry {\n             key,\n             payload_hash,"
+    },
+    {
+      "sha": "a3f1d98269cb17d462d4d16e72a9cee019c1a2d9",
+      "filename": "crates/franken-node/src/vef/sdk_integration.rs",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 0,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/7a7edc2daa5ce37c273432a499a1afe4f114c4c5/crates%2Ffranken-node%2Fsrc%2Fvef%2Fsdk_integration.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/7a7edc2daa5ce37c273432a499a1afe4f114c4c5/crates%2Ffranken-node%2Fsrc%2Fvef%2Fsdk_integration.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fvef%2Fsdk_integration.rs?ref=7a7edc2daa5ce37c273432a499a1afe4f114c4c5",
+      "patch": "@@ -29,6 +29,8 @@ use std::collections::BTreeMap;\n use std::fmt;\n \n const MAX_EVENTS: usize = 4096;\n+/// Maximum evidence records in the verification endpoint store.\n+const MAX_EVIDENCE_RECORDS: usize = 8192;\n \n // \u2500\u2500 Schema version \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n \n@@ -561,6 +563,14 @@ impl ExternalVerificationEndpoint {\n             )));\n         }\n \n+        // Capacity check: prevent unbounded store growth.\n+        if self.store.len() >= MAX_EVIDENCE_RECORDS {\n+            return Err(VsiError::submission_rejected(format!(\n+                \"evidence store at capacity ({} records, max {MAX_EVIDENCE_RECORDS})\",\n+                self.store.len()\n+            )));\n+        }\n+\n         // Compute binding hash from proof payload\n         let binding_hash = sha256_hex(submission.proof_payload.as_bytes());\n "
+    }
+  ]
+}

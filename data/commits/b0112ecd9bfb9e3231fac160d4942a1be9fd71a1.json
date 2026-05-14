@@ -1,0 +1,41 @@
+{
+  "message": "Fix DataLoader batch counting, CTCLoss bounds validation, and unused import\n\nft-data: Use indices.len() instead of dataset.len() for num_batches()\nand next_batch() bounds, fixing incorrect batch counts when a subset\nsampler is active. Remove redundant numel cross-sample check in collate\n(shape validation already catches mismatches). Clean up unused bindings.\n\nft-nn: Add bounds validation in CTCLoss forward pass -- reject\ninput_lengths exceeding T dimension and target_lengths exceeding S\ndimension with descriptive errors. Validate target labels are within\nnum_classes range to prevent silent out-of-bounds indexing.\n\nft-serialize: Remove unused std::io::Read import.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "5afc0be46508e8787dced7d3c4eb5a7188b89ae3",
+      "filename": "crates/ft-data/src/lib.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 14,
+      "changes": 18,
+      "blob_url": "https://github.com/Dicklesworthstone/frankentorch/blob/b0112ecd9bfb9e3231fac160d4942a1be9fd71a1/crates%2Fft-data%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankentorch/raw/b0112ecd9bfb9e3231fac160d4942a1be9fd71a1/crates%2Fft-data%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankentorch/contents/crates%2Fft-data%2Fsrc%2Flib.rs?ref=b0112ecd9bfb9e3231fac160d4942a1be9fd71a1",
+      "patch": "@@ -497,7 +497,7 @@ impl<'a, D: Dataset> DataLoader<'a, D> {\n \n     /// Number of batches in one epoch.\n     pub fn num_batches(&self) -> usize {\n-        let n = self.dataset.len();\n+        let n = self.indices.len();\n         if n == 0 || self.config.batch_size == 0 {\n             return 0;\n         }\n@@ -516,7 +516,7 @@ impl<'a, D: Dataset> DataLoader<'a, D> {\n         &mut self,\n         session: &mut FrankenTorchSession,\n     ) -> Result<Option<Batch>, AutogradError> {\n-        let n = self.dataset.len();\n+        let n = self.indices.len();\n         if self.position >= n {\n             return Ok(None);\n         }\n@@ -570,11 +570,11 @@ fn collate(\n     let mut batch_tensors = Vec::with_capacity(num_tensors);\n \n     for tensor_idx in 0..num_tensors {\n-        let (ref name, ref first_values, ref first_shape) = samples[0].tensors[tensor_idx];\n+        let (ref name, _, ref first_shape) = samples[0].tensors[tensor_idx];\n \n         // Validate all samples have matching shapes for this tensor\n         let sample_numel: usize = first_shape.iter().product();\n-        for (s_idx, sample) in samples.iter().enumerate().skip(1) {\n+        for sample in samples.iter().skip(1) {\n             if sample.tensors.len() != num_tensors {\n                 return Err(AutogradError::Dispatch(\n                     ft_dispatch::DispatchError::Key(\n@@ -594,16 +594,6 @@ fn collate(\n                     ),\n                 ));\n             }\n-            let s_numel: usize = s_shape.iter().product();\n-            if s_numel != sample_numel {\n-                return Err(AutogradError::Dispatch(\n-                    ft_dispatch::DispatchError::Key(\n-                        ft_dispatch::DispatchKeyError::IncompatibleSet {\n-                            reason: \"DataLoader: tensor numel mismatch across samples\",\n-                        },\n-                    ),\n-                ));\n-            }\n         }\n \n         // Stack along batch dimension: new shape = [batch_size] ++ sample_shape"
+    },
+    {
+      "sha": "534c1a6db295ee69c5f65f5f93aa1cb3c50ea484",
+      "filename": "crates/ft-nn/src/lib.rs",
+      "status": "modified",
+      "additions": 25,
+      "deletions": 1,
+      "changes": 26,
+      "blob_url": "https://github.com/Dicklesworthstone/frankentorch/blob/b0112ecd9bfb9e3231fac160d4942a1be9fd71a1/crates%2Fft-nn%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankentorch/raw/b0112ecd9bfb9e3231fac160d4942a1be9fd71a1/crates%2Fft-nn%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankentorch/contents/crates%2Fft-nn%2Fsrc%2Flib.rs?ref=b0112ecd9bfb9e3231fac160d4942a1be9fd71a1",
+      "patch": "@@ -9398,6 +9398,22 @@ impl CTCLoss {\n                     let input_len = il_data[b] as usize;\n                     let target_len = tl_data[b] as usize;\n \n+                    // Validate lengths are within tensor bounds\n+                    if input_len > t_max {\n+                        return Err(AutogradError::Dispatch(DispatchError::Key(\n+                            DispatchKeyError::IncompatibleSet {\n+                                reason: \"CTCLoss: input_lengths[b] exceeds T dimension of log_probs\",\n+                            },\n+                        )));\n+                    }\n+                    if target_len > s_max {\n+                        return Err(AutogradError::Dispatch(DispatchError::Key(\n+                            DispatchKeyError::IncompatibleSet {\n+                                reason: \"CTCLoss: target_lengths[b] exceeds S dimension of targets\",\n+                            },\n+                        )));\n+                    }\n+\n                     if target_len == 0 {\n                         // Empty target: loss = -sum of log P(blank) at each timestep\n                         let mut loss = 0.0;\n@@ -9413,7 +9429,15 @@ impl CTCLoss {\n                     let lattice_len = 2 * target_len + 1;\n                     let mut labels = vec![blank; lattice_len];\n                     for i in 0..target_len {\n-                        labels[2 * i + 1] = tgt_data[b * s_max + i] as usize;\n+                        let label = tgt_data[b * s_max + i] as usize;\n+                        if label >= num_classes {\n+                            return Err(AutogradError::Dispatch(DispatchError::Key(\n+                                DispatchKeyError::IncompatibleSet {\n+                                    reason: \"CTCLoss: target label >= num_classes\",\n+                                },\n+                            )));\n+                        }\n+                        labels[2 * i + 1] = label;\n                     }\n \n                     // Check feasibility: input must be long enough"
+    },
+    {
+      "sha": "c0aa0fbde42d54a0b28b6ff8216271384080f213",
+      "filename": "crates/ft-serialize/src/lib.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/frankentorch/blob/b0112ecd9bfb9e3231fac160d4942a1be9fd71a1/crates%2Fft-serialize%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankentorch/raw/b0112ecd9bfb9e3231fac160d4942a1be9fd71a1/crates%2Fft-serialize%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankentorch/contents/crates%2Fft-serialize%2Fsrc%2Flib.rs?ref=b0112ecd9bfb9e3231fac160d4942a1be9fd71a1",
+      "patch": "@@ -477,7 +477,7 @@ fn bounded(input: &str, max_len: usize) -> String {\n // \u2500\u2500 Tensor State Dict Save/Load \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n \n use std::collections::BTreeMap;\n-use std::io::{Read, Write};\n+use std::io::Write;\n use std::path::Path;\n \n use ft_core::{DType, DenseTensor, DenseTensorError, Device, TensorMeta};"
+    }
+  ]
+}

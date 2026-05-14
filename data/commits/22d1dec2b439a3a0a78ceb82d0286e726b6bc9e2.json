@@ -1,0 +1,29 @@
+{
+  "message": "fix: deduplicate blocked-cache batch entries before write\n\ninsert_blocked_cache_entries could receive duplicate issue IDs in the\nsame batch, causing redundant DELETE+INSERT cycles with only the last\nvalue surviving. Add dedupe_blocked_cache_batch() helper that collapses\nduplicates (last value wins) before writing, avoiding wasted I/O.\n\nAlso add cross-reference comment in resources.rs MCP schema doc linking\ntitle max-length to validation::MAX_TITLE_CHARS.\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "d9ffd1279ff773f55f26d95a4ba16dd3eb82d232",
+      "filename": "src/mcp/resources.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_rust/blob/22d1dec2b439a3a0a78ceb82d0286e726b6bc9e2/src%2Fmcp%2Fresources.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_rust/raw/22d1dec2b439a3a0a78ceb82d0286e726b6bc9e2/src%2Fmcp%2Fresources.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_rust/contents/src%2Fmcp%2Fresources.rs?ref=22d1dec2b439a3a0a78ceb82d0286e726b6bc9e2",
+      "patch": "@@ -283,6 +283,7 @@ impl ResourceHandler for SchemaResource {\n             ],\n             \"issue_fields\": {\n                 \"id\": \"string \u2014 unique ID (e.g. br-abc123)\",\n+                // Must match validation::MAX_TITLE_CHARS\n                 \"title\": \"string \u2014 1-500 characters\",\n                 \"description\": \"string|null \u2014 detailed description\",\n                 \"status\": \"string \u2014 see statuses above\","
+    },
+    {
+      "sha": "5dc64786ad5b45ef9d070f2e967007e53bf12649",
+      "filename": "src/storage/sqlite.rs",
+      "status": "modified",
+      "additions": 60,
+      "deletions": 1,
+      "changes": 61,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_rust/blob/22d1dec2b439a3a0a78ceb82d0286e726b6bc9e2/src%2Fstorage%2Fsqlite.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_rust/raw/22d1dec2b439a3a0a78ceb82d0286e726b6bc9e2/src%2Fstorage%2Fsqlite.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_rust/contents/src%2Fstorage%2Fsqlite.rs?ref=22d1dec2b439a3a0a78ceb82d0286e726b6bc9e2",
+      "patch": "@@ -3046,8 +3046,9 @@ impl SqliteStorage {\n         conn: &Connection,\n         entries: &[(String, String)],\n     ) -> Result<usize> {\n+        let unique_entries = Self::dedupe_blocked_cache_batch(entries);\n         let mut count = 0;\n-        for (issue_id, blockers_json) in entries {\n+        for (issue_id, blockers_json) in &unique_entries {\n             // Explicit DELETE + INSERT instead of INSERT OR REPLACE because\n             // fsqlite does not reliably support UNIQUE constraint upserts.\n             conn.execute_with_params(\n@@ -3066,6 +3067,22 @@ impl SqliteStorage {\n         Ok(count)\n     }\n \n+    fn dedupe_blocked_cache_batch(entries: &[(String, String)]) -> Vec<(String, String)> {\n+        let mut deduped: Vec<(String, String)> = Vec::with_capacity(entries.len());\n+        let mut positions: HashMap<String, usize> = HashMap::with_capacity(entries.len());\n+\n+        for (issue_id, blockers_json) in entries {\n+            if let Some(position) = positions.get(issue_id).copied() {\n+                deduped[position].1.clone_from(blockers_json);\n+            } else {\n+                positions.insert(issue_id.clone(), deduped.len());\n+                deduped.push((issue_id.clone(), blockers_json.clone()));\n+            }\n+        }\n+\n+        deduped\n+    }\n+\n     fn load_direct_blockers_impl(conn: &Connection) -> Result<HashMap<String, Vec<String>>> {\n         // Exclude external dependencies from the persisted cache because their\n         // status is not locally known and must be resolved at query time.\n@@ -9358,6 +9375,48 @@ mod tests {\n         assert_eq!(storage.get_blockers(&blocked.id).unwrap(), vec![blocker.id]);\n     }\n \n+    #[test]\n+    fn test_insert_blocked_cache_entries_deduplicates_duplicate_issue_ids_last_value_wins() {\n+        let mut storage = SqliteStorage::open_memory().unwrap();\n+        let issue = make_issue(\n+            \"bd-cache-dup\",\n+            \"Cache target\",\n+            Status::Open,\n+            2,\n+            None,\n+            Utc::now(),\n+            None,\n+        );\n+        storage.create_issue(&issue, \"tester\").unwrap();\n+\n+        let inserted = SqliteStorage::insert_blocked_cache_entries(\n+            &storage.conn,\n+            &[\n+                (issue.id.clone(), \"[\\\"bd-blocker-old:open\\\"]\".to_string()),\n+                (issue.id.clone(), \"[\\\"bd-blocker-new:open\\\"]\".to_string()),\n+            ],\n+        )\n+        .unwrap();\n+\n+        assert_eq!(\n+            inserted, 1,\n+            \"duplicate blocked-cache rows should collapse to one write\"\n+        );\n+\n+        let blocked_by = storage\n+            .conn\n+            .query_row_with_params(\n+                \"SELECT blocked_by FROM blocked_issues_cache WHERE issue_id = ?\",\n+                &[SqliteValue::from(issue.id.as_str())],\n+            )\n+            .unwrap()\n+            .get(0)\n+            .and_then(SqliteValue::as_text)\n+            .unwrap()\n+            .to_string();\n+        assert_eq!(blocked_by, \"[\\\"bd-blocker-new:open\\\"]\");\n+    }\n+\n     #[test]\n     fn test_get_blocked_ids_and_is_blocked_fall_back_when_cache_table_missing() {\n         let mut storage = SqliteStorage::open_memory().unwrap();"
+    }
+  ]
+}

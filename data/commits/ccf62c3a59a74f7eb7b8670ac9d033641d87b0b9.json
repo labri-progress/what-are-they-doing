@@ -1,0 +1,53 @@
+{
+  "message": "feat(fwc): atomic write-then-rename for credential, config, lock, and preference files\n\nReplace direct fs::write() calls with a temp-file \u2192 sync_all \u2192 rename\npattern across all four fwc persistence paths:\n\n- credential.rs (FileBackend::put): Credential JSON files now written\n  to .tmp suffix, synced, then atomically renamed. On Unix, file mode\n  0o600 is set via OpenOptions::mode() at creation time rather than\n  post-creation chmod. Temp file cleaned up on error.\n\n- main.rs (save_context_config): Host context TOML files use the same\n  atomic write pattern. Error message updated to \"failed to safely\n  write host context file\".\n\n- op_lock.rs (LockStore::persist): Lock store JSON files gain crash\n  safety via atomic rename. Error message updated accordingly.\n\n- routing.rs (PreferenceStore::save): Routing preference JSON files\n  follow the same pattern with temp-file cleanup on failure.\n\nAll four paths share the same structure: create temp file with .tmp\nsuffix \u2192 write full content \u2192 sync_all() \u2192 rename over target \u2192\nclean up temp on error. On Windows, the existing file is removed\nbefore rename since Windows does not support atomic rename-over.\n\nThis prevents partial/corrupt files when the process is killed mid-write,\nwhich is common in multi-agent environments where connectors may be\nrestarted at any time.\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "e446df17471b0887d970fd74182b18337f1ac25b",
+      "filename": "crates/fwc/src/credential.rs",
+      "status": "modified",
+      "additions": 38,
+      "deletions": 7,
+      "changes": 45,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/ccf62c3a59a74f7eb7b8670ac9d033641d87b0b9/crates%2Ffwc%2Fsrc%2Fcredential.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/ccf62c3a59a74f7eb7b8670ac9d033641d87b0b9/crates%2Ffwc%2Fsrc%2Fcredential.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffwc%2Fsrc%2Fcredential.rs?ref=ccf62c3a59a74f7eb7b8670ac9d033641d87b0b9",
+      "patch": "@@ -328,14 +328,45 @@ impl CredentialBackend for FileBackend {\n         };\n         let json = serde_json::to_string_pretty(&disk)?;\n         let path = self.credential_path(&entry.connector_id);\n-        let mut file = fs::File::create(&path)\n-            .with_context(|| format!(\"writing credential to {}\", path.display()))?;\n-        #[cfg(unix)]\n-        {\n-            use std::os::unix::fs::PermissionsExt;\n-            file.set_permissions(fs::Permissions::from_mode(0o600))?;\n+        \n+        let mut temp_path = path.as_os_str().to_os_string();\n+        temp_path.push(\".tmp\");\n+        let temp_path = std::path::PathBuf::from(temp_path);\n+\n+        let write_result = (|| -> Result<()> {\n+            let mut opts = fs::OpenOptions::new();\n+            opts.write(true).create(true).truncate(true);\n+            \n+            #[cfg(unix)]\n+            {\n+                use std::os::unix::fs::OpenOptionsExt;\n+                opts.mode(0o600);\n+            }\n+\n+            let mut file = opts.open(&temp_path)\n+                .with_context(|| format!(\"writing credential to {}\", temp_path.display()))?;\n+                \n+            file.write_all(json.as_bytes())?;\n+            file.sync_all()?;\n+\n+            #[cfg(not(windows))]\n+            std::fs::rename(&temp_path, &path)?;\n+\n+            #[cfg(windows)]\n+            {\n+                if path.exists() {\n+                    std::fs::remove_file(&path)?;\n+                }\n+                std::fs::rename(&temp_path, &path)?;\n+            }\n+            Ok(())\n+        })();\n+\n+        if write_result.is_err() && temp_path.exists() {\n+            let _ = std::fs::remove_file(&temp_path);\n         }\n-        file.write_all(json.as_bytes())?;\n+\n+        write_result?;\n         Ok(())\n     }\n "
+    },
+    {
+      "sha": "bfe8a882c10bcea36b3973f7054ed27bc4030fe5",
+      "filename": "crates/fwc/src/main.rs",
+      "status": "modified",
+      "additions": 29,
+      "deletions": 2,
+      "changes": 31,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/ccf62c3a59a74f7eb7b8670ac9d033641d87b0b9/crates%2Ffwc%2Fsrc%2Fmain.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/ccf62c3a59a74f7eb7b8670ac9d033641d87b0b9/crates%2Ffwc%2Fsrc%2Fmain.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffwc%2Fsrc%2Fmain.rs?ref=ccf62c3a59a74f7eb7b8670ac9d033641d87b0b9",
+      "patch": "@@ -3811,8 +3811,35 @@ fn save_context_config(path: &PathBuf, config: &ContextConfigFile) -> Result<()>\n         })?;\n     }\n     let raw = toml::to_string_pretty(config)?;\n-    std::fs::write(path, raw)\n-        .with_context(|| format!(\"failed to write host context file `{}`\", path.display()))\n+    \n+    let mut temp_path = path.as_os_str().to_os_string();\n+    temp_path.push(\".tmp\");\n+    let temp_path = PathBuf::from(temp_path);\n+\n+    let write_result = (|| -> std::io::Result<()> {\n+        use std::io::Write;\n+        let mut file = std::fs::File::create(&temp_path)?;\n+        file.write_all(raw.as_bytes())?;\n+        file.sync_all()?;\n+\n+        #[cfg(not(windows))]\n+        std::fs::rename(&temp_path, path)?;\n+\n+        #[cfg(windows)]\n+        {\n+            if path.exists() {\n+                std::fs::remove_file(path)?;\n+            }\n+            std::fs::rename(&temp_path, path)?;\n+        }\n+        Ok(())\n+    })();\n+\n+    if write_result.is_err() && temp_path.exists() {\n+        let _ = std::fs::remove_file(&temp_path);\n+    }\n+\n+    write_result.with_context(|| format!(\"failed to safely write host context file `{}`\", path.display()))\n }\n \n #[cfg(test)]"
+    },
+    {
+      "sha": "fba16777d471a69bcbe16c760f3805b9520884ac",
+      "filename": "crates/fwc/src/op_lock.rs",
+      "status": "modified",
+      "additions": 30,
+      "deletions": 2,
+      "changes": 32,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/ccf62c3a59a74f7eb7b8670ac9d033641d87b0b9/crates%2Ffwc%2Fsrc%2Fop_lock.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/ccf62c3a59a74f7eb7b8670ac9d033641d87b0b9/crates%2Ffwc%2Fsrc%2Fop_lock.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffwc%2Fsrc%2Fop_lock.rs?ref=ccf62c3a59a74f7eb7b8670ac9d033641d87b0b9",
+      "patch": "@@ -272,8 +272,36 @@ impl LockStore {\n             .map_err(|e| format!(\"failed to create lock directory: {e}\"))?;\n         let json = serde_json::to_string_pretty(data)\n             .map_err(|e| format!(\"failed to serialize locks: {e}\"))?;\n-        std::fs::write(self.data_path(), json)\n-            .map_err(|e| format!(\"failed to write lock store: {e}\"))\n+            \n+        let mut temp_path = self.data_path().into_os_string();\n+        temp_path.push(\".tmp\");\n+        let temp_path = PathBuf::from(temp_path);\n+        let path = self.data_path();\n+\n+        let write_result = (|| -> std::io::Result<()> {\n+            use std::io::Write;\n+            let mut file = std::fs::File::create(&temp_path)?;\n+            file.write_all(json.as_bytes())?;\n+            file.sync_all()?;\n+\n+            #[cfg(not(windows))]\n+            std::fs::rename(&temp_path, &path)?;\n+\n+            #[cfg(windows)]\n+            {\n+                if path.exists() {\n+                    std::fs::remove_file(&path)?;\n+                }\n+                std::fs::rename(&temp_path, &path)?;\n+            }\n+            Ok(())\n+        })();\n+\n+        if write_result.is_err() && temp_path.exists() {\n+            let _ = std::fs::remove_file(&temp_path);\n+        }\n+\n+        write_result.map_err(|e| format!(\"failed to safely write lock store: {e}\"))\n     }\n \n     fn data_path(&self) -> PathBuf {"
+    },
+    {
+      "sha": "52f26ffc35487604387cfe64a4e4195bb6cf94e1",
+      "filename": "crates/fwc/src/routing.rs",
+      "status": "modified",
+      "additions": 29,
+      "deletions": 1,
+      "changes": 30,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/ccf62c3a59a74f7eb7b8670ac9d033641d87b0b9/crates%2Ffwc%2Fsrc%2Frouting.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/ccf62c3a59a74f7eb7b8670ac9d033641d87b0b9/crates%2Ffwc%2Fsrc%2Frouting.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffwc%2Fsrc%2Frouting.rs?ref=ccf62c3a59a74f7eb7b8670ac9d033641d87b0b9",
+      "patch": "@@ -419,7 +419,35 @@ impl PreferenceStore {\n         }\n         let json = serde_json::to_string_pretty(&self.data)\n             .map_err(|e| format!(\"failed to serialize preferences: {e}\"))?;\n-        fs::write(&self.path, json).map_err(|e| format!(\"failed to write preferences: {e}\"))?;\n+        \n+        let mut temp_path = self.path.as_os_str().to_os_string();\n+        temp_path.push(\".tmp\");\n+        let temp_path = std::path::PathBuf::from(temp_path);\n+\n+        let write_result = (|| -> std::io::Result<()> {\n+            use std::io::Write;\n+            let mut file = std::fs::File::create(&temp_path)?;\n+            file.write_all(json.as_bytes())?;\n+            file.sync_all()?;\n+\n+            #[cfg(not(windows))]\n+            std::fs::rename(&temp_path, &self.path)?;\n+\n+            #[cfg(windows)]\n+            {\n+                if self.path.exists() {\n+                    std::fs::remove_file(&self.path)?;\n+                }\n+                std::fs::rename(&temp_path, &self.path)?;\n+            }\n+            Ok(())\n+        })();\n+\n+        if write_result.is_err() && temp_path.exists() {\n+            let _ = std::fs::remove_file(&temp_path);\n+        }\n+\n+        write_result.map_err(|e| format!(\"failed to safely write preferences: {e}\"))?;\n         Ok(())\n     }\n "
+    }
+  ]
+}

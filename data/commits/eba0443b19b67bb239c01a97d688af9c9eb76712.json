@@ -1,0 +1,77 @@
+{
+  "message": "feat(net): add Windows named-pipe client; fix(time): correct timer wheel coalescing group counting\n\nAdd a Windows named-pipe client surface (NamedPipeClientOptions,\nNamedPipeClient) under src/net/sys/windows.rs, mirroring the\ntokio::net::windows::named_pipe migration shape. The implementation\nvalidates pipe-namespace paths, supports configurable read/write access,\nand includes unit tests for path validation and access-mode enforcement.\nWire it into the net module's public API behind cfg(target_os=\"windows\").\n\nFix a bug in TimerWheel::coalescing_group_size() where only timers in\nthe ready queue were counted, ignoring timers already placed in wheel\nlevels and the overflow list. The fix scans all occupied slots within\nthe coalescing window boundary across every level plus overflow entries.\nAdd coalescing_bug_test.rs as a targeted regression test.\n\nAdd wheel_cascade_test.rs to verify that timers placed at exact level\nboundaries (e.g., tick 256 at level 0's boundary) correctly cascade\nfrom higher levels and fire on time.\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "d779ff6548762e5854fc5a54145374f276648837",
+      "filename": "src/net/mod.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/eba0443b19b67bb239c01a97d688af9c9eb76712/src%2Fnet%2Fmod.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/eba0443b19b67bb239c01a97d688af9c9eb76712/src%2Fnet%2Fmod.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fnet%2Fmod.rs?ref=eba0443b19b67bb239c01a97d688af9c9eb76712",
+      "patch": "@@ -75,6 +75,8 @@ pub use quic_native::{\n     StreamTable, StreamTableError, TransportError,\n };\n pub use resolve::{lookup_all, lookup_one};\n+#[cfg(target_os = \"windows\")]\n+pub use sys::windows::{NamedPipeClient, NamedPipeClientOptions};\n pub use tcp::listener::{Incoming, TcpListener};\n pub use tcp::socket::TcpSocket;\n pub use tcp::split::{OwnedReadHalf, OwnedWriteHalf, ReadHalf, ReuniteError, WriteHalf};"
+    },
+    {
+      "sha": "c010fa253afdeb19873447b3016bae4ea357943e",
+      "filename": "src/net/sys/mod.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/eba0443b19b67bb239c01a97d688af9c9eb76712/src%2Fnet%2Fsys%2Fmod.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/eba0443b19b67bb239c01a97d688af9c9eb76712/src%2Fnet%2Fsys%2Fmod.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fnet%2Fsys%2Fmod.rs?ref=eba0443b19b67bb239c01a97d688af9c9eb76712",
+      "patch": "@@ -13,4 +13,4 @@ pub mod macos {}\n \n /// Windows-specific networking primitives.\n #[cfg(target_os = \"windows\")]\n-pub mod windows {}\n+pub mod windows;"
+    },
+    {
+      "sha": "f8ecdf1051d1819c13257cfa0b7062c9b7ecfeaf",
+      "filename": "src/net/sys/windows.rs",
+      "status": "added",
+      "additions": 177,
+      "deletions": 0,
+      "changes": 177,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/eba0443b19b67bb239c01a97d688af9c9eb76712/src%2Fnet%2Fsys%2Fwindows.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/eba0443b19b67bb239c01a97d688af9c9eb76712/src%2Fnet%2Fsys%2Fwindows.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fnet%2Fsys%2Fwindows.rs?ref=eba0443b19b67bb239c01a97d688af9c9eb76712",
+      "patch": "@@ -0,0 +1,177 @@\n+//! Windows-specific networking primitives.\n+//!\n+//! This module currently provides a named-pipe client surface that mirrors the\n+//! core migration shape from `tokio::net::windows::named_pipe::ClientOptions`\n+//! and `NamedPipeClient`.\n+\n+#![cfg(target_os = \"windows\")]\n+\n+use std::fs::{File, OpenOptions};\n+use std::io;\n+use std::io::{Read, Write};\n+use std::path::{Path, PathBuf};\n+\n+const PIPE_PREFIX: &str = r\"\\\\.\\pipe\\\";\n+\n+fn validate_named_pipe_path(path: &Path) -> io::Result<()> {\n+    let raw = path.to_string_lossy();\n+    if !raw.starts_with(PIPE_PREFIX) {\n+        return Err(io::Error::new(\n+            io::ErrorKind::InvalidInput,\n+            \"named pipe path must start with \\\\\\\\.\\\\pipe\\\\\",\n+        ));\n+    }\n+    if raw.len() <= PIPE_PREFIX.len() {\n+        return Err(io::Error::new(\n+            io::ErrorKind::InvalidInput,\n+            \"named pipe path must include a pipe name\",\n+        ));\n+    }\n+    Ok(())\n+}\n+\n+/// Builder for opening a Windows named-pipe client.\n+#[derive(Debug, Clone, Copy)]\n+pub struct NamedPipeClientOptions {\n+    read: bool,\n+    write: bool,\n+}\n+\n+impl Default for NamedPipeClientOptions {\n+    fn default() -> Self {\n+        Self {\n+            read: true,\n+            write: true,\n+        }\n+    }\n+}\n+\n+impl NamedPipeClientOptions {\n+    /// Construct default options (`read = true`, `write = true`).\n+    #[must_use]\n+    pub fn new() -> Self {\n+        Self::default()\n+    }\n+\n+    /// Enable/disable read access.\n+    #[must_use]\n+    pub fn read(mut self, enabled: bool) -> Self {\n+        self.read = enabled;\n+        self\n+    }\n+\n+    /// Enable/disable write access.\n+    #[must_use]\n+    pub fn write(mut self, enabled: bool) -> Self {\n+        self.write = enabled;\n+        self\n+    }\n+\n+    /// Connect to a named pipe with the configured access mode.\n+    ///\n+    /// The path must use the canonical Windows named-pipe namespace prefix:\n+    /// `\\\\.\\pipe\\...`.\n+    pub fn open(self, path: impl AsRef<Path>) -> io::Result<NamedPipeClient> {\n+        if !self.read && !self.write {\n+            return Err(io::Error::new(\n+                io::ErrorKind::InvalidInput,\n+                \"named pipe client requires read or write access\",\n+            ));\n+        }\n+\n+        let path = path.as_ref();\n+        validate_named_pipe_path(path)?;\n+\n+        let mut options = OpenOptions::new();\n+        options.read(self.read).write(self.write);\n+\n+        let file = options.open(path)?;\n+        Ok(NamedPipeClient {\n+            inner: file,\n+            path: path.to_path_buf(),\n+        })\n+    }\n+}\n+\n+/// Connected Windows named-pipe client.\n+#[derive(Debug)]\n+pub struct NamedPipeClient {\n+    inner: File,\n+    path: PathBuf,\n+}\n+\n+impl NamedPipeClient {\n+    /// Connect to a named pipe with default read/write options.\n+    pub fn connect(path: impl AsRef<Path>) -> io::Result<Self> {\n+        NamedPipeClientOptions::new().open(path)\n+    }\n+\n+    /// Return the pipe path used for this client.\n+    #[must_use]\n+    pub fn path(&self) -> &Path {\n+        &self.path\n+    }\n+\n+    /// Clone the underlying handle.\n+    pub fn try_clone(&self) -> io::Result<Self> {\n+        Ok(Self {\n+            inner: self.inner.try_clone()?,\n+            path: self.path.clone(),\n+        })\n+    }\n+\n+    /// Consume the wrapper and return the underlying file handle.\n+    #[must_use]\n+    pub fn into_inner(self) -> File {\n+        self.inner\n+    }\n+}\n+\n+impl Read for NamedPipeClient {\n+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {\n+        self.inner.read(buf)\n+    }\n+}\n+\n+impl Write for NamedPipeClient {\n+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {\n+        self.inner.write(buf)\n+    }\n+\n+    fn flush(&mut self) -> io::Result<()> {\n+        self.inner.flush()\n+    }\n+}\n+\n+#[cfg(test)]\n+mod tests {\n+    use super::*;\n+\n+    #[test]\n+    fn validate_named_pipe_path_rejects_non_pipe_namespace() {\n+        let err = validate_named_pipe_path(Path::new(r\"C:\\tmp\\not-a-pipe\")).unwrap_err();\n+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);\n+    }\n+\n+    #[test]\n+    fn validate_named_pipe_path_rejects_empty_pipe_name() {\n+        let err = validate_named_pipe_path(Path::new(r\"\\\\.\\pipe\\\")).unwrap_err();\n+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);\n+    }\n+\n+    #[test]\n+    fn validate_named_pipe_path_accepts_valid_prefix_and_name() {\n+        let valid = validate_named_pipe_path(Path::new(r\"\\\\.\\pipe\\asupersync-test\"));\n+        assert!(valid.is_ok());\n+    }\n+\n+    #[test]\n+    fn options_reject_read_and_write_both_disabled() {\n+        let err = NamedPipeClientOptions::new()\n+            .read(false)\n+            .write(false)\n+            .open(Path::new(r\"\\\\.\\pipe\\asupersync-test\"))\n+            .unwrap_err();\n+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);\n+    }\n+}"
+    },
+    {
+      "sha": "175b243c5e1f6bfddbc2fe751a9642fc3f171627",
+      "filename": "src/time/wheel.rs",
+      "status": "modified",
+      "additions": 33,
+      "deletions": 1,
+      "changes": 34,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/eba0443b19b67bb239c01a97d688af9c9eb76712/src%2Ftime%2Fwheel.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/eba0443b19b67bb239c01a97d688af9c9eb76712/src%2Ftime%2Fwheel.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Ftime%2Fwheel.rs?ref=eba0443b19b67bb239c01a97d688af9c9eb76712",
+      "patch": "@@ -916,12 +916,44 @@ impl TimerWheel {\n             .saturating_mul(window_ns);\n         let coalesced_time = Time::from_nanos(window_end_ns);\n \n-        let coalesced_count = self\n+        let mut coalesced_count = self\n             .ready\n             .iter()\n             .filter(|e| self.is_live(e) && e.deadline <= coalesced_time)\n             .count();\n \n+        for (idx, level) in self.levels.iter().enumerate() {\n+            let shift = idx * 8;\n+            let level_tick_current = self.current_tick >> shift;\n+            let level_tick_boundary = window_end_ns / level.resolution_ns;\n+\n+            if level_tick_boundary < level_tick_current {\n+                continue;\n+            }\n+\n+            let current_slot = (level_tick_current % (SLOTS_PER_LEVEL as u64)) as usize;\n+            let mut diff = (level_tick_boundary - level_tick_current) as usize;\n+            if diff >= SLOTS_PER_LEVEL {\n+                diff = SLOTS_PER_LEVEL - 1;\n+            }\n+\n+            for i in 0..=diff {\n+                let slot_idx = (current_slot + i) % SLOTS_PER_LEVEL;\n+                if level.is_occupied(slot_idx) {\n+                    coalesced_count += level.slots[slot_idx]\n+                        .iter()\n+                        .filter(|e| self.is_live(e) && e.deadline <= coalesced_time)\n+                        .count();\n+                }\n+            }\n+        }\n+\n+        coalesced_count += self\n+            .overflow\n+            .iter()\n+            .filter(|e| self.is_live(&e.entry) && e.deadline <= coalesced_time)\n+            .count();\n+\n         if coalesced_count >= self.coalescing.min_group_size.max(1) {\n             coalesced_count\n         } else {"
+    },
+    {
+      "sha": "04dd8569ebbb1a3bb1643d3fd85432f38799c07d",
+      "filename": "tests/coalescing_bug_test.rs",
+      "status": "added",
+      "additions": 34,
+      "deletions": 0,
+      "changes": 34,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/eba0443b19b67bb239c01a97d688af9c9eb76712/tests%2Fcoalescing_bug_test.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/eba0443b19b67bb239c01a97d688af9c9eb76712/tests%2Fcoalescing_bug_test.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/tests%2Fcoalescing_bug_test.rs?ref=eba0443b19b67bb239c01a97d688af9c9eb76712",
+      "patch": "@@ -0,0 +1,34 @@\n+#![allow(missing_docs)]\n+use asupersync::time::{CoalescingConfig, TimerWheel, TimerWheelConfig};\n+use asupersync::types::Time;\n+use std::sync::Arc;\n+use std::task::Waker;\n+use std::time::Duration;\n+\n+#[test]\n+fn test_coalescing_group_size_bug() {\n+    struct NoopWaker;\n+    impl std::task::Wake for NoopWaker {\n+        fn wake(self: Arc<Self>) {}\n+    }\n+    let waker = Waker::from(Arc::new(NoopWaker));\n+\n+    // Coalescing window: 10ms\n+    let config = CoalescingConfig::enabled_with_window(Duration::from_millis(10));\n+    let mut wheel =\n+        TimerWheel::with_config(Time::from_nanos(0), TimerWheelConfig::default(), config);\n+\n+    // Register timer at 2ms (within window 0..10ms)\n+    // This timer goes into the wheel levels (level 0).\n+    wheel.register(Time::from_nanos(2 * 1_000_000), waker);\n+\n+    // Current time: 1ms.\n+    // The coalescing boundary for 1ms is 10ms.\n+    // 2ms is <= 10ms, so it SHOULD be in the coalescing group!\n+    // But it's in the wheel, not in `ready`.\n+    let group_size = wheel.coalescing_group_size(Time::from_nanos(1_000_000));\n+    assert_eq!(\n+        group_size, 1,\n+        \"Expected coalescing_group_size to find the timer in the wheel\"\n+    );\n+}"
+    },
+    {
+      "sha": "605b9849717280e3f3bc7f0a02bdd8cfa49095d7",
+      "filename": "tests/wheel_cascade_test.rs",
+      "status": "added",
+      "additions": 29,
+      "deletions": 0,
+      "changes": 29,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/eba0443b19b67bb239c01a97d688af9c9eb76712/tests%2Fwheel_cascade_test.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/eba0443b19b67bb239c01a97d688af9c9eb76712/tests%2Fwheel_cascade_test.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/tests%2Fwheel_cascade_test.rs?ref=eba0443b19b67bb239c01a97d688af9c9eb76712",
+      "patch": "@@ -0,0 +1,29 @@\n+#![allow(missing_docs)]\n+use asupersync::time::TimerWheel;\n+use asupersync::types::Time;\n+use std::sync::Arc;\n+use std::task::Waker;\n+\n+#[test]\n+fn test_cascade_bug() {\n+    struct NoopWaker;\n+    impl std::task::Wake for NoopWaker {\n+        fn wake(self: Arc<Self>) {}\n+    }\n+    let waker = Waker::from(Arc::new(NoopWaker));\n+\n+    let mut wheel = TimerWheel::new_at(Time::from_nanos(0));\n+\n+    // Insert a timer at exactly 256ms (tick 256).\n+    // Level 0 range is 256. At tick 0, level 0 holds ticks 0..255.\n+    // So tick 256 goes to Level 1.\n+    wheel.register(Time::from_nanos(256 * 1_000_000), waker);\n+\n+    // Advance to tick 256\n+    let expired = wheel.collect_expired(Time::from_nanos(256 * 1_000_000));\n+    assert_eq!(\n+        expired.len(),\n+        1,\n+        \"Timer should fire at 256ms, but it didn't!\"\n+    );\n+}"
+    }
+  ]
+}

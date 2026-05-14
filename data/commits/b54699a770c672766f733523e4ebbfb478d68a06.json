@@ -1,0 +1,53 @@
+{
+  "message": "fix(signal+shutdown): signal notify race and shutdown phase_changed\u2192wait_for_phase\n\nsignal.rs:\n  Capture the Notified future BEFORE reading the delivery counter.\n  Previously, the notify could fire between the counter check and\n  the notified().await call, causing the signal to be missed until\n  the next delivery. Classic check-then-wait TOCTOU pattern.\n\nshutdown.rs:\n  Replace phase_changed() (returns after any phase transition) with\n  wait_for_phase(target) (loops until phase >= target). The new\n  method captures the Notified future before checking the phase,\n  preventing the same TOCTOU race. Callers no longer need to\n  manually loop checking phases.\n\nlistener.rs, server.rs:\n  Update callers from phase_changed() to wait_for_phase() with\n  the specific target phase they're waiting for.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "74d22b556bcd5c87efe52b20b9acaa34a890de8a",
+      "filename": "src/http/h1/listener.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 6,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/b54699a770c672766f733523e4ebbfb478d68a06/src%2Fhttp%2Fh1%2Flistener.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/b54699a770c672766f733523e4ebbfb478d68a06/src%2Fhttp%2Fh1%2Flistener.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fhttp%2Fh1%2Flistener.rs?ref=b54699a770c672766f733523e4ebbfb478d68a06",
+      "patch": "@@ -602,12 +602,7 @@ mod tests {\n             let began = shutdown.begin_drain(Duration::from_millis(0));\n             assert!(began);\n \n-            loop {\n-                if shutdown.phase() == ShutdownPhase::ForceClosing {\n-                    break;\n-                }\n-                shutdown.phase_changed().await;\n-            }\n+            shutdown.wait_for_phase(ShutdownPhase::ForceClosing).await;\n \n             finished.notify_one();\n             let stats = run_handle.await.expect(\"run\");"
+    },
+    {
+      "sha": "a447dcdb56fbeafe228bb2ba2430d04925a172c5",
+      "filename": "src/http/h1/server.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 1,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/b54699a770c672766f733523e4ebbfb478d68a06/src%2Fhttp%2Fh1%2Fserver.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/b54699a770c672766f733523e4ebbfb478d68a06/src%2Fhttp%2Fh1%2Fserver.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fhttp%2Fh1%2Fserver.rs?ref=b54699a770c672766f733523e4ebbfb478d68a06",
+      "patch": "@@ -227,7 +227,9 @@ where\n                 }\n \n                 let mut read_fut = std::pin::pin!(framed.poll_next_ready());\n-                let mut shutdown_fut = std::pin::pin!(signal.phase_changed());\n+                let mut shutdown_fut = std::pin::pin!(\n+                    signal.wait_for_phase(crate::server::shutdown::ShutdownPhase::Draining)\n+                );\n \n                 poll_fn(|cx| {\n                     if signal.is_shutting_down() {"
+    },
+    {
+      "sha": "db597e32c95f5e59894b1ab701757bc0884c246b",
+      "filename": "src/server/shutdown.rs",
+      "status": "modified",
+      "additions": 25,
+      "deletions": 12,
+      "changes": 37,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/b54699a770c672766f733523e4ebbfb478d68a06/src%2Fserver%2Fshutdown.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/b54699a770c672766f733523e4ebbfb478d68a06/src%2Fserver%2Fshutdown.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fserver%2Fshutdown.rs?ref=b54699a770c672766f733523e4ebbfb478d68a06",
+      "patch": "@@ -231,12 +231,18 @@ impl ShutdownSignal {\n         self.state.phase_notify.notify_waiters();\n     }\n \n-    /// Waits until the shutdown phase changes.\n+    /// Waits until the shutdown phase reaches or passes the target phase.\n     ///\n-    /// Returns the new phase after the change.\n-    pub async fn phase_changed(&self) -> ShutdownPhase {\n-        self.state.phase_notify.notified().await;\n-        self.phase()\n+    /// This method is race-free: it guarantees that it will not miss a phase\n+    /// transition that occurs concurrently.\n+    pub async fn wait_for_phase(&self, target: ShutdownPhase) {\n+        loop {\n+            let notified = self.state.phase_notify.notified();\n+            if self.phase() as u8 >= target as u8 {\n+                return;\n+            }\n+            notified.await;\n+        }\n     }\n \n     /// Returns the time when drain began, if applicable.\n@@ -526,7 +532,8 @@ mod tests {\n             });\n \n             // Wait for the phase change\n-            let new_phase = signal.phase_changed().await;\n+            signal.wait_for_phase(ShutdownPhase::Draining).await;\n+            let new_phase = signal.phase();\n             crate::assert_with_log!(\n                 new_phase == ShutdownPhase::Draining,\n                 \"phase after drain\",\n@@ -554,7 +561,8 @@ mod tests {\n                 assert!(forced, \"force close should succeed\");\n             });\n \n-            let new_phase = signal.phase_changed().await;\n+            signal.wait_for_phase(ShutdownPhase::ForceClosing).await;\n+            let new_phase = signal.phase();\n             crate::assert_with_log!(\n                 new_phase == ShutdownPhase::ForceClosing,\n                 \"phase after force close\",\n@@ -583,7 +591,8 @@ mod tests {\n                 signal2.mark_stopped();\n             });\n \n-            let new_phase = signal.phase_changed().await;\n+            signal.wait_for_phase(ShutdownPhase::ForceClosing).await;\n+            let new_phase = signal.phase();\n             crate::assert_with_log!(\n                 new_phase == ShutdownPhase::Stopped,\n                 \"phase after stopped\",\n@@ -608,7 +617,8 @@ mod tests {\n                 signal2.trigger_immediate();\n             });\n \n-            let new_phase = signal.phase_changed().await;\n+            signal.wait_for_phase(ShutdownPhase::ForceClosing).await;\n+            let new_phase = signal.phase();\n             crate::assert_with_log!(\n                 new_phase == ShutdownPhase::Stopped,\n                 \"phase after immediate\",\n@@ -643,7 +653,8 @@ mod tests {\n                     let began = sig.begin_drain(Duration::from_secs(1));\n                     assert!(began, \"begin drain should succeed\");\n                 });\n-                let p = signal.phase_changed().await;\n+                signal.wait_for_phase(ShutdownPhase::Draining).await;\n+                let p = signal.phase();\n                 crate::assert_with_log!(\n                     p == ShutdownPhase::Draining,\n                     \"draining\",\n@@ -661,7 +672,8 @@ mod tests {\n                     let forced = sig.begin_force_close();\n                     assert!(forced, \"force close should succeed\");\n                 });\n-                let p = signal.phase_changed().await;\n+                signal.wait_for_phase(ShutdownPhase::ForceClosing).await;\n+                let p = signal.phase();\n                 crate::assert_with_log!(\n                     p == ShutdownPhase::ForceClosing,\n                     \"force closing\",\n@@ -678,7 +690,8 @@ mod tests {\n                     std::thread::sleep(Duration::from_millis(10));\n                     sig.mark_stopped();\n                 });\n-                let p = signal.phase_changed().await;\n+                signal.wait_for_phase(ShutdownPhase::Stopped).await;\n+                let p = signal.phase();\n                 crate::assert_with_log!(\n                     p == ShutdownPhase::Stopped,\n                     \"stopped\","
+    },
+    {
+      "sha": "1d090ff32c52d1f63697a80f8fa447b3d050ae06",
+      "filename": "src/signal/signal.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/b54699a770c672766f733523e4ebbfb478d68a06/src%2Fsignal%2Fsignal.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/b54699a770c672766f733523e4ebbfb478d68a06/src%2Fsignal%2Fsignal.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fsignal%2Fsignal.rs?ref=b54699a770c672766f733523e4ebbfb478d68a06",
+      "patch": "@@ -376,12 +376,13 @@ impl Signal {\n         #[cfg(any(unix, windows))]\n         {\n             loop {\n+                let notified = self.slot.notify.notified();\n                 let current = self.slot.deliveries.load(Ordering::Acquire);\n                 if current > self.seen_deliveries {\n                     self.seen_deliveries = current;\n                     return Some(());\n                 }\n-                self.slot.notify.notified().await;\n+                notified.await;\n             }\n         }\n "
+    }
+  ]
+}

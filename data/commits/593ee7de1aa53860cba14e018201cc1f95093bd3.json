@@ -1,0 +1,53 @@
+{
+  "message": "fix(io): optimize Lines newline scan; broaden process module to non-WASM; harden timer safety\n\nThree targeted fixes:\n\n- io/lines.rs: Replace linear position() scan over buf[bytes_read..]\n  with a simple buf.last() == Some(&b'\\n') check. The newline can only\n  appear at the end of the buffer (enforced by step 4's\n  read_until(b'\\n')), so scanning from bytes_read was wasteful. This\n  reduces per-line overhead from O(n) to O(1).\n\n- lib.rs + process.rs: Widen the process module gate from #[cfg(unix)]\n  to #[cfg(not(target_arch = \"wasm32\"))], enabling compilation on\n  Windows. Gate unix-specific imports (AsRawFd, RawFd, libc::fcntl)\n  behind #[cfg(unix)] and add a #[cfg(windows)] import block for\n  AsRawHandle/RawHandle. Provide a no-op set_nonblocking() stub on\n  non-unix to maintain compilation.\n\n- time/intrusive_wheel.rs: Add a Drop impl for TimerNode that panics if\n  the node is still linked, catching use-after-free bugs at drop time\n  rather than silently corrupting the wheel. Promote two debug_assert!\n  guards on is_linked() to assert! so they fire in release builds too,\n  since inserting an already-linked node is a memory safety hazard.\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "43dc4b58799642c74e4ebe1f4cfe5e69f3e4800b",
+      "filename": "src/io/lines.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 3,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/593ee7de1aa53860cba14e018201cc1f95093bd3/src%2Fio%2Flines.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/593ee7de1aa53860cba14e018201cc1f95093bd3/src%2Fio%2Flines.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fio%2Flines.rs?ref=593ee7de1aa53860cba14e018201cc1f95093bd3",
+      "patch": "@@ -33,9 +33,10 @@ impl<R: AsyncBufRead + Unpin> Stream for Lines<R> {\n         let this = self.get_mut();\n \n         loop {\n-            // 1. Check if we already have a newline in `this.buf`\n-            if let Some(_pos) = this.buf[this.bytes_read..].iter().position(|&b| b == b'\\n') {\n-                // Remove \\n (we know it's always exactly at the end because of step 4)\n+            // 1. Check if we already have a newline at the end of `this.buf`\n+            // We know it can only be at the end because of step 4.\n+            if this.buf.last() == Some(&b'\\n') {\n+                // Remove \\n\n                 this.buf.pop();\n \n                 // Handle \\r\\n"
+    },
+    {
+      "sha": "c927b85b40226bf886e20c19412c02d0186c22dc",
+      "filename": "src/lib.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/593ee7de1aa53860cba14e018201cc1f95093bd3/src%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/593ee7de1aa53860cba14e018201cc1f95093bd3/src%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Flib.rs?ref=593ee7de1aa53860cba14e018201cc1f95093bd3",
+      "patch": "@@ -221,7 +221,7 @@ pub mod fs;\n pub mod grpc;\n #[cfg(not(target_arch = \"wasm32\"))]\n pub mod messaging;\n-#[cfg(unix)]\n+#[cfg(not(target_arch = \"wasm32\"))]\n pub mod process;\n #[cfg(not(target_arch = \"wasm32\"))]\n pub mod server;"
+    },
+    {
+      "sha": "f531020a6e73bbb7c5566b4564dfe354a5026a87",
+      "filename": "src/process.rs",
+      "status": "modified",
+      "additions": 75,
+      "deletions": 19,
+      "changes": 94,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/593ee7de1aa53860cba14e018201cc1f95093bd3/src%2Fprocess.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/593ee7de1aa53860cba14e018201cc1f95093bd3/src%2Fprocess.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fprocess.rs?ref=593ee7de1aa53860cba14e018201cc1f95093bd3",
+      "patch": "@@ -38,12 +38,17 @@ use crate::runtime::reactor::Interest;\n use std::collections::BTreeMap;\n use std::ffi::{OsStr, OsString};\n use std::io::{self, Read, Write};\n-use std::os::unix::io::{AsRawFd, RawFd};\n use std::path::{Path, PathBuf};\n use std::pin::Pin;\n use std::process as std_process;\n use std::task::{Context, Poll};\n \n+#[cfg(unix)]\n+use std::os::unix::io::{AsRawFd, RawFd};\n+#[cfg(windows)]\n+use std::os::windows::io::{AsRawHandle, RawHandle};\n+\n+#[cfg(unix)]\n fn set_nonblocking(fd: RawFd) -> io::Result<()> {\n     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };\n     if flags < 0 {\n@@ -56,6 +61,11 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {\n     Ok(())\n }\n \n+#[cfg(not(unix))]\n+fn set_nonblocking() -> io::Result<()> {\n+    Ok(())\n+}\n+\n fn drain_nonblocking<R: Read>(reader: &mut R, out: &mut Vec<u8>) -> io::Result<(bool, bool)> {\n     let mut any = false;\n     let mut buf = [0u8; 4096];\n@@ -935,6 +945,7 @@ pub struct ChildStdin {\n }\n \n impl ChildStdin {\n+    #[cfg(unix)]\n     fn from_std(stdin: std_process::ChildStdin) -> io::Result<Self> {\n         set_nonblocking(stdin.as_raw_fd())?;\n         Ok(Self {\n@@ -943,11 +954,28 @@ impl ChildStdin {\n         })\n     }\n \n+    #[cfg(not(unix))]\n+    fn from_std(stdin: std_process::ChildStdin) -> io::Result<Self> {\n+        set_nonblocking()?;\n+        Ok(Self {\n+            inner: stdin,\n+            registration: None,\n+        })\n+    }\n+\n     /// Returns the raw file descriptor.\n+    #[cfg(unix)]\n     #[must_use]\n     pub fn as_raw_fd(&self) -> RawFd {\n         self.inner.as_raw_fd()\n     }\n+\n+    /// Returns the raw handle on Windows.\n+    #[cfg(windows)]\n+    #[must_use]\n+    pub fn as_raw_handle(&self) -> RawHandle {\n+        self.inner.as_raw_handle()\n+    }\n }\n \n impl AsyncWrite for ChildStdin {\n@@ -957,33 +985,61 @@ impl AsyncWrite for ChildStdin {\n         buf: &[u8],\n     ) -> Poll<io::Result<usize>> {\n         let this = self.get_mut();\n-        match this.inner.write(buf) {\n-            Ok(n) => Poll::Ready(Ok(n)),\n-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {\n-                if let Err(err) =\n-                    register_interest(&mut this.registration, &this.inner, cx, Interest::WRITABLE)\n-                {\n-                    return Poll::Ready(Err(err));\n+        #[cfg(unix)]\n+        {\n+            match this.inner.write(buf) {\n+                Ok(n) => Poll::Ready(Ok(n)),\n+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {\n+                    if let Err(err) = register_interest(\n+                        &mut this.registration,\n+                        &this.inner,\n+                        cx,\n+                        Interest::WRITABLE,\n+                    ) {\n+                        return Poll::Ready(Err(err));\n+                    }\n+                    Poll::Pending\n                 }\n-                Poll::Pending\n+                Err(e) => Poll::Ready(Err(e)),\n             }\n-            Err(e) => Poll::Ready(Err(e)),\n+        }\n+        #[cfg(not(unix))]\n+        {\n+            let _ = (this, cx, buf);\n+            Poll::Ready(Err(io::Error::new(\n+                io::ErrorKind::Unsupported,\n+                \"async child stdin is only supported on Unix in this build\",\n+            )))\n         }\n     }\n \n     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {\n         let this = self.get_mut();\n-        match this.inner.flush() {\n-            Ok(()) => Poll::Ready(Ok(())),\n-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {\n-                if let Err(err) =\n-                    register_interest(&mut this.registration, &this.inner, cx, Interest::WRITABLE)\n-                {\n-                    return Poll::Ready(Err(err));\n+        #[cfg(unix)]\n+        {\n+            match this.inner.flush() {\n+                Ok(()) => Poll::Ready(Ok(())),\n+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {\n+                    if let Err(err) = register_interest(\n+                        &mut this.registration,\n+                        &this.inner,\n+                        cx,\n+                        Interest::WRITABLE,\n+                    ) {\n+                        return Poll::Ready(Err(err));\n+                    }\n+                    Poll::Pending\n                 }\n-                Poll::Pending\n+                Err(e) => Poll::Ready(Err(e)),\n             }\n-            Err(e) => Poll::Ready(Err(e)),\n+        }\n+        #[cfg(not(unix))]\n+        {\n+            let _ = (this, cx);\n+            Poll::Ready(Err(io::Error::new(\n+                io::ErrorKind::Unsupported,\n+                \"async child stdin is only supported on Unix in this build\",\n+            )))\n         }\n     }\n "
+    },
+    {
+      "sha": "6dcbb9e2f669e17864b8e3042c6237a63efd6010",
+      "filename": "src/time/intrusive_wheel.rs",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 2,
+      "changes": 12,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/593ee7de1aa53860cba14e018201cc1f95093bd3/src%2Ftime%2Fintrusive_wheel.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/593ee7de1aa53860cba14e018201cc1f95093bd3/src%2Ftime%2Fintrusive_wheel.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Ftime%2Fintrusive_wheel.rs?ref=593ee7de1aa53860cba14e018201cc1f95093bd3",
+      "patch": "@@ -94,6 +94,14 @@ impl std::fmt::Debug for TimerNode {\n     }\n }\n \n+impl Drop for TimerNode {\n+    fn drop(&mut self) {\n+        if self.is_linked() {\n+            panic!(\"TimerNode dropped while still linked in TimerWheel! This is a severe safety violation and use-after-free bug.\");\n+        }\n+    }\n+}\n+\n impl TimerNode {\n     /// Creates a new unlinked timer node.\n     #[must_use]\n@@ -410,7 +418,7 @@ impl<const SLOTS: usize> TimerWheel<SLOTS> {\n         deadline: Instant,\n         waker: Waker,\n     ) {\n-        debug_assert!(\n+        assert!(\n             !node.is_linked(),\n             \"attempted to insert already-linked timer node\"\n         );\n@@ -666,7 +674,7 @@ impl HierarchicalTimerWheel {\n         deadline: Instant,\n         waker: Waker,\n     ) {\n-        debug_assert!(\n+        assert!(\n             !node.is_linked(),\n             \"attempted to insert already-linked timer node\"\n         );"
+    }
+  ]
+}

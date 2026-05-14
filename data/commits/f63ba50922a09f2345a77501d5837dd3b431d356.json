@@ -1,0 +1,29 @@
+{
+  "message": "fix: saturating uptime_ms cast in WhatsApp and add SSE max_data_bytes limit\n\nWhatsApp: replace truncating as-u64 cast on uptime_ms with\ntry_from().unwrap_or(u64::MAX) to prevent overflow on long-running\nconnectors.\n\nfcp-streaming/sse: add max_data_bytes field to SseParser with\nconfigurable retained payload limit (default 10MB in tests). Replace\nDefault derive with explicit with_max_data_bytes constructor. This\nprevents DoS from SSE streams that accumulate unbounded data: lines\nwithout producing a complete event.\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "f786678dc67f479e3266be963914ff0c3977725e",
+      "filename": "connectors/whatsapp/src/connector.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/f63ba50922a09f2345a77501d5837dd3b431d356/connectors%2Fwhatsapp%2Fsrc%2Fconnector.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/f63ba50922a09f2345a77501d5837dd3b431d356/connectors%2Fwhatsapp%2Fsrc%2Fconnector.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/connectors%2Fwhatsapp%2Fsrc%2Fconnector.rs?ref=f63ba50922a09f2345a77501d5837dd3b431d356",
+      "patch": "@@ -378,7 +378,8 @@ impl FcpConnector for WhatsAppConnector {\n         } else {\n             HealthSnapshot::degraded(\"not configured\")\n         };\n-        snapshot.uptime_ms = self.started_at.elapsed().as_millis() as u64;\n+        snapshot.uptime_ms =\n+            u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);\n         snapshot\n     }\n "
+    },
+    {
+      "sha": "03b022c90170a9fc6f42213deb7d20feb1beb80e",
+      "filename": "crates/fcp-streaming/src/sse.rs",
+      "status": "modified",
+      "additions": 40,
+      "deletions": 4,
+      "changes": 44,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/f63ba50922a09f2345a77501d5837dd3b431d356/crates%2Ffcp-streaming%2Fsrc%2Fsse.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/f63ba50922a09f2345a77501d5837dd3b431d356/crates%2Ffcp-streaming%2Fsrc%2Fsse.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-streaming%2Fsrc%2Fsse.rs?ref=f63ba50922a09f2345a77501d5837dd3b431d356",
+      "patch": "@@ -80,8 +80,11 @@ impl SseEvent {\n     }\n }\n \n+#[cfg(test)]\n+const DEFAULT_MAX_DATA_BYTES: usize = 10 * 1024 * 1024;\n+\n /// SSE parser state.\n-#[derive(Debug, Default)]\n+#[derive(Debug)]\n struct SseParser {\n     /// Buffer for incomplete data.\n     buffer: BytesMut,\n@@ -97,12 +100,29 @@ struct SseParser {\n     last_event_id: Option<String>,\n     /// Total bytes accumulated in `data_lines` (`DoS` protection).\n     data_bytes_len: usize,\n+    /// Maximum `data:` payload bytes retained for an in-progress event.\n+    max_data_bytes: usize,\n }\n \n impl SseParser {\n     /// Create a new parser.\n+    #[cfg(test)]\n     fn new() -> Self {\n-        Self::default()\n+        Self::with_max_data_bytes(DEFAULT_MAX_DATA_BYTES)\n+    }\n+\n+    /// Create a new parser with a specific retained payload limit.\n+    fn with_max_data_bytes(max_data_bytes: usize) -> Self {\n+        Self {\n+            buffer: BytesMut::new(),\n+            event_type: None,\n+            data_lines: Vec::new(),\n+            event_id: None,\n+            retry: None,\n+            last_event_id: None,\n+            data_bytes_len: 0,\n+            max_data_bytes,\n+        }\n     }\n \n     /// Parse incoming data and return complete events.\n@@ -161,7 +181,7 @@ impl SseParser {\n             \"event\" => self.event_type = Some(value.to_string()),\n             \"data\" => {\n                 let val_len = value.len();\n-                if self.data_bytes_len.saturating_add(val_len) <= 10 * 1024 * 1024 {\n+                if self.data_bytes_len.saturating_add(val_len) <= self.max_data_bytes {\n                     self.data_lines.push(value.to_string());\n                     self.data_bytes_len += val_len;\n                 }\n@@ -473,7 +493,7 @@ impl SseStream {\n     fn new(body: ClientIncomingBody<ClientIo>, max_buffer_size: usize) -> Self {\n         Self {\n             inner: SseChunkStream::new(body),\n-            parser: SseParser::new(),\n+            parser: SseParser::with_max_data_bytes(max_buffer_size),\n             pending_events: Vec::new(),\n             max_buffer_size,\n         }\n@@ -1121,6 +1141,22 @@ mod tests {\n         assert!(events[0].data.len() <= 10 * 1024 * 1024);\n     }\n \n+    #[test]\n+    fn test_parse_data_honors_custom_retained_limit() {\n+        use std::fmt::Write;\n+\n+        let mut parser = SseParser::with_max_data_bytes(12 * 1024 * 1024);\n+        let big_line = \"a\".repeat(11 * 1024 * 1024);\n+        let mut input = String::new();\n+        let _ = writeln!(input, \"data: {big_line}\");\n+        input.push('\\n');\n+\n+        let events = parser.parse(&Bytes::from(input));\n+\n+        assert_eq!(events.len(), 1);\n+        assert_eq!(events[0].data.len(), big_line.len());\n+    }\n+\n     #[test]\n     fn test_retained_bytes_counts_payload_and_raw_buffer() {\n         let mut parser = SseParser::new();"
+    }
+  ]
+}

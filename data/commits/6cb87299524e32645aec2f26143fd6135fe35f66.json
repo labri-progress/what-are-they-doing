@@ -1,0 +1,29 @@
+{
+  "message": "fix: harden windows gateway stop cleanup",
+  "files": [
+    {
+      "sha": "8142ff0d839de7c2d67b574b20cbd5a9ae77769d",
+      "filename": "src/daemon/schtasks.stop.test.ts",
+      "status": "modified",
+      "additions": 46,
+      "deletions": 0,
+      "changes": 46,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6cb87299524e32645aec2f26143fd6135fe35f66/src%2Fdaemon%2Fschtasks.stop.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6cb87299524e32645aec2f26143fd6135fe35f66/src%2Fdaemon%2Fschtasks.stop.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fdaemon%2Fschtasks.stop.test.ts?ref=6cb87299524e32645aec2f26143fd6135fe35f66",
+      "patch": "@@ -121,6 +121,52 @@ describe(\"Scheduled Task stop/restart cleanup\", () => {\n     });\n   });\n \n+  it(\"force-kills remaining busy port listeners when the first stop pass does not free the port\", async () => {\n+    await withWindowsEnv(async ({ env }) => {\n+      await writeGatewayScript(env);\n+      schtasksResponses.push(\n+        { code: 0, stdout: \"\", stderr: \"\" },\n+        { code: 0, stdout: \"\", stderr: \"\" },\n+        { code: 0, stdout: \"\", stderr: \"\" },\n+      );\n+      findVerifiedGatewayListenerPidsOnPortSync.mockReturnValue([4242]);\n+      inspectPortUsage.mockResolvedValueOnce({\n+        port: 18789,\n+        status: \"busy\",\n+        listeners: [{ pid: 4242, command: \"node.exe\" }],\n+        hints: [],\n+      });\n+      for (let i = 0; i < 20; i += 1) {\n+        inspectPortUsage.mockResolvedValueOnce({\n+          port: 18789,\n+          status: \"busy\",\n+          listeners: [{ pid: 4242, command: \"node.exe\" }],\n+          hints: [],\n+        });\n+      }\n+      inspectPortUsage\n+        .mockResolvedValueOnce({\n+          port: 18789,\n+          status: \"busy\",\n+          listeners: [{ pid: 5252, command: \"node.exe\" }],\n+          hints: [],\n+        })\n+        .mockResolvedValueOnce({\n+          port: 18789,\n+          status: \"free\",\n+          listeners: [],\n+          hints: [],\n+        });\n+\n+      const stdout = new PassThrough();\n+      await stopScheduledTask({ env, stdout });\n+\n+      expect(killProcessTree).toHaveBeenNthCalledWith(1, 4242, { graceMs: 300 });\n+      expect(killProcessTree).toHaveBeenNthCalledWith(2, expect.any(Number), { graceMs: 300 });\n+      expect(inspectPortUsage.mock.calls.length).toBeGreaterThanOrEqual(22);\n+    });\n+  });\n+\n   it(\"falls back to inspected gateway listeners when sync verification misses on Windows\", async () => {\n     await withWindowsEnv(async ({ env }) => {\n       await writeGatewayScript(env);"
+    },
+    {
+      "sha": "3a92f0944fc9c87c737db83e8c415263e730f260",
+      "filename": "src/daemon/schtasks.ts",
+      "status": "modified",
+      "additions": 34,
+      "deletions": 2,
+      "changes": 36,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/6cb87299524e32645aec2f26143fd6135fe35f66/src%2Fdaemon%2Fschtasks.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/6cb87299524e32645aec2f26143fd6135fe35f66/src%2Fdaemon%2Fschtasks.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fdaemon%2Fschtasks.ts?ref=6cb87299524e32645aec2f26143fd6135fe35f66",
+      "patch": "@@ -463,6 +463,24 @@ async function waitForGatewayPortRelease(port: number, timeoutMs = 5_000): Promi\n   return false;\n }\n \n+async function terminateBusyPortListeners(port: number): Promise<number[]> {\n+  const diagnostics = await inspectPortUsage(port).catch(() => null);\n+  if (diagnostics?.status !== \"busy\") {\n+    return [];\n+  }\n+  const pids = Array.from(\n+    new Set(\n+      diagnostics.listeners\n+        .map((listener) => listener.pid)\n+        .filter((pid): pid is number => Number.isFinite(pid) && pid > 0),\n+    ),\n+  );\n+  for (const pid of pids) {\n+    await terminateGatewayProcessTree(pid, 300);\n+  }\n+  return pids;\n+}\n+\n async function resolveFallbackRuntime(env: GatewayServiceEnv): Promise<GatewayServiceRuntime> {\n   const port = resolveConfiguredGatewayPort(env);\n   if (!port) {\n@@ -655,7 +673,14 @@ export async function stopScheduledTask({ stdout, env }: GatewayServiceControlAr\n   await terminateScheduledTaskGatewayListeners(effectiveEnv);\n   await terminateInstalledStartupRuntime(effectiveEnv);\n   if (stopPort) {\n-    await waitForGatewayPortRelease(stopPort);\n+    const released = await waitForGatewayPortRelease(stopPort);\n+    if (!released) {\n+      await terminateBusyPortListeners(stopPort);\n+      const releasedAfterForce = await waitForGatewayPortRelease(stopPort, 2_000);\n+      if (!releasedAfterForce) {\n+        throw new Error(`gateway port ${stopPort} is still busy after stop`);\n+      }\n+    }\n   }\n   stdout.write(`${formatLine(\"Stopped Scheduled Task\", taskName)}\\n`);\n }\n@@ -684,7 +709,14 @@ export async function restartScheduledTask({\n   await terminateScheduledTaskGatewayListeners(effectiveEnv);\n   await terminateInstalledStartupRuntime(effectiveEnv);\n   if (restartPort) {\n-    await waitForGatewayPortRelease(restartPort);\n+    const released = await waitForGatewayPortRelease(restartPort);\n+    if (!released) {\n+      await terminateBusyPortListeners(restartPort);\n+      const releasedAfterForce = await waitForGatewayPortRelease(restartPort, 2_000);\n+      if (!releasedAfterForce) {\n+        throw new Error(`gateway port ${restartPort} is still busy before restart`);\n+      }\n+    }\n   }\n   const res = await execSchtasks([\"/Run\", \"/TN\", taskName]);\n   if (res.code !== 0) {"
+    }
+  ]
+}

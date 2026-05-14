@@ -1,0 +1,41 @@
+{
+  "message": "Pack 3 Return-side accessor calls into one boundary call\n\ncpp_rpc_get_return_summary writes answerId + retKind + capCount packed\ninto cpp_out so JS reads them with a single DataView. Mirrors the\nexisting cpp_rpc_get_call_summary pattern. Saves 2 wasm-boundary\ncrossings on every Return \u2014 small (~100 ns/call) but it's free, the\ncode is cleaner, and consistent with the Call path.",
+  "files": [
+    {
+      "sha": "be41a106c9bcb2b455dcbcd3f436f681cb4382c5",
+      "filename": "cpp/build.sh",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/teamchong/capnwasm/blob/d0dbe0d6bb257e86313b3d2f19446f803de84ab7/cpp%2Fbuild.sh",
+      "raw_url": "https://github.com/teamchong/capnwasm/raw/d0dbe0d6bb257e86313b3d2f19446f803de84ab7/cpp%2Fbuild.sh",
+      "contents_url": "https://api.github.com/repos/teamchong/capnwasm/contents/cpp%2Fbuild.sh?ref=d0dbe0d6bb257e86313b3d2f19446f803de84ab7",
+      "patch": "@@ -166,6 +166,7 @@ FLAGS=(\n   -Wl,--export=cpp_rpc_get_call_params\n   -Wl,--export=cpp_rpc_get_return_answer_id\n   -Wl,--export=cpp_rpc_get_return_kind\n+  -Wl,--export=cpp_rpc_get_return_summary\n   -Wl,--export=cpp_rpc_get_return_results\n   -Wl,--export=cpp_rpc_get_return_exception\n   -Wl,--export=cpp_rpc_get_finish_question_id"
+    },
+    {
+      "sha": "7700ef1947caa9d9b202da0475bc4f6c8112b73f",
+      "filename": "cpp/wrapper.cpp",
+      "status": "modified",
+      "additions": 26,
+      "deletions": 0,
+      "changes": 26,
+      "blob_url": "https://github.com/teamchong/capnwasm/blob/d0dbe0d6bb257e86313b3d2f19446f803de84ab7/cpp%2Fwrapper.cpp",
+      "raw_url": "https://github.com/teamchong/capnwasm/raw/d0dbe0d6bb257e86313b3d2f19446f803de84ab7/cpp%2Fwrapper.cpp",
+      "contents_url": "https://api.github.com/repos/teamchong/capnwasm/contents/cpp%2Fwrapper.cpp?ref=d0dbe0d6bb257e86313b3d2f19446f803de84ab7",
+      "patch": "@@ -1481,6 +1481,32 @@ uint32_t cpp_rpc_get_return_kind() {\n   return 3;\n }\n \n+// Pack the three Return accessors JS reads on every Return into one\n+// boundary call. Layout in cpp_out:\n+//   [0..4]   answerId\n+//   [4..8]   retKind  (0=results, 1=exception, 2=canceled, 3=other)\n+//   [8..12]  capCount (0 if retKind != results)\n+// Returns 1 on success, 0 if no rpc_reader is live.\n+uint32_t cpp_rpc_get_return_summary() {\n+  if (!rpc_reader) return 0;\n+  auto ret = rpc_reader->getRoot<capnp::rpc::Message>().getReturn();\n+  uint32_t answerId = ret.getAnswerId();\n+  uint32_t retKind  = 3;\n+  uint32_t capCount = 0;\n+  if (ret.isResults()) {\n+    retKind = 0;\n+    capCount = ret.getResults().getCapTable().size();\n+  } else if (ret.isException()) {\n+    retKind = 1;\n+  } else if (ret.isCanceled()) {\n+    retKind = 2;\n+  }\n+  std::memcpy(cpp_out + 0, &answerId, 4);\n+  std::memcpy(cpp_out + 4, &retKind,  4);\n+  std::memcpy(cpp_out + 8, &capCount, 4);\n+  return 1;\n+}\n+\n uint32_t cpp_rpc_get_return_results() {\n   if (!rpc_reader) return 0;\n   auto ret = rpc_reader->getRoot<capnp::rpc::Message>().getReturn();"
+    },
+    {
+      "sha": "04d8524c2439de3ded213f2ae5a4c8e073d2d4df",
+      "filename": "js/rpc.mjs",
+      "status": "modified",
+      "additions": 23,
+      "deletions": 11,
+      "changes": 34,
+      "blob_url": "https://github.com/teamchong/capnwasm/blob/d0dbe0d6bb257e86313b3d2f19446f803de84ab7/js%2Frpc.mjs",
+      "raw_url": "https://github.com/teamchong/capnwasm/raw/d0dbe0d6bb257e86313b3d2f19446f803de84ab7/js%2Frpc.mjs",
+      "contents_url": "https://api.github.com/repos/teamchong/capnwasm/contents/js%2Frpc.mjs?ref=d0dbe0d6bb257e86313b3d2f19446f803de84ab7",
+      "patch": "@@ -89,11 +89,16 @@ class FrameReader {\n \n // Deferred is a tiny promise + resolver pair so we can park awaiters on a\n // question id and resolve them when the matching Return arrives.\n-function deferred() {\n-  let resolve, reject;\n-  const promise = new Promise((res, rej) => { resolve = res; reject = rej; });\n-  return { promise, resolve, reject };\n-}\n+// Promise.withResolvers (ES2024) skips the executor closure that the\n+// classic { let r; new Promise((res) => r = res); } pattern needs. One\n+// fewer allocation per Call. Falls back where unavailable.\n+const deferred = typeof Promise.withResolvers === \"function\"\n+  ? () => Promise.withResolvers()\n+  : () => {\n+      let resolve, reject;\n+      const promise = new Promise((res, rej) => { resolve = res; reject = rej; });\n+      return { promise, resolve, reject };\n+    };\n \n /**\n  * RpcSession drives one peer of an RPC connection. Both sides instantiate one,\n@@ -592,16 +597,23 @@ export class RpcSession {\n   }\n \n   #handleReturn() {\n-    const answerId = this.#exp.cpp_rpc_get_return_answer_id();\n-    const retKind  = this.#exp.cpp_rpc_get_return_kind();\n+    // One wasm call returns answerId + retKind + capCount packed in\n+    // cpp_out (saves 2-3 boundary crossings per Return). Layout matches\n+    // cpp_rpc_get_return_summary in cpp/wrapper.cpp.\n+    if (this.#exp.cpp_rpc_get_return_summary() !== 1) return;\n+    const u8  = this.#mem();\n+    const out = this.#outPtr;\n+    const dv  = new DataView(u8.buffer, out, 12);\n+    const answerId = dv.getUint32(0, true);\n+    const retKind  = dv.getUint32(4, true);\n+    const capCount = dv.getUint32(8, true);\n     const q = this.#questions.get(answerId);\n     if (!q) return;\n     this.#questions.delete(answerId);\n     if (retKind === RET_RESULTS) {\n-      // Read the capTable first (it lives inside the Payload but doesn't\n-      // touch cpp_out), then either run the synchronous extractor against\n-      // the live rpc_reader, or copy out the result bytes for the caller.\n-      const capCount = this.#exp.cpp_rpc_get_return_cap_count();\n+      // capCount already populated by the summary call; per-cap kind/id\n+      // still need their own boundary calls (rare path \u2014 most Returns\n+      // carry zero caps).\n       const caps = new Array(capCount);\n       for (let i = 0; i < capCount; i++) {\n         const kind = this.#exp.cpp_rpc_get_return_cap_kind(i);"
+    }
+  ]
+}

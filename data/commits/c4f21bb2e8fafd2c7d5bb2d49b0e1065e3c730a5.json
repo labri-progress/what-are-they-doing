@@ -1,0 +1,29 @@
+{
+  "message": "Respect CLIENT NO-TOUCH LRU behavior",
+  "files": [
+    {
+      "sha": "d63286badae1fd023c7c50369407ad074a003695",
+      "filename": "crates/fr-runtime/src/lib.rs",
+      "status": "modified",
+      "additions": 40,
+      "deletions": 1,
+      "changes": 41,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/c4f21bb2e8fafd2c7d5bb2d49b0e1065e3c730a5/crates%2Ffr-runtime%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/c4f21bb2e8fafd2c7d5bb2d49b0e1065e3c730a5/crates%2Ffr-runtime%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/crates%2Ffr-runtime%2Fsrc%2Flib.rs?ref=c4f21bb2e8fafd2c7d5bb2d49b0e1065e3c730a5",
+      "patch": "@@ -2662,7 +2662,16 @@ impl Runtime {\n         // No eager digest computation here. Threat events compute their own\n         // digests on demand inside record_threat_event, so the success path\n         // pays nothing for the evidence ledger.\n-        let reply = self.execute_frame_internal(frame, argv_result, now_ms, packet_id);\n+        let disable_touch = self.session.client_no_touch\n+            && argv_result\n+                .as_ref()\n+                .ok()\n+                .and_then(|argv| argv.first())\n+                .map(|cmd| !eq_ascii_token(cmd, b\"TOUCH\"))\n+                .unwrap_or(false);\n+        let reply = fr_store::with_touch_disabled(disable_touch, || {\n+            self.execute_frame_internal(frame, argv_result, now_ms, packet_id)\n+        });\n         if matches!(reply, RespFrame::Error(_)) {\n             self.server.store.stat_total_error_replies += 1;\n             if self.execution_source.counts_as_unexpected_error_reply() {\n@@ -13128,4 +13137,34 @@ mod tests {\n             RespFrame::Error(\"ERR There is no configured ACL file\".to_string())\n         );\n     }\n+\n+    #[test]\n+    fn client_no_touch_skips_lru_updates_except_touch_command() {\n+        let mut rt = Runtime::default_strict();\n+\n+        assert_eq!(\n+            rt.execute_frame(command(&[b\"SET\", b\"k\", b\"v\"]), 0),\n+            RespFrame::SimpleString(\"OK\".to_string())\n+        );\n+        assert_eq!(\n+            rt.execute_frame(command(&[b\"CLIENT\", b\"NO-TOUCH\", b\"ON\"]), 1),\n+            RespFrame::SimpleString(\"OK\".to_string())\n+        );\n+        assert_eq!(\n+            rt.execute_frame(command(&[b\"GET\", b\"k\"]), 1_000),\n+            RespFrame::BulkString(Some(b\"v\".to_vec()))\n+        );\n+        assert_eq!(\n+            rt.execute_frame(command(&[b\"OBJECT\", b\"IDLETIME\", b\"k\"]), 2_000),\n+            RespFrame::Integer(2)\n+        );\n+        assert_eq!(\n+            rt.execute_frame(command(&[b\"TOUCH\", b\"k\"]), 2_500),\n+            RespFrame::Integer(1)\n+        );\n+        assert_eq!(\n+            rt.execute_frame(command(&[b\"OBJECT\", b\"IDLETIME\", b\"k\"]), 3_000),\n+            RespFrame::Integer(0)\n+        );\n+    }\n }"
+    },
+    {
+      "sha": "36f2075b39fe6ef0d6c71bb3c478d558457711a0",
+      "filename": "crates/fr-store/src/lib.rs",
+      "status": "modified",
+      "additions": 39,
+      "deletions": 0,
+      "changes": 39,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/c4f21bb2e8fafd2c7d5bb2d49b0e1065e3c730a5/crates%2Ffr-store%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/c4f21bb2e8fafd2c7d5bb2d49b0e1065e3c730a5/crates%2Ffr-store%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/crates%2Ffr-store%2Fsrc%2Flib.rs?ref=c4f21bb2e8fafd2c7d5bb2d49b0e1065e3c730a5",
+      "patch": "@@ -1,12 +1,48 @@\n #![forbid(unsafe_code)]\n \n use fr_expire::evaluate_expiry;\n+use std::cell::Cell;\n use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};\n use std::ops::Bound::{Excluded, Included, Unbounded};\n \n /// Redis-compatible version string. Single source of truth for all version reporting.\n pub const REDIS_COMPAT_VERSION: &str = \"7.2.0\";\n \n+thread_local! {\n+    static TOUCH_DISABLED: Cell<bool> = const { Cell::new(false) };\n+}\n+\n+struct TouchGuard {\n+    previous: bool,\n+}\n+\n+impl TouchGuard {\n+    fn new(disabled: bool) -> Self {\n+        let previous = TOUCH_DISABLED.with(|flag| {\n+            let prev = flag.get();\n+            flag.set(disabled);\n+            prev\n+        });\n+        Self { previous }\n+    }\n+}\n+\n+impl Drop for TouchGuard {\n+    fn drop(&mut self) {\n+        TOUCH_DISABLED.with(|flag| flag.set(self.previous));\n+    }\n+}\n+\n+fn touch_disabled() -> bool {\n+    TOUCH_DISABLED.with(Cell::get)\n+}\n+\n+/// Temporarily disable LRU/LFU touch updates for the current thread.\n+pub fn with_touch_disabled<T>(disabled: bool, f: impl FnOnce() -> T) -> T {\n+    let _guard = TouchGuard::new(disabled);\n+    f()\n+}\n+\n // \u2500\u2500 Keyspace notification flags (matching Redis server.h) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n pub const NOTIFY_KEYSPACE: u32 = 1 << 0; // K\n pub const NOTIFY_KEYEVENT: u32 = 1 << 1; // E\n@@ -493,6 +529,9 @@ impl Entry {\n     }\n \n     fn touch(&mut self, now_ms: u64) {\n+        if touch_disabled() {\n+            return;\n+        }\n         self.last_access_ms = now_ms;\n     }\n "
+    }
+  ]
+}

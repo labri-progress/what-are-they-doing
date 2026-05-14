@@ -1,0 +1,41 @@
+{
+  "message": "fix(epoch,h2): barrier TOCTOU and RFC 7540 unknown frame compliance\n\nepoch.rs: Hold participants write lock across both the dedup check and\nthe atomic arrived counter increment to prevent TOCTOU where the list\nand counter could desync if a thread panics between the two operations.\n\nh2/frame.rs: Add Frame::Unknown variant so parse_frame returns Ok for\nunrecognized frame types instead of Err, per RFC 7540 \u00a74.1 which\nrequires endpoints to ignore unknown frame types. The connection codec\nalready skipped unknown types before calling parse_frame, but the\nfunction itself was non-compliant.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "d9c4ef191c8016a1df8053e2036a756fd298af98",
+      "filename": "src/epoch.rs",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 5,
+      "changes": 13,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/535e9410b16adaf47755944be292fe342aea2e3a/src%2Fepoch.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/535e9410b16adaf47755944be292fe342aea2e3a/src%2Fepoch.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fepoch.rs?ref=535e9410b16adaf47755944be292fe342aea2e3a",
+      "patch": "@@ -715,8 +715,9 @@ impl EpochBarrier {\n             }\n         }\n \n-        // Record arrival\n-        {\n+        // Record arrival \u2014 hold participants lock across both the dedup check and\n+        // the atomic increment so the list and counter stay in sync (fixes TOCTOU).\n+        let arrived = {\n             let mut participants = self.participants.write();\n             if participants.contains(&participant_id.to_string()) {\n                 return Err(Box::new(\n@@ -725,9 +726,11 @@ impl EpochBarrier {\n                 ));\n             }\n             participants.push(participant_id.to_string());\n-        }\n-\n-        let arrived = self.arrived.fetch_add(1, Ordering::AcqRel) + 1;\n+            // NB: intentionally hold participants lock across fetch_add to prevent TOCTOU\n+            let count = self.arrived.fetch_add(1, Ordering::AcqRel) + 1;\n+            drop(participants);\n+            count\n+        };\n \n         // Check if all arrived\n         if arrived >= u64::from(self.expected) {"
+    },
+    {
+      "sha": "3856bca6c9eefbbb8d69691e9c31ede81b6a1fc4",
+      "filename": "src/http/h2/connection.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/535e9410b16adaf47755944be292fe342aea2e3a/src%2Fhttp%2Fh2%2Fconnection.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/535e9410b16adaf47755944be292fe342aea2e3a/src%2Fhttp%2Fh2%2Fconnection.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fhttp%2Fh2%2Fconnection.rs?ref=535e9410b16adaf47755944be292fe342aea2e3a",
+      "patch": "@@ -555,6 +555,7 @@ impl Connection {\n             Frame::GoAway(f) => Ok(Some(self.process_goaway(f))),\n             Frame::WindowUpdate(f) => self.process_window_update(f),\n             Frame::Continuation(f) => self.process_continuation(f),\n+            Frame::Unknown { .. } => Ok(None), // RFC 7540 \u00a74.1: ignore unknown types\n         };\n \n         // Prune closed streams when the map grows large relative to the"
+    },
+    {
+      "sha": "da769a3daefe5f0f520da122fd562e57c7c72018",
+      "filename": "src/http/h2/frame.rs",
+      "status": "modified",
+      "additions": 48,
+      "deletions": 11,
+      "changes": 59,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/535e9410b16adaf47755944be292fe342aea2e3a/src%2Fhttp%2Fh2%2Fframe.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/535e9410b16adaf47755944be292fe342aea2e3a/src%2Fhttp%2Fh2%2Fframe.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fhttp%2Fh2%2Fframe.rs?ref=535e9410b16adaf47755944be292fe342aea2e3a",
+      "patch": "@@ -189,6 +189,15 @@ pub enum Frame {\n     WindowUpdate(WindowUpdateFrame),\n     /// CONTINUATION frame for header block continuation.\n     Continuation(ContinuationFrame),\n+    /// Unknown/extension frame type \u2014 MUST be ignored per RFC 7540 \u00a74.1.\n+    Unknown {\n+        /// The raw frame type byte.\n+        frame_type: u8,\n+        /// The stream ID from the frame header.\n+        stream_id: u32,\n+        /// The opaque payload.\n+        payload: Bytes,\n+    },\n }\n \n impl Frame {\n@@ -204,6 +213,7 @@ impl Frame {\n             Self::PushPromise(f) => f.stream_id,\n             Self::WindowUpdate(f) => f.stream_id,\n             Self::Continuation(f) => f.stream_id,\n+            Self::Unknown { stream_id, .. } => *stream_id,\n         }\n     }\n \n@@ -221,6 +231,20 @@ impl Frame {\n             Self::GoAway(f) => f.encode(dst),\n             Self::WindowUpdate(f) => f.encode(dst),\n             Self::Continuation(f) => f.encode(dst),\n+            Self::Unknown {\n+                frame_type,\n+                stream_id,\n+                payload,\n+            } => {\n+                let header = FrameHeader {\n+                    length: payload.len() as u32,\n+                    frame_type: *frame_type,\n+                    flags: 0,\n+                    stream_id: *stream_id,\n+                };\n+                header.write(dst);\n+                dst.extend_from_slice(payload);\n+            }\n         }\n     }\n }\n@@ -1074,10 +1098,11 @@ pub fn parse_frame(header: &FrameHeader, payload: Bytes) -> Result<Frame, H2Erro\n         Some(FrameType::Continuation) => Ok(Frame::Continuation(ContinuationFrame::parse(\n             header, payload,\n         )?)),\n-        None => Err(H2Error::protocol(format!(\n-            \"unknown frame type: {}\",\n-            header.frame_type\n-        ))),\n+        None => Ok(Frame::Unknown {\n+            frame_type: header.frame_type,\n+            stream_id: header.stream_id,\n+            payload,\n+        }),\n     }\n }\n \n@@ -1761,17 +1786,29 @@ mod tests {\n     }\n \n     #[test]\n-    fn test_unknown_frame_type_rejected() {\n+    fn test_unknown_frame_type_ignored() {\n+        // RFC 7540 \u00a74.1: unknown frame types MUST be ignored\n         let header = FrameHeader {\n-            length: 0,\n+            length: 3,\n             frame_type: 0xFF,\n             flags: 0,\n-            stream_id: 0,\n+            stream_id: 7,\n         };\n-        let payload = Bytes::new();\n-\n-        let err = parse_frame(&header, payload).unwrap_err();\n-        assert_eq!(err.code, ErrorCode::ProtocolError);\n+        let payload = Bytes::from_static(b\"abc\");\n+\n+        let frame = parse_frame(&header, payload.clone()).unwrap();\n+        match frame {\n+            Frame::Unknown {\n+                frame_type,\n+                stream_id,\n+                payload: p,\n+            } => {\n+                assert_eq!(frame_type, 0xFF);\n+                assert_eq!(stream_id, 7);\n+                assert_eq!(p, payload);\n+            }\n+            _ => panic!(\"expected Frame::Unknown\"),\n+        }\n     }\n \n     // ========================================================================"
+    }
+  ]
+}

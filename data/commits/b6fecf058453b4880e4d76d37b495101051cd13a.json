@@ -1,0 +1,53 @@
+{
+  "message": "Fix PR widget refresh behavior\n\nGive GitHub PR lookups a longer timeout while keeping local git\ncommands fast. Move the PR cache TTL into git collection so the\nrefresh logic has a single owner.\n\nAlso render PR numbers with a leading # to match GitHub\nconventions.",
+  "files": [
+    {
+      "sha": "9293a63ce1d54d0cc3a08f7033e0af348541092d",
+      "filename": "extensions/fancy-footer.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 11,
+      "changes": 12,
+      "blob_url": "https://github.com/mavam/pi-fancy-footer/blob/b6fecf058453b4880e4d76d37b495101051cd13a/extensions%2Ffancy-footer.ts",
+      "raw_url": "https://github.com/mavam/pi-fancy-footer/raw/b6fecf058453b4880e4d76d37b495101051cd13a/extensions%2Ffancy-footer.ts",
+      "contents_url": "https://api.github.com/repos/mavam/pi-fancy-footer/contents/extensions%2Ffancy-footer.ts?ref=b6fecf058453b4880e4d76d37b495101051cd13a",
+      "patch": "@@ -34,8 +34,6 @@ interface ActiveFooterControls {\n   applyHeader: () => void;\n }\n \n-const PULL_REQUEST_REFRESH_MS = 60_000;\n-\n export default function (pi: ExtensionAPI) {\n   let compactionSettings: CompactionSettingsSnapshot = { ...DEFAULT_COMPACTION_SETTINGS };\n   let footerConfig: FooterConfigSnapshot = {\n@@ -77,7 +75,6 @@ export default function (pi: ExtensionAPI) {\n       let refreshQueued = false;\n       let disposed = false;\n       let refreshTimer: ReturnType<typeof setTimeout> | undefined;\n-      let lastPullRequestLookupAt = 0;\n \n       const requestRender = () => {\n         if (disposed) return;\n@@ -99,15 +96,8 @@ export default function (pi: ExtensionAPI) {\n             footerConfig = loadFooterConfig();\n             usageMetrics = collectSessionUsageMetrics(ctx);\n \n-            const pullRequestCacheExpired = Date.now() - lastPullRequestLookupAt >= PULL_REQUEST_REFRESH_MS;\n-            const cachedGit = pullRequestCacheExpired ? undefined : currentGit;\n-            const previousRepository = currentGit.repository;\n-            const previousBranch = currentGit.branch;\n-            const git = await collectGitInfo(pi, ctx.cwd, cachedGit);\n+            const git = await collectGitInfo(pi, ctx.cwd, currentGit);\n             if (disposed) return;\n-            if (cachedGit === undefined || git.repository !== previousRepository || git.branch !== previousBranch) {\n-              lastPullRequestLookupAt = Date.now();\n-            }\n             currentGit = git;\n             requestRender();\n           } while (!disposed && refreshQueued);"
+    },
+    {
+      "sha": "4397b1dec1f48806574765fb0ae8578a01cb5327",
+      "filename": "extensions/fancy-footer/git.ts",
+      "status": "modified",
+      "additions": 35,
+      "deletions": 6,
+      "changes": 41,
+      "blob_url": "https://github.com/mavam/pi-fancy-footer/blob/b6fecf058453b4880e4d76d37b495101051cd13a/extensions%2Ffancy-footer%2Fgit.ts",
+      "raw_url": "https://github.com/mavam/pi-fancy-footer/raw/b6fecf058453b4880e4d76d37b495101051cd13a/extensions%2Ffancy-footer%2Fgit.ts",
+      "contents_url": "https://api.github.com/repos/mavam/pi-fancy-footer/contents/extensions%2Ffancy-footer%2Fgit.ts?ref=b6fecf058453b4880e4d76d37b495101051cd13a",
+      "patch": "@@ -7,14 +7,19 @@ interface ExecResult {\n   stderr: string;\n }\n \n+const DEFAULT_COMMAND_TIMEOUT_MS = 2_000;\n+const GITHUB_COMMAND_TIMEOUT_MS = 5_000;\n+const PULL_REQUEST_REFRESH_MS = 60_000;\n+\n async function execResult(\n   pi: ExtensionAPI,\n   command: string,\n   args: string[],\n   cwd: string,\n+  timeout = DEFAULT_COMMAND_TIMEOUT_MS,\n ): Promise<ExecResult> {\n   try {\n-    const result = await pi.exec(command, args, { cwd, timeout: 2000 });\n+    const result = await pi.exec(command, args, { cwd, timeout });\n     return {\n       code: result.code,\n       // Keep leading whitespace (git porcelain uses it), only drop trailing newlines.\n@@ -80,7 +85,13 @@ async function collectPullRequest(\n ): Promise<GitInfo[\"pullRequest\"]> {\n   if (!repository || !branch) return undefined;\n \n-  const result = await execResult(pi, \"gh\", [\"pr\", \"view\", branch, \"--json\", \"number,url\"], cwd);\n+  const result = await execResult(\n+    pi,\n+    \"gh\",\n+    [\"pr\", \"view\", branch, \"--repo\", repository, \"--json\", \"number,url\"],\n+    cwd,\n+    GITHUB_COMMAND_TIMEOUT_MS,\n+  );\n   if (result.code !== 0 || !result.stdout) return undefined;\n \n   try {\n@@ -97,7 +108,7 @@ async function collectPullRequest(\n export async function collectGitInfo(\n   pi: ExtensionAPI,\n   cwd: string,\n-  previousGit: Pick<GitInfo, \"repository\" | \"branch\" | \"pullRequest\"> | undefined = undefined,\n+  previousGit: Pick<GitInfo, \"repository\" | \"branch\" | \"pullRequest\" | \"pullRequestLookupAt\"> | undefined = undefined,\n ): Promise<GitInfo> {\n   const [porcelainV2, remoteUrls] = await Promise.all([\n     exec(pi, \"git\", [\"status\", \"--porcelain=2\", \"--branch\"], cwd),\n@@ -159,9 +170,26 @@ export async function collectGitInfo(\n   }\n \n   const repository = selectGitHubRepository(remoteUrls, parseRemoteName(upstream));\n-  const pullRequest = previousGit && previousGit.repository === repository && previousGit.branch === branch\n-    ? previousGit.pullRequest\n-    : await collectPullRequest(pi, cwd, repository, branch);\n+  const samePullRequestTarget = previousGit !== undefined\n+    && previousGit.repository === repository\n+    && previousGit.branch === branch;\n+\n+  let pullRequest: GitInfo[\"pullRequest\"] = undefined;\n+  let pullRequestLookupAt = 0;\n+\n+  if (repository && branch) {\n+    const pullRequestCacheFresh = samePullRequestTarget\n+      && previousGit !== undefined\n+      && Date.now() - previousGit.pullRequestLookupAt < PULL_REQUEST_REFRESH_MS;\n+\n+    if (pullRequestCacheFresh && previousGit !== undefined) {\n+      pullRequest = previousGit.pullRequest;\n+      pullRequestLookupAt = previousGit.pullRequestLookupAt;\n+    } else {\n+      pullRequest = await collectPullRequest(pi, cwd, repository, branch);\n+      pullRequestLookupAt = Date.now();\n+    }\n+  }\n \n   let added = 0;\n   let removed = 0;\n@@ -187,6 +215,7 @@ export async function collectGitInfo(\n     branch,\n     commit,\n     pullRequest,\n+    pullRequestLookupAt,\n     added,\n     removed,\n     counts: {"
+    },
+    {
+      "sha": "0f774d007b163e1f7101df5ef903f29c6ac2e806",
+      "filename": "extensions/fancy-footer/render.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/mavam/pi-fancy-footer/blob/b6fecf058453b4880e4d76d37b495101051cd13a/extensions%2Ffancy-footer%2Frender.ts",
+      "raw_url": "https://github.com/mavam/pi-fancy-footer/raw/b6fecf058453b4880e4d76d37b495101051cd13a/extensions%2Ffancy-footer%2Frender.ts",
+      "contents_url": "https://api.github.com/repos/mavam/pi-fancy-footer/contents/extensions%2Ffancy-footer%2Frender.ts?ref=b6fecf058453b4880e4d76d37b495101051cd13a",
+      "patch": "@@ -442,7 +442,7 @@ function buildFooterWidgets(): FooterWidget[] {\n     {\n       ...baseWidgetDefaults(\"pull-request\"),\n       visible: ({ metrics }) => metrics.pullRequestNumber > 0,\n-      renderText: ({ metrics }) => `${metrics.pullRequestNumber}`,\n+      renderText: ({ metrics }) => `#${metrics.pullRequestNumber}`,\n     },\n     {\n       ...baseWidgetDefaults(\"diff-added\"),"
+    },
+    {
+      "sha": "6c43015c5b7ee15701a66879f04cd2695c505b2f",
+      "filename": "extensions/fancy-footer/shared.ts",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/mavam/pi-fancy-footer/blob/b6fecf058453b4880e4d76d37b495101051cd13a/extensions%2Ffancy-footer%2Fshared.ts",
+      "raw_url": "https://github.com/mavam/pi-fancy-footer/raw/b6fecf058453b4880e4d76d37b495101051cd13a/extensions%2Ffancy-footer%2Fshared.ts",
+      "contents_url": "https://api.github.com/repos/mavam/pi-fancy-footer/contents/extensions%2Ffancy-footer%2Fshared.ts?ref=b6fecf058453b4880e4d76d37b495101051cd13a",
+      "patch": "@@ -74,6 +74,7 @@ export interface GitInfo {\n   branch: string;\n   commit: string;\n   pullRequest: GitHubPullRequest | undefined;\n+  pullRequestLookupAt: number;\n   added: number;\n   removed: number;\n   counts: GitCounts;\n@@ -84,6 +85,7 @@ export const EMPTY_GIT_INFO: GitInfo = {\n   branch: \"\",\n   commit: \"\",\n   pullRequest: undefined,\n+  pullRequestLookupAt: 0,\n   added: 0,\n   removed: 0,\n   counts: {"
+    }
+  ]
+}

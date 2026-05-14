@@ -1,0 +1,29 @@
+{
+  "message": "fix(signal): support Windows compilation via low-level signal registration\n\nReplace signal_hook::iterator (Unix-only) with signal_hook::low_level::register\non Windows. Replace non-existent libc::SIGBREAK with signal_hook::consts::SIGBREAK\n(or const literal in const fn context). Enables cross-platform builds of\ndownstream crates like franken_whisper.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "933e956b4def43bce38cb007df9f42b363e6d247",
+      "filename": "src/signal/kind.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 3,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/49d70f3b1c708aed7eedcd2eefc1ff80981bbb0a/src%2Fsignal%2Fkind.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/49d70f3b1c708aed7eedcd2eefc1ff80981bbb0a/src%2Fsignal%2Fkind.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fsignal%2Fkind.rs?ref=49d70f3b1c708aed7eedcd2eefc1ff80981bbb0a",
+      "patch": "@@ -121,10 +121,14 @@ impl SignalKind {\n     #[cfg(windows)]\n     #[must_use]\n     pub const fn as_raw_value(&self) -> Option<i32> {\n+        // signal_hook::consts::SIGBREAK is 21 on Windows (Ctrl+Break).\n+        // We use the literal here because `const fn` cannot call non-const\n+        // items from external crates.\n+        const SIGBREAK: i32 = 21;\n         match self {\n             Self::Interrupt => Some(libc::SIGINT),\n             Self::Terminate => Some(libc::SIGTERM),\n-            Self::Quit => Some(libc::SIGBREAK),\n+            Self::Quit => Some(SIGBREAK),\n             _ => None,\n         }\n     }\n@@ -302,9 +306,9 @@ mod tests {\n         );\n         let quit = SignalKind::Quit.as_raw_value();\n         crate::assert_with_log!(\n-            quit == Some(libc::SIGBREAK),\n+            quit == Some(signal_hook::consts::SIGBREAK),\n             \"quit\",\n-            Some(libc::SIGBREAK),\n+            Some(signal_hook::consts::SIGBREAK),\n             quit\n         );\n         let user1 = SignalKind::User1.as_raw_value();"
+    },
+    {
+      "sha": "b22b121307cd789ec298b961a65cdf6ec00be2f6",
+      "filename": "src/signal/signal.rs",
+      "status": "modified",
+      "additions": 44,
+      "deletions": 4,
+      "changes": 48,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/49d70f3b1c708aed7eedcd2eefc1ff80981bbb0a/src%2Fsignal%2Fsignal.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/49d70f3b1c708aed7eedcd2eefc1ff80981bbb0a/src%2Fsignal%2Fsignal.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fsignal%2Fsignal.rs?ref=49d70f3b1c708aed7eedcd2eefc1ff80981bbb0a",
+      "patch": "@@ -18,7 +18,7 @@ use std::collections::HashMap;\n use std::sync::atomic::{AtomicU64, Ordering};\n #[cfg(any(unix, windows))]\n use std::sync::{Arc, OnceLock};\n-#[cfg(any(unix, windows))]\n+#[cfg(unix)]\n use std::thread;\n \n #[cfg(any(unix, windows))]\n@@ -82,10 +82,11 @@ impl SignalSlot {\n #[derive(Debug)]\n struct SignalDispatcher {\n     slots: HashMap<SignalKind, Arc<SignalSlot>>,\n+    #[cfg(unix)]\n     _handle: signal_hook::iterator::Handle,\n }\n \n-#[cfg(any(unix, windows))]\n+#[cfg(unix)]\n impl SignalDispatcher {\n     fn start() -> io::Result<Self> {\n         let mut slots = HashMap::with_capacity(8);\n@@ -133,6 +134,45 @@ impl SignalDispatcher {\n     }\n }\n \n+#[cfg(windows)]\n+impl SignalDispatcher {\n+    #[allow(unsafe_code)] // signal_hook::low_level::register requires unsafe\n+    fn start() -> io::Result<Self> {\n+        let mut slots = HashMap::with_capacity(4);\n+        for kind in all_signal_kinds() {\n+            slots.insert(kind, Arc::new(SignalSlot::new()));\n+        }\n+\n+        // On Windows, signal_hook::iterator is unavailable. Use low-level\n+        // register() which installs CRT signal handlers that invoke our\n+        // callback directly \u2014 no dispatcher thread needed.\n+        for kind in all_signal_kinds() {\n+            let raw = raw_signal_for_kind(kind);\n+            let slot = slots.get(&kind).expect(\"slot just inserted\").clone();\n+            // SAFETY: our closure only touches atomics and Notify (both\n+            // Send+Sync) and performs no allocations or locks.\n+            unsafe {\n+                signal_hook::low_level::register(raw, move || {\n+                    slot.record_delivery();\n+                })?;\n+            }\n+        }\n+\n+        Ok(Self { slots })\n+    }\n+\n+    fn slot(&self, kind: SignalKind) -> Option<Arc<SignalSlot>> {\n+        self.slots.get(&kind).cloned()\n+    }\n+\n+    #[cfg(test)]\n+    fn inject(&self, kind: SignalKind) {\n+        if let Some(slot) = self.slots.get(&kind) {\n+            slot.record_delivery();\n+        }\n+    }\n+}\n+\n #[cfg(unix)]\n fn all_signal_kinds() -> [SignalKind; 10] {\n     [\n@@ -201,7 +241,7 @@ fn signal_kind_from_raw(raw: i32) -> Option<SignalKind> {\n         Some(SignalKind::Interrupt)\n     } else if raw == libc::SIGTERM {\n         Some(SignalKind::Terminate)\n-    } else if raw == libc::SIGBREAK {\n+    } else if raw == signal_hook::consts::SIGBREAK {\n         Some(SignalKind::Quit)\n     } else {\n         None\n@@ -554,7 +594,7 @@ mod tests {\n             Some(SignalKind::Terminate),\n             terminate\n         );\n-        let quit = signal_kind_from_raw(libc::SIGBREAK);\n+        let quit = signal_kind_from_raw(signal_hook::consts::SIGBREAK);\n         crate::assert_with_log!(\n             quit == Some(SignalKind::Quit),\n             \"SIGBREAK mapped\","
+    }
+  ]
+}

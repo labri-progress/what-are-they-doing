@@ -1,0 +1,41 @@
+{
+  "message": "fix: resolve buffer merge conflicts and ensure drop-safety in db transaction rollbacks",
+  "files": [
+    {
+      "sha": "aaaa5539d8866b93462cbaf4026a134b25650937",
+      "filename": "src/database/mysql.rs",
+      "status": "modified",
+      "additions": 32,
+      "deletions": 8,
+      "changes": 40,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/df9f21e9a59b3bd35acb5d1ac739eae11bdb2241/src%2Fdatabase%2Fmysql.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/df9f21e9a59b3bd35acb5d1ac739eae11bdb2241/src%2Fdatabase%2Fmysql.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fdatabase%2Fmysql.rs?ref=df9f21e9a59b3bd35acb5d1ac739eae11bdb2241",
+      "patch": "@@ -1864,25 +1864,49 @@ impl MySqlConnection {\n         if !self.inner.needs_rollback {\n             return Ok(());\n         }\n-        self.inner.needs_rollback = false;\n+\n+        // Mark the connection closed while we perform the rollback.\n+        // If this future is dropped mid-flight (e.g. by timeout), the connection\n+        // will remain closed, preventing protocol desynchronization.\n+        self.inner.closed = true;\n \n         let mut buf = PacketBuffer::new();\n         buf.set_sequence(0);\n         buf.write_byte(command::COM_QUERY);\n         buf.write_bytes(b\"ROLLBACK\");\n         let packet = buf.build_packet();\n-        self.write_all(&packet).await?;\n+        \n+        if let Err(e) = self.write_all(&packet).await {\n+            let _ = self.inner.stream.shutdown(std::net::Shutdown::Both);\n+            return Err(e);\n+        }\n         self.inner.sequence = 1;\n \n-        let (data, seq) = self.read_packet().await?;\n+        let (data, seq) = match self.read_packet().await {\n+            Ok(res) => res,\n+            Err(e) => {\n+                let _ = self.inner.stream.shutdown(std::net::Shutdown::Both);\n+                return Err(e);\n+            }\n+        };\n         self.inner.sequence = seq.wrapping_add(1);\n \n         match data.first() {\n-            Some(0x00) => Ok(()),\n-            Some(0xFF) => Err(Self::parse_error(&data)),\n-            _ => Err(MySqlError::Protocol(\n-                \"unexpected response to implicit ROLLBACK\".to_string(),\n-            )),\n+            Some(0x00) => {\n+                self.inner.needs_rollback = false;\n+                self.inner.closed = false;\n+                Ok(())\n+            }\n+            Some(0xFF) => {\n+                let _ = self.inner.stream.shutdown(std::net::Shutdown::Both);\n+                Err(Self::parse_error(&data))\n+            }\n+            _ => {\n+                let _ = self.inner.stream.shutdown(std::net::Shutdown::Both);\n+                Err(MySqlError::Protocol(\n+                    \"unexpected response to implicit ROLLBACK\".to_string(),\n+                ))\n+            }\n         }\n     }\n "
+    },
+    {
+      "sha": "a660e7573e1b6d164cde1d1b3de7ed7875abb7a1",
+      "filename": "src/database/postgres.rs",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 3,
+      "changes": 16,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/df9f21e9a59b3bd35acb5d1ac739eae11bdb2241/src%2Fdatabase%2Fpostgres.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/df9f21e9a59b3bd35acb5d1ac739eae11bdb2241/src%2Fdatabase%2Fpostgres.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fdatabase%2Fpostgres.rs?ref=df9f21e9a59b3bd35acb5d1ac739eae11bdb2241",
+      "patch": "@@ -2653,25 +2653,35 @@ impl PgConnection {\n             return Ok(());\n         }\n \n-        self.inner.needs_rollback = false;\n+        // Mark the connection closed while we perform the rollback.\n+        // If this future is dropped mid-flight (e.g. by timeout), the connection\n+        // will remain closed, preventing protocol desynchronization.\n+        self.inner.closed = true;\n \n         let mut buf = MessageBuffer::new();\n         buf.write_cstring(\"ROLLBACK\");\n         let msg = buf.build_message(b'Q');\n-        self.write_all(&msg).await?;\n+        \n+        if let Err(e) = self.write_all(&msg).await {\n+            let _ = self.inner.stream.shutdown(std::net::Shutdown::Both);\n+            return Err(e);\n+        }\n \n         if let Err(e) = self.drain_to_ready().await {\n             // Drain errors during rollback are suppressed since the rollback\n             // itself is the priority operation and a drain failure at that\n             // point is non-fatal.\n             let _ = self.inner.stream.shutdown(std::net::Shutdown::Both);\n-            self.inner.closed = true;\n             if let Some(cx) = crate::cx::Cx::current() {\n                 cx.trace(&format!(\"Failed to drain after ROLLBACK: {e}\"));\n             }\n             return Err(e);\n         }\n \n+        // Successfully rolled back, restore connection state.\n+        self.inner.needs_rollback = false;\n+        self.inner.closed = false;\n+\n         Ok(())\n     }\n "
+    },
+    {
+      "sha": "1d0b16bd620d23299a7f3328c4e519f0483ce7e2",
+      "filename": "src/service/buffer.rs",
+      "status": "modified",
+      "additions": 18,
+      "deletions": 0,
+      "changes": 18,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/df9f21e9a59b3bd35acb5d1ac739eae11bdb2241/src%2Fservice%2Fbuffer.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/df9f21e9a59b3bd35acb5d1ac739eae11bdb2241/src%2Fservice%2Fbuffer.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fservice%2Fbuffer.rs?ref=df9f21e9a59b3bd35acb5d1ac739eae11bdb2241",
+      "patch": "@@ -283,6 +283,19 @@ where\n                         }\n                         Poll::Ready(Err(e)) => {\n                             drop(inner);\n+                            \n+                            let mut pending = shared.pending.lock();\n+                            *pending = pending.saturating_sub(1);\n+                            let wakers = std::mem::take(&mut *shared.ready_wakers.lock());\n+                            drop(pending);\n+                            for w in wakers {\n+                                w.wake();\n+                            }\n+                            let inner_wakers = std::mem::take(&mut *shared.inner_wakers.lock());\n+                            for w in inner_wakers {\n+                                w.wake();\n+                            }\n+\n                             this.state = BufferFutureState::Error(Some(BufferError::Inner(e)));\n                             // Loop around to poll Error\n                         }\n@@ -308,6 +321,11 @@ where\n                         for w in wakers {\n                             w.wake();\n                         }\n+                        \n+                        let inner_wakers = std::mem::take(&mut *shared.inner_wakers.lock());\n+                        for w in inner_wakers {\n+                            w.wake();\n+                        }\n \n                         match result {\n                             Ok(v) => return Poll::Ready(Ok(v)),"
+    }
+  ]
+}

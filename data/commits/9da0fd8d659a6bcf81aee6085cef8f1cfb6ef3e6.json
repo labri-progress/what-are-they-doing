@@ -1,0 +1,41 @@
+{
+  "message": "fix(policy,compression,tx): rate limit off-by-one, silent compression failure, silenced ledger errors\n\nThree bugs found during deep code review:\n\n1. policy.rs prune_old: strict inequality (>) excluded timestamps at\n   the window boundary, effectively shrinking the rate limit window by\n   one operation. Changed to >= for correct boundary inclusion.\n\n2. byte_compression.rs compress_with_level: compression errors were\n   silently swallowed, returning uncompressed data that would then fail\n   decompression. Added tracing::warn so failures are observable. Also\n   added try_into guard for the u32 size prefix to catch >4GB inputs\n   instead of silently truncating.\n\n3. tx_execution.rs: three `let _ = ledger.append/transition_phase`\n   calls silently discarded errors from the idempotency ledger. Added\n   tracing::warn for each so ledger write failures are observable in\n   logs rather than silently lost.\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "5c97283394a54e43a27e72728ade30e9144b313d",
+      "filename": "crates/frankenterm-core/src/byte_compression.rs",
+      "status": "modified",
+      "additions": 17,
+      "deletions": 2,
+      "changes": 19,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/9da0fd8d659a6bcf81aee6085cef8f1cfb6ef3e6/crates%2Ffrankenterm-core%2Fsrc%2Fbyte_compression.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/9da0fd8d659a6bcf81aee6085cef8f1cfb6ef3e6/crates%2Ffrankenterm-core%2Fsrc%2Fbyte_compression.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Ffrankenterm-core%2Fsrc%2Fbyte_compression.rs?ref=9da0fd8d659a6bcf81aee6085cef8f1cfb6ef3e6",
+      "patch": "@@ -177,8 +177,15 @@ impl ByteCompressor {\n         let compressed = self.compress_with_level(input, level);\n \n         if self.config.include_size_prefix {\n+            let input_len: u32 = input.len().try_into().unwrap_or_else(|_| {\n+                tracing::error!(\n+                    input_len = input.len(),\n+                    \"input exceeds u32::MAX for size prefix, truncating\"\n+                );\n+                u32::MAX\n+            });\n             let mut result = Vec::with_capacity(4 + compressed.len());\n-            result.extend_from_slice(&(input.len() as u32).to_le_bytes());\n+            result.extend_from_slice(&input_len.to_le_bytes());\n             result.extend_from_slice(&compressed);\n             result\n         } else {\n@@ -315,7 +322,15 @@ impl ByteCompressor {\n             .and_then(|mut c| c.compress(input));\n         match result {\n             Ok(compressed) => compressed,\n-            Err(_) => input.to_vec(), // Fallback: return uncompressed\n+            Err(err) => {\n+                tracing::warn!(\n+                    input_len = input.len(),\n+                    level,\n+                    error = %err,\n+                    \"zstd compression failed, returning uncompressed \u2014 decompression will fail\"\n+                );\n+                input.to_vec()\n+            }\n         }\n     }\n "
+    },
+    {
+      "sha": "a6b6246df0ef7faeb1395139944fcda0ecf2b443",
+      "filename": "crates/frankenterm-core/src/policy.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 1,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/9da0fd8d659a6bcf81aee6085cef8f1cfb6ef3e6/crates%2Ffrankenterm-core%2Fsrc%2Fpolicy.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/9da0fd8d659a6bcf81aee6085cef8f1cfb6ef3e6/crates%2Ffrankenterm-core%2Fsrc%2Fpolicy.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Ffrankenterm-core%2Fsrc%2Fpolicy.rs?ref=9da0fd8d659a6bcf81aee6085cef8f1cfb6ef3e6",
+      "patch": "@@ -2140,7 +2140,9 @@ impl RateLimiter {\n }\n \n fn prune_old(timestamps: &mut Vec<Instant>, window_start: Instant) {\n-    timestamps.retain(|t| *t > window_start);\n+    // Use >= to include timestamps exactly at the window boundary,\n+    // preventing an off-by-one that would shrink the effective window.\n+    timestamps.retain(|t| *t >= window_start);\n }\n \n fn retry_after(now: Instant, timestamps: &[Instant]) -> Duration {"
+    },
+    {
+      "sha": "721e049c667c74126e279113500c9e19585ccf8a",
+      "filename": "crates/frankenterm-core/src/tx_execution.rs",
+      "status": "modified",
+      "additions": 23,
+      "deletions": 5,
+      "changes": 28,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/9da0fd8d659a6bcf81aee6085cef8f1cfb6ef3e6/crates%2Ffrankenterm-core%2Fsrc%2Ftx_execution.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/9da0fd8d659a6bcf81aee6085cef8f1cfb6ef3e6/crates%2Ffrankenterm-core%2Fsrc%2Ftx_execution.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Ffrankenterm-core%2Fsrc%2Ftx_execution.rs?ref=9da0fd8d659a6bcf81aee6085cef8f1cfb6ef3e6",
+      "patch": "@@ -321,7 +321,13 @@ impl<E: StepExecutor> TxExecutionEngine<E> {\n             } else {\n                 TxPhase::Aborted\n             };\n-            let _ = ledger.transition_phase(terminal_phase);\n+            if let Err(err) = ledger.transition_phase(terminal_phase) {\n+                tracing::warn!(\n+                    phase = ?terminal_phase,\n+                    error = %err,\n+                    \"failed to transition ledger to terminal phase\"\n+                );\n+            }\n         }\n \n         // Emit completion event\n@@ -609,13 +615,19 @@ impl<E: StepExecutor> TxExecutionEngine<E> {\n                 },\n             };\n \n-            let _ = ledger.append(\n+            if let Err(err) = ledger.append(\n                 idem_key,\n                 outcome,\n                 crate::tx_plan_compiler::StepRisk::Low,\n                 &format!(\"agent-{}\", step_result.step_id.0),\n                 now_ms as u64,\n-            );\n+            ) {\n+                tracing::warn!(\n+                    step_id = %step_result.step_id.0,\n+                    error = %err,\n+                    \"failed to record commit step result in idempotency ledger\"\n+                );\n+            }\n \n             let event_kind = if step_result.outcome.is_committed() {\n                 TxEventKind::StepCommitted\n@@ -681,13 +693,19 @@ impl<E: StepExecutor> TxExecutionEngine<E> {\n                     }\n                 };\n \n-                let _ = ledger.append(\n+                if let Err(err) = ledger.append(\n                     idem_key,\n                     outcome,\n                     crate::tx_plan_compiler::StepRisk::Low,\n                     &format!(\"agent-{step_id}\"),\n                     now_ms as u64,\n-                );\n+                ) {\n+                    tracing::warn!(\n+                        step_id = %step_id,\n+                        error = %err,\n+                        \"failed to record compensation step result in idempotency ledger\"\n+                    );\n+                }\n \n                 events.push(self.make_event(\n                     TxEventKind::StepCompensated,"
+    }
+  ]
+}

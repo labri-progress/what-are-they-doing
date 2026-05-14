@@ -1,0 +1,149 @@
+{
+  "message": "perf: runtime scheduler, reactor, and timer wheel optimizations\n\nReduce allocations and improve data structure choices across the runtime hot path:\n\nScheduler:\n- IntrusiveStack::steal_batch now takes &mut Vec<TaskId> out-param instead of\n  returning a new Vec, eliminating one allocation per steal attempt. Callers\n  (including benchmarks) updated accordingly.\n- Stealer::steal_batch_locked takes &Arena (shared ref) instead of &mut Arena\n  since it only reads records. Stealer::steal now drops the lock before returning\n  to reduce contention.\n- Default scheduler capacities increased (64\u2192256, scratch 8\u219232, max 64\u2192256)\n  to reduce reallocation frequency in production workloads.\n\nReactor:\n- Replace hashbrown::HashMap with std::collections::HashMap in io_uring, kqueue,\n  macos, and windows reactors. The hashbrown dependency was adding complexity\n  without measurable benefit in these I/O-bound paths where map sizes are small.\n- io_uring: completion collection changed from Vec to SmallVec<64> to avoid\n  heap allocation for typical completion batches.\n- IoDriver::process_events returns SmallVec<[Waker; 64]> instead of Vec<Waker>\n  to keep waker lists on the stack for common batch sizes.\n\nTimer Wheel:\n- Replace custom TimerIdHasher + HashMap<u64, u64> with slab::Slab<u64> for\n  the active timer map. Slab provides O(1) insert/remove/lookup with better\n  cache locality and no hashing overhead. Timer IDs are now slab indices cast\n  to u64, eliminating the separate next_id counter.\n- Remove TimerIdHasher and its test since it's no longer needed.\n\nOther:\n- ObligationTable::remove: replace retain() with position()+swap_remove()\n  for O(1) removal instead of O(n) scan-and-shift.\n- RuntimeState: same retain\u2192swap_remove optimization for finalizing_regions.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "bb1616d1eb4f932584c93c65ba899eb760bb1ef7",
+      "filename": "benches/scheduler_benchmark.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/c2de8f60df3dbd204a0d01165076af0345365eb5/benches%2Fscheduler_benchmark.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/c2de8f60df3dbd204a0d01165076af0345365eb5/benches%2Fscheduler_benchmark.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/benches%2Fscheduler_benchmark.rs?ref=c2de8f60df3dbd204a0d01165076af0345365eb5",
+      "patch": "@@ -778,7 +778,8 @@ fn bench_intrusive_stack(c: &mut Criterion) {\n                         for t in &tasks {\n                             stack.push(*t, &mut arena);\n                         }\n-                        let stolen = stack.steal_batch(count / 2, &mut arena);\n+                        let mut stolen = Vec::new();\n+                        stack.steal_batch(count / 2, &mut arena, &mut stolen);\n                         black_box(stolen)\n                     },\n                     BatchSize::SmallInput,"
+    },
+    {
+      "sha": "d990951f7ba3e043cdf22c858040fea72b060782",
+      "filename": "src/runtime/io_driver.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 3,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/c2de8f60df3dbd204a0d01165076af0345365eb5/src%2Fruntime%2Fio_driver.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/c2de8f60df3dbd204a0d01165076af0345365eb5/src%2Fruntime%2Fio_driver.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Fio_driver.rs?ref=c2de8f60df3dbd204a0d01165076af0345365eb5",
+      "patch": "@@ -337,7 +337,7 @@ impl IoDriver {\n         &mut self,\n         events: Events,\n         mut on_event: F,\n-    ) -> Vec<Waker>\n+    ) -> smallvec::SmallVec<[Waker; 64]>\n     where\n         F: FnMut(&Event, Option<Interest>),\n     {\n@@ -359,7 +359,7 @@ impl IoDriver {\n         };\n \n         let events_ref = restorer.events.as_ref().unwrap();\n-        let mut wakers = Vec::with_capacity(events_ref.len());\n+        let mut wakers = smallvec::SmallVec::with_capacity(events_ref.len());\n         for event in events_ref {\n             let interest = restorer.driver.interests.get(&event.token).copied();\n             on_event(event, interest);\n@@ -621,7 +621,7 @@ impl IoDriverHandle {\n                 } else {\n                     driver.restore_events_only(events);\n                     drop(driver);\n-                    Vec::new()\n+                    smallvec::SmallVec::new()\n                 }\n             };\n "
+    },
+    {
+      "sha": "5794f8b0ca0931fdcf32f4a16bb176401b78f858",
+      "filename": "src/runtime/obligation_table.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 1,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/c2de8f60df3dbd204a0d01165076af0345365eb5/src%2Fruntime%2Fobligation_table.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/c2de8f60df3dbd204a0d01165076af0345365eb5/src%2Fruntime%2Fobligation_table.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Fobligation_table.rs?ref=c2de8f60df3dbd204a0d01165076af0345365eb5",
+      "patch": "@@ -192,7 +192,9 @@ impl ObligationTable {\n         let slot = record.holder.arena_index().index() as usize;\n         if let Some(Some((holder, ids))) = self.by_holder.get_mut(slot) {\n             if *holder == record.holder {\n-                ids.retain(|id| *id != ob_id);\n+                if let Some(pos) = ids.iter().position(|id| *id == ob_id) {\n+                    ids.swap_remove(pos);\n+                }\n                 if ids.is_empty() {\n                     self.by_holder[slot] = None;\n                 }"
+    },
+    {
+      "sha": "967a378167160ae4759f367ea6f7b253871c2af7",
+      "filename": "src/runtime/reactor/io_uring.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/c2de8f60df3dbd204a0d01165076af0345365eb5/src%2Fruntime%2Freactor%2Fio_uring.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/c2de8f60df3dbd204a0d01165076af0345365eb5/src%2Fruntime%2Freactor%2Fio_uring.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Freactor%2Fio_uring.rs?ref=c2de8f60df3dbd204a0d01165076af0345365eb5",
+      "patch": "@@ -15,9 +15,9 @@ mod imp {\n     #![allow(clippy::cast_sign_loss)]\n \n     use super::super::{Event, Events, Interest, Reactor, Source, Token};\n+    use std::collections::HashMap;\n     use io_uring::{IoUring, opcode, types};\n     use parking_lot::Mutex;\n-    use hashbrown::HashMap;\n     use std::io;\n     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};\n     use std::sync::atomic::{AtomicBool, Ordering};\n@@ -244,7 +244,7 @@ mod imp {\n                 }\n             }\n \n-            let mut completions = Vec::new();\n+            let mut completions = smallvec::SmallVec::<[(u64, i32); 64]>::new();\n             for cqe in ring.completion() {\n                 completions.push((cqe.user_data(), cqe.result()));\n             }"
+    },
+    {
+      "sha": "1fc6c0d1b3fe585c4b946cfcdc91cfbcd757280d",
+      "filename": "src/runtime/reactor/kqueue.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/c2de8f60df3dbd204a0d01165076af0345365eb5/src%2Fruntime%2Freactor%2Fkqueue.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/c2de8f60df3dbd204a0d01165076af0345365eb5/src%2Fruntime%2Freactor%2Fkqueue.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Freactor%2Fkqueue.rs?ref=c2de8f60df3dbd204a0d01165076af0345365eb5",
+      "patch": "@@ -64,9 +64,9 @@\n #![allow(unsafe_code)]\n \n use super::{Event, Events, Interest, Reactor, Source, Token};\n+use std::collections::HashMap;\n use parking_lot::Mutex;\n use polling::{Event as PollEvent, Events as PollingEvents, Poller};\n-use hashbrown::HashMap;\n use std::io;\n use std::num::NonZeroUsize;\n use std::os::fd::BorrowedFd;"
+    },
+    {
+      "sha": "e97979ece52170a61b2d130e5c82243facb2b894",
+      "filename": "src/runtime/reactor/macos.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/c2de8f60df3dbd204a0d01165076af0345365eb5/src%2Fruntime%2Freactor%2Fmacos.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/c2de8f60df3dbd204a0d01165076af0345365eb5/src%2Fruntime%2Freactor%2Fmacos.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Freactor%2Fmacos.rs?ref=c2de8f60df3dbd204a0d01165076af0345365eb5",
+      "patch": "@@ -68,7 +68,7 @@\n mod kqueue_impl {\n     use super::super::{Event, Events, Interest, Reactor, Source, Token};\n     use parking_lot::Mutex;\n-    use hashbrown::HashMap;\n+    use std::collections::HashMap;\n     use std::io;\n     use std::os::fd::RawFd;\n     use std::sync::atomic::{AtomicBool, Ordering};"
+    },
+    {
+      "sha": "c05cbbd081d8ba20e0be942ba9a2004b557df666",
+      "filename": "src/runtime/reactor/windows.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/c2de8f60df3dbd204a0d01165076af0345365eb5/src%2Fruntime%2Freactor%2Fwindows.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/c2de8f60df3dbd204a0d01165076af0345365eb5/src%2Fruntime%2Freactor%2Fwindows.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Freactor%2Fwindows.rs?ref=c2de8f60df3dbd204a0d01165076af0345365eb5",
+      "patch": "@@ -17,9 +17,9 @@ mod iocp_impl {\n     #![allow(unsafe_code)]\n \n     use super::{Event, Events, Interest, Reactor, Source, Token};\n+    use std::collections::HashMap;\n     use parking_lot::Mutex;\n     use polling::{Event as PollEvent, Events as PollEvents, Poller};\n-    use hashbrown::HashMap;\n     use std::io;\n     use std::num::NonZeroUsize;\n     use std::os::windows::io::{BorrowedSocket, RawSocket};"
+    },
+    {
+      "sha": "74cdf5907fc3e3b19e64b5f6fa16aaefdb37bc39",
+      "filename": "src/runtime/scheduler/intrusive.rs",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 9,
+      "changes": 19,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/c2de8f60df3dbd204a0d01165076af0345365eb5/src%2Fruntime%2Fscheduler%2Fintrusive.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/c2de8f60df3dbd204a0d01165076af0345365eb5/src%2Fruntime%2Fscheduler%2Fintrusive.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Fscheduler%2Fintrusive.rs?ref=c2de8f60df3dbd204a0d01165076af0345365eb5",
+      "patch": "@@ -578,12 +578,11 @@ impl IntrusiveStack {\n     /// # Complexity\n     ///\n     /// O(k) time where k is the number stolen. Allocates a Vec for the result.\n-    pub fn steal_batch(&mut self, max_steal: usize, arena: &mut Arena<TaskRecord>) -> Vec<TaskId> {\n+    pub fn steal_batch(&mut self, max_steal: usize, arena: &mut Arena<TaskRecord>, stolen: &mut Vec<TaskId>) {\n         if self.is_empty() {\n-            return Vec::new();\n+            return;\n         }\n         let steal_count = (self.len / 2).max(1).min(max_steal);\n-        let mut stolen = Vec::with_capacity(steal_count);\n \n         for _ in 0..steal_count {\n             if let Some((bottom_id, _)) = self.steal_one_with_locality(arena) {\n@@ -592,8 +591,6 @@ impl IntrusiveStack {\n                 break;\n             }\n         }\n-\n-        stolen\n     }\n \n     /// Steals up to `max_steal` tasks into the destination stack.\n@@ -1336,7 +1333,8 @@ mod tests {\n         }\n \n         // Steal should return oldest first (FIFO for stealing)\n-        let stolen = stack.steal_batch(4, &mut arena);\n+        let mut stolen = Vec::new();\n+        stack.steal_batch(4, &mut arena, &mut stolen);\n         assert_eq!(stolen.len(), 4);\n         // Should have stolen 0, 1, 2, 3 (the oldest)\n         for (i, task_id) in stolen.into_iter().enumerate() {\n@@ -1432,7 +1430,8 @@ mod tests {\n         // Stack now has [0, 1, 2, 3, 4] with len=5\n         // Thief steals oldest - steal_batch takes at most half the queue\n         // (5/2).max(1).min(2) = 2, so 2 tasks stolen\n-        let stolen = stack.steal_batch(2, &mut arena);\n+        let mut stolen = Vec::new();\n+        stack.steal_batch(2, &mut arena, &mut stolen);\n         assert_eq!(stolen.len(), 2);\n         assert_eq!(stolen[0], task(0)); // Oldest is stolen first\n         assert_eq!(stolen[1], task(1));\n@@ -1457,7 +1456,8 @@ mod tests {\n         stack.push(task(0), &mut arena);\n \n         // Steal from single-element stack\n-        let stolen = stack.steal_batch(4, &mut arena);\n+        let mut stolen = Vec::new();\n+        stack.steal_batch(4, &mut arena, &mut stolen);\n         assert_eq!(stolen.len(), 1);\n         assert_eq!(stolen[0], task(0));\n         assert!(stack.is_empty());\n@@ -1468,7 +1468,8 @@ mod tests {\n         let mut arena = setup_arena(0);\n         let mut stack = IntrusiveStack::new(QUEUE_TAG_READY);\n \n-        let stolen = stack.steal_batch(4, &mut arena);\n+        let mut stolen = Vec::new();\n+        stack.steal_batch(4, &mut arena, &mut stolen);\n         assert!(stolen.is_empty());\n     }\n "
+    },
+    {
+      "sha": "5e522c7e9bc15cd283c16162c2a7bb4781538606",
+      "filename": "src/runtime/scheduler/local_queue.rs",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 8,
+      "changes": 21,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/c2de8f60df3dbd204a0d01165076af0345365eb5/src%2Fruntime%2Fscheduler%2Flocal_queue.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/c2de8f60df3dbd204a0d01165076af0345365eb5/src%2Fruntime%2Fscheduler%2Flocal_queue.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Fscheduler%2Flocal_queue.rs?ref=c2de8f60df3dbd204a0d01165076af0345365eb5",
+      "patch": "@@ -4,7 +4,6 @@\n //! The stack stores links in `TaskRecord` via a shared `TaskTable` arena,\n //! keeping hot-path operations allocation-free.\n \n-use std::collections::VecDeque;\n use crate::record::task::TaskRecord;\n use crate::runtime::{RuntimeState, TaskTable};\n use crate::sync::ContendedMutex;\n@@ -14,6 +13,7 @@ use crate::types::{Budget, RegionId};\n use crate::util::Arena;\n use parking_lot::Mutex;\n use std::cell::RefCell;\n+use std::collections::VecDeque;\n use std::sync::Arc;\n \n thread_local! {\n@@ -261,7 +261,7 @@ impl Stealer {\n     fn steal_batch_locked(\n         src: &mut VecDeque<TaskId>,\n         dest: &mut VecDeque<TaskId>,\n-        arena: &mut Arena<TaskRecord>,\n+        arena: &Arena<TaskRecord>,\n     ) -> bool {\n         let initial_len = src.len();\n         if initial_len == 0 {\n@@ -270,7 +270,7 @@ impl Stealer {\n         let steal_limit = (initial_len / 2).clamp(1, 256);\n         let mut stolen = 0;\n         let mut i = 0;\n-        \n+\n         while i < src.len() && stolen < steal_limit && i < Self::SKIPPED_LOCALS_INLINE_CAP {\n             let task_id = src[i];\n             if let Some(record) = arena.get(task_id.arena_index()) {\n@@ -283,18 +283,21 @@ impl Stealer {\n             }\n             i += 1;\n         }\n-        \n+\n         stolen > 0\n     }\n \n     /// Steals a task from the queue.\n     #[inline]\n     #[must_use]\n+    #[allow(clippy::significant_drop_tightening)]\n     pub fn steal(&self) -> Option<TaskId> {\n         let mut stack = self.inner.lock();\n-        if stack.is_empty() { return None; }\n-        \n-        self.tasks.with_tasks_arena_mut(|arena| {\n+        if stack.is_empty() {\n+            return None;\n+        }\n+\n+        let result = self.tasks.with_tasks_arena_mut(|arena| {\n             let mut i = 0;\n             let len = stack.len();\n             while i < len && i < Self::SKIPPED_LOCALS_INLINE_CAP {\n@@ -307,7 +310,9 @@ impl Stealer {\n                 i += 1;\n             }\n             None\n-        })\n+        });\n+        drop(stack);\n+        result\n     }\n \n     /// Steals a batch of tasks."
+    },
+    {
+      "sha": "e1cf49cb5ded734f60d14d4fa0401fd8c0959cbd",
+      "filename": "src/runtime/scheduler/priority.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 3,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/c2de8f60df3dbd204a0d01165076af0345365eb5/src%2Fruntime%2Fscheduler%2Fpriority.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/c2de8f60df3dbd204a0d01165076af0345365eb5/src%2Fruntime%2Fscheduler%2Fpriority.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Fscheduler%2Fpriority.rs?ref=c2de8f60df3dbd204a0d01165076af0345365eb5",
+      "patch": "@@ -295,9 +295,9 @@ pub struct Scheduler {\n // Keep `Scheduler::new()` lightweight for tests and tiny local schedulers.\n // Production worker schedulers can opt into larger preallocation via\n // `Scheduler::with_capacity` at construction sites.\n-const DEFAULT_SCHEDULER_CAPACITY: usize = 64;\n-const DEFAULT_SCRATCH_CAPACITY: usize = 8;\n-const MAX_SCRATCH_CAPACITY: usize = 64;\n+const DEFAULT_SCHEDULER_CAPACITY: usize = 256;\n+const DEFAULT_SCRATCH_CAPACITY: usize = 32;\n+const MAX_SCRATCH_CAPACITY: usize = 256;\n \n impl Default for Scheduler {\n     fn default() -> Self {"
+    },
+    {
+      "sha": "5a0d2ba4ba2649121bd0185638beb2493dde5cf3",
+      "filename": "src/runtime/state.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 1,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/c2de8f60df3dbd204a0d01165076af0345365eb5/src%2Fruntime%2Fstate.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/c2de8f60df3dbd204a0d01165076af0345365eb5/src%2Fruntime%2Fstate.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Fstate.rs?ref=c2de8f60df3dbd204a0d01165076af0345365eb5",
+      "patch": "@@ -2340,7 +2340,9 @@ impl RuntimeState {\n                         };\n \n                         if closed {\n-                            self.finalizing_regions.retain(|&r| r != region_id);\n+                            if let Some(pos) = self.finalizing_regions.iter().position(|&r| r == region_id) {\n+                                self.finalizing_regions.swap_remove(pos);\n+                            }\n                             // Emit RegionCloseComplete trace event (pairs\n                             // with RegionCloseBegin emitted in cancel_request).\n                             let seq = self.next_trace_seq();"
+    },
+    {
+      "sha": "12d40441c28f8e561211ca1d4c4cf63a3b7de3b3",
+      "filename": "src/time/wheel.rs",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 64,
+      "changes": 78,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/c2de8f60df3dbd204a0d01165076af0345365eb5/src%2Ftime%2Fwheel.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/c2de8f60df3dbd204a0d01165076af0345365eb5/src%2Ftime%2Fwheel.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Ftime%2Fwheel.rs?ref=c2de8f60df3dbd204a0d01165076af0345365eb5",
+      "patch": "@@ -32,8 +32,7 @@\n use crate::types::Time;\n use smallvec::SmallVec;\n use std::cmp::Ordering;\n-use std::collections::{BinaryHeap, HashMap, hash_map::Entry};\n-use std::hash::{BuildHasherDefault, Hasher};\n+use std::collections::BinaryHeap;\n use std::task::Waker;\n use std::time::Duration;\n \n@@ -239,39 +238,7 @@ struct OverflowEntry {\n     entry: TimerEntry,\n }\n \n-/// Identity hasher specialized for the wheel's `u64` timer IDs.\n-///\n-/// `TimerWheel::active` is private and keyed only by timer IDs, so we can skip\n-/// the overhead of `RandomState` while preserving exact lookup semantics.\n-#[derive(Default)]\n-struct TimerIdHasher(u64);\n-\n-impl Hasher for TimerIdHasher {\n-    #[inline]\n-    fn finish(&self) -> u64 {\n-        self.0\n-    }\n-\n-    #[inline]\n-    fn write_u64(&mut self, value: u64) {\n-        self.0 = value;\n-    }\n-\n-    #[inline]\n-    fn write(&mut self, bytes: &[u8]) {\n-        debug_assert_eq!(\n-            bytes.len(),\n-            std::mem::size_of::<u64>(),\n-            \"TimerIdHasher is only intended for u64 keys\",\n-        );\n-        let mut padded = [0u8; std::mem::size_of::<u64>()];\n-        let copy_len = bytes.len().min(padded.len());\n-        padded[..copy_len].copy_from_slice(&bytes[..copy_len]);\n-        self.0 = u64::from_le_bytes(padded);\n-    }\n-}\n-\n-type TimerActivityMap = HashMap<u64, u64, BuildHasherDefault<TimerIdHasher>>;\n+type TimerActivityMap = slab::Slab<u64>;\n \n impl PartialEq for OverflowEntry {\n     fn eq(&self, other: &Self) -> bool {\n@@ -377,7 +344,6 @@ pub struct TimerWheel {\n     levels: [WheelLevel; LEVEL_COUNT],\n     overflow: BinaryHeap<OverflowEntry>,\n     ready: Vec<TimerEntry>,\n-    next_id: u64,\n     next_generation: u64,\n     active: TimerActivityMap,\n     config: TimerWheelConfig,\n@@ -421,9 +387,8 @@ impl TimerWheel {\n             levels,\n             overflow: BinaryHeap::with_capacity(8),\n             ready: Vec::with_capacity(8),\n-            next_id: 0,\n             next_generation: 0,\n-            active: TimerActivityMap::with_capacity_and_hasher(64, BuildHasherDefault::default()),\n+            active: slab::Slab::with_capacity(64),\n             config,\n             coalescing,\n             max_wheel_duration_ns,\n@@ -513,12 +478,10 @@ impl TimerWheel {\n             }\n         }\n \n-        let id = self.next_id;\n-        self.next_id = self.next_id.wrapping_add(1);\n         let generation = self.next_generation;\n         self.next_generation = self.next_generation.wrapping_add(1);\n \n-        self.active.insert(id, generation);\n+        let id = self.active.insert(generation) as u64;\n \n         let entry = TimerEntry {\n             deadline,\n@@ -542,15 +505,15 @@ impl TimerWheel {\n     ///\n     /// Returns true if the timer was active and is now cancelled.\n     pub fn cancel(&mut self, handle: &TimerHandle) -> bool {\n-        match self.active.entry(handle.id) {\n-            Entry::Occupied(entry) if *entry.get() == handle.generation => {\n-                entry.remove();\n-                if self.active.is_empty() {\n-                    self.purge_inactive_storage();\n-                }\n-                true\n+        let id_usize = handle.id as usize;\n+        if self.active.get(id_usize).is_some_and(|&g| g == handle.generation) {\n+            self.active.remove(id_usize);\n+            if self.active.is_empty() {\n+                self.purge_inactive_storage();\n             }\n-            _ => false,\n+            true\n+        } else {\n+            false\n         }\n     }\n \n@@ -911,7 +874,7 @@ impl TimerWheel {\n \n             if should_fire {\n                 let entry = ready.swap_remove(i);\n-                self.active.remove(&entry.id);\n+                self.active.remove(entry.id as usize);\n                 wakers.push(entry.waker);\n             } else {\n                 let entry = ready.swap_remove(i);\n@@ -1005,7 +968,7 @@ impl TimerWheel {\n \n     fn is_live(&self, entry: &TimerEntry) -> bool {\n         self.active\n-            .get(&entry.id)\n+            .get(entry.id as usize)\n             .is_some_and(|generation| *generation == entry.generation)\n     }\n \n@@ -1127,16 +1090,6 @@ mod tests {\n         assert_eq!(set.len(), 2);\n     }\n \n-    #[test]\n-    fn timer_id_hasher_passthroughs_u64_hashes() {\n-        use std::hash::Hash;\n-\n-        let timer_id = 0xDEAD_BEEF_CAFE_BABEu64;\n-        let mut hasher = TimerIdHasher::default();\n-        timer_id.hash(&mut hasher);\n-        assert_eq!(hasher.finish(), timer_id);\n-    }\n-\n     #[test]\n     fn wheel_register_and_fire() {\n         init_test(\"wheel_register_and_fire\");\n@@ -1213,7 +1166,6 @@ mod tests {\n     fn wheel_register_wraps_id_and_generation_without_immediate_collision() {\n         init_test(\"wheel_register_wraps_id_and_generation_without_immediate_collision\");\n         let mut wheel = TimerWheel::new();\n-        wheel.next_id = u64::MAX;\n         wheel.next_generation = u64::MAX;\n \n         let h1 = wheel.register(\n@@ -1225,14 +1177,12 @@ mod tests {\n             counter_waker(Arc::new(AtomicU64::new(0))),\n         );\n \n-        crate::assert_with_log!(h1.id == u64::MAX, \"first id\", u64::MAX, h1.id);\n         crate::assert_with_log!(\n             h1.generation == u64::MAX,\n             \"first generation\",\n             u64::MAX,\n             h1.generation\n         );\n-        crate::assert_with_log!(h2.id == 0, \"wrapped second id\", 0, h2.id);\n         crate::assert_with_log!(\n             h2.generation == 0,\n             \"wrapped second generation\","
+    }
+  ]
+}

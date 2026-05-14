@@ -1,0 +1,89 @@
+{
+  "message": "fix(engine): harden interpreter register bounds, parser error handling, serde naming, and entry API usage\n\nSeven targeted correctness fixes across core engine modules:\n\n- baseline_interpreter: add bounds check on register index before\n  write_reg in Call/MethodCall paths; fix string concatenation with\n  non-string types to match JS semantics (Object\u2192\"[object Object]\",\n  Function\u2192\"function\")\n- parser: replace two expect(\"non-empty events\") panics with proper\n  Err returns in ParseEventIr materialization\n- array_fast_lane: return ElementKindTransition directly from\n  transition() instead of unnecessary last().cloned().unwrap()\n- execution_cell: replace insert+get_mut+expect(\"just inserted\")\n  patterns with idiomatic BTreeMap::entry() API\n- ts_normalization: fix SourceLanguage serde from snake_case\n  (java_script/type_script) to explicit per-variant rename\n  (javascript/typescript)\n- versioned_rewrite_pack: replace dedup() with dedup_by() keyed on\n  (rule_a, rule_b, kind, is_blocking) so symmetric pairs with\n  different descriptions collapse correctly; remove unnecessary clone\n- hindsight_escalation_bundle: use struct update syntax in tests\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "d1148688c2787756116f523bc9672cab0be85da6",
+      "filename": "crates/franken-engine/src/array_fast_lane.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 4,
+      "changes": 8,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_engine/blob/8b7bab8c614a872d8dc4ba1ffc37a57df5f5e132/crates%2Ffranken-engine%2Fsrc%2Farray_fast_lane.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_engine/raw/8b7bab8c614a872d8dc4ba1ffc37a57df5f5e132/crates%2Ffranken-engine%2Fsrc%2Farray_fast_lane.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_engine/contents/crates%2Ffranken-engine%2Fsrc%2Farray_fast_lane.rs?ref=8b7bab8c614a872d8dc4ba1ffc37a57df5f5e132",
+      "patch": "@@ -297,11 +297,12 @@ impl ArrayLaneDescriptor {\n         reason: TransitionReason,\n         epoch: SecurityEpoch,\n         trigger_offset: u32,\n-    ) {\n+    ) -> ElementKindTransition {\n         let transition =\n             ElementKindTransition::new(self.element_kind, new_kind, reason, epoch, trigger_offset);\n-        self.transitions.push(transition);\n+        self.transitions.push(transition.clone());\n         self.element_kind = new_kind;\n+        transition\n     }\n \n     /// Record an element access.\n@@ -745,11 +746,10 @@ impl ArrayFastLaneEngine {\n             return None;\n         }\n \n-        lane.transition(new_kind, reason.clone(), self.epoch, trigger_offset);\n+        let transition = lane.transition(new_kind, reason.clone(), self.epoch, trigger_offset);\n         let survived = lane.fast_lane_active;\n \n         if self.policy.emit_transition_receipts {\n-            let transition = lane.transitions.last().cloned().unwrap();\n             let receipt = TransitionReceipt::new(array_id, transition, survived);\n             let result = receipt.clone();\n             self.receipts.push(receipt);"
+    },
+    {
+      "sha": "cf6e2736b699c1d6d31ea107b086059096da09f3",
+      "filename": "crates/franken-engine/src/baseline_interpreter.rs",
+      "status": "modified",
+      "additions": 26,
+      "deletions": 6,
+      "changes": 32,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_engine/blob/8b7bab8c614a872d8dc4ba1ffc37a57df5f5e132/crates%2Ffranken-engine%2Fsrc%2Fbaseline_interpreter.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_engine/raw/8b7bab8c614a872d8dc4ba1ffc37a57df5f5e132/crates%2Ffranken-engine%2Fsrc%2Fbaseline_interpreter.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_engine/contents/crates%2Ffranken-engine%2Fsrc%2Fbaseline_interpreter.rs?ref=8b7bab8c614a872d8dc4ba1ffc37a57df5f5e132",
+      "patch": "@@ -966,7 +966,10 @@ impl InterpreterCore {\n \n                             // Copy arguments into registers for the callee.\n                             for (i, val) in arg_vals.into_iter().enumerate() {\n-                                self.write_reg(i as u32, val)?;\n+                                let reg = i as u32;\n+                                if reg < self.config.max_registers {\n+                                    self.write_reg(reg, val)?;\n+                                }\n                             }\n \n                             self.ip = func.entry as usize;\n@@ -1293,7 +1296,10 @@ impl InterpreterCore {\n                             self.write_reg(0, this_val)?;\n                             // Arguments start at register 1.\n                             for (i, val) in arg_vals.into_iter().enumerate() {\n-                                self.write_reg((i + 1) as u32, val)?;\n+                                let reg = (i + 1) as u32;\n+                                if reg < self.config.max_registers {\n+                                    self.write_reg(reg, val)?;\n+                                }\n                             }\n \n                             self.ip = func.entry as usize;\n@@ -1457,8 +1463,22 @@ impl InterpreterCore {\n         match (&a, &b) {\n             (Value::Int(x), Value::Int(y)) => Ok(Value::Int(x.wrapping_add(*y))),\n             (Value::Str(x), Value::Str(y)) => Ok(Value::Str(format!(\"{x}{y}\"))),\n-            (Value::Str(x), other) => Ok(Value::Str(format!(\"{x}{other}\"))),\n-            (other, Value::Str(y)) => Ok(Value::Str(format!(\"{other}{y}\"))),\n+            (Value::Str(x), other) => {\n+                let other_str = match other {\n+                    Value::Object(_) | Value::Iterator(_) => \"[object Object]\".to_string(),\n+                    Value::Function(_) => \"function\".to_string(),\n+                    _ => other.to_string(),\n+                };\n+                Ok(Value::Str(format!(\"{x}{other_str}\")))\n+            }\n+            (other, Value::Str(y)) => {\n+                let other_str = match other {\n+                    Value::Object(_) | Value::Iterator(_) => \"[object Object]\".to_string(),\n+                    Value::Function(_) => \"function\".to_string(),\n+                    _ => other.to_string(),\n+                };\n+                Ok(Value::Str(format!(\"{other_str}{y}\")))\n+            }\n             _ => {\n                 // JS coercion: non-string primitives coerce to number for +.\n                 let x = Self::coerce_to_number(&a).ok_or(InterpreterError::TypeError {\n@@ -1957,7 +1977,7 @@ impl InterpreterCore {\n \n     /// Allocate a new object with an explicit prototype link.\n     fn alloc_object_with_prototype(&mut self, prototype: Option<ObjectId>) -> ObjectId {\n-        let id = ObjectId(self.heap.len() as u32);\n+        let id = ObjectId(u32::try_from(self.heap.len()).unwrap_or(u32::MAX));\n         let mut object = HeapObject::new();\n         object.prototype = prototype;\n         self.heap.push(object);\n@@ -1970,7 +1990,7 @@ impl InterpreterCore {\n     }\n \n     fn alloc_iterator(&mut self, iterator: RuntimeIteratorState) -> u32 {\n-        let handle = self.iterators.len() as u32;\n+        let handle = u32::try_from(self.iterators.len()).unwrap_or(u32::MAX);\n         self.iterators.push(iterator);\n         handle\n     }"
+    },
+    {
+      "sha": "3fbc6761da32ef5c0216e027dfaaaccf610f8382",
+      "filename": "crates/franken-engine/src/execution_cell.rs",
+      "status": "modified",
+      "additions": 21,
+      "deletions": 6,
+      "changes": 27,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_engine/blob/8b7bab8c614a872d8dc4ba1ffc37a57df5f5e132/crates%2Ffranken-engine%2Fsrc%2Fexecution_cell.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_engine/raw/8b7bab8c614a872d8dc4ba1ffc37a57df5f5e132/crates%2Ffranken-engine%2Fsrc%2Fexecution_cell.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_engine/contents/crates%2Ffranken-engine%2Fsrc%2Fexecution_cell.rs?ref=8b7bab8c614a872d8dc4ba1ffc37a57df5f5e132",
+      "patch": "@@ -553,8 +553,13 @@ impl CellManager {\n     ) -> &mut ExecutionCell {\n         let cell_id = cell_id.into();\n         let cell = ExecutionCell::new(&cell_id, CellKind::Extension, trace_id);\n-        self.cells.insert(cell_id.clone(), cell);\n-        self.cells.get_mut(&cell_id).expect(\"just inserted\")\n+        match self.cells.entry(cell_id) {\n+            std::collections::btree_map::Entry::Occupied(mut o) => {\n+                o.insert(cell);\n+                o.into_mut()\n+            }\n+            std::collections::btree_map::Entry::Vacant(v) => v.insert(cell),\n+        }\n     }\n \n     /// Create and register a new delegate cell.\n@@ -565,8 +570,13 @@ impl CellManager {\n     ) -> &mut ExecutionCell {\n         let cell_id = cell_id.into();\n         let cell = ExecutionCell::new(&cell_id, CellKind::Delegate, trace_id);\n-        self.cells.insert(cell_id.clone(), cell);\n-        self.cells.get_mut(&cell_id).expect(\"just inserted\")\n+        match self.cells.entry(cell_id) {\n+            std::collections::btree_map::Entry::Occupied(mut o) => {\n+                o.insert(cell);\n+                o.into_mut()\n+            }\n+            std::collections::btree_map::Entry::Vacant(v) => v.insert(cell),\n+        }\n     }\n \n     /// Register a pre-created cell.\n@@ -576,8 +586,13 @@ impl CellManager {\n         cell: ExecutionCell,\n     ) -> &mut ExecutionCell {\n         let cell_id = cell_id.into();\n-        self.cells.insert(cell_id.clone(), cell);\n-        self.cells.get_mut(&cell_id).expect(\"just inserted\")\n+        match self.cells.entry(cell_id) {\n+            std::collections::btree_map::Entry::Occupied(mut o) => {\n+                o.insert(cell);\n+                o.into_mut()\n+            }\n+            std::collections::btree_map::Entry::Vacant(v) => v.insert(cell),\n+        }\n     }\n \n     /// Get a reference to a cell."
+    },
+    {
+      "sha": "520457a603dcffb54f546f9a0d959daf24e7b12d",
+      "filename": "crates/franken-engine/src/hindsight_escalation_bundle.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 2,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_engine/blob/8b7bab8c614a872d8dc4ba1ffc37a57df5f5e132/crates%2Ffranken-engine%2Fsrc%2Fhindsight_escalation_bundle.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_engine/raw/8b7bab8c614a872d8dc4ba1ffc37a57df5f5e132/crates%2Ffranken-engine%2Fsrc%2Fhindsight_escalation_bundle.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_engine/contents/crates%2Ffranken-engine%2Fsrc%2Fhindsight_escalation_bundle.rs?ref=8b7bab8c614a872d8dc4ba1ffc37a57df5f5e132",
+      "patch": "@@ -1452,8 +1452,10 @@ mod tests {\n \n     #[test]\n     fn pipeline_receipt_preserves_budget_before_for_forced_auto_escalation() {\n-        let mut policy = EscalationPolicy::default();\n-        policy.cost_budget_millionths = 1;\n+        let mut policy = EscalationPolicy {\n+            cost_budget_millionths: 1,\n+            ..Default::default()\n+        };\n         policy.always_escalate.clear();\n         let mut pipeline = EscalationPipeline::new(policy, test_epoch());\n "
+    },
+    {
+      "sha": "c934e098e85657e39d30569aa607866a3425ce86",
+      "filename": "crates/franken-engine/src/parser.rs",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 2,
+      "changes": 16,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_engine/blob/8b7bab8c614a872d8dc4ba1ffc37a57df5f5e132/crates%2Ffranken-engine%2Fsrc%2Fparser.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_engine/raw/8b7bab8c614a872d8dc4ba1ffc37a57df5f5e132/crates%2Ffranken-engine%2Fsrc%2Fparser.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_engine/contents/crates%2Ffranken-engine%2Fsrc%2Fparser.rs?ref=8b7bab8c614a872d8dc4ba1ffc37a57df5f5e132",
+      "patch": "@@ -1115,15 +1115,27 @@ impl ParseEventIr {\n             }\n         }\n \n-        let started = self.events.first().expect(\"non-empty events\");\n+        let started = self.events.first().ok_or_else(|| {\n+            ParseEventMaterializationError::new(\n+                ParseEventMaterializationErrorCode::MissingParseStarted,\n+                \"event stream is empty\".to_string(),\n+                None,\n+            )\n+        })?;\n         if started.kind != ParseEventKind::ParseStarted || started.sequence != 0 {\n             return Err(ParseEventMaterializationError::new(\n                 ParseEventMaterializationErrorCode::MissingParseStarted,\n                 \"first event must be parse_started at sequence 0\".to_string(),\n                 Some(started.sequence),\n             ));\n         }\n-        let completed = self.events.last().expect(\"non-empty events\");\n+        let completed = self.events.last().ok_or_else(|| {\n+            ParseEventMaterializationError::new(\n+                ParseEventMaterializationErrorCode::MissingParseCompleted,\n+                \"event stream is empty\".to_string(),\n+                None,\n+            )\n+        })?;\n         if completed.kind != ParseEventKind::ParseCompleted {\n             return Err(ParseEventMaterializationError::new(\n                 ParseEventMaterializationErrorCode::MissingParseCompleted,"
+    },
+    {
+      "sha": "efd4a4161a3f3fee8e0fe76b7e913cea352c74de",
+      "filename": "crates/franken-engine/src/ts_normalization.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_engine/blob/8b7bab8c614a872d8dc4ba1ffc37a57df5f5e132/crates%2Ffranken-engine%2Fsrc%2Fts_normalization.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_engine/raw/8b7bab8c614a872d8dc4ba1ffc37a57df5f5e132/crates%2Ffranken-engine%2Fsrc%2Fts_normalization.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_engine/contents/crates%2Ffranken-engine%2Fsrc%2Fts_normalization.rs?ref=8b7bab8c614a872d8dc4ba1ffc37a57df5f5e132",
+      "patch": "@@ -87,10 +87,11 @@ pub struct TsNormalizationOutput {\n }\n \n #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]\n-#[serde(rename_all = \"snake_case\")]\n pub enum SourceLanguage {\n     #[default]\n+    #[serde(rename = \"javascript\")]\n     JavaScript,\n+    #[serde(rename = \"typescript\")]\n     TypeScript,\n }\n "
+    },
+    {
+      "sha": "edad568725685f488bc54907488ba7503e3f8fb8",
+      "filename": "crates/franken-engine/src/versioned_rewrite_pack.rs",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 2,
+      "changes": 11,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_engine/blob/8b7bab8c614a872d8dc4ba1ffc37a57df5f5e132/crates%2Ffranken-engine%2Fsrc%2Fversioned_rewrite_pack.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_engine/raw/8b7bab8c614a872d8dc4ba1ffc37a57df5f5e132/crates%2Ffranken-engine%2Fsrc%2Fversioned_rewrite_pack.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_engine/contents/crates%2Ffranken-engine%2Fsrc%2Fversioned_rewrite_pack.rs?ref=8b7bab8c614a872d8dc4ba1ffc37a57df5f5e132",
+      "patch": "@@ -454,7 +454,14 @@ impl InterferenceMetadata {\n         let mut canonical_entries: Vec<_> =\n             entries.into_iter().map(Self::canonicalize_entry).collect();\n         canonical_entries.sort();\n-        canonical_entries.dedup();\n+        // Dedup by key fields (rule_a, rule_b, kind, is_blocking), ignoring\n+        // detail so symmetric pairs with different descriptions collapse.\n+        canonical_entries.dedup_by(|a, b| {\n+            a.rule_a == b.rule_a\n+                && a.rule_b == b.rule_b\n+                && a.kind == b.kind\n+                && a.is_blocking == b.is_blocking\n+        });\n         canonical_entries\n     }\n \n@@ -1507,7 +1514,7 @@ mod tests {\n         catalog.register(test_pack(\"b\", vec![]));\n \n         assert!(catalog.add_cross_interference(\"a\", \"b\", InterferenceMetadata::build(vec![]),));\n-        let hash_before = catalog.content_hash.clone();\n+        let hash_before = catalog.content_hash;\n \n         assert!(!catalog.add_cross_interference(\n             \"b\","
+    }
+  ]
+}

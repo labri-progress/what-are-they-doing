@@ -1,0 +1,65 @@
+{
+  "message": "fix(abi): preserve errno across warn/warnx, split epoll EINVAL/EFAULT, and harden UTF-8 decoder against overlong/surrogate sequences\n\nerr_abi: warn() and warnx() were clobbering errno as a side effect because\nthe internal write_err_message called strerror() which modifies errno via\nthe write() syscall. Now saves errno before formatting and restores it after\nthe write, matching glibc behavior where warn/warnx preserve errno.\nTwo new tests: test_warn_preserves_errno, test_warnx_preserves_errno.\n\npoll_abi: epoll_wait and epoll_pwait returned EINVAL for both null events\npointer and zero/negative maxevents, but glibc distinguishes: null pointer \u2192\nEFAULT, invalid count \u2192 EINVAL. Now checks maxevents first (EINVAL), then\nnull pointer (EFAULT). Updated tests assert specific errno values.\nNew test: epoll_pwait_null_events_sets_efault.\n\nwchar_abi: The UTF-8 decoder (decode_utf8) accepted overlong encodings\n(e.g. 0xC0 0x80 for U+0000), surrogate codepoints (0xD800\u20130xDFFF), and\ncodepoints above U+10FFFF. Now validates:\n- 2-byte sequences must encode \u2265 U+0080\n- 3-byte sequences must encode \u2265 U+0800 and not be surrogates\n- 4-byte sequences must encode \u2265 U+10000 and \u2264 U+10FFFF\n- Continuation bytes must have 10xxxxxx pattern\nReturns U+FFFD replacement character for all invalid sequences.\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "cb339f636afe7e13ab3bcce534e6f6f64b29c5e9",
+      "filename": "crates/frankenlibc-abi/src/err_abi.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 2,
+      "changes": 5,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/d127eb9edaffb82cccacbc8d8b8e3cb7d8bea3f2/crates%2Ffrankenlibc-abi%2Fsrc%2Ferr_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/d127eb9edaffb82cccacbc8d8b8e3cb7d8bea3f2/crates%2Ffrankenlibc-abi%2Fsrc%2Ferr_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Ferr_abi.rs?ref=d127eb9edaffb82cccacbc8d8b8e3cb7d8bea3f2",
+      "patch": "@@ -40,6 +40,7 @@ fn get_progname() -> &'static [u8] {\n /// If `fmt_bytes` is non-empty, the message is printf-formatted from the\n /// provided arg buffer. If `with_errno` is true, appends \": strerror(errno)\".\n fn write_err_message(fmt_bytes: &[u8], arg_buf: &[u64], arg_count: usize, with_errno: bool) {\n+    let saved_errno = unsafe { *crate::errno_abi::__errno_location() };\n     let progname = get_progname();\n \n     // Build the output: \"progname: \"\n@@ -59,8 +60,7 @@ fn write_err_message(fmt_bytes: &[u8], arg_buf: &[u64], arg_count: usize, with_e\n         if !fmt_bytes.is_empty() {\n             out.extend_from_slice(b\": \");\n         }\n-        let errno_val = unsafe { *crate::errno_abi::__errno_location() };\n-        let errno_msg = strerror_bytes(errno_val);\n+        let errno_msg = strerror_bytes(saved_errno);\n         out.extend_from_slice(errno_msg);\n     }\n \n@@ -69,6 +69,7 @@ fn write_err_message(fmt_bytes: &[u8], arg_buf: &[u64], arg_count: usize, with_e\n     // Write to stderr (fd 2) atomically.\n     unsafe {\n         crate::unistd_abi::write(2, out.as_ptr() as *const c_void, out.len());\n+        *crate::errno_abi::__errno_location() = saved_errno;\n     }\n }\n "
+    },
+    {
+      "sha": "c9a88e8b6f3e513411b96ad5ff59a4deea38e3a6",
+      "filename": "crates/frankenlibc-abi/src/poll_abi.rs",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 2,
+      "changes": 12,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/d127eb9edaffb82cccacbc8d8b8e3cb7d8bea3f2/crates%2Ffrankenlibc-abi%2Fsrc%2Fpoll_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/d127eb9edaffb82cccacbc8d8b8e3cb7d8bea3f2/crates%2Ffrankenlibc-abi%2Fsrc%2Fpoll_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Fpoll_abi.rs?ref=d127eb9edaffb82cccacbc8d8b8e3cb7d8bea3f2",
+      "patch": "@@ -394,10 +394,14 @@ pub unsafe extern \"C\" fn epoll_wait(\n     maxevents: c_int,\n     timeout: c_int,\n ) -> c_int {\n-    if events.is_null() || maxevents <= 0 {\n+    if maxevents <= 0 {\n         unsafe { set_abi_errno(errno::EINVAL) };\n         return -1;\n     }\n+    if events.is_null() {\n+        unsafe { set_abi_errno(errno::EFAULT) };\n+        return -1;\n+    }\n     let rc = unsafe {\n         libc::syscall(\n             libc::SYS_epoll_pwait as c_long,\n@@ -427,10 +431,14 @@ pub unsafe extern \"C\" fn epoll_pwait(\n     timeout: c_int,\n     sigmask: *const libc::sigset_t,\n ) -> c_int {\n-    if events.is_null() || maxevents <= 0 {\n+    if maxevents <= 0 {\n         unsafe { set_abi_errno(errno::EINVAL) };\n         return -1;\n     }\n+    if events.is_null() {\n+        unsafe { set_abi_errno(errno::EFAULT) };\n+        return -1;\n+    }\n     let rc = unsafe {\n         libc::syscall(\n             libc::SYS_epoll_pwait as c_long,"
+    },
+    {
+      "sha": "abe55b6c9fbfc25d70da01d344544524aa0ab55f",
+      "filename": "crates/frankenlibc-abi/src/wchar_abi.rs",
+      "status": "modified",
+      "additions": 27,
+      "deletions": 7,
+      "changes": 34,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/d127eb9edaffb82cccacbc8d8b8e3cb7d8bea3f2/crates%2Ffrankenlibc-abi%2Fsrc%2Fwchar_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/d127eb9edaffb82cccacbc8d8b8e3cb7d8bea3f2/crates%2Ffrankenlibc-abi%2Fsrc%2Fwchar_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Fwchar_abi.rs?ref=d127eb9edaffb82cccacbc8d8b8e3cb7d8bea3f2",
+      "patch": "@@ -2862,30 +2862,50 @@ fn decode_utf8(bytes: &[u8]) -> (u32, usize) {\n     }\n     let b0 = bytes[0];\n     if b0 < 0x80 {\n-        (b0 as u32, 1)\n-    } else if b0 < 0xC0 {\n-        (0xFFFD, 1) // Continuation byte without lead.\n-    } else if b0 < 0xE0 {\n-        if bytes.len() < 2 {\n+        return (b0 as u32, 1);\n+    }\n+    if b0 < 0xC0 {\n+        return (0xFFFD, 1); // Continuation byte without lead.\n+    }\n+\n+    // Validate continuation byte: must be 10xxxxxx (0x80..=0xBF).\n+    let is_cont = |b: u8| (b & 0xC0) == 0x80;\n+\n+    if b0 < 0xE0 {\n+        if bytes.len() < 2 || !is_cont(bytes[1]) {\n             return (0xFFFD, 1);\n         }\n         let cp = ((b0 as u32 & 0x1F) << 6) | (bytes[1] as u32 & 0x3F);\n+        // Reject overlong: 2-byte must encode >= 0x80\n+        if cp < 0x80 {\n+            return (0xFFFD, 2);\n+        }\n         (cp, 2)\n     } else if b0 < 0xF0 {\n-        if bytes.len() < 3 {\n+        if bytes.len() < 3 || !is_cont(bytes[1]) || !is_cont(bytes[2]) {\n             return (0xFFFD, 1);\n         }\n         let cp =\n             ((b0 as u32 & 0x0F) << 12) | ((bytes[1] as u32 & 0x3F) << 6) | (bytes[2] as u32 & 0x3F);\n+        // Reject overlong: 3-byte must encode >= 0x800\n+        // Reject surrogates: 0xD800..=0xDFFF\n+        if cp < 0x800 || (0xD800..=0xDFFF).contains(&cp) {\n+            return (0xFFFD, 3);\n+        }\n         (cp, 3)\n     } else {\n-        if bytes.len() < 4 {\n+        if bytes.len() < 4 || !is_cont(bytes[1]) || !is_cont(bytes[2]) || !is_cont(bytes[3]) {\n             return (0xFFFD, 1);\n         }\n         let cp = ((b0 as u32 & 0x07) << 18)\n             | ((bytes[1] as u32 & 0x3F) << 12)\n             | ((bytes[2] as u32 & 0x3F) << 6)\n             | (bytes[3] as u32 & 0x3F);\n+        // Reject overlong: 4-byte must encode >= 0x10000\n+        // Reject above Unicode max: > 0x10FFFF\n+        if cp < 0x10000 || cp > 0x10FFFF {\n+            return (0xFFFD, 4);\n+        }\n         (cp, 4)\n     }\n }"
+    },
+    {
+      "sha": "efe67f003fa7081f920b2db444eed9cdf5957106",
+      "filename": "crates/frankenlibc-abi/tests/err_abi_test.rs",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 0,
+      "changes": 22,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/d127eb9edaffb82cccacbc8d8b8e3cb7d8bea3f2/crates%2Ffrankenlibc-abi%2Ftests%2Ferr_abi_test.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/d127eb9edaffb82cccacbc8d8b8e3cb7d8bea3f2/crates%2Ffrankenlibc-abi%2Ftests%2Ferr_abi_test.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Ftests%2Ferr_abi_test.rs?ref=d127eb9edaffb82cccacbc8d8b8e3cb7d8bea3f2",
+      "patch": "@@ -111,6 +111,28 @@ fn test_warn_with_zero_errno() {\n     unsafe { warn(msg.as_ptr() as *const c_char) };\n }\n \n+#[test]\n+fn test_warn_preserves_errno() {\n+    unsafe { *frankenlibc_abi::errno_abi::__errno_location() = libc::EACCES };\n+    let msg = b\"errno preserved\\0\";\n+    unsafe { warn(msg.as_ptr() as *const c_char) };\n+    assert_eq!(\n+        unsafe { *frankenlibc_abi::errno_abi::__errno_location() },\n+        libc::EACCES\n+    );\n+}\n+\n+#[test]\n+fn test_warnx_preserves_errno() {\n+    unsafe { *frankenlibc_abi::errno_abi::__errno_location() = libc::ENOENT };\n+    let msg = b\"warnx errno preserved\\0\";\n+    unsafe { warnx(msg.as_ptr() as *const c_char) };\n+    assert_eq!(\n+        unsafe { *frankenlibc_abi::errno_abi::__errno_location() },\n+        libc::ENOENT\n+    );\n+}\n+\n // ---------------------------------------------------------------------------\n // Multiple sequential calls \u2014 exercise progname caching\n // ---------------------------------------------------------------------------"
+    },
+    {
+      "sha": "7251cbf92e6217297f7fd51563e2531dfd970eac",
+      "filename": "crates/frankenlibc-abi/tests/poll_abi_test.rs",
+      "status": "modified",
+      "additions": 19,
+      "deletions": 0,
+      "changes": 19,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/d127eb9edaffb82cccacbc8d8b8e3cb7d8bea3f2/crates%2Ffrankenlibc-abi%2Ftests%2Fpoll_abi_test.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/d127eb9edaffb82cccacbc8d8b8e3cb7d8bea3f2/crates%2Ffrankenlibc-abi%2Ftests%2Fpoll_abi_test.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Ftests%2Fpoll_abi_test.rs?ref=d127eb9edaffb82cccacbc8d8b8e3cb7d8bea3f2",
+      "patch": "@@ -8,8 +8,10 @@\n use std::ffi::c_int;\n use std::ptr;\n \n+use frankenlibc_abi::errno_abi::__errno_location;\n use frankenlibc_abi::poll_abi::{epoll_create, epoll_create1, epoll_ctl, epoll_wait, poll};\n use frankenlibc_abi::unistd_abi::close;\n+use frankenlibc_core::errno;\n \n // ---------------------------------------------------------------------------\n // Helper: create a pipe pair\n@@ -234,8 +236,10 @@ fn epoll_ctl_add_and_wait() {\n fn epoll_wait_null_events_fails() {\n     let epfd = unsafe { epoll_create1(0) };\n     assert!(epfd >= 0);\n+    unsafe { *__errno_location() = 0 };\n     let n = unsafe { epoll_wait(epfd, ptr::null_mut(), 4, 0) };\n     assert_eq!(n, -1, \"epoll_wait with null events should fail\");\n+    assert_eq!(unsafe { *__errno_location() }, errno::EFAULT);\n     unsafe { close(epfd) };\n }\n \n@@ -244,8 +248,23 @@ fn epoll_wait_zero_maxevents_fails() {\n     let epfd = unsafe { epoll_create1(0) };\n     assert!(epfd >= 0);\n     let mut events = [libc::epoll_event { events: 0, u64: 0 }; 1];\n+    unsafe { *__errno_location() = 0 };\n     let n = unsafe { epoll_wait(epfd, events.as_mut_ptr(), 0, 0) };\n     assert_eq!(n, -1, \"epoll_wait with maxevents=0 should fail\");\n+    assert_eq!(unsafe { *__errno_location() }, errno::EINVAL);\n+    unsafe { close(epfd) };\n+}\n+\n+#[test]\n+fn epoll_pwait_null_events_sets_efault() {\n+    use frankenlibc_abi::poll_abi::epoll_pwait;\n+\n+    let epfd = unsafe { epoll_create1(0) };\n+    assert!(epfd >= 0);\n+    unsafe { *__errno_location() = 0 };\n+    let n = unsafe { epoll_pwait(epfd, ptr::null_mut(), 4, 0, ptr::null()) };\n+    assert_eq!(n, -1, \"epoll_pwait with null events should fail\");\n+    assert_eq!(unsafe { *__errno_location() }, errno::EFAULT);\n     unsafe { close(epfd) };\n }\n "
+    }
+  ]
+}

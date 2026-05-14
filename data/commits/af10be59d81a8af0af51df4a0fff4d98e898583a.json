@@ -1,0 +1,65 @@
+{
+  "message": "fix(approvals): stop stale approval resume loops",
+  "files": [
+    {
+      "sha": "042ef485058a03cf301004238dd542c401923094",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/af10be59d81a8af0af51df4a0fff4d98e898583a/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/af10be59d81a8af0af51df4a0fff4d98e898583a/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=af10be59d81a8af0af51df4a0fff4d98e898583a",
+      "patch": "@@ -57,6 +57,8 @@ Docs: https://docs.openclaw.ai\n \n ### Fixes\n \n+- Agents/approvals: fail restart-interrupted sessions whose transcript tail is still `approval-pending` instead of replaying stale exec approval IDs into the new Gateway process after restart. Fixes #65486. Thanks @mjmai20682068-create.\n+- CLI/Gateway: use method-specific least-privilege scopes for classified CLI Gateway calls while preserving legacy broad scopes for unclassified plugin methods, so read-only commands no longer create admin/write/pairing scope-upgrade prompts. Fixes #68634. Thanks @nightmusher.\n - Gateway/sessions: align `chat.history` and `sessions.list` thinking defaults with owning-agent and catalog-aware resolution so Control UI session defaults match backend runtime state. (#63418) Thanks @jpreagan.\n - Devices/pairing: recover array-shaped device and node pairing state files before persisting approvals, so UUID-keyed pending and paired entries no longer disappear after a malformed JSON store write. Fixes #63035. Thanks @sar618.\n - Gateway/auth: clear reused stale device tokens and stop reconnecting on device-token mismatch in the Control UI and Node gateway clients, avoiding rate-limit loops after scope-upgrade or token-rotation handoffs. Fixes #71609. Thanks @ricksayhi."
+    },
+    {
+      "sha": "2de96b2757415c69f7b4d51c987439524eaf13fd",
+      "filename": "src/agents/main-session-restart-recovery.test.ts",
+      "status": "modified",
+      "additions": 34,
+      "deletions": 0,
+      "changes": 34,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/af10be59d81a8af0af51df4a0fff4d98e898583a/src%2Fagents%2Fmain-session-restart-recovery.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/af10be59d81a8af0af51df4a0fff4d98e898583a/src%2Fagents%2Fmain-session-restart-recovery.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fagents%2Fmain-session-restart-recovery.test.ts?ref=af10be59d81a8af0af51df4a0fff4d98e898583a",
+      "patch": "@@ -123,6 +123,40 @@ describe(\"main-session-restart-recovery\", () => {\n     expect(store[\"agent:main:main\"]?.abortedLastRun).toBe(false);\n   });\n \n+  it(\"fails marked sessions with stale approval-pending exec tool results\", async () => {\n+    const sessionsDir = await makeSessionsDir();\n+    await writeStore(sessionsDir, {\n+      \"agent:main:main\": {\n+        sessionId: \"main-session\",\n+        updatedAt: Date.now() - 10_000,\n+        status: \"running\",\n+        abortedLastRun: true,\n+      },\n+    });\n+    await writeTranscript(sessionsDir, \"main-session\", [\n+      { role: \"user\", content: \"run a command that needs approval\" },\n+      { role: \"assistant\", content: [{ type: \"toolCall\", id: \"call-1\", name: \"exec\" }] },\n+      {\n+        role: \"toolResult\",\n+        content: \"Approval required (id stale, full stale-approval-id).\",\n+        details: {\n+          status: \"approval-pending\",\n+          approvalId: \"stale-approval-id\",\n+          host: \"gateway\",\n+          command: \"echo stale\",\n+        },\n+      },\n+    ]);\n+\n+    const result = await recoverRestartAbortedMainSessions({ stateDir: tmpDir });\n+\n+    expect(result).toEqual({ recovered: 0, failed: 1, skipped: 0 });\n+    expect(callGateway).not.toHaveBeenCalled();\n+    const store = loadSessionStore(path.join(sessionsDir, \"sessions.json\"));\n+    expect(store[\"agent:main:main\"]?.status).toBe(\"failed\");\n+    expect(store[\"agent:main:main\"]?.abortedLastRun).toBe(true);\n+  });\n+\n   it(\"does not scan ordinary running sessions without the restart-aborted marker\", async () => {\n     const sessionsDir = await makeSessionsDir();\n     await writeStore(sessionsDir, {"
+    },
+    {
+      "sha": "48635665c8e5cf58df4054f23f3c0fb0ced94f2f",
+      "filename": "src/agents/main-session-restart-recovery.ts",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 4,
+      "changes": 26,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/af10be59d81a8af0af51df4a0fff4d98e898583a/src%2Fagents%2Fmain-session-restart-recovery.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/af10be59d81a8af0af51df4a0fff4d98e898583a/src%2Fagents%2Fmain-session-restart-recovery.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fagents%2Fmain-session-restart-recovery.ts?ref=af10be59d81a8af0af51df4a0fff4d98e898583a",
+      "patch": "@@ -62,9 +62,26 @@ function isResumableTailMessage(message: unknown): boolean {\n   return role === \"user\" || role === \"tool\" || role === \"toolResult\";\n }\n \n-function isMainSessionResumable(messages: unknown[]): boolean {\n+function isApprovalPendingToolResult(message: unknown): boolean {\n+  if (!message || typeof message !== \"object\" || getMessageRole(message) !== \"toolResult\") {\n+    return false;\n+  }\n+  const details = (message as { details?: unknown }).details;\n+  if (!details || typeof details !== \"object\") {\n+    return false;\n+  }\n+  return (details as { status?: unknown }).status === \"approval-pending\";\n+}\n+\n+function resolveMainSessionResumeBlockReason(messages: unknown[]): string | null {\n   const lastMeaningful = messages.toReversed().find(isMeaningfulTailMessage);\n-  return lastMeaningful ? isResumableTailMessage(lastMeaningful) : false;\n+  if (!lastMeaningful || !isResumableTailMessage(lastMeaningful)) {\n+    return \"transcript tail is not resumable\";\n+  }\n+  if (isApprovalPendingToolResult(lastMeaningful)) {\n+    return \"transcript tail is a stale approval-pending tool result\";\n+  }\n+  return null;\n }\n \n function buildResumeMessage(): string {\n@@ -216,11 +233,12 @@ async function recoverStore(params: {\n       continue;\n     }\n \n-    if (!isMainSessionResumable(messages)) {\n+    const resumeBlockReason = resolveMainSessionResumeBlockReason(messages);\n+    if (resumeBlockReason) {\n       await markSessionFailed({\n         storePath: params.storePath,\n         sessionKey,\n-        reason: \"transcript tail is not resumable\",\n+        reason: resumeBlockReason,\n       });\n       result.failed++;\n       continue;"
+    },
+    {
+      "sha": "32361ac2ed91d4d134a8618ea5c4796785c15f8d",
+      "filename": "src/gateway/call.test.ts",
+      "status": "modified",
+      "additions": 17,
+      "deletions": 9,
+      "changes": 26,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/af10be59d81a8af0af51df4a0fff4d98e898583a/src%2Fgateway%2Fcall.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/af10be59d81a8af0af51df4a0fff4d98e898583a/src%2Fgateway%2Fcall.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fcall.test.ts?ref=af10be59d81a8af0af51df4a0fff4d98e898583a",
+      "patch": "@@ -482,23 +482,31 @@ describe(\"callGateway url resolution\", () => {\n       expectedScopes: [\"operator.read\"],\n     },\n     {\n-      label: \"keeps legacy admin scopes for explicit CLI callers\",\n+      label: \"uses least-privilege scopes by default for explicit CLI callers\",\n       call: () => callGatewayCli({ method: \"health\" }),\n-      expectedScopes: [\n-        \"operator.admin\",\n-        \"operator.read\",\n-        \"operator.write\",\n-        \"operator.approvals\",\n-        \"operator.pairing\",\n-        \"operator.talk.secrets\",\n-      ],\n+      expectedScopes: [\"operator.read\"],\n     },\n   ])(\"scope selection: $label\", async ({ call, expectedScopes }) => {\n     setLocalLoopbackGatewayConfig();\n     await call();\n     expect(lastClientOptions?.scopes).toEqual(expectedScopes);\n   });\n \n+  it(\"keeps legacy broad scopes for unclassified explicit CLI methods\", async () => {\n+    setLocalLoopbackGatewayConfig();\n+\n+    await callGatewayCli({ method: \"plugin.custom.unclassified\" });\n+\n+    expect(lastClientOptions?.scopes).toEqual([\n+      \"operator.admin\",\n+      \"operator.read\",\n+      \"operator.write\",\n+      \"operator.approvals\",\n+      \"operator.pairing\",\n+      \"operator.talk.secrets\",\n+    ]);\n+  });\n+\n   it(\"passes explicit scopes through, including empty arrays\", async () => {\n     setLocalLoopbackGatewayConfig();\n "
+    },
+    {
+      "sha": "2984a74fcefb1cc96d2a8e1c115c43598992af2c",
+      "filename": "src/gateway/call.ts",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 1,
+      "changes": 7,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/af10be59d81a8af0af51df4a0fff4d98e898583a/src%2Fgateway%2Fcall.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/af10be59d81a8af0af51df4a0fff4d98e898583a/src%2Fgateway%2Fcall.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Fgateway%2Fcall.ts?ref=af10be59d81a8af0af51df4a0fff4d98e898583a",
+      "patch": "@@ -35,6 +35,7 @@ import {\n import { canSkipGatewayConfigLoad } from \"./explicit-connection-policy.js\";\n import {\n   CLI_DEFAULT_OPERATOR_SCOPES,\n+  isGatewayMethodClassified,\n   resolveLeastPrivilegeOperatorScopesForMethod,\n   type OperatorScope,\n } from \"./method-scopes.js\";\n@@ -635,7 +636,11 @@ export async function callGatewayScoped<T = Record<string, unknown>>(\n export async function callGatewayCli<T = Record<string, unknown>>(\n   opts: CallGatewayCliOptions,\n ): Promise<T> {\n-  const scopes = Array.isArray(opts.scopes) ? opts.scopes : CLI_DEFAULT_OPERATOR_SCOPES;\n+  const scopes = Array.isArray(opts.scopes)\n+    ? opts.scopes\n+    : isGatewayMethodClassified(opts.method)\n+      ? resolveLeastPrivilegeOperatorScopesForMethod(opts.method)\n+      : CLI_DEFAULT_OPERATOR_SCOPES;\n   return await callGatewayWithScopes(opts, scopes);\n }\n "
+    }
+  ]
+}

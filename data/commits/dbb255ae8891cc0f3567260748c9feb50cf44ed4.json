@@ -1,0 +1,53 @@
+{
+  "message": "Reject invalid TLS probe prefixes\n\nKeep partial probes on the TLS path only while the bytes remain compatible with a ClientHello. Once a byte contradicts the TLS header shape, the connection returns to the plaintext path instead of waiting for the rest of the probe or forcing a TLS upgrade after a timeout. Add a split-payload regression fixture for non-TLS data that starts with the TLS record byte.\n\nAssisted-by: ChatGPT (pi)",
+  "files": [
+    {
+      "sha": "a9e1a4266d4aa4dfb57418cfd3a13f9df4baf982",
+      "filename": "libtenzir/builtins/operators/accept_tcp.cpp",
+      "status": "modified",
+      "additions": 27,
+      "deletions": 6,
+      "changes": 33,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/dbb255ae8891cc0f3567260748c9feb50cf44ed4/libtenzir%2Fbuiltins%2Foperators%2Faccept_tcp.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/dbb255ae8891cc0f3567260748c9feb50cf44ed4/libtenzir%2Fbuiltins%2Foperators%2Faccept_tcp.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Fbuiltins%2Foperators%2Faccept_tcp.cpp?ref=dbb255ae8891cc0f3567260748c9feb50cf44ed4",
+      "patch": "@@ -565,11 +565,29 @@ class AcceptTcpListener final : public Operator<void, table_slice> {\n   // plaintext. This also covers ECH, where the visible outer ClientHello still\n   // uses the regular TLS record and handshake headers. OpenSSL performs full\n   // validation after we put these bytes back.\n+  static auto could_be_tls_client_hello(std::span<std::byte const> bytes)\n+    -> bool {\n+    if (bytes.empty()) {\n+      return false;\n+    }\n+    if (bytes[0] != std::byte{0x16}) {\n+      return false;\n+    }\n+    if (bytes.size() >= 2 and bytes[1] != std::byte{0x03}) {\n+      return false;\n+    }\n+    if (bytes.size() >= 3 and bytes[2] > std::byte{0x04}) {\n+      return false;\n+    }\n+    if (bytes.size() >= 6 and bytes[5] != std::byte{0x01}) {\n+      return false;\n+    }\n+    return true;\n+  }\n+\n   static auto looks_like_tls_client_hello(std::span<std::byte const> bytes)\n     -> bool {\n-    return bytes.size() >= 6 and bytes[0] == std::byte{0x16}\n-           and bytes[1] == std::byte{0x03} and bytes[2] <= std::byte{0x04}\n-           and bytes[5] == std::byte{0x01};\n+    return bytes.size() >= 6 and could_be_tls_client_hello(bytes);\n   }\n \n   static auto set_pre_received_data(folly::coro::Transport& transport,\n@@ -592,12 +610,15 @@ class AcceptTcpListener final : public Operator<void, table_slice> {\n     auto read_some = [&](size_t min_size) -> Task<void> {\n       while (size < min_size) {\n         auto* data = reinterpret_cast<unsigned char*>(prefix.data() + size);\n-        auto n = co_await transport.read(\n-          folly::MutableByteRange{data, min_size - size}, tls_probe_timeout);\n+        auto n = co_await transport.read(folly::MutableByteRange{data, 1},\n+                                         tls_probe_timeout);\n         if (n == 0) {\n           co_return;\n         }\n         size += n;\n+        if (not could_be_tls_client_hello(std::span{prefix.data(), size})) {\n+          co_return;\n+        }\n       }\n     };\n     auto timed_out = false;\n@@ -624,7 +645,7 @@ class AcceptTcpListener final : public Operator<void, table_slice> {\n       set_pre_received_data(transport, bytes);\n     }\n     if (looks_like_tls_client_hello(bytes)\n-        or (timed_out and size > 0 and prefix[0] == std::byte{0x16})) {\n+        or (timed_out and could_be_tls_client_hello(bytes))) {\n       co_return TlsProbeResult{.is_tls = true};\n     }\n     co_return {};"
+    },
+    {
+      "sha": "739d907e23190c037324ef774815f26383b6b15b",
+      "filename": "test/fixtures/tcp.py",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 1,
+      "changes": 14,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/dbb255ae8891cc0f3567260748c9feb50cf44ed4/test%2Ffixtures%2Ftcp.py",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/dbb255ae8891cc0f3567260748c9feb50cf44ed4/test%2Ffixtures%2Ftcp.py",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ffixtures%2Ftcp.py?ref=dbb255ae8891cc0f3567260748c9feb50cf44ed4",
+      "patch": "@@ -29,6 +29,8 @@ class TcpOptions:\n     certs: bool = False\n     invalid_tls_handshake_first: bool = False\n     client_send_delay: float = 0.0\n+    client_split_payload_at: int | None = None\n+    client_split_send_delay: float = 0.0\n     mode: str = \"client\"  # \"client\" sends data; \"server\" receives data\n     payload: str = \"foo\\n\"\n \n@@ -90,6 +92,8 @@ def tcp() -> FixtureHandle:\n                 \"capture_path\": client_capture_path,\n                 \"invalid_tls_handshake_first\": opts.invalid_tls_handshake_first,\n                 \"send_delay\": opts.client_send_delay,\n+                \"split_payload_at\": opts.client_split_payload_at,\n+                \"split_send_delay\": opts.client_split_send_delay,\n             },\n             daemon=True,\n         )\n@@ -217,6 +221,8 @@ def _run_client_worker(\n     capture_path: str | None,\n     invalid_tls_handshake_first: bool,\n     send_delay: float,\n+    split_payload_at: int | None,\n+    split_send_delay: float,\n ) -> None:\n     context: ssl.SSLContext | None = None\n     if tls:\n@@ -244,7 +250,13 @@ def _run_client_worker(\n                     if send_delay > 0:\n                         stop_event.wait(send_delay)\n                     if payload:\n-                        sock.sendall(payload)\n+                        if split_payload_at is None:\n+                            sock.sendall(payload)\n+                        else:\n+                            sock.sendall(payload[:split_payload_at])\n+                            if split_send_delay > 0:\n+                                stop_event.wait(split_send_delay)\n+                            sock.sendall(payload[split_payload_at:])\n                     if context is None:\n                         try:\n                             sock.shutdown(socket.SHUT_WR)"
+    },
+    {
+      "sha": "4ae9c85934c9dd87aa3e5ac825510d48879580c7",
+      "filename": "test/tests/operators/accept_tcp/tls/auto_detect_slow_non_tls_prefix_read_lines.tql",
+      "status": "added",
+      "additions": 22,
+      "deletions": 0,
+      "changes": 22,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/dbb255ae8891cc0f3567260748c9feb50cf44ed4/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Fauto_detect_slow_non_tls_prefix_read_lines.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/dbb255ae8891cc0f3567260748c9feb50cf44ed4/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Fauto_detect_slow_non_tls_prefix_read_lines.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Fauto_detect_slow_non_tls_prefix_read_lines.tql?ref=dbb255ae8891cc0f3567260748c9feb50cf44ed4",
+      "patch": "@@ -0,0 +1,22 @@\n+---\n+fixtures:\n+  - tcp:\n+      mode: client\n+      certs: true\n+      payload: \"\\u0016Xfoo\\n\"\n+      client_split_payload_at: 2\n+      client_split_send_delay: 1.0\n+timeout: 30\n+---\n+\n+let $tls = {\n+  certfile: env(\"TCP_CERTFILE\"),\n+  keyfile: env(\"TCP_KEYFILE\"),\n+  skip_peer_verification: true,\n+}\n+\n+accept_tcp env(\"TCP_ENDPOINT\"), tls=$tls, auto_detect_tls=true {\n+  read_lines\n+  line = \"ok\"\n+}\n+head 1"
+    },
+    {
+      "sha": "bf2d0f64cc58202092aa4b3e6847d11f635e95ce",
+      "filename": "test/tests/operators/accept_tcp/tls/auto_detect_slow_non_tls_prefix_read_lines.txt",
+      "status": "added",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/dbb255ae8891cc0f3567260748c9feb50cf44ed4/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Fauto_detect_slow_non_tls_prefix_read_lines.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/dbb255ae8891cc0f3567260748c9feb50cf44ed4/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Fauto_detect_slow_non_tls_prefix_read_lines.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Fauto_detect_slow_non_tls_prefix_read_lines.txt?ref=dbb255ae8891cc0f3567260748c9feb50cf44ed4",
+      "patch": "@@ -0,0 +1,3 @@\n+{\n+  line: \"ok\",\n+}"
+    }
+  ]
+}

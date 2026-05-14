@@ -1,0 +1,41 @@
+{
+  "message": "feat: add LIKE prefix page skip for string columns\n\nExtracts the fixed prefix from LIKE patterns (before the first wildcard)\nand skips pages where the string range doesn't overlap. Patterns\nstarting with % or _ fall through to row-level evaluation.",
+  "files": [
+    {
+      "sha": "2ad944991963c8c3c0df25bdd4a1f038011805a4",
+      "filename": "docs/src/content/docs/performance.mdx",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/teamchong/querymode/blob/cb2a6f9c9e83b4675ed567e64a862e35dac94576/docs%2Fsrc%2Fcontent%2Fdocs%2Fperformance.mdx",
+      "raw_url": "https://github.com/teamchong/querymode/raw/cb2a6f9c9e83b4675ed567e64a862e35dac94576/docs%2Fsrc%2Fcontent%2Fdocs%2Fperformance.mdx",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/docs%2Fsrc%2Fcontent%2Fdocs%2Fperformance.mdx?ref=cb2a6f9c9e83b4675ed567e64a862e35dac94576",
+      "patch": "@@ -109,7 +109,7 @@ This is automatic \u2014 no configuration needed. Supported filter ops:\n | `is_null` | Page has zero null values (nullCount = 0) |\n | `is_not_null` | Page is entirely null (nullCount = rowCount) |\n \n-String columns also have min/max stats (lexicographic). `like` and `not_like` filters don't benefit from page skip.\n+String columns also have min/max stats (lexicographic). `like` patterns with a fixed prefix (e.g., `'abc%'`) can skip pages where the string range doesn't overlap the prefix. Patterns starting with a wildcard (e.g., `'%xyz'`) cannot be pruned. `not_like` does not benefit from page skip.\n \n ### OR filters and page skip\n "
+    },
+    {
+      "sha": "cc8c69b1530bdcf529d37d8edfb9bd792c812141",
+      "filename": "src/decode.test.ts",
+      "status": "modified",
+      "additions": 19,
+      "deletions": 0,
+      "changes": 19,
+      "blob_url": "https://github.com/teamchong/querymode/blob/cb2a6f9c9e83b4675ed567e64a862e35dac94576/src%2Fdecode.test.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/cb2a6f9c9e83b4675ed567e64a862e35dac94576/src%2Fdecode.test.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fdecode.test.ts?ref=cb2a6f9c9e83b4675ed567e64a862e35dac94576",
+      "patch": "@@ -199,6 +199,25 @@ describe(\"canSkipPage\", () => {\n     const withNulls: PageInfo = { byteOffset: 0n, byteLength: 100, rowCount: 50, nullCount: 5, minValue: 10, maxValue: 90 };\n     expect(canSkipPage(withNulls, [{ column: \"x\", op: \"is_not_null\", value: 0 }], \"x\")).toBe(false);\n   });\n+\n+  it(\"skips page with LIKE prefix when range doesn't overlap\", () => {\n+    const strPage: PageInfo = { byteOffset: 0n, byteLength: 100, rowCount: 50, nullCount: 0, minValue: \"apple\", maxValue: \"banana\" };\n+    // Prefix \"car\" is entirely above [apple, banana]\n+    expect(canSkipPage(strPage, [{ column: \"x\", op: \"like\", value: \"car%\" }], \"x\")).toBe(true);\n+    // Prefix \"aa\" is entirely below [apple, banana]\n+    expect(canSkipPage(strPage, [{ column: \"x\", op: \"like\", value: \"aa%\" }], \"x\")).toBe(true);\n+  });\n+\n+  it(\"does not skip page with LIKE prefix when range overlaps\", () => {\n+    const strPage: PageInfo = { byteOffset: 0n, byteLength: 100, rowCount: 50, nullCount: 0, minValue: \"apple\", maxValue: \"banana\" };\n+    expect(canSkipPage(strPage, [{ column: \"x\", op: \"like\", value: \"ba%\" }], \"x\")).toBe(false);\n+    expect(canSkipPage(strPage, [{ column: \"x\", op: \"like\", value: \"app%\" }], \"x\")).toBe(false);\n+  });\n+\n+  it(\"does not skip page with LIKE pattern starting with wildcard\", () => {\n+    const strPage: PageInfo = { byteOffset: 0n, byteLength: 100, rowCount: 50, nullCount: 0, minValue: \"apple\", maxValue: \"banana\" };\n+    expect(canSkipPage(strPage, [{ column: \"x\", op: \"like\", value: \"%xyz%\" }], \"x\")).toBe(false);\n+  });\n });\n \n describe(\"assembleRows\", () => {"
+    },
+    {
+      "sha": "0ab693d325dd6a1427cc19651b9fd62500a07c0b",
+      "filename": "src/decode.ts",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 0,
+      "changes": 22,
+      "blob_url": "https://github.com/teamchong/querymode/blob/cb2a6f9c9e83b4675ed567e64a862e35dac94576/src%2Fdecode.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/cb2a6f9c9e83b4675ed567e64a862e35dac94576/src%2Fdecode.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fdecode.ts?ref=cb2a6f9c9e83b4675ed567e64a862e35dac94576",
+      "patch": "@@ -71,6 +71,16 @@ export function canSkipPage(page: PageInfo, filters: QueryDescriptor[\"filters\"],\n         if (min >= lo && max <= hi) return true;\n         break;\n       }\n+      // like: skip when the fixed prefix doesn't overlap the page's string range\n+      case \"like\": {\n+        if (typeof filter.value !== \"string\" || typeof min !== \"string\") break;\n+        const prefix = extractLikePrefix(filter.value);\n+        if (!prefix) break;\n+        // Page max < prefix or page min >= prefix + '\\uffff' \u2192 no match possible\n+        const prefixEnd = prefix.slice(0, -1) + String.fromCharCode(prefix.charCodeAt(prefix.length - 1) + 1);\n+        if ((max as string) < prefix || (min as string) >= prefixEnd) return true;\n+        break;\n+      }\n     }\n   }\n   return false;\n@@ -547,6 +557,18 @@ export function rowPassesFilters(row: Row, filters: FilterOp[], filterGroups?: F\n   return true;\n }\n \n+/** Extract the fixed prefix from a LIKE pattern (before the first wildcard). Returns null if no useful prefix. */\n+function extractLikePrefix(pattern: string): string | null {\n+  let prefix = \"\";\n+  for (let i = 0; i < pattern.length; i++) {\n+    const ch = pattern[i];\n+    if (ch === \"%\" || ch === \"_\") break;\n+    if (ch === \"\\\\\" && i + 1 < pattern.length) { prefix += pattern[++i]; continue; }\n+    prefix += ch;\n+  }\n+  return prefix.length > 0 ? prefix : null;\n+}\n+\n /** Cache compiled LIKE regexes \u2014 avoids re-compilation per row. */\n const likeRegexCache = new Map<string, RegExp>();\n "
+    }
+  ]
+}

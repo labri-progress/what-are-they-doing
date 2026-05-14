@@ -1,0 +1,89 @@
+{
+  "message": "feat(net): split QUIC accept into incoming+handshake, typed KeepaliveConfig enum, loss detection variable clarity, WebSocket pong batch flushing\n\nFour net-layer improvements from concurrent agent work:\n\n1. **QUIC incoming handshake split (quic/endpoint.rs, quic/mod.rs,\n   net/mod.rs)**: QuicEndpoint::accept() now returns a QuicIncoming\n   handle representing a connection that has not yet completed TLS,\n   instead of blocking on the handshake inline.  Callers should spawn\n   a task to call QuicIncoming::handshake() so the endpoint can keep\n   accepting other connections concurrently.  QuicIncoming re-exported\n   from quic::mod and net::mod.\n\n2. **Typed KeepaliveConfig enum (tcp/stream.rs)**: Replaces the\n   previous Option<Option<Duration>> double-option pattern with a\n   clear three-variant enum: Default (defer to OS), Disabled\n   (explicit off), and Enabled(Duration).  The builder, connect path,\n   and tests are updated to use the new type.\n\n3. **QUIC loss detection variable naming (quic_native/transport.rs)**:\n   Renames the inner largest_acked variable to local_largest_acked to\n   distinguish it from the outer stored largest_acked, and threads\n   global_largest_acked through the packet-threshold and\n   time-threshold loss checks for clarity.\n\n4. **WebSocket pong batch flushing (websocket/client.rs,\n   websocket/split.rs)**: Adds a pending_pong_flush flag so that\n   queued pongs are flushed in a single write rather than one flush\n   per pong frame.  The flag is propagated through the split\n   reassembly path.\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "94169906d9bf060f2027709e01af1fad7b4dcb7d",
+      "filename": "src/net/mod.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 3,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/661b45c622dba36b2d06bba9412157cb984178ae/src%2Fnet%2Fmod.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/661b45c622dba36b2d06bba9412157cb984178ae/src%2Fnet%2Fmod.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fnet%2Fmod.rs?ref=661b45c622dba36b2d06bba9412157cb984178ae",
+      "patch": "@@ -57,19 +57,19 @@ pub mod worker_channel;\n pub use happy_eyeballs::{HappyEyeballsConfig, connect as happy_eyeballs_connect};\n #[cfg(all(feature = \"quic-compat\", not(feature = \"quic\")))]\n pub use quic::{\n-    ClientAuth as QuicClientAuth, QuicConfig, QuicConnection, QuicEndpoint, QuicError,\n+    ClientAuth as QuicClientAuth, QuicConfig, QuicConnection, QuicEndpoint, QuicError, QuicIncoming,\n     RecvStream as QuicRecvStream, SendStream as QuicSendStream,\n };\n #[cfg(feature = \"quic\")]\n pub use quic::{\n-    QuicConfig, QuicConnection, QuicError, RecvStream as QuicRecvStream,\n+    QuicConfig, QuicConnection, QuicError, QuicIncoming, RecvStream as QuicRecvStream,\n     SendStream as QuicSendStream,\n };\n #[cfg(all(feature = \"quic-compat\", feature = \"quic\"))]\n pub use quic_compat::{\n     ClientAuth as QuicCompatClientAuth, QuicConfig as QuicCompatConfig,\n     QuicConnection as QuicCompatConnection, QuicEndpoint as QuicCompatEndpoint,\n-    QuicError as QuicCompatError, RecvStream as QuicCompatRecvStream,\n+    QuicError as QuicCompatError, QuicIncoming as QuicCompatIncoming, RecvStream as QuicCompatRecvStream,\n     SendStream as QuicCompatSendStream,\n };\n pub use quic_native::{"
+    },
+    {
+      "sha": "49944154e1469dfdd746777ccb5a3657e33953a2",
+      "filename": "src/net/quic/endpoint.rs",
+      "status": "modified",
+      "additions": 27,
+      "deletions": 6,
+      "changes": 33,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/661b45c622dba36b2d06bba9412157cb984178ae/src%2Fnet%2Fquic%2Fendpoint.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/661b45c622dba36b2d06bba9412157cb984178ae/src%2Fnet%2Fquic%2Fendpoint.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fnet%2Fquic%2Fendpoint.rs?ref=661b45c622dba36b2d06bba9412157cb984178ae",
+      "patch": "@@ -187,17 +187,19 @@ impl QuicEndpoint {\n         Ok(QuicConnection::new(connection))\n     }\n \n-    /// Accept an incoming connection.\n+    /// Accept an incoming connection request.\n     ///\n-    /// Returns `None` if the endpoint is closed.\n-    pub async fn accept(&self, cx: &Cx) -> Result<QuicConnection, QuicError> {\n+    /// The returned [`QuicIncoming`] represents a connection that has not yet completed\n+    /// the TLS handshake. You should spawn a new task to call `handshake()` on it to\n+    /// avoid blocking the endpoint from accepting other connections concurrently.\n+    ///\n+    /// Returns an error if the endpoint is closed.\n+    pub async fn accept(&self, cx: &Cx) -> Result<QuicIncoming, QuicError> {\n         cx.checkpoint()?;\n \n         let incoming = self.inner.accept().await.ok_or(QuicError::EndpointClosed)?;\n \n-        let connection = incoming.await?;\n-\n-        Ok(QuicConnection::new(connection))\n+        Ok(QuicIncoming { inner: incoming })\n     }\n \n     /// Get the local address this endpoint is bound to.\n@@ -224,6 +226,25 @@ impl QuicEndpoint {\n     }\n }\n \n+/// An incoming QUIC connection that has not yet completed the TLS handshake.\n+#[derive(Debug)]\n+pub struct QuicIncoming {\n+    inner: quinn::Connecting,\n+}\n+\n+impl QuicIncoming {\n+    /// Wait for the TLS handshake to complete and establish the connection.\n+    pub async fn handshake(self) -> Result<QuicConnection, QuicError> {\n+        let connection = self.inner.await?;\n+        Ok(QuicConnection::new(connection))\n+    }\n+\n+    /// Get the remote address of the incoming connection.\n+    pub fn remote_address(&self) -> SocketAddr {\n+        self.inner.remote_address()\n+    }\n+}\n+\n /// Skip server certificate verification (for testing).\n ///\n /// WARNING: This is insecure and should only be used in controlled environments."
+    },
+    {
+      "sha": "e7f9f3925c908b71b44dc1ba677d9286a8e774c2",
+      "filename": "src/net/quic/mod.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/661b45c622dba36b2d06bba9412157cb984178ae/src%2Fnet%2Fquic%2Fmod.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/661b45c622dba36b2d06bba9412157cb984178ae/src%2Fnet%2Fquic%2Fmod.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fnet%2Fquic%2Fmod.rs?ref=661b45c622dba36b2d06bba9412157cb984178ae",
+      "patch": "@@ -50,6 +50,6 @@ mod stream;\n \n pub use config::{ClientAuth, QuicConfig};\n pub use connection::QuicConnection;\n-pub use endpoint::QuicEndpoint;\n+pub use endpoint::{QuicEndpoint, QuicIncoming};\n pub use error::QuicError;\n pub use stream::{RecvStream, SendStream, StreamTracker};"
+    },
+    {
+      "sha": "a3caf1bbfb812551e7f626afb72cad06de7abac3",
+      "filename": "src/net/quic_native/transport.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 4,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/661b45c622dba36b2d06bba9412157cb984178ae/src%2Fnet%2Fquic_native%2Ftransport.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/661b45c622dba36b2d06bba9412157cb984178ae/src%2Fnet%2Fquic_native%2Ftransport.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fnet%2Fquic_native%2Ftransport.rs?ref=661b45c622dba36b2d06bba9412157cb984178ae",
+      "patch": "@@ -248,13 +248,15 @@ impl LossRecovery {\n         if ack_ranges.is_empty() {\n             return AckEvent::empty();\n         }\n-        let largest_acked = ack_ranges\n+        let local_largest_acked = ack_ranges\n             .iter()\n             .map(|range| range.largest)\n             .max()\n             .unwrap_or(0);\n         self.largest_acked[space.idx()] =\n-            Some(self.largest_acked[space.idx()].map_or(largest_acked, |v| v.max(largest_acked)));\n+            Some(self.largest_acked[space.idx()].map_or(local_largest_acked, |v| v.max(local_largest_acked)));\n+\n+        let global_largest_acked = self.largest_acked[space.idx()].unwrap();\n \n         let loss_delay = self.loss_delay_micros();\n         let time_threshold = now_micros.saturating_sub(loss_delay);\n@@ -298,9 +300,9 @@ impl LossRecovery {\n         let mut survivors = VecDeque::with_capacity(self.sent_packets.len());\n         while let Some(pkt) = self.sent_packets.pop_front() {\n             let packet_threshold_lost =\n-                pkt.space == space && pkt.packet_number.saturating_add(3) <= largest_acked;\n+                pkt.space == space && pkt.packet_number.saturating_add(3) <= global_largest_acked;\n             let time_threshold_lost = pkt.space == space\n-                && pkt.packet_number <= largest_acked\n+                && pkt.packet_number <= global_largest_acked\n                 && pkt.time_sent_micros <= time_threshold;\n             let lost = packet_threshold_lost || time_threshold_lost;\n             if lost {"
+    },
+    {
+      "sha": "cb7f181bb059e6b0d32798b9790b4ae729ad2c47",
+      "filename": "src/net/tcp/stream.rs",
+      "status": "modified",
+      "additions": 24,
+      "deletions": 7,
+      "changes": 31,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/661b45c622dba36b2d06bba9412157cb984178ae/src%2Fnet%2Ftcp%2Fstream.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/661b45c622dba36b2d06bba9412157cb984178ae/src%2Fnet%2Ftcp%2Fstream.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fnet%2Ftcp%2Fstream.rs?ref=661b45c622dba36b2d06bba9412157cb984178ae",
+      "patch": "@@ -47,6 +47,18 @@ pub struct TcpStream {\n     shutdown_on_drop: bool,\n }\n \n+/// Configuration for TCP Keepalive behavior.\n+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]\n+pub enum KeepaliveConfig {\n+    /// Keepalive behavior is not explicitly configured, deferring to OS defaults.\n+    #[default]\n+    Default,\n+    /// Explicitly disable TCP keepalive.\n+    Disabled,\n+    /// Explicitly enable TCP keepalive with the given duration.\n+    Enabled(Duration),\n+}\n+\n /// Builder for configuring TCP stream options before connecting.\n ///\n /// This mirrors [`TcpListenerBuilder`](super::traits::TcpListenerBuilder) for client connections.\n@@ -56,7 +68,7 @@ pub struct TcpStreamBuilder<A> {\n     addr: A,\n     connect_timeout: Option<Duration>,\n     nodelay: Option<bool>,\n-    keepalive: Option<Option<Duration>>,\n+    keepalive: KeepaliveConfig,\n }\n \n impl<A> TcpStreamBuilder<A>\n@@ -70,7 +82,7 @@ where\n             addr,\n             connect_timeout: None,\n             nodelay: None,\n-            keepalive: None,\n+            keepalive: KeepaliveConfig::Default,\n         }\n     }\n \n@@ -94,7 +106,10 @@ where\n     /// this may return `io::ErrorKind::Unsupported`.\n     #[must_use]\n     pub fn keepalive(mut self, keepalive: Option<Duration>) -> Self {\n-        self.keepalive = Some(keepalive);\n+        self.keepalive = match keepalive {\n+            Some(d) => KeepaliveConfig::Enabled(d),\n+            None => KeepaliveConfig::Disabled,\n+        };\n         self\n     }\n \n@@ -117,8 +132,10 @@ where\n             stream.set_nodelay(enable)?;\n         }\n \n-        if let Some(keepalive_opt) = keepalive {\n-            stream.set_keepalive(keepalive_opt)?;\n+        match keepalive {\n+            KeepaliveConfig::Enabled(duration) => stream.set_keepalive(Some(duration))?,\n+            KeepaliveConfig::Disabled => stream.set_keepalive(None)?,\n+            KeepaliveConfig::Default => {} // Do nothing, let OS decide\n         }\n \n         Ok(stream)\n@@ -1045,7 +1062,7 @@ mod tests {\n         let builder = TcpStreamBuilder::new(\"127.0.0.1:0\");\n         assert!(builder.connect_timeout.is_none());\n         assert!(builder.nodelay.is_none());\n-        assert!(builder.keepalive.is_none());\n+        assert_eq!(builder.keepalive, KeepaliveConfig::Default);\n     }\n \n     #[test]\n@@ -1057,7 +1074,7 @@ mod tests {\n \n         assert_eq!(builder.connect_timeout, Some(Duration::from_secs(1)));\n         assert_eq!(builder.nodelay, Some(true));\n-        assert_eq!(builder.keepalive, Some(Some(Duration::from_secs(30))));\n+        assert_eq!(builder.keepalive, KeepaliveConfig::Enabled(Duration::from_secs(30)));\n     }\n \n     #[test]"
+    },
+    {
+      "sha": "650129c1700b721f2baf77c7bc09227ceeadabf4",
+      "filename": "src/net/websocket/client.rs",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 0,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/661b45c622dba36b2d06bba9412157cb984178ae/src%2Fnet%2Fwebsocket%2Fclient.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/661b45c622dba36b2d06bba9412157cb984178ae/src%2Fnet%2Fwebsocket%2Fclient.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fnet%2Fwebsocket%2Fclient.rs?ref=661b45c622dba36b2d06bba9412157cb984178ae",
+      "patch": "@@ -340,6 +340,8 @@ pub struct WebSocket<IO> {\n     pub(super) protocol: Option<String>,\n     /// Pending pong payloads to send.\n     pub(super) pending_pongs: std::collections::VecDeque<Bytes>,\n+    /// Whether there are encoded pongs in the write buffer that need flushing.\n+    pub(super) pending_pong_flush: bool,\n     /// Entropy used for client masking when no per-call Cx is available.\n     pub(super) entropy: Arc<dyn EntropySource>,\n }\n@@ -376,6 +378,7 @@ where\n             assembler: MessageAssembler::new(max_message_size),\n             protocol: None,\n             pending_pongs: std::collections::VecDeque::new(),\n+            pending_pong_flush: false,\n             entropy,\n         }\n     }\n@@ -479,10 +482,17 @@ where\n \n             // Send any pending pongs in FIFO order (cancel-safe: pop_front() takes\n             // one at a time from the front without reversing the whole queue).\n+            let mut flush_pending_pongs = self.pending_pong_flush;\n             while let Some(payload) = self.pending_pongs.pop_front() {\n+                flush_pending_pongs = true;\n+                self.pending_pong_flush = true;\n                 let pong = Frame::pong(payload);\n                 self.encode_frame_with_entropy(&pong, cx.entropy())?;\n+            }\n+\n+            if flush_pending_pongs {\n                 self.flush_write_buf().await?;\n+                self.pending_pong_flush = false;\n             }\n \n             if let Some(frame) = self.codec.decode(&mut self.read_buf)? {"
+    },
+    {
+      "sha": "5949a8a436647ff83946bd3cccacff731959c7a0",
+      "filename": "src/net/websocket/split.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/661b45c622dba36b2d06bba9412157cb984178ae/src%2Fnet%2Fwebsocket%2Fsplit.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/661b45c622dba36b2d06bba9412157cb984178ae/src%2Fnet%2Fwebsocket%2Fsplit.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fnet%2Fwebsocket%2Fsplit.rs?ref=661b45c622dba36b2d06bba9412157cb984178ae",
+      "patch": "@@ -433,6 +433,7 @@ where\n             assembler: shared.assembler,\n             protocol: shared.protocol,\n             pending_pongs: shared.pending_pongs,\n+            pending_pong_flush: shared.pending_pong_flush,\n             entropy: shared.entropy,\n         })\n     }"
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "message": "feat: DO RPC typed interface \u2014 callFunction() for direct Python function calls\n\nAdd PythonDO.callFunction(module, function, kwargs) that lets TS workers\ncall Python functions by name and get JSON return values, without HTTP\nserialization. Imports the module, calls the function with kwargs, and\nreturns the JSON-serialized result.\n\nAlso export PythonDORpc interface from the npm package for typed RPC\ncalls from other workers/DOs.",
+  "files": [
+    {
+      "sha": "ee0c878b0036b8c088a7a2e18a407c9665761106",
+      "filename": "packages/pymode/src/index.ts",
+      "status": "modified",
+      "additions": 44,
+      "deletions": 0,
+      "changes": 44,
+      "blob_url": "https://github.com/teamchong/pymode/blob/c6dfa5dcd22cd8e575dc6349d5d0c20e5c5aeb86/packages%2Fpymode%2Fsrc%2Findex.ts",
+      "raw_url": "https://github.com/teamchong/pymode/raw/c6dfa5dcd22cd8e575dc6349d5d0c20e5c5aeb86/packages%2Fpymode%2Fsrc%2Findex.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/pymode/contents/packages%2Fpymode%2Fsrc%2Findex.ts?ref=c6dfa5dcd22cd8e575dc6349d5d0c20e5c5aeb86",
+      "patch": "@@ -30,6 +30,50 @@ export { AsyncifyRuntime } from \"./asyncify\";\n // PythonDO \u2014 full Durable Object with CF binding host imports\n export { PythonDO } from \"./python-do\";\n \n+/**\n+ * Typed RPC interface for calling PythonDO methods from other workers/DOs.\n+ *\n+ * Usage:\n+ *   import type { PythonDORpc } from \"pymode\";\n+ *\n+ *   const doId = env.PYTHON_DO.idFromName(\"default\");\n+ *   const pythonDO = env.PYTHON_DO.get(doId) as unknown as PythonDORpc;\n+ *   const result = await pythonDO.callFunction(\"mymodule\", \"process\", { data: [1, 2, 3] });\n+ */\n+export interface PythonDORpc {\n+  executeCode(code: string): Promise<{\n+    stdout: string;\n+    stderr: string;\n+    exitCode: number;\n+  }>;\n+  handleRequest(\n+    entryModule: string,\n+    userFiles: Record<string, string>,\n+    pythonPath: string,\n+    requestJson: string,\n+    sitePackagesData?: ArrayBuffer,\n+  ): Promise<{\n+    stdout: string;\n+    stderr: string;\n+    exitCode: number;\n+  }>;\n+  callFunction(\n+    modulePath: string,\n+    functionName: string,\n+    args?: Record<string, unknown>,\n+    options?: {\n+      pythonPath?: string;\n+      sitePackagesData?: ArrayBuffer;\n+      userFiles?: Record<string, string>;\n+    },\n+  ): Promise<{\n+    returnValue: unknown;\n+    stdout: string;\n+    stderr: string;\n+    exitCode: number;\n+  }>;\n+}\n+\n // Stdlib filesystem bundle\n export { stdlibFS } from \"./stdlib-fs\";\n "
+    },
+    {
+      "sha": "58e366a18b97bcf2924fade72b2e964619be285e",
+      "filename": "worker/src/python-do.ts",
+      "status": "modified",
+      "additions": 58,
+      "deletions": 0,
+      "changes": 58,
+      "blob_url": "https://github.com/teamchong/pymode/blob/c6dfa5dcd22cd8e575dc6349d5d0c20e5c5aeb86/worker%2Fsrc%2Fpython-do.ts",
+      "raw_url": "https://github.com/teamchong/pymode/raw/c6dfa5dcd22cd8e575dc6349d5d0c20e5c5aeb86/worker%2Fsrc%2Fpython-do.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/pymode/contents/worker%2Fsrc%2Fpython-do.ts?ref=c6dfa5dcd22cd8e575dc6349d5d0c20e5c5aeb86",
+      "patch": "@@ -549,6 +549,64 @@ export class PythonDO extends DurableObject<PythonDOEnv> {\n     );\n   }\n \n+  /**\n+   * RPC entry point \u2014 call a Python function by module path and get JSON result.\n+   *\n+   * Usage from another worker/DO:\n+   *   const pythonDO = env.PYTHON_DO.get(doId);\n+   *   const result = await pythonDO.callFunction(\"mymodule\", \"process\", { data: [1, 2, 3] });\n+   *   // result.returnValue is the JSON-serialized return value\n+   */\n+  async callFunction(\n+    modulePath: string,\n+    functionName: string,\n+    args?: Record<string, unknown>,\n+    options?: {\n+      pythonPath?: string;\n+      sitePackagesData?: ArrayBuffer;\n+      userFiles?: Record<string, string>;\n+    },\n+  ): Promise<{\n+    returnValue: unknown;\n+    stdout: string;\n+    stderr: string;\n+    exitCode: number;\n+  }> {\n+    const argsJson = JSON.stringify(args || {});\n+    const code = [\n+      \"import _wasi_compat\",\n+      \"import json, sys, importlib\",\n+      `_mod = importlib.import_module(${JSON.stringify(modulePath)})`,\n+      `_fn = getattr(_mod, ${JSON.stringify(functionName)})`,\n+      `_args = json.loads(${JSON.stringify(argsJson)})`,\n+      \"_result = _fn(**_args)\",\n+      'print(json.dumps({\"__pymode_return__\": _result}))',\n+    ].join(\"\\n\");\n+\n+    const pythonPath = options?.pythonPath || \"/stdlib\";\n+    const result = await this.run(\n+      [\"python\", \"-S\", \"-c\", code],\n+      { PYTHONPATH: pythonPath, PYTHONDONTWRITEBYTECODE: \"1\", PYTHONNOUSERSITE: \"1\" },\n+      options?.userFiles,\n+      undefined,\n+      options?.sitePackagesData,\n+    );\n+\n+    let returnValue: unknown = null;\n+    if (result.exitCode === 0 && result.stdout.trim()) {\n+      try {\n+        const parsed = JSON.parse(result.stdout.trim());\n+        if (parsed && \"__pymode_return__\" in parsed) {\n+          returnValue = parsed.__pymode_return__;\n+        }\n+      } catch {\n+        // stdout wasn't valid JSON \u2014 leave returnValue as null\n+      }\n+    }\n+\n+    return { returnValue, ...result };\n+  }\n+\n   /**\n    * Clean up TCP connections when DO is evicted.\n    */"
+    }
+  ]
+}

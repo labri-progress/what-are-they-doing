@@ -1,0 +1,41 @@
+{
+  "message": "fix: bound member refresh during sync",
+  "files": [
+    {
+      "sha": "91666f527a1abca4abd1b4edb1dbb9ca97c8cb8a",
+      "filename": "README.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/discrawl/blob/075dbb5e0ec90cf12189a46b2bc0cfdd91967b1c/README.md",
+      "raw_url": "https://github.com/openclaw/discrawl/raw/075dbb5e0ec90cf12189a46b2bc0cfdd91967b1c/README.md",
+      "contents_url": "https://api.github.com/repos/openclaw/discrawl/contents/README.md?ref=075dbb5e0ec90cf12189a46b2bc0cfdd91967b1c",
+      "patch": "@@ -153,6 +153,7 @@ bin/discrawl sync --channels 111,222 --since 2026-03-01T00:00:00Z\n When `--channels` includes a forum channel id, `discrawl` expands that forum's threads and syncs their messages as part of the targeted run.\n `--since` limits initial history/bootstrap and full-history backfill to messages at or after the given RFC3339 timestamp. It does not mark older history as complete, so a later `sync --full` without `--since` can continue the backfill.\n Long runs now emit periodic progress logs to stderr so large backfills do not look hung.\n+Full sync member refresh is best-effort and currently gives up after two minutes without a caller-supplied deadline, so message sync completion is not held hostage by a slow guild member crawl.\n \n ### `tail`\n "
+    },
+    {
+      "sha": "8094807a3ce00abc047a7e7f70de5e7a78cfb7d0",
+      "filename": "internal/syncer/syncer.go",
+      "status": "modified",
+      "additions": 39,
+      "deletions": 2,
+      "changes": 41,
+      "blob_url": "https://github.com/openclaw/discrawl/blob/075dbb5e0ec90cf12189a46b2bc0cfdd91967b1c/internal%2Fsyncer%2Fsyncer.go",
+      "raw_url": "https://github.com/openclaw/discrawl/raw/075dbb5e0ec90cf12189a46b2bc0cfdd91967b1c/internal%2Fsyncer%2Fsyncer.go",
+      "contents_url": "https://api.github.com/repos/openclaw/discrawl/contents/internal%2Fsyncer%2Fsyncer.go?ref=075dbb5e0ec90cf12189a46b2bc0cfdd91967b1c",
+      "patch": "@@ -3,6 +3,7 @@ package syncer\n import (\n \t\"context\"\n \t\"encoding/json\"\n+\t\"errors\"\n \t\"fmt\"\n \t\"log/slog\"\n \t\"slices\"\n@@ -33,6 +34,7 @@ type Syncer struct {\n \tstore                 *store.Store\n \tlogger                *slog.Logger\n \tattachmentTextEnabled bool\n+\tmemberRefreshTimeout  time.Duration\n }\n \n type SyncOptions struct {\n@@ -54,6 +56,7 @@ type SyncStats struct {\n }\n \n const fullSyncBatchSize = 25\n+const defaultMemberRefreshTimeout = 2 * time.Minute\n \n func New(client Client, store *store.Store, logger *slog.Logger) *Syncer {\n \tif logger == nil {\n@@ -64,6 +67,7 @@ func New(client Client, store *store.Store, logger *slog.Logger) *Syncer {\n \t\tstore:                 store,\n \t\tlogger:                logger,\n \t\tattachmentTextEnabled: true,\n+\t\tmemberRefreshTimeout:  defaultMemberRefreshTimeout,\n \t}\n }\n \n@@ -195,9 +199,29 @@ func (s *Syncer) syncGuildIncompleteBatches(ctx context.Context, guildID string,\n }\n \n func (s *Syncer) refreshGuildMembers(ctx context.Context, guildID string) int {\n-\tmembers, err := s.client.GuildMembers(ctx, guildID)\n+\tmemberCtx := ctx\n+\tcancel := func() {}\n+\tif s.memberRefreshTimeout > 0 {\n+\t\tif _, ok := ctx.Deadline(); !ok {\n+\t\t\tmemberCtx, cancel = context.WithTimeout(ctx, s.memberRefreshTimeout)\n+\t\t}\n+\t}\n+\tdefer cancel()\n+\tstartedAt := time.Now()\n+\ts.logger.Info(\n+\t\t\"member sync started\",\n+\t\t\"guild_id\", guildID,\n+\t\t\"timeout\", timeoutLabel(s.memberRefreshTimeout),\n+\t)\n+\tmembers, err := s.client.GuildMembers(memberCtx, guildID)\n \tif err != nil {\n-\t\ts.logger.Warn(\"member crawl failed\", \"guild_id\", guildID, \"err\", err)\n+\t\ts.logger.Warn(\n+\t\t\t\"member crawl failed\",\n+\t\t\t\"guild_id\", guildID,\n+\t\t\t\"err\", err,\n+\t\t\t\"elapsed\", time.Since(startedAt).Round(time.Second).String(),\n+\t\t\t\"timed_out\", errors.Is(err, context.DeadlineExceeded),\n+\t\t)\n \t\treturn 0\n \t}\n \tconverted := make([]store.MemberRecord, 0, len(members))\n@@ -208,5 +232,18 @@ func (s *Syncer) refreshGuildMembers(ctx context.Context, guildID string) int {\n \t\ts.logger.Warn(\"member replace failed\", \"guild_id\", guildID, \"err\", err)\n \t\treturn 0\n \t}\n+\ts.logger.Info(\n+\t\t\"member sync completed\",\n+\t\t\"guild_id\", guildID,\n+\t\t\"members\", len(converted),\n+\t\t\"elapsed\", time.Since(startedAt).Round(time.Second).String(),\n+\t)\n \treturn len(converted)\n }\n+\n+func timeoutLabel(d time.Duration) string {\n+\tif d <= 0 {\n+\t\treturn \"none\"\n+\t}\n+\treturn d.String()\n+}"
+    },
+    {
+      "sha": "e3027e39db291d7c5a1424d9eeeca0e1dbd4f7db",
+      "filename": "internal/syncer/syncer_test.go",
+      "status": "modified",
+      "additions": 57,
+      "deletions": 1,
+      "changes": 58,
+      "blob_url": "https://github.com/openclaw/discrawl/blob/075dbb5e0ec90cf12189a46b2bc0cfdd91967b1c/internal%2Fsyncer%2Fsyncer_test.go",
+      "raw_url": "https://github.com/openclaw/discrawl/raw/075dbb5e0ec90cf12189a46b2bc0cfdd91967b1c/internal%2Fsyncer%2Fsyncer_test.go",
+      "contents_url": "https://api.github.com/repos/openclaw/discrawl/contents/internal%2Fsyncer%2Fsyncer_test.go?ref=075dbb5e0ec90cf12189a46b2bc0cfdd91967b1c",
+      "patch": "@@ -28,6 +28,7 @@ type fakeClient struct {\n \tmessageErrors    map[string]error\n \tmessageCalls     map[string]int\n \tbeforeErrors     map[string]map[string]error\n+\tmemberDelay      time.Duration\n \ttailCalls        int\n \tmessageDelay     time.Duration\n \tguildChanCalls   int\n@@ -81,8 +82,17 @@ func (f *fakeClient) ThreadsArchived(_ context.Context, channelID string, privat\n \treturn f.publicArchived[channelID], nil\n }\n \n-func (f *fakeClient) GuildMembers(_ context.Context, guildID string) ([]*discordgo.Member, error) {\n+func (f *fakeClient) GuildMembers(ctx context.Context, guildID string) ([]*discordgo.Member, error) {\n \tf.memberCalls++\n+\tif f.memberDelay > 0 {\n+\t\ttimer := time.NewTimer(f.memberDelay)\n+\t\tdefer timer.Stop()\n+\t\tselect {\n+\t\tcase <-ctx.Done():\n+\t\t\treturn nil, ctx.Err()\n+\t\tcase <-timer.C:\n+\t\t}\n+\t}\n \treturn f.members[guildID], nil\n }\n \n@@ -278,6 +288,52 @@ func TestSyncUsesConfiguredConcurrency(t *testing.T) {\n \trequire.GreaterOrEqual(t, maxInFlight, 2)\n }\n \n+func TestSyncMemberRefreshTimeoutStillMarksSuccess(t *testing.T) {\n+\tt.Parallel()\n+\n+\tctx := context.Background()\n+\tdbPath := filepath.Join(t.TempDir(), \"discrawl.db\")\n+\ts, err := store.Open(ctx, dbPath)\n+\trequire.NoError(t, err)\n+\tdefer func() { _ = s.Close() }()\n+\n+\tclient := &fakeClient{\n+\t\tguilds: []*discordgo.UserGuild{{ID: \"g1\", Name: \"Guild\"}},\n+\t\tguildByID: map[string]*discordgo.Guild{\n+\t\t\t\"g1\": {ID: \"g1\", Name: \"Guild\"},\n+\t\t},\n+\t\tchannels: map[string][]*discordgo.Channel{\n+\t\t\t\"g1\": {\n+\t\t\t\t{ID: \"c1\", GuildID: \"g1\", Name: \"general\", Type: discordgo.ChannelTypeGuildText},\n+\t\t\t},\n+\t\t},\n+\t\tmessages: map[string][]*discordgo.Message{\n+\t\t\t\"c1\": {{\n+\t\t\t\tID:        \"100\",\n+\t\t\t\tGuildID:   \"g1\",\n+\t\t\t\tChannelID: \"c1\",\n+\t\t\t\tContent:   \"hello\",\n+\t\t\t\tTimestamp: time.Now().UTC(),\n+\t\t\t\tAuthor:    &discordgo.User{ID: \"u1\", Username: \"peter\"},\n+\t\t\t}},\n+\t\t},\n+\t\tmemberDelay: 100 * time.Millisecond,\n+\t}\n+\n+\tsvc := New(client, s, nil)\n+\tsvc.memberRefreshTimeout = 10 * time.Millisecond\n+\n+\tstats, err := svc.Sync(ctx, SyncOptions{Full: true})\n+\trequire.NoError(t, err)\n+\trequire.Equal(t, 0, stats.Members)\n+\trequire.Equal(t, 1, stats.Messages)\n+\trequire.Equal(t, 1, client.memberCalls)\n+\n+\tlastSync, err := s.GetSyncState(ctx, \"sync:last_success\")\n+\trequire.NoError(t, err)\n+\trequire.NotEmpty(t, lastSync)\n+}\n+\n func TestSyncFullAutoBatchesIncompleteStoredChannels(t *testing.T) {\n \tt.Parallel()\n "
+    }
+  ]
+}

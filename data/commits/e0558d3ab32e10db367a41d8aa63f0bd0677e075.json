@@ -1,0 +1,89 @@
+{
+  "message": "refactor(bus): session-wide events topic for O(1) depth-independent delivery\n\nReplace the fragile relay chain (each subprocess forwarding grandchild\nevents through its own emitter) with a session-wide events topic. Every\nagent process now publishes directly to session/{id}/events, and the\nsession controller subscribes once to that topic.\n\nThis works at any depth \u2014 3, 12, or 100 \u2014 with a single bus hop per\nevent instead of N-1 intermediate relays.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "974b071a64d26e157cf69ca2d34ada0746213ad5",
+      "filename": "src/bus/agent-process.ts",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 11,
+      "changes": 20,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/e0558d3ab32e10db367a41d8aa63f0bd0677e075/src%2Fbus%2Fagent-process.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/e0558d3ab32e10db367a41d8aa63f0bd0677e075/src%2Fbus%2Fagent-process.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/src%2Fbus%2Fagent-process.ts?ref=e0558d3ab32e10db367a41d8aa63f0bd0677e075",
+      "patch": "@@ -15,7 +15,7 @@ import { BusClient } from \"./client.ts\";\n import { BusLearnForwarder } from \"./learn-forwarder.ts\";\n import { replayHandleLog } from \"./resume.ts\";\n import { AgentSpawner } from \"./spawner.ts\";\n-import { agentEvents, agentInbox, agentReady, agentResult } from \"./topics.ts\";\n+import { agentEvents, agentInbox, agentReady, agentResult, sessionEvents } from \"./topics.ts\";\n import type { ContinueMessage, EventMessage, ResultMessage, StartMessage } from \"./types.ts\";\n import { parseBusMessage } from \"./types.ts\";\n \n@@ -120,28 +120,26 @@ export async function runAgentProcess(config: AgentProcessConfig): Promise<void>\n \t\tconst priorLogPath = `${logBasePath}.jsonl`;\n \t\tconst initialHistory = await replayHandleLog(priorLogPath);\n \n-\t\t// Forward agent events to the bus (best-effort; ignore if disconnected)\n+\t\t// Forward agent events to the bus (best-effort; ignore if disconnected).\n+\t\t// Publishes to both the per-handle topic (for spawner result tracking)\n+\t\t// and the session-wide topic (so the UI sees events at any depth without\n+\t\t// needing a relay chain through intermediate spawners).\n+\t\tconst sessionEventsTopic = sessionEvents(sessionId);\n \t\tevents.on((event) => {\n \t\t\tif (!bus.connected) return;\n \t\t\tconst eventMsg: EventMessage = {\n \t\t\t\tkind: \"event\",\n \t\t\t\thandle_id: handleId,\n \t\t\t\tevent,\n \t\t\t};\n-\t\t\tbus.publish(eventsTopic, JSON.stringify(eventMsg));\n+\t\t\tconst payload = JSON.stringify(eventMsg);\n+\t\t\tbus.publish(eventsTopic, payload);\n+\t\t\tbus.publish(sessionEventsTopic, payload);\n \t\t});\n \n \t\t// Create a spawner so this agent can delegate to other agents via the bus\n \t\tchildSpawner = new AgentSpawner(bus, busUrl, sessionId);\n \n-\t\t// Relay grandchild events up through this agent's event emitter so they\n-\t\t// bubble through the spawner chain all the way to the root session bus.\n-\t\t// Without this, events from depth 2+ agents are silently dropped.\n-\t\tchildSpawner.onEvent((eventMsg) => {\n-\t\t\tconst ev = eventMsg.event;\n-\t\t\tevents.emit(ev.kind, ev.agent_id, ev.depth, ev.data);\n-\t\t});\n-\n \t\t// Wire learn signal forwarding for agents that can learn\n \t\tconst learnProcess = agentSpec.constraints.can_learn\n \t\t\t? new BusLearnForwarder(bus, sessionId)"
+    },
+    {
+      "sha": "53e2c82defced0804de0c71775c4a1851cf3baa4",
+      "filename": "src/bus/spawner.ts",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 1,
+      "changes": 23,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/e0558d3ab32e10db367a41d8aa63f0bd0677e075/src%2Fbus%2Fspawner.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/e0558d3ab32e10db367a41d8aa63f0bd0677e075/src%2Fbus%2Fspawner.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/src%2Fbus%2Fspawner.ts?ref=e0558d3ab32e10db367a41d8aa63f0bd0677e075",
+      "patch": "@@ -1,7 +1,7 @@\n import { resolve } from \"node:path\";\n import { ulid } from \"../util/ulid.ts\";\n import type { BusClient } from \"./client.ts\";\n-import { agentEvents, agentInbox, agentReady, agentResult } from \"./topics.ts\";\n+import { agentEvents, agentInbox, agentReady, agentResult, sessionEvents } from \"./topics.ts\";\n import type {\n \tCallerIdentity,\n \tContinueMessage,\n@@ -114,6 +114,27 @@ export class AgentSpawner {\n \t\tthis.eventCallback = callback;\n \t}\n \n+\t/**\n+\t * Subscribe to the session-wide events topic.\n+\t * Every agent subprocess publishes here regardless of depth,\n+\t * so this provides O(1) event delivery without relay chains.\n+\t */\n+\tasync subscribeSessionEvents(\n+\t\tcallback: (event: EventMessage) => void,\n+\t): Promise<void> {\n+\t\tconst topic = sessionEvents(this.sessionId);\n+\t\tawait this.bus.subscribe(topic, (payload) => {\n+\t\t\ttry {\n+\t\t\t\tconst parsed = JSON.parse(payload);\n+\t\t\t\tif (parsed.kind === \"event\") {\n+\t\t\t\t\tcallback(parsed as EventMessage);\n+\t\t\t\t}\n+\t\t\t} catch {\n+\t\t\t\t// Ignore malformed messages\n+\t\t\t}\n+\t\t});\n+\t}\n+\n \t/**\n \t * Spawn a new agent process.\n \t *"
+    },
+    {
+      "sha": "dca84c9c96eed65552ea0c4201a01e03711f40a7",
+      "filename": "src/bus/topics.ts",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 1,
+      "changes": 6,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/e0558d3ab32e10db367a41d8aa63f0bd0677e075/src%2Fbus%2Ftopics.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/e0558d3ab32e10db367a41d8aa63f0bd0677e075/src%2Fbus%2Ftopics.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/src%2Fbus%2Ftopics.ts?ref=e0558d3ab32e10db367a41d8aa63f0bd0677e075",
+      "patch": "@@ -44,11 +44,15 @@ export function genomeEvents(sessionId: string): string {\n \treturn `session/${sessionId}/genome/events`;\n }\n \n+export function sessionEvents(sessionId: string): string {\n+\treturn `session/${sessionId}/events`;\n+}\n+\n // --- Parser ---\n \n const AGENT_RE = /^session\\/([^/]+)\\/agent\\/([^/]+)\\/(inbox|events|ready|result)$/;\n const GENOME_RE = /^session\\/([^/]+)\\/(genome\\/(?:mutations|events))$/;\n-const SESSION_RE = /^session\\/([^/]+)\\/(commands)$/;\n+const SESSION_RE = /^session\\/([^/]+)\\/(commands|events)$/;\n \n export function parseTopic(topic: string): ParsedTopic | null {\n \tlet m = AGENT_RE.exec(topic);"
+    },
+    {
+      "sha": "04f8aa58a7e6b81d5c7e1ba6edeaa875d723c3b4",
+      "filename": "src/host/session-controller.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 2,
+      "changes": 5,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/e0558d3ab32e10db367a41d8aa63f0bd0677e075/src%2Fhost%2Fsession-controller.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/e0558d3ab32e10db367a41d8aa63f0bd0677e075/src%2Fhost%2Fsession-controller.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/src%2Fhost%2Fsession-controller.ts?ref=e0558d3ab32e10db367a41d8aa63f0bd0677e075",
+      "patch": "@@ -109,9 +109,10 @@ async function defaultFactory(options: AgentFactoryOptions): Promise<AgentFactor\n \t\toptions.events.emitEvent(event.kind, event.agent_id, event.depth, event.data);\n \t});\n \n-\t// Relay sub-agent bus events to the session bus so the TUI sees them\n+\t// Subscribe to session-wide events topic so the UI sees events from ALL\n+\t// subprocess agents regardless of depth (O(1) delivery, no relay chain).\n \tif (options.spawner) {\n-\t\toptions.spawner.onEvent((eventMsg) => {\n+\t\tawait options.spawner.subscribeSessionEvents((eventMsg) => {\n \t\t\tconst ev = eventMsg.event;\n \t\t\toptions.events.emitEvent(ev.kind, ev.agent_id, ev.depth, ev.data);\n \t\t});"
+    },
+    {
+      "sha": "d0b1ba164e34180b18e100d28dd6ef0e36a646d8",
+      "filename": "test/bus/agent-process.test.ts",
+      "status": "modified",
+      "additions": 57,
+      "deletions": 0,
+      "changes": 57,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/e0558d3ab32e10db367a41d8aa63f0bd0677e075/test%2Fbus%2Fagent-process.test.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/e0558d3ab32e10db367a41d8aa63f0bd0677e075/test%2Fbus%2Fagent-process.test.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/test%2Fbus%2Fagent-process.test.ts?ref=e0558d3ab32e10db367a41d8aa63f0bd0677e075",
+      "patch": "@@ -264,6 +264,63 @@ describe(\"runAgentProcess\", () => {\n \t\tawait processPromise;\n \t}, 15_000);\n \n+\ttest(\"publishes events to session-wide topic for depth-independent delivery\", async () => {\n+\t\tconst mockClient = createMockClient(\"Done.\");\n+\n+\t\t// Subscribe to session-wide events topic (not the per-handle topic)\n+\t\tconst { sessionEvents } = await import(\"../../src/bus/topics.ts\");\n+\t\tconst sessionTopic = sessionEvents(SESSION_ID);\n+\t\tconst collectedEvents: string[] = [];\n+\t\tawait parentClient.subscribe(sessionTopic, (payload) => {\n+\t\t\tcollectedEvents.push(payload);\n+\t\t});\n+\n+\t\tconst resultTopic = agentResult(SESSION_ID, HANDLE_ID);\n+\t\tconst resultPromise = parentClient.waitForMessage(resultTopic, 10_000);\n+\n+\t\tconst processPromise = runAgentProcess({\n+\t\t\tbusUrl: server.url,\n+\t\t\thandleId: HANDLE_ID,\n+\t\t\tsessionId: SESSION_ID,\n+\t\t\tgenomePath: genomeDir,\n+\t\t\tclient: mockClient,\n+\t\t\tworkDir: tempDir,\n+\t\t});\n+\n+\t\tawait delay(100);\n+\n+\t\tconst inboxTopic = agentInbox(SESSION_ID, HANDLE_ID);\n+\t\tconst startMsg: StartMessage = {\n+\t\t\tkind: \"start\",\n+\t\t\thandle_id: HANDLE_ID,\n+\t\t\tagent_name: \"test-leaf\",\n+\t\t\tgenome_path: genomeDir,\n+\t\t\tsession_id: SESSION_ID,\n+\t\t\tcaller: { agent_name: \"root\", depth: 0 },\n+\t\t\tgoal: \"Session-wide test\",\n+\t\t\tshared: false,\n+\t\t};\n+\t\tawait parentClient.publish(inboxTopic, JSON.stringify(startMsg));\n+\n+\t\tawait resultPromise;\n+\t\tawait delay(100);\n+\n+\t\t// Events should appear on the session-wide topic\n+\t\texpect(collectedEvents.length).toBeGreaterThan(0);\n+\n+\t\tconst parsed = collectedEvents.map((e) => JSON.parse(e));\n+\t\tconst kinds = parsed.map((e: any) => e.event.kind);\n+\t\texpect(kinds).toContain(\"session_start\");\n+\t\texpect(kinds).toContain(\"session_end\");\n+\n+\t\t// Each event should include the handle_id for tracing\n+\t\tfor (const evt of parsed) {\n+\t\t\texpect(evt.handle_id).toBe(HANDLE_ID);\n+\t\t}\n+\n+\t\tawait processPromise;\n+\t}, 15_000);\n+\n \ttest(\"shared agent handles continue message after initial run\", async () => {\n \t\tlet callCount = 0;\n \t\tconst mockClient = {"
+    },
+    {
+      "sha": "afbc8b0c54545474e469259f72f934e62948d14c",
+      "filename": "test/bus/spawner.test.ts",
+      "status": "modified",
+      "additions": 27,
+      "deletions": 0,
+      "changes": 27,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/e0558d3ab32e10db367a41d8aa63f0bd0677e075/test%2Fbus%2Fspawner.test.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/e0558d3ab32e10db367a41d8aa63f0bd0677e075/test%2Fbus%2Fspawner.test.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/test%2Fbus%2Fspawner.test.ts?ref=e0558d3ab32e10db367a41d8aa63f0bd0677e075",
+      "patch": "@@ -613,6 +613,33 @@ describe(\"AgentSpawner\", () => {\n \t\t}, 15_000);\n \t});\n \n+\tdescribe(\"subscribeSessionEvents\", () => {\n+\t\ttest(\"receives events from all agents via session-wide topic\", async () => {\n+\t\t\tconst mockClient = createMockClient(\"Session-wide event test.\");\n+\t\t\tspawner = new AgentSpawner(bus, server.url, SESSION_ID, createInProcessSpawnFn(mockClient));\n+\n+\t\t\tconst events: EventMessage[] = [];\n+\t\t\tawait spawner.subscribeSessionEvents((event) => events.push(event));\n+\n+\t\t\tawait spawner.spawnAgent({\n+\t\t\t\tagentName: \"test-leaf\",\n+\t\t\t\tgenomePath: genomeDir,\n+\t\t\t\tcaller: { agent_name: \"root\", depth: 0 },\n+\t\t\t\tgoal: \"Session topic test\",\n+\t\t\t\thints: [],\n+\t\t\t\tblocking: true,\n+\t\t\t\tshared: false,\n+\t\t\t\tworkDir: tempDir,\n+\t\t\t});\n+\n+\t\t\t// Events should arrive via the session-wide topic\n+\t\t\texpect(events.length).toBeGreaterThan(0);\n+\t\t\tconst eventKinds = events.map((e) => e.event.kind);\n+\t\t\texpect(eventKinds).toContain(\"session_start\");\n+\t\t\texpect(eventKinds).toContain(\"session_end\");\n+\t\t}, 15_000);\n+\t});\n+\n \tdescribe(\"access control\", () => {\n \t\ttest(\"waitAgent rejects non-owner on non-shared handle\", async () => {\n \t\t\tconst mockClient = createMockClient(\"Done.\");"
+    },
+    {
+      "sha": "96e17a3b3709b1f220dfbcc8a0166d0e91ec3149",
+      "filename": "test/bus/topics.test.ts",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 0,
+      "changes": 13,
+      "blob_url": "https://github.com/prime-radiant-inc/sprout/blob/e0558d3ab32e10db367a41d8aa63f0bd0677e075/test%2Fbus%2Ftopics.test.ts",
+      "raw_url": "https://github.com/prime-radiant-inc/sprout/raw/e0558d3ab32e10db367a41d8aa63f0bd0677e075/test%2Fbus%2Ftopics.test.ts",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/sprout/contents/test%2Fbus%2Ftopics.test.ts?ref=e0558d3ab32e10db367a41d8aa63f0bd0677e075",
+      "patch": "@@ -9,6 +9,7 @@ import {\n \tgenomeEvents,\n \tgenomeMutations,\n \tparseTopic,\n+\tsessionEvents,\n } from \"../../src/bus/topics.ts\";\n \n describe(\"topic builders\", () => {\n@@ -39,6 +40,10 @@ describe(\"topic builders\", () => {\n \ttest(\"genomeEvents\", () => {\n \t\texpect(genomeEvents(\"S1\")).toBe(\"session/S1/genome/events\");\n \t});\n+\n+\ttest(\"sessionEvents\", () => {\n+\t\texpect(sessionEvents(\"S1\")).toBe(\"session/S1/events\");\n+\t});\n });\n \n describe(\"parseTopic\", () => {\n@@ -104,6 +109,14 @@ describe(\"parseTopic\", () => {\n \t\t\t\tchannel: \"genome/events\",\n \t\t\t});\n \t\t});\n+\n+\t\ttest(\"parses session events topic\", () => {\n+\t\t\tconst result = parseTopic(\"session/S1/events\");\n+\t\t\texpect(result).toEqual({\n+\t\t\t\tsession_id: \"S1\",\n+\t\t\t\tchannel: \"events\",\n+\t\t\t});\n+\t\t});\n \t});\n \n \tdescribe(\"invalid topics\", () => {"
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "message": "fix(server): prevent command processing during blocking operations\n\nFix race condition in blocked client handling:\n- Skip command processing while client is in blocked state (BLPOP/BRPOP/\n  BZPOPMIN/BZPOPMAX/BRPOPLPUSH) to prevent buffer overflow from\n  pipelined commands arriving during the blocking wait\n- After unblocking, process any pipelined commands remaining in\n  read_buf before returning to the event loop\n\nThis prevents scenarios where a client pipelines additional commands\nimmediately after a blocking command, which would previously be\nprocessed out of order or cause buffer corruption.\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "0b9ba179a041d141ce14ad43da61176685f84730",
+      "filename": "crates/fr-persist/src/lib.rs",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 2,
+      "changes": 17,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/045ae0a5c14126020289f7b81fc041f1520fbd85/crates%2Ffr-persist%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/045ae0a5c14126020289f7b81fc041f1520fbd85/crates%2Ffr-persist%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/crates%2Ffr-persist%2Fsrc%2Flib.rs?ref=045ae0a5c14126020289f7b81fc041f1520fbd85",
+      "patch": "@@ -556,7 +556,7 @@ pub fn read_rdb_file(\n     match std::fs::read(path) {\n         Ok(data) => {\n             if data.is_empty() {\n-                return Ok((Vec::new(), BTreeMap::new()));\n+                return Err(PersistError::InvalidFrame);\n             }\n             decode_rdb(&data)\n         }\n@@ -855,12 +855,25 @@ mod tests {\n     }\n \n     #[test]\n-    fn rdb_empty_file_returns_empty() {\n+    fn rdb_missing_file_returns_empty() {\n         let path = std::path::Path::new(\"/tmp/fr_persist_nonexistent_test_file.rdb\");\n         let (entries, _) = super::read_rdb_file(path).expect(\"read missing\");\n         assert!(entries.is_empty());\n     }\n \n+    #[test]\n+    fn rdb_existing_empty_file_is_rejected() {\n+        let dir = std::env::temp_dir().join(\"fr_persist_rdb_empty_test\");\n+        let _ = std::fs::create_dir_all(&dir);\n+        let path = dir.join(\"empty.rdb\");\n+        std::fs::write(&path, []).expect(\"create empty rdb\");\n+\n+        let err = super::read_rdb_file(&path).expect_err(\"empty rdb must fail\");\n+        assert_eq!(err, PersistError::InvalidFrame);\n+\n+        let _ = std::fs::remove_file(&path);\n+    }\n+\n     #[test]\n     fn rdb_write_and_read_round_trip() {\n         let dir = std::env::temp_dir().join(\"fr_persist_rdb_test\");"
+    },
+    {
+      "sha": "1e2cedaf240eb494ac11d0069992088e31af4dc3",
+      "filename": "crates/fr-server/src/main.rs",
+      "status": "modified",
+      "additions": 29,
+      "deletions": 3,
+      "changes": 32,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/045ae0a5c14126020289f7b81fc041f1520fbd85/crates%2Ffr-server%2Fsrc%2Fmain.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/045ae0a5c14126020289f7b81fc041f1520fbd85/crates%2Ffr-server%2Fsrc%2Fmain.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/crates%2Ffr-server%2Fsrc%2Fmain.rs?ref=045ae0a5c14126020289f7b81fc041f1520fbd85",
+      "patch": "@@ -419,6 +419,14 @@ fn handle_readable(\n         }\n     }\n \n+    // If the client is blocked (BLPOP/BRPOP/etc.), don't process new\n+    // commands. We still read data above (to detect disconnection and\n+    // prevent kernel buffer overflow), but commands are held in read_buf\n+    // until the blocking operation completes or times out.\n+    if conn.blocked.is_some() {\n+        return;\n+    }\n+\n     // Swap in this client's session, process frames, swap back.\n     let session = std::mem::take(&mut conn.session);\n     let prev = runtime.swap_session(session);\n@@ -835,6 +843,16 @@ fn check_blocked_clients(\n             };\n             conn.write_buf.extend_from_slice(&nil_response.to_bytes());\n             conn.blocked = None;\n+\n+            // Process any commands the client pipelined while blocked.\n+            if !conn.read_buf.is_empty() {\n+                let session = std::mem::take(&mut conn.session);\n+                let prev = runtime.swap_session(session);\n+                process_buffered_frames(conn, runtime);\n+                let updated_session = runtime.swap_session(prev);\n+                conn.session = updated_session;\n+            }\n+\n             let _ = flush_or_rearm_client(token, conn, poll);\n             continue;\n         }\n@@ -845,12 +863,20 @@ fn check_blocked_clients(\n \n         let result = try_fulfill_blocked(&blocked.op, runtime, ts);\n \n-        let updated_session = runtime.swap_session(prev);\n-        conn.session = updated_session;\n-\n         if let Some(response) = result {\n             conn.write_buf.extend_from_slice(&response.to_bytes());\n             conn.blocked = None;\n+\n+            // Process any commands the client pipelined while blocked.\n+            if !conn.read_buf.is_empty() {\n+                process_buffered_frames(conn, runtime);\n+            }\n+        }\n+\n+        let updated_session = runtime.swap_session(prev);\n+        conn.session = updated_session;\n+\n+        if conn.blocked.is_none() {\n             let _ = flush_or_rearm_client(token, conn, poll);\n         }\n     }"
+    }
+  ]
+}

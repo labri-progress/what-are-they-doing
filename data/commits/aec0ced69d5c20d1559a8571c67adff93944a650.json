@@ -1,0 +1,29 @@
+{
+  "message": "fix: LIKE case sensitivity, bigint arithmetic precision, CAST(str AS BIGINT)\n\nThree SQL correctness fixes:\n\n1. decode.ts: compileLikeRegex used \"i\" flag \u2014 LIKE was case-insensitive,\n   violating SQL standard and disagreeing with the WASM SIMD path (which\n   does byte-level comparison). Removed \"i\" flag, kept \"s\" for dotAll.\n\n2. evaluator.ts: arithmetic ops (add/subtract/multiply) went through\n   toNumber() which loses precision for bigint values > MAX_SAFE_INTEGER.\n   Added numericOp() that preserves bigint arithmetic when both operands\n   are bigint or safe integers. Unary minus also preserves bigint.\n\n3. evaluator.ts: CAST(string AS BIGINT) went through toNumber() \u2192 float\n   before BigInt(), losing precision for large integer strings. Now uses\n   BigInt(val) directly for string inputs.",
+  "files": [
+    {
+      "sha": "3e43dcc6f1f1b747693febc7a6e3079a5527d5d0",
+      "filename": "src/decode.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/teamchong/querymode/blob/aec0ced69d5c20d1559a8571c67adff93944a650/src%2Fdecode.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/aec0ced69d5c20d1559a8571c67adff93944a650/src%2Fdecode.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fdecode.ts?ref=aec0ced69d5c20d1559a8571c67adff93944a650",
+      "patch": "@@ -584,7 +584,7 @@ export function compileLikeRegex(pattern: string): RegExp {\n   if (cached) return cached;\n   // Escape regex metacharacters, then replace SQL wildcards\n   const escaped = pattern.replace(/[.+?^${}()|[\\]\\\\*]/g, \"\\\\$&\");\n-  const re = new RegExp(\"^\" + escaped.replace(/%/g, \".*\").replace(/_/g, \".\") + \"$\", \"i\");\n+  const re = new RegExp(\"^\" + escaped.replace(/%/g, \".*\").replace(/_/g, \".\") + \"$\", \"s\");\n   likeRegexCache.set(pattern, re);\n   if (likeRegexCache.size > 1000) likeRegexCache.clear(); // prevent unbounded growth\n   return re;"
+    },
+    {
+      "sha": "65f7b0d0e41a60f48ed6bcd4a975ebca61f6c088",
+      "filename": "src/sql/evaluator.ts",
+      "status": "modified",
+      "additions": 23,
+      "deletions": 5,
+      "changes": 28,
+      "blob_url": "https://github.com/teamchong/querymode/blob/aec0ced69d5c20d1559a8571c67adff93944a650/src%2Fsql%2Fevaluator.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/aec0ced69d5c20d1559a8571c67adff93944a650/src%2Fsql%2Fevaluator.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fsql%2Fevaluator.ts?ref=aec0ced69d5c20d1559a8571c67adff93944a650",
+      "patch": "@@ -118,9 +118,9 @@ function evaluateBinary(op: string, leftExpr: SqlExpr, rightExpr: SqlExpr, row:\n     case \"le\": return compare(left, right) <= 0;\n     case \"gt\": return compare(left, right) > 0;\n     case \"ge\": return compare(left, right) >= 0;\n-    case \"add\": return toNumber(left) + toNumber(right);\n-    case \"subtract\": return toNumber(left) - toNumber(right);\n-    case \"multiply\": return toNumber(left) * toNumber(right);\n+    case \"add\": return numericOp(left, right, (a, b) => a + b, (a, b) => a + b);\n+    case \"subtract\": return numericOp(left, right, (a, b) => a - b, (a, b) => a - b);\n+    case \"multiply\": return numericOp(left, right, (a, b) => a * b, (a, b) => a * b);\n     case \"divide\": {\n       const divisor = toNumber(right);\n       return divisor === 0 ? null : toNumber(left) / divisor;\n@@ -149,7 +149,7 @@ function evaluateUnary(op: string, operandExpr: SqlExpr, row: Row): unknown {\n   }\n   if (op === \"minus\") {\n     if (val === null) return null;\n-    return -toNumber(val);\n+    return typeof val === \"bigint\" ? -val : -toNumber(val);\n   }\n   return null;\n }\n@@ -183,14 +183,32 @@ function toNumber(val: unknown): number {\n   return 0;\n }\n \n+/** Preserve bigint precision when both operands are bigint or safe integers. */\n+function numericOp(\n+  left: unknown, right: unknown,\n+  numFn: (a: number, b: number) => number,\n+  bigFn: (a: bigint, b: bigint) => bigint,\n+): number | bigint {\n+  const lb = typeof left === \"bigint\";\n+  const rb = typeof right === \"bigint\";\n+  if (lb && rb) return bigFn(left as bigint, right as bigint);\n+  if (lb && typeof right === \"number\" && Number.isInteger(right)) return bigFn(left as bigint, BigInt(right));\n+  if (rb && typeof left === \"number\" && Number.isInteger(left)) return bigFn(BigInt(left), right as bigint);\n+  return numFn(toNumber(left), toNumber(right));\n+}\n+\n function matchLike(value: string, pattern: string): boolean {\n   return compileLikeRegex(pattern).test(value);\n }\n \n function castValue(val: unknown, targetType: string): unknown {\n   if (val === null) return null;\n   const t = targetType.toLowerCase();\n-  if (t === \"bigint\") return typeof val === \"bigint\" ? val : BigInt(Math.trunc(toNumber(val)));\n+  if (t === \"bigint\") {\n+    if (typeof val === \"bigint\") return val;\n+    if (typeof val === \"string\") { try { return BigInt(val); } catch { return 0n; } }\n+    return BigInt(Math.trunc(toNumber(val)));\n+  }\n   if (t === \"int\" || t === \"integer\") return Math.trunc(toNumber(val));\n   if (t === \"float\" || t === \"double\" || t === \"real\" || t === \"decimal\" || t === \"numeric\") return toNumber(val);\n   if (t === \"text\" || t === \"varchar\" || t === \"string\" || t === \"char\") return String(val);"
+    }
+  ]
+}

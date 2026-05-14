@@ -1,0 +1,29 @@
+{
+  "message": "feat(channel): add Receiver::close() and fix actor mailbox drain to guarantee no silent drops\n\nTwo coupled changes that close a correctness gap in actor shutdown sequencing:\n\nReceiver::close() (src/channel/mpsc.rs):\n- New method that seals the channel to prevent further sends while leaving\n  existing queued messages available for receiving\n- Sets receiver_dropped flag, wakes all pending senders so they get\n  Disconnected errors immediately\n- Required by the actor drain fix below\n\nActor mailbox drain fix (src/actor.rs):\n- Replace capacity-based drain limit with explicit mailbox.close() call\n  before draining\n- Previous approach: drained up to capacity messages, then stopped \u2014 this\n  could silently drop messages committed to the mailbox between the capacity\n  snapshot and the drain loop finishing, violating the \"no message silently\n  dropped\" guarantee\n- New approach: seal the mailbox first (preventing new reservations/commits),\n  then drain all remaining messages unconditionally before running on_stop\n- This ensures the two-phase mailbox guarantee holds: every message that was\n  successfully committed is handled before the actor stops\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "5fe4af57719d847f5b89ad1ace76e42e55800bc1",
+      "filename": "src/actor.rs",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 9,
+      "changes": 14,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/3bb0c022a2570c144d83283fcfe1156783f023fb/src%2Factor.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/3bb0c022a2570c144d83283fcfe1156783f023fb/src%2Factor.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Factor.rs?ref=3bb0c022a2570c144d83283fcfe1156783f023fb",
+      "patch": "@@ -717,19 +717,15 @@ async fn run_actor_loop<A: Actor>(mut actor: A, cx: Cx, cell: &mut ActorCell<A::\n     cell.state.store(ActorState::Stopping);\n \n     // Phase 3: Drain remaining buffered messages.\n-    // Two-phase mailbox guarantee: no message silently dropped. Every message\n-    // that was successfully sent (committed) into the mailbox will be handled\n-    // before the actor's on_stop runs. We cap the drain to the mailbox\n-    // capacity to avoid unbounded work if the mailbox is being filled\n-    // concurrently during shutdown.\n-    let drain_limit = cell.mailbox.capacity() as u64;\n+    // Two-phase mailbox guarantee: no message silently dropped. We seal the\n+    // mailbox to prevent any new reservations or commits, then drain all\n+    // messages currently in the queue before running on_stop.\n+    cell.mailbox.close();\n+    \n     let mut drained: u64 = 0;\n     while let Ok(msg) = cell.mailbox.try_recv() {\n         actor.handle(&cx, msg).await;\n         drained += 1;\n-        if drained >= drain_limit {\n-            break;\n-        }\n     }\n     if drained > 0 {\n         debug!(drained = drained, \"actor::mailbox_drained\");"
+    },
+    {
+      "sha": "949092d42b756e6f5f583c4188733958a613c1b9",
+      "filename": "src/channel/mpsc.rs",
+      "status": "modified",
+      "additions": 24,
+      "deletions": 0,
+      "changes": 24,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/3bb0c022a2570c144d83283fcfe1156783f023fb/src%2Fchannel%2Fmpsc.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/3bb0c022a2570c144d83283fcfe1156783f023fb/src%2Fchannel%2Fmpsc.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fchannel%2Fmpsc.rs?ref=3bb0c022a2570c144d83283fcfe1156783f023fb",
+      "patch": "@@ -653,6 +653,30 @@ impl<T: std::fmt::Debug> std::fmt::Debug for Receiver<T> {\n }\n \n impl<T> Receiver<T> {\n+    /// Closes the channel, preventing any further messages from being sent.\n+    ///\n+    /// Existing messages in the queue remain available for receiving.\n+    /// Any pending senders will be woken and receive a `Disconnected` error.\n+    pub fn close(&mut self) {\n+        let wakers = {\n+            let mut inner = self.shared.inner.lock();\n+            if self.shared.receiver_dropped.load(Ordering::Relaxed) {\n+                return;\n+            }\n+            self.shared.receiver_dropped.store(true, Ordering::Release);\n+            let wakers: SmallVec<[Waker; 4]> = inner\n+                .send_wakers\n+                .drain(..)\n+                .map(|waiter| waiter.waker)\n+                .collect();\n+            drop(inner);\n+            wakers\n+        };\n+        for waker in wakers {\n+            waker.wake();\n+        }\n+    }\n+\n     /// Creates a receive future for the next value.\n     #[inline]\n     #[must_use]"
+    }
+  ]
+}

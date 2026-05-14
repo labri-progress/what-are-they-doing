@@ -1,0 +1,77 @@
+{
+  "message": "perf: TopK early reject, IN O(1) lookup, parallel R2 probing + vector search docs\n\nPerformance:\n- TopK columnar path: check sort column value against heap root before\n  materializing Row object \u2014 skips allocation for rows that can't enter\n  the heap (10-100x fewer allocations for selective LIMIT queries)\n- IN/NOT_IN filter: pre-build Set from filter values with WeakMap cache\n  \u2014 O(1) per row instead of O(m) linear scan per row\n- loadTableFromR2: probe all 6 R2 key candidates in parallel via\n  Promise.all instead of sequential head() calls \u2014 up to 200ms\n  cold-start improvement\n\nCorrectness:\n- Partition catalog neq/not_in also need exactPartition guard \u2014\n  range data (min\u2260max) could falsely exclude fragments containing\n  matching rows\n\nDocs:\n- Add vector-search.mdx: DataFrame .vector() API, SQL NEAR/TOPK,\n  distance metrics, IVF-PQ vs flat, encoder integration, filter\n  composition",
+  "files": [
+    {
+      "sha": "dbb26e4849d1815690182796b2d39ba5bf9c2b29",
+      "filename": "docs/src/content/docs/vector-search.mdx",
+      "status": "added",
+      "additions": 86,
+      "deletions": 0,
+      "changes": 86,
+      "blob_url": "https://github.com/teamchong/querymode/blob/e7b14757aef1e67ae137d15d28664f2c26bfcd81/docs%2Fsrc%2Fcontent%2Fdocs%2Fvector-search.mdx",
+      "raw_url": "https://github.com/teamchong/querymode/raw/e7b14757aef1e67ae137d15d28664f2c26bfcd81/docs%2Fsrc%2Fcontent%2Fdocs%2Fvector-search.mdx",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/docs%2Fsrc%2Fcontent%2Fdocs%2Fvector-search.mdx?ref=e7b14757aef1e67ae137d15d28664f2c26bfcd81",
+      "patch": "@@ -0,0 +1,86 @@\n+---\n+title: Vector Search\n+description: Similarity search with SIMD acceleration, IVF-PQ indexes, and text-to-vector encoding.\n+---\n+\n+QueryMode supports vector similarity search on embedding columns stored in Lance format. Searches use WASM SIMD for acceleration and IVF-PQ indexes when available.\n+\n+## DataFrame API\n+\n+```typescript\n+// Search with a raw vector\n+const similar = await qm\n+  .table(\"images\")\n+  .vector(\"embedding\", queryVector, 10)\n+  .select(\"id\", \"title\")\n+  .collect()\n+\n+// Search with text (requires encoder)\n+const similar = await qm\n+  .table(\"articles\")\n+  .vector(\"embedding\", \"climate change solutions\", 10, {\n+    encoder: async (text) => myModel.encode(text),\n+    metric: \"cosine\",\n+  })\n+  .collect()\n+```\n+\n+### Parameters\n+\n+| Parameter | Type | Description |\n+|-----------|------|-------------|\n+| `column` | `string` | Column containing `Float32Array` embeddings |\n+| `queryVector` | `Float32Array \\| string` | Query vector or text (text requires `encoder`) |\n+| `topK` | `number` | Number of nearest neighbors to return |\n+| `opts.metric` | `\"cosine\" \\| \"l2\" \\| \"dot\"` | Distance metric (default: `\"cosine\"`) |\n+| `opts.encoder` | `(text: string) => Promise<Float32Array>` | Text-to-vector encoder for string queries |\n+| `opts.nprobe` | `number` | IVF-PQ tuning: number of partitions to probe |\n+| `opts.efSearch` | `number` | HNSW tuning: search beam width |\n+\n+## SQL\n+\n+```sql\n+SELECT id, title FROM articles\n+WHERE embedding NEAR [0.1, 0.2, 0.3, ...] TOPK 10\n+```\n+\n+The `NEAR` operator performs vector similarity search. `TOPK` limits results to the K nearest neighbors.\n+\n+## Distance metrics\n+\n+| Metric | Description | Best for |\n+|--------|-------------|----------|\n+| `cosine` | Cosine similarity (default) | Text embeddings, normalized vectors |\n+| `l2` | Euclidean distance | Spatial data, unnormalized vectors |\n+| `dot` | Dot product | When vectors are pre-normalized |\n+\n+## Index types\n+\n+### Flat (no index)\n+\n+Without an index, QueryMode performs brute-force SIMD-accelerated distance computation across all vectors. Fast for datasets under ~100K vectors.\n+\n+### IVF-PQ\n+\n+For larger datasets, create an IVF-PQ (Inverted File with Product Quantization) index:\n+\n+- **IVF** partitions vectors into clusters. At query time, only `nprobe` clusters are searched.\n+- **PQ** compresses vectors into compact codes, reducing memory and I/O.\n+\n+IVF-PQ indexes are stored alongside data in R2 and loaded on first query.\n+\n+## Combining with filters\n+\n+Vector search composes with all other DataFrame operations:\n+\n+```typescript\n+const results = await qm\n+  .table(\"products\")\n+  .filter(\"category\", \"eq\", \"electronics\")\n+  .filter(\"price\", \"lt\", 1000)\n+  .vector(\"embedding\", queryVec, 20, { metric: \"l2\" })\n+  .select(\"id\", \"name\", \"price\")\n+  .collect()\n+```\n+\n+Filters are applied before vector search \u2014 only matching rows are scanned for similarity."
+    },
+    {
+      "sha": "b71fb5ed53a8fb37442386b049b39feba979f33f",
+      "filename": "src/decode.ts",
+      "status": "modified",
+      "additions": 24,
+      "deletions": 2,
+      "changes": 26,
+      "blob_url": "https://github.com/teamchong/querymode/blob/e7b14757aef1e67ae137d15d28664f2c26bfcd81/src%2Fdecode.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/e7b14757aef1e67ae137d15d28664f2c26bfcd81/src%2Fdecode.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fdecode.ts?ref=e7b14757aef1e67ae137d15d28664f2c26bfcd81",
+      "patch": "@@ -477,8 +477,16 @@ export function matchesFilter(\n     case \"gte\": { const [a, b] = coerceCompare(val, t); return (a as number | bigint | string) >= (b as number | bigint | string); }\n     case \"lt\":  { const [a, b] = coerceCompare(val, t); return (a as number | bigint | string) < (b as number | bigint | string); }\n     case \"lte\": { const [a, b] = coerceCompare(val, t); return (a as number | bigint | string) <= (b as number | bigint | string); }\n-    case \"in\":  return Array.isArray(t) && t.some(v => { const [a, b] = coerceCompare(val, v); return a === b; });\n-    case \"not_in\": return Array.isArray(t) && !t.some(v => { const [a, b] = coerceCompare(val, v); return a === b; });\n+    case \"in\": {\n+      if (!Array.isArray(t)) return false;\n+      const set = getInSet(t);\n+      return set.has(typeof val === \"bigint\" ? Number(val) : val);\n+    }\n+    case \"not_in\": {\n+      if (!Array.isArray(t)) return false;\n+      const set = getInSet(t);\n+      return !set.has(typeof val === \"bigint\" ? Number(val) : val);\n+    }\n     case \"between\": {\n       if (!Array.isArray(t) || t.length !== 2) return false;\n       const [, lo] = coerceCompare(val, t[0]);\n@@ -505,6 +513,20 @@ export function matchesFilter(\n   }\n }\n \n+/** Cache IN/NOT_IN value sets \u2014 O(1) lookup instead of O(m) per row. */\n+const inSetCache = new WeakMap<readonly (number | bigint | string)[], Set<number | string>>();\n+\n+function getInSet(values: readonly (number | bigint | string)[]): Set<number | string> {\n+  let cached = inSetCache.get(values);\n+  if (cached) return cached;\n+  const set = new Set<number | string>();\n+  for (const v of values) {\n+    set.add(typeof v === \"bigint\" ? Number(v) : v);\n+  }\n+  inSetCache.set(values, set);\n+  return set;\n+}\n+\n /** Cache compiled LIKE regexes \u2014 avoids re-compilation per row. */\n const likeRegexCache = new Map<string, RegExp>();\n "
+    },
+    {
+      "sha": "8f4650baddc89f1cfe0522c2a73a1b390c2d8525",
+      "filename": "src/operators.ts",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 1,
+      "changes": 10,
+      "blob_url": "https://github.com/teamchong/querymode/blob/e7b14757aef1e67ae137d15d28664f2c26bfcd81/src%2Foperators.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/e7b14757aef1e67ae137d15d28664f2c26bfcd81/src%2Foperators.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Foperators.ts?ref=e7b14757aef1e67ae137d15d28664f2c26bfcd81",
+      "patch": "@@ -1651,14 +1651,22 @@ export class TopKOperator implements Operator {\n       else if (heap.length > 0 && shouldReplace(row)) { heap[0] = row; siftDown(heap, 0); }\n     };\n \n-    // Use columnar path if available \u2014 materialize only the rows that enter the heap\n+    // Use columnar path if available \u2014 only materialize rows that would enter the heap\n     if (this.upstream.nextColumnar) {\n       while (true) {\n         const batch = await this.upstream.nextColumnar();\n         if (!batch) break;\n         const indices = batch.selection ?? Uint32Array.from({ length: batch.rowCount }, (_, i) => i);\n         const colNames = Array.from(batch.columns.keys());\n+        const sortVals = batch.columns.get(col);\n         for (const idx of indices) {\n+          // Fast reject: if heap is full and this value can't beat the root, skip materialization\n+          if (sortVals && heap.length >= k) {\n+            const nv = sortVals[idx] as Row[string];\n+            const rv = heap[0][col];\n+            if (nv === null) continue;\n+            if (rv !== null && (desc ? nv <= rv : nv >= rv)) continue;\n+          }\n           const row: Row = {};\n           for (const name of colNames) {\n             row[name] = (batch.columns.get(name)![idx] as Row[string]) ?? null;"
+    },
+    {
+      "sha": "0ac58f27bdf789d835df85fe0d90afebfd60ed26",
+      "filename": "src/partition-catalog.test.ts",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 3,
+      "changes": 16,
+      "blob_url": "https://github.com/teamchong/querymode/blob/e7b14757aef1e67ae137d15d28664f2c26bfcd81/src%2Fpartition-catalog.test.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/e7b14757aef1e67ae137d15d28664f2c26bfcd81/src%2Fpartition-catalog.test.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fpartition-catalog.test.ts?ref=e7b14757aef1e67ae137d15d28664f2c26bfcd81",
+      "patch": "@@ -184,15 +184,25 @@ describe(\"PartitionCatalog\", () => {\n       expect(result).toBeNull();\n     });\n \n-    it(\"neq still works on range data (conservative \u2014 includes all non-excluded)\", () => {\n+    it(\"neq returns null on range data (prevents false exclusion)\", () => {\n       const fragments = new Map<number, TableMeta>([\n         makeFragmentMeta(1, \"id\", 1, 100),\n         makeFragmentMeta(2, \"id\", 101, 200),\n       ]);\n       const catalog = PartitionCatalog.fromFragments(\"id\", fragments);\n-      // neq is safe even for range data \u2014 worst case is slightly over-inclusive\n+      // neq on range data could falsely exclude fragments containing matching rows\n       const result = catalog.prune([{ column: \"id\", op: \"neq\", value: 1 }]);\n-      expect(result).not.toBeNull();\n+      expect(result).toBeNull();\n+    });\n+\n+    it(\"not_in returns null on range data\", () => {\n+      const fragments = new Map<number, TableMeta>([\n+        makeFragmentMeta(1, \"id\", 1, 100),\n+        makeFragmentMeta(2, \"id\", 101, 200),\n+      ]);\n+      const catalog = PartitionCatalog.fromFragments(\"id\", fragments);\n+      const result = catalog.prune([{ column: \"id\", op: \"not_in\", value: [1, 101] }]);\n+      expect(result).toBeNull();\n     });\n   });\n "
+    },
+    {
+      "sha": "102faed75dee42381e1b3273cd237c48f42f240a",
+      "filename": "src/partition-catalog.ts",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/teamchong/querymode/blob/e7b14757aef1e67ae137d15d28664f2c26bfcd81/src%2Fpartition-catalog.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/e7b14757aef1e67ae137d15d28664f2c26bfcd81/src%2Fpartition-catalog.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fpartition-catalog.ts?ref=e7b14757aef1e67ae137d15d28664f2c26bfcd81",
+      "patch": "@@ -141,10 +141,12 @@ export class PartitionCatalog {\n         return [...ids];\n       }\n       case \"neq\": {\n+        if (!this.exactPartition) return null;\n         const excluded = new Set(this.index.get(String(filter.value)) ?? []);\n         return this.allFragmentIds.filter(id => !excluded.has(id));\n       }\n       case \"not_in\": {\n+        if (!this.exactPartition) return null;\n         if (!Array.isArray(filter.value)) return null;\n         const excluded = new Set<number>();\n         for (const v of filter.value) {"
+    },
+    {
+      "sha": "fb79fd65abecf07d2ff193523ed6c45c5731aae4",
+      "filename": "src/query-do.ts",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 3,
+      "changes": 13,
+      "blob_url": "https://github.com/teamchong/querymode/blob/e7b14757aef1e67ae137d15d28664f2c26bfcd81/src%2Fquery-do.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/e7b14757aef1e67ae137d15d28664f2c26bfcd81/src%2Fquery-do.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fquery-do.ts?ref=e7b14757aef1e67ae137d15d28664f2c26bfcd81",
+      "patch": "@@ -1438,9 +1438,16 @@ export class QueryDO extends DurableObject<Env> {\n       `${tableName}.lance`, `${tableName}.parquet`, tableName,\n       `data/${tableName}.lance`, `data/${tableName}.parquet`, `data/${tableName}`,\n     ];\n-    for (const r2Key of candidates) {\n-      const head = await this.r2(r2Key).head(r2Key);\n-      if (!head) continue;\n+    // Probe all candidates in parallel \u2014 first hit wins\n+    const heads = await Promise.all(\n+      candidates.map(async r2Key => {\n+        const head = await this.r2(r2Key).head(r2Key);\n+        return head ? { r2Key, head } : null;\n+      }),\n+    );\n+    for (const hit of heads) {\n+      if (!hit) continue;\n+      const { r2Key, head } = hit;\n \n       const fileSize = BigInt(head.size);\n       const tailSize = Math.min(Number(fileSize), 40);"
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "message": "fix(runtime): precedence-based eviction, queued task abort, and sequenced proposal revert\n\nAnti-entropy trust state:\n- Replace BTreeMap first-key eviction with precedence_cmp()-based\n  eviction when the trust record store reaches MAX_TRUST_RECORDS. The\n  previous approach always evicted the lexicographically first key,\n  which could discard high-value trust records in favor of retaining\n  lower-value ones that happened to sort later alphabetically.\n\nLane scheduler:\n- Add abort_queued_task() method that decrements the queued_count for\n  a task class's resolved lane. When the queue drops to zero, clears\n  first_queued_at_ms to prevent stale starvation detection. Includes\n  test verifying sequential abort fully drains the queue counter.\n\nOptimization governor:\n- Add seq field to AppliedProposal to track insertion order explicitly.\n  Replace .reverse() (which relied on HashMap iteration order, which\n  is non-deterministic) with .sort_by(|a, b| b.seq.cmp(&a.seq)) so\n  proposals are always reverted in last-applied-first order regardless\n  of HashMap iteration order changes across Rust versions.\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "3a72e738bc6c3a8aff7edb0a138e6cc0ecd9f46d",
+      "filename": "crates/franken-node/src/runtime/anti_entropy.rs",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 1,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/e98f12a3cd82e184ce066ede1605066ab31773a5/crates%2Ffranken-node%2Fsrc%2Fruntime%2Fanti_entropy.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/e98f12a3cd82e184ce066ede1605066ab31773a5/crates%2Ffranken-node%2Fsrc%2Fruntime%2Fanti_entropy.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fruntime%2Fanti_entropy.rs?ref=e98f12a3cd82e184ce066ede1605066ab31773a5",
+      "patch": "@@ -236,7 +236,11 @@ impl TrustState {\n     pub fn insert(&mut self, record: TrustRecord) {\n         if self.records.len() >= MAX_TRUST_RECORDS\n             && !self.records.contains_key(&record.id)\n-            && let Some(oldest_key) = self.records.keys().next().cloned()\n+            && let Some(oldest_key) = self\n+                .records\n+                .values()\n+                .min_by(|a, b| a.precedence_cmp(b))\n+                .map(|r| r.id.clone())\n         {\n             self.records.remove(&oldest_key);\n         }"
+    },
+    {
+      "sha": "6d050b5e335ec46db28256c6d31572c983d0b9fe",
+      "filename": "crates/franken-node/src/runtime/lane_scheduler.rs",
+      "status": "modified",
+      "additions": 54,
+      "deletions": 0,
+      "changes": 54,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/e98f12a3cd82e184ce066ede1605066ab31773a5/crates%2Ffranken-node%2Fsrc%2Fruntime%2Flane_scheduler.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/e98f12a3cd82e184ce066ede1605066ab31773a5/crates%2Ffranken-node%2Fsrc%2Fruntime%2Flane_scheduler.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fruntime%2Flane_scheduler.rs?ref=e98f12a3cd82e184ce066ede1605066ab31773a5",
+      "patch": "@@ -630,6 +630,29 @@ impl LaneScheduler {\n         Ok(assignment.lane)\n     }\n \n+    /// Abort a queued task assignment, decrementing the queue depth.\n+    pub fn abort_queued_task(&mut self, task_class: &TaskClass) -> Result<(), LaneSchedulerError> {\n+        let lane = self.policy.resolve(task_class).ok_or_else(|| {\n+            LaneSchedulerError::UnknownClass {\n+                task_class: task_class.to_string(),\n+            }\n+        })?;\n+\n+        let counters = self.counters.get_mut(lane.as_str()).ok_or_else(|| {\n+            LaneSchedulerError::UnknownLane {\n+                lane: lane.to_string(),\n+            }\n+        })?;\n+\n+        if counters.queued_count > 0 {\n+            counters.queued_count = counters.queued_count.saturating_sub(1);\n+            if counters.queued_count == 0 {\n+                counters.first_queued_at_ms = None;\n+            }\n+        }\n+        Ok(())\n+    }\n+\n     /// Check for lane starvation.\n     /// INV-LANE-STARVATION-DETECT\n     pub fn check_starvation(&mut self, current_ms: u64, trace_id: &str) -> Vec<LaneSchedulerError> {\n@@ -1488,6 +1511,37 @@ mod tests {\n         );\n     }\n \n+    #[test]\n+    fn abort_queued_task_decrements_queue_depth() {\n+        let mut p = LaneMappingPolicy::new();\n+        p.add_lane(LaneConfig::new(SchedulerLane::Background, 10, 1));\n+        p.add_rule(&task_classes::log_rotation(), SchedulerLane::Background);\n+        let mut s = LaneScheduler::new(p).unwrap();\n+\n+        // Assign one active\n+        s.assign_task(&task_classes::log_rotation(), 1000, \"t1\").unwrap();\n+        \n+        // Queue two more\n+        let _ = s.assign_task(&task_classes::log_rotation(), 1001, \"t2\");\n+        let _ = s.assign_task(&task_classes::log_rotation(), 1002, \"t3\");\n+\n+        let counters = s.lane_counter(SchedulerLane::Background).unwrap();\n+        assert_eq!(counters.queued_count, 2);\n+\n+        // Abort one queued task\n+        s.abort_queued_task(&task_classes::log_rotation()).unwrap();\n+        \n+        let counters = s.lane_counter(SchedulerLane::Background).unwrap();\n+        assert_eq!(counters.queued_count, 1);\n+        \n+        // Abort the other queued task\n+        s.abort_queued_task(&task_classes::log_rotation()).unwrap();\n+        \n+        let counters = s.lane_counter(SchedulerLane::Background).unwrap();\n+        assert_eq!(counters.queued_count, 0);\n+        assert_eq!(counters.first_queued_at_ms, None);\n+    }\n+\n     // ---- Default trait ----\n \n     #[test]"
+    },
+    {
+      "sha": "f1c418cded562de45892bcf701d53b9c51147298",
+      "filename": "crates/franken-node/src/runtime/optimization_governor.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 2,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/e98f12a3cd82e184ce066ede1605066ab31773a5/crates%2Ffranken-node%2Fsrc%2Fruntime%2Foptimization_governor.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/e98f12a3cd82e184ce066ede1605066ab31773a5/crates%2Ffranken-node%2Fsrc%2Fruntime%2Foptimization_governor.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fruntime%2Foptimization_governor.rs?ref=e98f12a3cd82e184ce066ede1605066ab31773a5",
+      "patch": "@@ -413,6 +413,7 @@ pub struct OptimizationGovernor {\n /// Tracks an applied proposal so we can auto-revert it.\n #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]\n struct AppliedProposal {\n+    pub seq: u64,\n     pub proposal_id: String,\n     pub knob: RuntimeKnob,\n     pub old_value: u64,\n@@ -642,6 +643,7 @@ impl OptimizationGovernor {\n         self.applied.insert(\n             proposal.proposal_id.clone(),\n             AppliedProposal {\n+                seq: self.next_seq,\n                 proposal_id: proposal.proposal_id.clone(),\n                 knob: proposal.knob,\n                 old_value: proposal.old_value,\n@@ -677,9 +679,9 @@ impl OptimizationGovernor {\n         }\n \n         // All currently applied proposals are suspect; revert them all.\n-        // Reverse so last-applied proposals revert first and earliest old_value wins.\n+        // Sort by sequence number descending so last-applied proposals revert first.\n         let mut to_revert: Vec<AppliedProposal> = self.applied.values().cloned().collect();\n-        to_revert.reverse();\n+        to_revert.sort_by_key(|ap| std::cmp::Reverse(ap.seq));\n         let mut reverted_ids = Vec::new();\n \n         for ap in &to_revert {"
+    }
+  ]
+}

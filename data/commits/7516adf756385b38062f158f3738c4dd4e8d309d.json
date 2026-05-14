@@ -1,0 +1,29 @@
+{
+  "message": "fix(crdt): ORSet tombstone tracking prevents removed values from reappearing on merge\n\nThe ORSet (Observed-Remove Set) CRDT had a correctness bug where\nremove() simply deleted all tags from the entries map, but merge()\nwould reintroduce those same tags from a stale replica that hadn't\nyet observed the remove.  This violates the fundamental ORSet\ncontract: a remove must win over any concurrent add that uses an\nalready-observed tag.\n\nFix: ORSet now maintains a tombstones BTreeSet.  remove() moves\ntags from entries into tombstones instead of discarding them.\nmerge() checks each incoming tag against tombstones before\ninserting it.  This ensures that once a tag is tombstoned, it\ncan never be reintroduced by a lagging replica.\n\nThe tombstone set grows monotonically, which is standard for\nORSet implementations \u2014 garbage collection of tombstones requires\ncausal stability (all replicas have observed the remove), which\nis outside the scope of this fix.\n\nNew regression test: tests/orset_bug.rs \u2014\norset_remove_is_not_undone_by_old_replica exercises the exact\nscenario: add on A, clone to B, remove on A, merge B back into A,\nassert value stays removed.\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "3a53afd279e044f7885b6db9d40fff8e9b32770e",
+      "filename": "src/trace/distributed/crdt.rs",
+      "status": "modified",
+      "additions": 23,
+      "deletions": 3,
+      "changes": 26,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/7516adf756385b38062f158f3738c4dd4e8d309d/src%2Ftrace%2Fdistributed%2Fcrdt.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/7516adf756385b38062f158f3738c4dd4e8d309d/src%2Ftrace%2Fdistributed%2Fcrdt.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Ftrace%2Fdistributed%2Fcrdt.rs?ref=7516adf756385b38062f158f3738c4dd4e8d309d",
+      "patch": "@@ -220,6 +220,8 @@ struct Tag {\n pub struct ORSet<V: Ord + Clone> {\n     /// Maps each value to the set of tags that added it.\n     entries: BTreeMap<V, BTreeSet<Tag>>,\n+    /// Set of tags that have been observed and removed.\n+    tombstones: BTreeSet<Tag>,\n     /// Per-node sequence counter for generating unique tags.\n     sequences: BTreeMap<NodeId, u64>,\n }\n@@ -230,6 +232,7 @@ impl<V: Ord + Clone> ORSet<V> {\n     pub fn new() -> Self {\n         Self {\n             entries: BTreeMap::new(),\n+            tombstones: BTreeSet::new(),\n             sequences: BTreeMap::new(),\n         }\n     }\n@@ -250,11 +253,15 @@ impl<V: Ord + Clone> ORSet<V> {\n         self.entries.entry(value).or_default().insert(tag);\n     }\n \n-    /// Removes a value by clearing all currently observed tags.\n+    /// Removes a value by moving all currently observed tags to tombstones.\n     ///\n     /// Concurrent adds (with tags not yet observed) will survive.\n     pub fn remove(&mut self, value: &V) {\n-        self.entries.remove(value);\n+        if let Some(tags) = self.entries.remove(value) {\n+            for tag in tags {\n+                self.tombstones.insert(tag);\n+            }\n+        }\n     }\n \n     /// Returns `true` if the value is present (has at least one live tag).\n@@ -295,12 +302,25 @@ impl<V: Ord + Clone> Default for ORSet<V> {\n \n impl<V: Ord + Clone> Merge for ORSet<V> {\n     fn merge(&mut self, other: &Self) {\n+        // Merge tombstones.\n+        for tag in &other.tombstones {\n+            self.tombstones.insert(tag.clone());\n+        }\n+\n         for (value, other_tags) in &other.entries {\n             let tags = self.entries.entry(value.clone()).or_default();\n             for tag in other_tags {\n-                tags.insert(tag.clone());\n+                if !self.tombstones.contains(tag) {\n+                    tags.insert(tag.clone());\n+                }\n             }\n         }\n+\n+        // Clean up our own entries that are in the merged tombstones\n+        for tags in self.entries.values_mut() {\n+            tags.retain(|tag| !self.tombstones.contains(tag));\n+        }\n+\n         // Merge sequence counters (take max per node).\n         for (node, &seq) in &other.sequences {\n             if let Some(v) = self.sequences.get_mut(node) {"
+    },
+    {
+      "sha": "6118fa10bb467110ebc7ff676e04104a2a2f086e",
+      "filename": "tests/orset_bug.rs",
+      "status": "added",
+      "additions": 18,
+      "deletions": 0,
+      "changes": 18,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/7516adf756385b38062f158f3738c4dd4e8d309d/tests%2Forset_bug.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/7516adf756385b38062f158f3738c4dd4e8d309d/tests%2Forset_bug.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/tests%2Forset_bug.rs?ref=7516adf756385b38062f158f3738c4dd4e8d309d",
+      "patch": "@@ -0,0 +1,18 @@\n+use asupersync::trace::distributed::crdt::{ORSet, Merge};\n+use asupersync::remote::NodeId;\n+\n+#[test]\n+fn orset_remove_is_not_undone_by_old_replica() {\n+    let mut a = ORSet::new();\n+    a.add(\"x\", &NodeId::new(\"n1\"));\n+    let b = a.clone(); // B has the tag\n+    \n+    a.remove(&\"x\"); // A completely removes \"x\" from its entries\n+    assert!(!a.contains(&\"x\"));\n+    \n+    // Now B (who hasn't seen the remove) merges back into A\n+    a.merge(&b);\n+    \n+    // The tag from B is merged back in, undoing the remove!\n+    assert!(!a.contains(&\"x\"), \"Remove was undone by merging old state!\");\n+}"
+    }
+  ]
+}

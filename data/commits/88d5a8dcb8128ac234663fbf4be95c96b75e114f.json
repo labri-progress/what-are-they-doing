@@ -1,0 +1,53 @@
+{
+  "message": "fix(actor,gen_server): honour pre-stop state in actor/server run loops\n\nrun_actor_loop and run_gen_server_loop unconditionally set state to\nRunning on entry, overriding Stopping set by stop() before the task was\nscheduled. This caused the poll_fn Stopping guard to never trigger,\nleaving the task permanently Pending.\n\nFix: only transition Created\u2192Running; preserve Stopping if already set.\nAlso skip on_start in gen_server when pre-stopped, matching test intent.\n\nAdditionally fix 5 clippy lints in grpc_production_features.rs\n(unchecked_time_subtraction, match_wildcard_for_single_variants) and\n1 uninlined_format_args in nightly_stress_soak_automation.rs.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "ea42bc720db231e0df6fc94057f85f1f23c6bdd8",
+      "filename": "src/actor.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 1,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/88d5a8dcb8128ac234663fbf4be95c96b75e114f/src%2Factor.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/88d5a8dcb8128ac234663fbf4be95c96b75e114f/src%2Factor.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Factor.rs?ref=88d5a8dcb8128ac234663fbf4be95c96b75e114f",
+      "patch": "@@ -671,7 +671,12 @@ pub const DEFAULT_MAILBOX_CAPACITY: usize = 64;\n async fn run_actor_loop<A: Actor>(mut actor: A, cx: Cx, cell: &mut ActorCell<A::Message>) -> A {\n     use crate::tracing_compat::debug;\n \n-    cell.state.store(ActorState::Running);\n+    // Only transition to Running if stop() wasn't called before the actor started.\n+    // stop() sets Stopping before scheduling; we must honour that signal so the\n+    // poll_fn guard in the message loop can detect the pre-stop and break.\n+    if cell.state.load() != ActorState::Stopping {\n+        cell.state.store(ActorState::Running);\n+    }\n \n     // Phase 1: Initialization\n     cx.trace(\"actor::on_start\");"
+    },
+    {
+      "sha": "efc83a5bbf0f26460a8873bd801eb29882a0da85",
+      "filename": "src/gen_server.rs",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 2,
+      "changes": 11,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/88d5a8dcb8128ac234663fbf4be95c96b75e114f/src%2Fgen_server.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/88d5a8dcb8128ac234663fbf4be95c96b75e114f/src%2Fgen_server.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fgen_server.rs?ref=88d5a8dcb8128ac234663fbf4be95c96b75e114f",
+      "patch": "@@ -1345,10 +1345,17 @@ async fn run_gen_server_loop<S: GenServer>(\n ) -> S {\n     use crate::tracing_compat::debug;\n \n-    cell.state.store(ActorState::Running);\n+    // Only transition to Running if stop() wasn't called before the server started.\n+    // stop() sets Stopping before scheduling; we must honour that signal so the\n+    // poll_fn guard in the message loop can detect the pre-stop and break.\n+    if cell.state.load() != ActorState::Stopping {\n+        cell.state.store(ActorState::Running);\n+    }\n \n     // Phase 1: Initialization\n-    if cx.is_cancel_requested() {\n+    // Skip init when either the Cx is cancelled or the server was pre-stopped\n+    // (stop() sets Stopping before scheduling, but does not cancel the Cx).\n+    if cx.is_cancel_requested() || cell.state.load() == ActorState::Stopping {\n         cx.trace(\"gen_server::init_skipped_cancelled\");\n     } else {\n         cx.trace(\"gen_server::init\");"
+    },
+    {
+      "sha": "ace272f8d5534a8f4d81fd8aa595c3e2800edde2",
+      "filename": "tests/grpc_production_features.rs",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 5,
+      "changes": 18,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/88d5a8dcb8128ac234663fbf4be95c96b75e114f/tests%2Fgrpc_production_features.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/88d5a8dcb8128ac234663fbf4be95c96b75e114f/tests%2Fgrpc_production_features.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/tests%2Fgrpc_production_features.rs?ref=88d5a8dcb8128ac234663fbf4be95c96b75e114f",
+      "patch": "@@ -259,7 +259,11 @@ fn call_context_remaining_before_deadline() {\n \n #[test]\n fn call_context_remaining_after_deadline() {\n-    let ctx = CallContext::with_deadline(Instant::now() - Duration::from_millis(1));\n+    let ctx = CallContext::with_deadline(\n+        Instant::now()\n+            .checked_sub(Duration::from_millis(1))\n+            .unwrap(),\n+    );\n     assert!(ctx.remaining().is_none());\n }\n \n@@ -271,7 +275,11 @@ fn call_context_remaining_no_deadline() {\n \n #[test]\n fn call_context_is_expired_with_past_deadline() {\n-    let ctx = CallContext::with_deadline(Instant::now() - Duration::from_millis(1));\n+    let ctx = CallContext::with_deadline(\n+        Instant::now()\n+            .checked_sub(Duration::from_millis(1))\n+            .unwrap(),\n+    );\n     assert!(ctx.is_expired());\n }\n \n@@ -535,7 +543,7 @@ fn timeout_interceptor_adds_header() {\n         asupersync::grpc::streaming::MetadataValue::Ascii(s) => {\n             assert_eq!(s, \"5000m\");\n         }\n-        _ => panic!(\"expected ASCII value\"),\n+        asupersync::grpc::streaming::MetadataValue::Binary(_) => panic!(\"expected ASCII value\"),\n     }\n }\n \n@@ -552,7 +560,7 @@ fn timeout_interceptor_preserves_existing_header() {\n         asupersync::grpc::streaming::MetadataValue::Ascii(s) => {\n             assert_eq!(s, \"1000m\");\n         }\n-        _ => panic!(\"expected ASCII value\"),\n+        asupersync::grpc::streaming::MetadataValue::Binary(_) => panic!(\"expected ASCII value\"),\n     }\n }\n \n@@ -567,7 +575,7 @@ fn bearer_auth_interceptor_adds_token() {\n         asupersync::grpc::streaming::MetadataValue::Ascii(s) => {\n             assert_eq!(s, \"Bearer my-token\");\n         }\n-        _ => panic!(\"expected ASCII value\"),\n+        asupersync::grpc::streaming::MetadataValue::Binary(_) => panic!(\"expected ASCII value\"),\n     }\n }\n "
+    },
+    {
+      "sha": "14f19a8c75f8e41902cb930830b96dbee0422e67",
+      "filename": "tests/nightly_stress_soak_automation.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 5,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/88d5a8dcb8128ac234663fbf4be95c96b75e114f/tests%2Fnightly_stress_soak_automation.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/88d5a8dcb8128ac234663fbf4be95c96b75e114f/tests%2Fnightly_stress_soak_automation.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/tests%2Fnightly_stress_soak_automation.rs?ref=88d5a8dcb8128ac234663fbf4be95c96b75e114f",
+      "patch": "@@ -162,7 +162,7 @@ fn runner_registers_required_categories() {\n     let content = std::fs::read_to_string(RUNNER_SCRIPT).unwrap();\n     for category in REQUIRED_SUITE_CATEGORIES {\n         assert!(\n-            content.contains(&format!(\"\\\"{}\\\"\", category)),\n+            content.contains(&format!(\"\\\"{category}\\\"\")),\n             \"Runner must use category: {category}\"\n         );\n     }\n@@ -172,10 +172,7 @@ fn runner_registers_required_categories() {\n fn doc_lists_all_required_suites() {\n     let content = std::fs::read_to_string(DOC_SPEC).unwrap();\n     for suite in REQUIRED_SUITES {\n-        assert!(\n-            content.contains(suite),\n-            \"Doc must list suite: {suite}\"\n-        );\n+        assert!(content.contains(suite), \"Doc must list suite: {suite}\");\n     }\n }\n "
+    }
+  ]
+}

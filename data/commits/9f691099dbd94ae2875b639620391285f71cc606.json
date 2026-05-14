@@ -1,0 +1,53 @@
+{
+  "message": "fix(voice-call): harden webhook lifecycle cleanup and retries (#32395) (thanks @scoootscooob)",
+  "files": [
+    {
+      "sha": "eb71555c3568ef3e76561cf313e578534651494d",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/9f691099dbd94ae2875b639620391285f71cc606/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/9f691099dbd94ae2875b639620391285f71cc606/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=9f691099dbd94ae2875b639620391285f71cc606",
+      "patch": "@@ -62,6 +62,7 @@ Docs: https://docs.openclaw.ai\n - Voice-call/Twilio external outbound: auto-register webhook-first `outbound-api` calls (initiated outside OpenClaw) so media streams are accepted and call direction metadata stays accurate. (#31181) Thanks @scoootscooob.\n - Voice-call/Twilio inbound greeting: run answered-call initial notify greeting for Twilio instead of skipping the manager speak path, with regression coverage for both Twilio and Plivo notify flows. (#29121) Thanks @xinhuagu.\n - Voice-call/stale call hydration: verify active calls with the provider before loading persisted in-progress calls so stale locally persisted records do not block or misroute new call handling after restarts. (#4325) Thanks @garnetlyx.\n+- Voice-call/runtime lifecycle: prevent `EADDRINUSE` loops by resetting failed runtime promises, making webhook `start()` idempotent with the actual bound port, and fully cleaning up webhook/tunnel/tailscale resources after startup failures. (#32395) Thanks @scoootscooob.\n - Feishu/topic session routing: use `thread_id` as topic session scope fallback when `root_id` is absent, keep first-turn topic keys stable across thread creation, and force thread replies when inbound events already carry topic/thread context. (#29788) Thanks @songyaolun.\n - Feishu/topic root replies: prefer `root_id` as outbound `replyTargetMessageId` when present, and parse millisecond `message_create_time` values correctly so topic replies anchor to the root message in grouped thread flows. (#29968) Thanks @bmendonca3.\n - Feishu/DM pairing reply target: send pairing challenge replies to `chat:<chat_id>` instead of `user:<sender_open_id>` so Lark/Feishu private chats with user-id-only sender payloads receive pairing messages reliably. (#31403) Thanks @stakeswky."
+    },
+    {
+      "sha": "27e42fc780c48a52fd475403f1dfcea820124c27",
+      "filename": "extensions/voice-call/src/runtime.ts",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 3,
+      "changes": 11,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/9f691099dbd94ae2875b639620391285f71cc606/extensions%2Fvoice-call%2Fsrc%2Fruntime.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/9f691099dbd94ae2875b639620391285f71cc606/extensions%2Fvoice-call%2Fsrc%2Fruntime.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fvoice-call%2Fsrc%2Fruntime.ts?ref=9f691099dbd94ae2875b639620391285f71cc606",
+      "patch": "@@ -125,6 +125,7 @@ export async function createVoiceCallRuntime(params: {\n   const webhookServer = new VoiceCallWebhookServer(config, manager, provider, coreConfig);\n \n   const localUrl = await webhookServer.start();\n+  let tunnelResult: TunnelResult | null = null;\n \n   // Wrap remaining initialization in try/catch so the webhook server is\n   // properly stopped if any subsequent step fails.  Without this, the server\n@@ -133,7 +134,6 @@ export async function createVoiceCallRuntime(params: {\n   try {\n     // Determine public URL - priority: config.publicUrl > tunnel > legacy tailscale\n     let publicUrl: string | null = config.publicUrl ?? null;\n-    let tunnelResult: TunnelResult | null = null;\n \n     if (!publicUrl && config.tunnel?.provider && config.tunnel.provider !== \"none\") {\n       try {\n@@ -217,8 +217,13 @@ export async function createVoiceCallRuntime(params: {\n       stop,\n     };\n   } catch (err) {\n-    // If any step after the server started fails, close the server to\n-    // release the port so the next attempt doesn't hit EADDRINUSE.\n+    // If any step after the server started fails, clean up every provisioned\n+    // resource (tunnel, tailscale exposure, and webhook server) so retries\n+    // don't leak processes or keep the port bound.\n+    if (tunnelResult) {\n+      await tunnelResult.stop().catch(() => {});\n+    }\n+    await cleanupTailscaleExposure(config).catch(() => {});\n     await webhookServer.stop().catch(() => {});\n     throw err;\n   }"
+    },
+    {
+      "sha": "6e3ecc6aafae6a0890a344f476c97aa8407ad77b",
+      "filename": "extensions/voice-call/src/webhook.test.ts",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 2,
+      "changes": 6,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/9f691099dbd94ae2875b639620391285f71cc606/extensions%2Fvoice-call%2Fsrc%2Fwebhook.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/9f691099dbd94ae2875b639620391285f71cc606/extensions%2Fvoice-call%2Fsrc%2Fwebhook.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fvoice-call%2Fsrc%2Fwebhook.test.ts?ref=9f691099dbd94ae2875b639620391285f71cc606",
+      "patch": "@@ -285,9 +285,11 @@ describe(\"VoiceCallWebhookServer start idempotency\", () => {\n       // Second call should return immediately without EADDRINUSE\n       const secondUrl = await server.start();\n \n-      // Both calls should return a valid URL (port may differ from config\n-      // since we use port 0 for dynamic allocation, but paths must match)\n+      // Dynamic port allocations should resolve to a real listening port.\n       expect(firstUrl).toContain(\"/voice/webhook\");\n+      expect(firstUrl).not.toContain(\":0/\");\n+      // Idempotent re-start should return the same already-bound URL.\n+      expect(secondUrl).toBe(firstUrl);\n       expect(secondUrl).toContain(\"/voice/webhook\");\n     } finally {\n       await server.stop();"
+    },
+    {
+      "sha": "6dda99edd8862025cd6fcf123b14d49f7dd3e9e2",
+      "filename": "extensions/voice-call/src/webhook.ts",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 3,
+      "changes": 25,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/9f691099dbd94ae2875b639620391285f71cc606/extensions%2Fvoice-call%2Fsrc%2Fwebhook.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/9f691099dbd94ae2875b639620391285f71cc606/extensions%2Fvoice-call%2Fsrc%2Fwebhook.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fvoice-call%2Fsrc%2Fwebhook.ts?ref=9f691099dbd94ae2875b639620391285f71cc606",
+      "patch": "@@ -30,6 +30,7 @@ type WebhookResponsePayload = {\n  */\n export class VoiceCallWebhookServer {\n   private server: http.Server | null = null;\n+  private listeningUrl: string | null = null;\n   private config: VoiceCallConfig;\n   private manager: CallManager;\n   private provider: VoiceCallProvider;\n@@ -195,7 +196,7 @@ export class VoiceCallWebhookServer {\n     // This prevents EADDRINUSE when start() is called more than once on the\n     // same instance (e.g. during config hot-reload or concurrent ensureRuntime).\n     if (this.server?.listening) {\n-      return `http://${bind}:${port}${webhookPath}`;\n+      return this.listeningUrl ?? this.resolveListeningUrl(bind, webhookPath);\n     }\n \n     return new Promise((resolve, reject) => {\n@@ -223,10 +224,16 @@ export class VoiceCallWebhookServer {\n       this.server.on(\"error\", reject);\n \n       this.server.listen(port, bind, () => {\n-        const url = `http://${bind}:${port}${webhookPath}`;\n+        const url = this.resolveListeningUrl(bind, webhookPath);\n+        this.listeningUrl = url;\n         console.log(`[voice-call] Webhook server listening on ${url}`);\n         if (this.mediaStreamHandler) {\n-          console.log(`[voice-call] Media stream WebSocket on ws://${bind}:${port}${streamPath}`);\n+          const address = this.server?.address();\n+          const actualPort =\n+            address && typeof address === \"object\" ? address.port : this.config.serve.port;\n+          console.log(\n+            `[voice-call] Media stream WebSocket on ws://${bind}:${actualPort}${streamPath}`,\n+          );\n         }\n         resolve(url);\n \n@@ -251,14 +258,26 @@ export class VoiceCallWebhookServer {\n       if (this.server) {\n         this.server.close(() => {\n           this.server = null;\n+          this.listeningUrl = null;\n           resolve();\n         });\n       } else {\n+        this.listeningUrl = null;\n         resolve();\n       }\n     });\n   }\n \n+  private resolveListeningUrl(bind: string, webhookPath: string): string {\n+    const address = this.server?.address();\n+    if (address && typeof address === \"object\") {\n+      const host = address.address && address.address.length > 0 ? address.address : bind;\n+      const normalizedHost = host.includes(\":\") && !host.startsWith(\"[\") ? `[${host}]` : host;\n+      return `http://${normalizedHost}:${address.port}${webhookPath}`;\n+    }\n+    return `http://${bind}:${this.config.serve.port}${webhookPath}`;\n+  }\n+\n   private getUpgradePathname(request: http.IncomingMessage): string | null {\n     try {\n       const host = request.headers.host || \"localhost\";"
+    }
+  ]
+}

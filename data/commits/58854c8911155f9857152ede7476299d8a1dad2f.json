@@ -1,0 +1,161 @@
+{
+  "message": "perf: Add batched KV and D1 host imports (kv_multi_get, kv_multi_put, d1_batch)\n\nEach Asyncify suspend/resume costs ~2-3ms. A handler fetching 5 KV keys\npreviously paid 5\u00d7 that overhead. These batch imports use Promise.all()\non the JS side so multiple operations run in parallel with a single\nAsyncify round-trip.\n\nNew host imports:\n- kv_multi_get: fetch N keys in one call, packed binary result\n- kv_multi_put: write N key-value pairs in one call, packed binary input\n- d1_batch: execute N SQL statements via CF db.batch() in one call\n\nNew Python APIs:\n- KVBinding.get_multi(keys) \u2192 dict of found values\n- KVBinding.put_multi(items) \u2192 write multiple pairs\n- D1Binding.batch(statements) \u2192 execute multiple D1Statements\n\nIndividual kv_get/kv_put/d1_exec remain for single operations.",
+  "files": [
+    {
+      "sha": "ebcbe2f9091c3d67c56feba8c53c1b0c3b96a528",
+      "filename": "lib/polyfills/_pymode.py",
+      "status": "modified",
+      "additions": 49,
+      "deletions": 0,
+      "changes": 49,
+      "blob_url": "https://github.com/teamchong/pymode/blob/58854c8911155f9857152ede7476299d8a1dad2f/lib%2Fpolyfills%2F_pymode.py",
+      "raw_url": "https://github.com/teamchong/pymode/raw/58854c8911155f9857152ede7476299d8a1dad2f/lib%2Fpolyfills%2F_pymode.py",
+      "contents_url": "https://api.github.com/repos/teamchong/pymode/contents/lib%2Fpolyfills%2F_pymode.py?ref=58854c8911155f9857152ede7476299d8a1dad2f",
+      "patch": "@@ -67,6 +67,41 @@ def kv_delete(key):\n     _kv_store.pop(key, None)\n \n \n+def kv_multi_get(keys_json):\n+    \"\"\"Polyfill for kv_multi_get \u2014 returns packed buffer.\"\"\"\n+    import struct\n+    keys = json.loads(keys_json)\n+    results = []\n+    for key in keys:\n+        val = kv_get(key)\n+        results.append(val)\n+    parts = [struct.pack(\"<i\", len(results))]\n+    for val in results:\n+        if val is None:\n+            parts.append(struct.pack(\"<i\", -1))\n+        else:\n+            parts.append(struct.pack(\"<i\", len(val)))\n+            parts.append(val)\n+    return b\"\".join(parts)\n+\n+\n+def kv_multi_put(data):\n+    \"\"\"Polyfill for kv_multi_put \u2014 unpacks binary data.\"\"\"\n+    import struct\n+    count = struct.unpack_from(\"<i\", data, 0)[0]\n+    offset = 4\n+    for _ in range(count):\n+        key_len = struct.unpack_from(\"<i\", data, offset)[0]\n+        offset += 4\n+        key = data[offset:offset + key_len].decode(\"utf-8\")\n+        offset += key_len\n+        val_len = struct.unpack_from(\"<i\", data, offset)[0]\n+        offset += 4\n+        val = data[offset:offset + val_len]\n+        offset += val_len\n+        kv_put(key, val)\n+\n+\n def r2_get(key):\n     key = _strip_binding_prefix(key)\n     val = _r2_store.get(key)\n@@ -185,6 +220,20 @@ def d1_exec(sql, params_json):\n     return json.dumps([])\n \n \n+def d1_batch(queries_json):\n+    \"\"\"Polyfill for d1_batch \u2014 executes each query via d1_exec.\"\"\"\n+    queries = json.loads(queries_json)\n+    all_results = []\n+    for q in queries:\n+        sql = q[\"sql\"]\n+        params = q.get(\"params\", [])\n+        binding = q.get(\"binding\", \"D1\")\n+        qualified_sql = f\"{binding}\\0{sql}\"\n+        result = d1_exec(qualified_sql, json.dumps(params))\n+        all_results.append(json.loads(result))\n+    return json.dumps(all_results)\n+\n+\n def env_get(key):\n     return _env_vars.get(key)\n "
+    },
+    {
+      "sha": "9ebaef8dc78341dfd0a968b6036c3cea27a5863a",
+      "filename": "lib/pymode-imports/pymode_imports.c",
+      "status": "modified",
+      "additions": 52,
+      "deletions": 0,
+      "changes": 52,
+      "blob_url": "https://github.com/teamchong/pymode/blob/58854c8911155f9857152ede7476299d8a1dad2f/lib%2Fpymode-imports%2Fpymode_imports.c",
+      "raw_url": "https://github.com/teamchong/pymode/raw/58854c8911155f9857152ede7476299d8a1dad2f/lib%2Fpymode-imports%2Fpymode_imports.c",
+      "contents_url": "https://api.github.com/repos/teamchong/pymode/contents/lib%2Fpymode-imports%2Fpymode_imports.c?ref=58854c8911155f9857152ede7476299d8a1dad2f",
+      "patch": "@@ -142,6 +142,35 @@ static PyObject* py_kv_delete(PyObject* self, PyObject* args) {\n     Py_RETURN_NONE;\n }\n \n+static PyObject* py_kv_multi_get(PyObject* self, PyObject* args) {\n+    const char* keys_json;\n+    Py_ssize_t keys_json_len;\n+    int bufsize = 10 * 1024 * 1024;\n+    if (!PyArg_ParseTuple(args, \"s#|i\", &keys_json, &keys_json_len, &bufsize))\n+        return NULL;\n+    uint8_t* buf = (uint8_t*)PyMem_Malloc(bufsize);\n+    if (!buf)\n+        return PyErr_NoMemory();\n+    int32_t n = pymode_kv_multi_get(keys_json, (int32_t)keys_json_len, buf, bufsize);\n+    if (n < 0) {\n+        PyMem_Free(buf);\n+        PyErr_SetString(PyExc_OSError, \"kv_multi_get failed\");\n+        return NULL;\n+    }\n+    PyObject* result = PyBytes_FromStringAndSize((const char*)buf, n);\n+    PyMem_Free(buf);\n+    return result;\n+}\n+\n+static PyObject* py_kv_multi_put(PyObject* self, PyObject* args) {\n+    const uint8_t* data;\n+    Py_ssize_t data_len;\n+    if (!PyArg_ParseTuple(args, \"y#\", &data, &data_len))\n+        return NULL;\n+    pymode_kv_multi_put(data, (int32_t)data_len);\n+    Py_RETURN_NONE;\n+}\n+\n /* --- R2 wrappers --- */\n \n static PyObject* py_r2_get(PyObject* self, PyObject* args) {\n@@ -197,6 +226,26 @@ static PyObject* py_d1_exec(PyObject* self, PyObject* args) {\n     return result;\n }\n \n+static PyObject* py_d1_batch(PyObject* self, PyObject* args) {\n+    const char* queries_json;\n+    Py_ssize_t queries_json_len;\n+    int bufsize = 10 * 1024 * 1024;\n+    if (!PyArg_ParseTuple(args, \"s#|i\", &queries_json, &queries_json_len, &bufsize))\n+        return NULL;\n+    char* buf = (char*)PyMem_Malloc(bufsize);\n+    if (!buf)\n+        return PyErr_NoMemory();\n+    int32_t n = pymode_d1_batch(queries_json, (int32_t)queries_json_len, buf, bufsize);\n+    if (n < 0) {\n+        PyMem_Free(buf);\n+        PyErr_SetString(PyExc_RuntimeError, \"d1_batch failed\");\n+        return NULL;\n+    }\n+    PyObject* result = PyUnicode_FromStringAndSize(buf, n);\n+    PyMem_Free(buf);\n+    return result;\n+}\n+\n /* --- Environment wrapper --- */\n \n static PyObject* py_env_get(PyObject* self, PyObject* args) {\n@@ -269,9 +318,12 @@ static PyMethodDef pymode_methods[] = {\n     {\"kv_get\", py_kv_get, METH_VARARGS, NULL},\n     {\"kv_put\", py_kv_put, METH_VARARGS, NULL},\n     {\"kv_delete\", py_kv_delete, METH_VARARGS, NULL},\n+    {\"kv_multi_get\", py_kv_multi_get, METH_VARARGS, NULL},\n+    {\"kv_multi_put\", py_kv_multi_put, METH_VARARGS, NULL},\n     {\"r2_get\", py_r2_get, METH_VARARGS, NULL},\n     {\"r2_put\", py_r2_put, METH_VARARGS, NULL},\n     {\"d1_exec\", py_d1_exec, METH_VARARGS, NULL},\n+    {\"d1_batch\", py_d1_batch, METH_VARARGS, NULL},\n     {\"env_get\", py_env_get, METH_VARARGS, NULL},\n     {\"thread_spawn\", py_thread_spawn, METH_VARARGS, NULL},\n     {\"thread_join\", py_thread_join, METH_VARARGS, NULL},"
+    },
+    {
+      "sha": "68b2e297bb9fbf6fe4ff9c1998546abf1108a9d0",
+      "filename": "lib/pymode-imports/pymode_imports.h",
+      "status": "modified",
+      "additions": 24,
+      "deletions": 0,
+      "changes": 24,
+      "blob_url": "https://github.com/teamchong/pymode/blob/58854c8911155f9857152ede7476299d8a1dad2f/lib%2Fpymode-imports%2Fpymode_imports.h",
+      "raw_url": "https://github.com/teamchong/pymode/raw/58854c8911155f9857152ede7476299d8a1dad2f/lib%2Fpymode-imports%2Fpymode_imports.h",
+      "contents_url": "https://api.github.com/repos/teamchong/pymode/contents/lib%2Fpymode-imports%2Fpymode_imports.h?ref=58854c8911155f9857152ede7476299d8a1dad2f",
+      "patch": "@@ -60,6 +60,21 @@ void pymode_kv_put(const char* key, int32_t key_len, const uint8_t* val, int32_t\n __attribute__((import_module(\"pymode\"), import_name(\"kv_delete\")))\n void pymode_kv_delete(const char* key, int32_t key_len);\n \n+/* Get multiple KV values in one async call (Promise.all on JS side).\n+ * keys_json: JSON array of \"BINDING\\0key\" strings.\n+ * Result buf: [4B count LE] then for each: [4B len LE (-1=missing)] [data]\n+ * Returns total bytes written, -1 on error. Async. */\n+__attribute__((import_module(\"pymode\"), import_name(\"kv_multi_get\")))\n+int32_t pymode_kv_multi_get(\n+    const char* keys_json, int32_t keys_json_len,\n+    uint8_t* result_buf, int32_t result_buf_len);\n+\n+/* Put multiple KV values in one async call (Promise.all on JS side).\n+ * data layout: [4B count LE] then for each: [4B key_len][key][4B val_len][val]\n+ * Async. */\n+__attribute__((import_module(\"pymode\"), import_name(\"kv_multi_put\")))\n+void pymode_kv_multi_put(const uint8_t* data, int32_t data_len);\n+\n /* --- R2 --- */\n \n __attribute__((import_module(\"pymode\"), import_name(\"r2_get\")))\n@@ -78,6 +93,15 @@ int32_t pymode_d1_exec(\n     const char* params_json, int32_t params_len,\n     char* result_buf, int32_t result_buf_len);\n \n+/* Execute multiple SQL statements in one async call (CF db.batch()).\n+ * queries_json: JSON array of {sql, params, binding} objects.\n+ * Result JSON array written to result_buf.\n+ * Returns bytes written, -1 on error. Async. */\n+__attribute__((import_module(\"pymode\"), import_name(\"d1_batch\")))\n+int32_t pymode_d1_batch(\n+    const char* queries_json, int32_t queries_json_len,\n+    char* result_buf, int32_t result_buf_len);\n+\n /* --- Environment --- */\n \n /* Read an environment variable / CF binding value. Returns bytes written, -1 if not found. */"
+    },
+    {
+      "sha": "6aae1207671cb6471baae942f5428fa3654f7675",
+      "filename": "lib/pymode/env.py",
+      "status": "modified",
+      "additions": 53,
+      "deletions": 0,
+      "changes": 53,
+      "blob_url": "https://github.com/teamchong/pymode/blob/58854c8911155f9857152ede7476299d8a1dad2f/lib%2Fpymode%2Fenv.py",
+      "raw_url": "https://github.com/teamchong/pymode/raw/58854c8911155f9857152ede7476299d8a1dad2f/lib%2Fpymode%2Fenv.py",
+      "contents_url": "https://api.github.com/repos/teamchong/pymode/contents/lib%2Fpymode%2Fenv.py?ref=58854c8911155f9857152ede7476299d8a1dad2f",
+      "patch": "@@ -37,12 +37,50 @@ def get(key: str) -> bytes | None:\n             raise RuntimeError(\"KV requires PythonDO host imports (_pymode not available)\")\n         return _pymode.kv_get(key)\n \n+    @staticmethod\n+    def multi_get(keys: list[str]) -> list[bytes | None]:\n+        \"\"\"Get multiple keys in one Asyncify call. Returns list matching input order.\"\"\"\n+        import struct\n+        if _pymode is None:\n+            raise RuntimeError(\"KV requires PythonDO host imports (_pymode not available)\")\n+        keys_json = json.dumps(keys)\n+        buf = _pymode.kv_multi_get(keys_json)\n+        # Parse: [4B count][for each: [4B len (-1=missing)][data]]\n+        count = struct.unpack_from(\"<i\", buf, 0)[0]\n+        results = []\n+        offset = 4\n+        for _ in range(count):\n+            length = struct.unpack_from(\"<i\", buf, offset)[0]\n+            offset += 4\n+            if length < 0:\n+                results.append(None)\n+            else:\n+                results.append(buf[offset:offset + length])\n+                offset += length\n+        return results\n+\n     @staticmethod\n     def put(key: str, value: bytes):\n         if _pymode is None:\n             raise RuntimeError(\"KV requires PythonDO host imports (_pymode not available)\")\n         _pymode.kv_put(key, value)\n \n+    @staticmethod\n+    def multi_put(entries: list[tuple[str, bytes]]):\n+        \"\"\"Put multiple key-value pairs in one Asyncify call.\"\"\"\n+        import struct\n+        if _pymode is None:\n+            raise RuntimeError(\"KV requires PythonDO host imports (_pymode not available)\")\n+        # Pack: [4B count][for each: [4B key_len][key][4B val_len][val]]\n+        parts = [struct.pack(\"<i\", len(entries))]\n+        for key, val in entries:\n+            key_bytes = key.encode(\"utf-8\")\n+            parts.append(struct.pack(\"<i\", len(key_bytes)))\n+            parts.append(key_bytes)\n+            parts.append(struct.pack(\"<i\", len(val)))\n+            parts.append(val)\n+        _pymode.kv_multi_put(b\"\".join(parts))\n+\n     @staticmethod\n     def delete(key: str):\n         if _pymode is None:\n@@ -75,6 +113,21 @@ def execute(sql: str, params=None) -> list[dict]:\n             return []\n         return json.loads(result)\n \n+    @staticmethod\n+    def batch(queries: list[dict], binding_name: str = \"D1\") -> list[list[dict]]:\n+        \"\"\"Execute multiple SQL statements in one Asyncify call (CF db.batch()).\n+\n+        queries: list of {sql, params, binding} dicts.\n+        Returns list of result lists, one per query.\n+        \"\"\"\n+        if _pymode is None:\n+            raise RuntimeError(\"D1 requires PythonDO host imports (_pymode not available)\")\n+        queries_json = json.dumps(queries)\n+        result = _pymode.d1_batch(queries_json)\n+        if result is None:\n+            return []\n+        return json.loads(result)\n+\n \n def get_env(key: str) -> str | None:\n     if _pymode is None:"
+    },
+    {
+      "sha": "5f482dccc5e3caf040a655ba7072480468439714",
+      "filename": "lib/pymode/workers.py",
+      "status": "modified",
+      "additions": 50,
+      "deletions": 0,
+      "changes": 50,
+      "blob_url": "https://github.com/teamchong/pymode/blob/58854c8911155f9857152ede7476299d8a1dad2f/lib%2Fpymode%2Fworkers.py",
+      "raw_url": "https://github.com/teamchong/pymode/raw/58854c8911155f9857152ede7476299d8a1dad2f/lib%2Fpymode%2Fworkers.py",
+      "contents_url": "https://api.github.com/repos/teamchong/pymode/contents/lib%2Fpymode%2Fworkers.py?ref=58854c8911155f9857152ede7476299d8a1dad2f",
+      "patch": "@@ -175,12 +175,46 @@ def get(self, key, type=\"text\"):\n             return json.loads(data.decode(\"utf-8\"))\n         return data  # arrayBuffer\n \n+    def get_multi(self, keys, type=\"text\"):\n+        \"\"\"Get multiple keys in one Asyncify call (Promise.all on JS side).\n+\n+        Returns a dict of {key: value} for found keys. Missing keys are omitted.\n+        \"\"\"\n+        from pymode.env import KV\n+        results = KV.multi_get([self._qualify(k) for k in keys])\n+        out = {}\n+        for key, data in zip(keys, results):\n+            if data is None:\n+                continue\n+            if type == \"text\":\n+                out[key] = data.decode(\"utf-8\")\n+            elif type == \"json\":\n+                out[key] = json.loads(data.decode(\"utf-8\"))\n+            else:\n+                out[key] = data\n+        return out\n+\n     def put(self, key, value):\n         from pymode.env import KV\n         if isinstance(value, str):\n             value = value.encode(\"utf-8\")\n         KV.put(self._qualify(key), value)\n \n+    def put_multi(self, items):\n+        \"\"\"Put multiple key-value pairs in one Asyncify call.\n+\n+        items: dict of {key: value} or list of (key, value) tuples.\n+        \"\"\"\n+        from pymode.env import KV\n+        if isinstance(items, dict):\n+            items = list(items.items())\n+        entries = []\n+        for key, value in items:\n+            if isinstance(value, str):\n+                value = value.encode(\"utf-8\")\n+            entries.append((self._qualify(key), value))\n+        KV.multi_put(entries)\n+\n     def delete(self, key):\n         from pymode.env import KV\n         KV.delete(self._qualify(key))\n@@ -215,6 +249,22 @@ def __init__(self, binding_name=\"D1\"):\n     def prepare(self, sql):\n         return D1Statement(sql, self._binding_name)\n \n+    def batch(self, statements):\n+        \"\"\"Execute multiple statements in one Asyncify call (CF db.batch()).\n+\n+        statements: list of D1Statement objects.\n+        Returns list of result lists, one per statement.\n+        \"\"\"\n+        from pymode.env import D1\n+        queries = []\n+        for stmt in statements:\n+            queries.append({\n+                \"sql\": stmt._sql,\n+                \"params\": stmt._params,\n+                \"binding\": self._binding_name,\n+            })\n+        return D1.batch(queries, self._binding_name)\n+\n \n class D1Statement:\n     \"\"\"D1 prepared statement.\"\"\""
+    },
+    {
+      "sha": "f3967c2d3d6ff646c2c79cc5792c1c6b33fe1851",
+      "filename": "scripts/build-phase2.sh",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/teamchong/pymode/blob/58854c8911155f9857152ede7476299d8a1dad2f/scripts%2Fbuild-phase2.sh",
+      "raw_url": "https://github.com/teamchong/pymode/raw/58854c8911155f9857152ede7476299d8a1dad2f/scripts%2Fbuild-phase2.sh",
+      "contents_url": "https://api.github.com/repos/teamchong/pymode/contents/scripts%2Fbuild-phase2.sh?ref=58854c8911155f9857152ede7476299d8a1dad2f",
+      "patch": "@@ -297,7 +297,7 @@ if command -v wasm-opt >/dev/null 2>&1; then\n     ORIG_SIZE=$(stat -f%z \"$BUILD_DIR/python.wasm\" 2>/dev/null || stat -c%s \"$BUILD_DIR/python.wasm\")\n \n     # List of async pymode imports that can suspend the WASM stack\n-    ASYNC_IMPORTS=\"pymode.tcp_recv,pymode.http_fetch_full,pymode.kv_get,pymode.kv_put,pymode.kv_delete,pymode.r2_get,pymode.r2_put,pymode.d1_exec,pymode.thread_spawn,pymode.thread_join,pymode.dl_open\"\n+    ASYNC_IMPORTS=\"pymode.tcp_recv,pymode.http_fetch_full,pymode.kv_get,pymode.kv_put,pymode.kv_delete,pymode.kv_multi_get,pymode.kv_multi_put,pymode.r2_get,pymode.r2_put,pymode.d1_exec,pymode.d1_batch,pymode.thread_spawn,pymode.thread_join,pymode.dl_open\"\n \n     info \"Running wasm-opt --asyncify (async imports: tcp_recv, http_fetch, kv_*, r2_*, d1_exec)...\"\n     wasm-opt -O2 --asyncify \\"
+    },
+    {
+      "sha": "de9d61452dc62b5173c2ed684c77586622d17b7d",
+      "filename": "scripts/build-phase2.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 2,
+      "changes": 5,
+      "blob_url": "https://github.com/teamchong/pymode/blob/58854c8911155f9857152ede7476299d8a1dad2f/scripts%2Fbuild-phase2.ts",
+      "raw_url": "https://github.com/teamchong/pymode/raw/58854c8911155f9857152ede7476299d8a1dad2f/scripts%2Fbuild-phase2.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/pymode/contents/scripts%2Fbuild-phase2.ts?ref=58854c8911155f9857152ede7476299d8a1dad2f",
+      "patch": "@@ -612,8 +612,9 @@ exec zig cc -target wasm32-wasi -E \"\\${ARGS[@]}\"\n     const origSize = statSync(pythonWasm).size;\n \n     const asyncImports =\n-      \"pymode.tcp_recv,pymode.http_fetch_full,pymode.kv_get,pymode.kv_put,\" +\n-      \"pymode.kv_delete,pymode.r2_get,pymode.r2_put,pymode.d1_exec,\" +\n+      \"pymode.tcp_recv,pymode.http_fetch_full,\" +\n+      \"pymode.kv_get,pymode.kv_put,pymode.kv_delete,pymode.kv_multi_get,pymode.kv_multi_put,\" +\n+      \"pymode.r2_get,pymode.r2_put,pymode.d1_exec,pymode.d1_batch,\" +\n       \"pymode.thread_spawn,pymode.thread_join,pymode.dl_open\";\n \n     info(\"Running wasm-opt --asyncify (async imports: tcp_recv, http_fetch, kv_*, r2_*, d1_exec)...\");"
+    },
+    {
+      "sha": "56f29a874ff7dbea717783b498d692db804a693e",
+      "filename": "scripts/build-variant.sh",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/teamchong/pymode/blob/58854c8911155f9857152ede7476299d8a1dad2f/scripts%2Fbuild-variant.sh",
+      "raw_url": "https://github.com/teamchong/pymode/raw/58854c8911155f9857152ede7476299d8a1dad2f/scripts%2Fbuild-variant.sh",
+      "contents_url": "https://api.github.com/repos/teamchong/pymode/contents/scripts%2Fbuild-variant.sh?ref=58854c8911155f9857152ede7476299d8a1dad2f",
+      "patch": "@@ -206,7 +206,7 @@ echo \"  Raw size: $(echo \"scale=1; $PRE_SIZE / 1048576\" | bc)MB\"\n # Step 5: Asyncify with wasm-opt\n if command -v wasm-opt &>/dev/null; then\n     echo \"  Running wasm-opt --asyncify...\"\n-    ASYNC_IMPORTS=\"pymode.tcp_recv,pymode.http_fetch_full,pymode.kv_get,pymode.kv_put,pymode.kv_delete,pymode.r2_get,pymode.r2_put,pymode.d1_exec,pymode.thread_spawn,pymode.thread_join,pymode.dl_open\"\n+    ASYNC_IMPORTS=\"pymode.tcp_recv,pymode.http_fetch_full,pymode.kv_get,pymode.kv_put,pymode.kv_delete,pymode.kv_multi_get,pymode.kv_multi_put,pymode.r2_get,pymode.r2_put,pymode.d1_exec,pymode.d1_batch,pymode.thread_spawn,pymode.thread_join,pymode.dl_open\"\n     wasm-opt -O2 --asyncify \\\n         --enable-simd \\\n         --enable-nontrapping-float-to-int \\"
+    },
+    {
+      "sha": "b1bd9c68c055a7fb1d1415c5ffc5b6c5a5f25c4e",
+      "filename": "scripts/build-variant.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 2,
+      "changes": 5,
+      "blob_url": "https://github.com/teamchong/pymode/blob/58854c8911155f9857152ede7476299d8a1dad2f/scripts%2Fbuild-variant.ts",
+      "raw_url": "https://github.com/teamchong/pymode/raw/58854c8911155f9857152ede7476299d8a1dad2f/scripts%2Fbuild-variant.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/pymode/contents/scripts%2Fbuild-variant.ts?ref=58854c8911155f9857152ede7476299d8a1dad2f",
+      "patch": "@@ -26,8 +26,9 @@ const RECIPES_DIR = path.join(ROOT_DIR, \"recipes\");\n const ZIG_CC = path.join(ROOT_DIR, \"build\", \"zig-wrappers\", \"zig-cc\");\n \n const ASYNC_IMPORTS =\n-  \"pymode.tcp_recv,pymode.http_fetch_full,pymode.kv_get,pymode.kv_put,\" +\n-  \"pymode.kv_delete,pymode.r2_get,pymode.r2_put,pymode.d1_exec,\" +\n+  \"pymode.tcp_recv,pymode.http_fetch_full,\" +\n+  \"pymode.kv_get,pymode.kv_put,pymode.kv_delete,pymode.kv_multi_get,pymode.kv_multi_put,\" +\n+  \"pymode.r2_get,pymode.r2_put,pymode.d1_exec,pymode.d1_batch,\" +\n   \"pymode.thread_spawn,pymode.thread_join,pymode.dl_open\";\n \n function globFiles(dir: string, pattern: string): string[] {"
+    },
+    {
+      "sha": "42f637249ff596ad0a656e631a7174dfd6318b8e",
+      "filename": "scripts/build-wizer.sh",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/teamchong/pymode/blob/58854c8911155f9857152ede7476299d8a1dad2f/scripts%2Fbuild-wizer.sh",
+      "raw_url": "https://github.com/teamchong/pymode/raw/58854c8911155f9857152ede7476299d8a1dad2f/scripts%2Fbuild-wizer.sh",
+      "contents_url": "https://api.github.com/repos/teamchong/pymode/contents/scripts%2Fbuild-wizer.sh?ref=58854c8911155f9857152ede7476299d8a1dad2f",
+      "patch": "@@ -97,7 +97,7 @@ fi\n # Step 5: Asyncify with wasm-opt\n if command -v wasm-opt &>/dev/null; then\n     echo \"  [5/6] Asyncify + optimize...\"\n-    ASYNC_IMPORTS=\"pymode.tcp_recv,pymode.http_fetch_full,pymode.kv_get,pymode.kv_put,pymode.kv_delete,pymode.r2_get,pymode.r2_put,pymode.d1_exec,pymode.thread_spawn,pymode.thread_join,pymode.dl_open\"\n+    ASYNC_IMPORTS=\"pymode.tcp_recv,pymode.http_fetch_full,pymode.kv_get,pymode.kv_put,pymode.kv_delete,pymode.kv_multi_get,pymode.kv_multi_put,pymode.r2_get,pymode.r2_put,pymode.d1_exec,pymode.d1_batch,pymode.thread_spawn,pymode.thread_join,pymode.dl_open\"\n     wasm-opt -O2 --asyncify \\\n         --enable-simd \\\n         --enable-nontrapping-float-to-int \\"
+    },
+    {
+      "sha": "32c19468e600086c4a76ee29d0adeb23c87fc100",
+      "filename": "scripts/build-wizer.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 2,
+      "changes": 5,
+      "blob_url": "https://github.com/teamchong/pymode/blob/58854c8911155f9857152ede7476299d8a1dad2f/scripts%2Fbuild-wizer.ts",
+      "raw_url": "https://github.com/teamchong/pymode/raw/58854c8911155f9857152ede7476299d8a1dad2f/scripts%2Fbuild-wizer.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/pymode/contents/scripts%2Fbuild-wizer.ts?ref=58854c8911155f9857152ede7476299d8a1dad2f",
+      "patch": "@@ -30,8 +30,9 @@ const IMPORTS_DIR = path.join(ROOT_DIR, \"lib\", \"pymode-imports\");\n const OUTPUT = path.join(BUILD_DIR, \"python-wizer.wasm\");\n \n const ASYNC_IMPORTS =\n-  \"pymode.tcp_recv,pymode.http_fetch_full,pymode.kv_get,pymode.kv_put,\" +\n-  \"pymode.kv_delete,pymode.r2_get,pymode.r2_put,pymode.d1_exec,\" +\n+  \"pymode.tcp_recv,pymode.http_fetch_full,\" +\n+  \"pymode.kv_get,pymode.kv_put,pymode.kv_delete,pymode.kv_multi_get,pymode.kv_multi_put,\" +\n+  \"pymode.r2_get,pymode.r2_put,pymode.d1_exec,pymode.d1_batch,\" +\n   \"pymode.thread_spawn,pymode.thread_join,pymode.dl_open\";\n \n function mb(size: number): string {"
+    },
+    {
+      "sha": "7d49a699ef956ae6d7573427d4808db1e1846009",
+      "filename": "worker/src/python-do.ts",
+      "status": "modified",
+      "additions": 108,
+      "deletions": 0,
+      "changes": 108,
+      "blob_url": "https://github.com/teamchong/pymode/blob/58854c8911155f9857152ede7476299d8a1dad2f/worker%2Fsrc%2Fpython-do.ts",
+      "raw_url": "https://github.com/teamchong/pymode/raw/58854c8911155f9857152ede7476299d8a1dad2f/worker%2Fsrc%2Fpython-do.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/pymode/contents/worker%2Fsrc%2Fpython-do.ts?ref=58854c8911155f9857152ede7476299d8a1dad2f",
+      "patch": "@@ -40,9 +40,12 @@ const ASYNC_IMPORTS = new Set([\n   \"pymode.kv_get\",\n   \"pymode.kv_put\",\n   \"pymode.kv_delete\",\n+  \"pymode.kv_multi_get\",\n+  \"pymode.kv_multi_put\",\n   \"pymode.r2_get\",\n   \"pymode.r2_put\",\n   \"pymode.d1_exec\",\n+  \"pymode.d1_batch\",\n   \"pymode.thread_spawn\",\n   \"pymode.thread_join\",\n   \"pymode.dl_open\",\n@@ -249,6 +252,80 @@ export class PythonDO extends DurableObject<PythonDOEnv> {\n         }\n       },\n \n+      // --- KV batch (async) ---\n+      // Fetch multiple keys in parallel (Promise.all), one Asyncify suspend\n+      kv_multi_get: async (\n+        keysPtr: number, keysLen: number,\n+        resultPtr: number, resultLen: number\n+      ): Promise<number> => {\n+        try {\n+          const keysJson: string[] = JSON.parse(self.readString(keysPtr, keysLen));\n+          const results = await Promise.all(keysJson.map(async (raw) => {\n+            const [bindingName, key] = parseBindingKey(raw, \"KV\");\n+            const kv = self.env[bindingName] as KVNamespace | undefined;\n+            if (!kv) return null;\n+            const val = await kv.get(key, \"arrayBuffer\");\n+            return val !== null ? new Uint8Array(val) : null;\n+          }));\n+\n+          // Pack: [4B count][for each: [4B len (-1=missing)][data]]\n+          const count = results.length;\n+          let totalLen = 4; // count header\n+          for (const r of results) totalLen += 4 + (r ? r.length : 0);\n+          if (totalLen > resultLen) return -1;\n+\n+          const mem = self.getMemBytes();\n+          const view = new DataView(mem.buffer, resultPtr, totalLen);\n+          view.setInt32(0, count, true);\n+          let offset = 4;\n+          for (const r of results) {\n+            if (r) {\n+              view.setInt32(offset, r.length, true);\n+              offset += 4;\n+              mem.set(r, resultPtr + offset);\n+              offset += r.length;\n+            } else {\n+              view.setInt32(offset, -1, true);\n+              offset += 4;\n+            }\n+          }\n+          return offset;\n+        } catch (e: unknown) {\n+          console.error(\"kv_multi_get error:\", e);\n+          return -1;\n+        }\n+      },\n+\n+      // Write multiple keys in parallel (Promise.all), one Asyncify suspend\n+      kv_multi_put: async (dataPtr: number, dataLen: number): Promise<void> => {\n+        try {\n+          const mem = self.getMemBytes();\n+          const view = new DataView(mem.buffer, dataPtr, dataLen);\n+          const count = view.getInt32(0, true);\n+          let offset = 4;\n+          const ops: Promise<void>[] = [];\n+\n+          for (let i = 0; i < count; i++) {\n+            const keyLen = view.getInt32(offset, true);\n+            offset += 4;\n+            const rawKey = _decoder.decode(mem.subarray(dataPtr + offset, dataPtr + offset + keyLen));\n+            offset += keyLen;\n+            const valLen = view.getInt32(offset, true);\n+            offset += 4;\n+            const val = mem.slice(dataPtr + offset, dataPtr + offset + valLen);\n+            offset += valLen;\n+\n+            const [bindingName, key] = parseBindingKey(rawKey, \"KV\");\n+            const kv = self.env[bindingName] as KVNamespace | undefined;\n+            if (kv) ops.push(kv.put(key, val));\n+          }\n+\n+          await Promise.all(ops);\n+        } catch (e: unknown) {\n+          console.error(\"kv_multi_put error:\", e);\n+        }\n+      },\n+\n       // --- R2 (async) ---\n       r2_get: async (keyPtr: number, keyLen: number, bufPtr: number, bufLen: number): Promise<number> => {\n         try {\n@@ -300,6 +377,37 @@ export class PythonDO extends DurableObject<PythonDOEnv> {\n         }\n       },\n \n+      // Batch multiple SQL statements in one async call (CF db.batch())\n+      d1_batch: async (\n+        queriesPtr: number, queriesLen: number,\n+        resultPtr: number, resultLen: number\n+      ): Promise<number> => {\n+        try {\n+          const queries: Array<{ sql: string; params?: unknown[]; binding?: string }> =\n+            JSON.parse(self.readString(queriesPtr, queriesLen));\n+          if (queries.length === 0) {\n+            const encoded = _encoder.encode(\"[]\");\n+            return self.writeBytes(resultPtr, encoded, resultLen);\n+          }\n+\n+          // Group queries by binding name for batch execution\n+          const bindingName = queries[0].binding || \"D1\";\n+          const d1 = self.env[bindingName] as D1Database | undefined;\n+          if (!d1) return -1;\n+\n+          const stmts = queries.map((q) =>\n+            d1.prepare(q.sql).bind(...(q.params || []))\n+          );\n+          const batchResults = await d1.batch(stmts);\n+          const allResults = batchResults.map((r) => r.results);\n+          const encoded = _encoder.encode(JSON.stringify(allResults));\n+          return self.writeBytes(resultPtr, encoded, resultLen);\n+        } catch (e: unknown) {\n+          console.error(\"d1_batch error:\", e);\n+          return -1;\n+        }\n+      },\n+\n       // --- Environment (sync) ---\n       env_get: (keyPtr: number, keyLen: number, bufPtr: number, bufLen: number): number => {\n         const key = self.readString(keyPtr, keyLen);"
+    },
+    {
+      "sha": "d3bd6a35438ec3d444962419a2cea43deea160fe",
+      "filename": "worker/src/thread-do.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/teamchong/pymode/blob/58854c8911155f9857152ede7476299d8a1dad2f/worker%2Fsrc%2Fthread-do.ts",
+      "raw_url": "https://github.com/teamchong/pymode/raw/58854c8911155f9857152ede7476299d8a1dad2f/worker%2Fsrc%2Fthread-do.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/pymode/contents/worker%2Fsrc%2Fthread-do.ts?ref=58854c8911155f9857152ede7476299d8a1dad2f",
+      "patch": "@@ -59,9 +59,12 @@ export class ThreadDO extends DurableObject<ThreadDOEnv> {\n       kv_get: () => -1,\n       kv_put: () => {},\n       kv_delete: () => {},\n+      kv_multi_get: () => -1,\n+      kv_multi_put: () => {},\n       r2_get: () => -1,\n       r2_put: () => {},\n       d1_exec: () => -1,\n+      d1_batch: () => -1,\n       env_get: () => -1,\n       thread_spawn: () => -1,\n       thread_join: () => -1,"
+    }
+  ]
+}

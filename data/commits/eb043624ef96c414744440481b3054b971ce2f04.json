@@ -1,0 +1,29 @@
+{
+  "message": "fix: compileLikeRegex mishandled SQL escape sequences \\% and \\_, canSkipPage LIKE prefix overflow at U+FFFF\n\nTwo LIKE bugs fixed:\n\n1. compileLikeRegex escaped all regex metacharacters first, then\n   replaced % and _. SQL escape sequences like \\% (literal percent)\n   got broken: the backslash was escaped to \\\\, then % was still\n   treated as wildcard. Now walks char-by-char: \\% \u2192 literal %,\n   \\_ \u2192 literal _, then regex-escapes remaining characters.\n\n2. canSkipPage LIKE prefix computation: charCodeAt(last) + 1\n   overflows when last char is U+FFFF (0xFFFF + 1 = 0x10000 wraps\n   to U+0000 via String.fromCharCode). Now guards with < 0xFFFF\n   check \u2014 skips the prefix-successor test when overflow would occur.",
+  "files": [
+    {
+      "sha": "932835bdc7e6ea95597f36a36e6d1fa8c2587e5b",
+      "filename": "src/decode.test.ts",
+      "status": "modified",
+      "additions": 17,
+      "deletions": 0,
+      "changes": 17,
+      "blob_url": "https://github.com/teamchong/querymode/blob/eb043624ef96c414744440481b3054b971ce2f04/src%2Fdecode.test.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/eb043624ef96c414744440481b3054b971ce2f04/src%2Fdecode.test.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fdecode.test.ts?ref=eb043624ef96c414744440481b3054b971ce2f04",
+      "patch": "@@ -530,6 +530,23 @@ describe(\"matchesFilter\", () => {\n     expect(matchesFilter(\"Alice\", { column: \"x\", op: \"not_like\", value: \"Ali%\" })).toBe(false);\n     expect(matchesFilter(\"alice\", { column: \"x\", op: \"not_like\", value: \"Ali%\" })).toBe(true);\n   });\n+\n+  it(\"LIKE with escaped percent (\\\\%) matches literal %\", () => {\n+    expect(matchesFilter(\"100%\", { column: \"x\", op: \"like\", value: \"100\\\\%\" })).toBe(true);\n+    expect(matchesFilter(\"100abc\", { column: \"x\", op: \"like\", value: \"100\\\\%\" })).toBe(false);\n+    expect(matchesFilter(\"100%done\", { column: \"x\", op: \"like\", value: \"100\\\\%%\"})).toBe(true);\n+  });\n+\n+  it(\"LIKE with escaped underscore (\\\\_) matches literal _\", () => {\n+    expect(matchesFilter(\"a_b\", { column: \"x\", op: \"like\", value: \"a\\\\_b\" })).toBe(true);\n+    expect(matchesFilter(\"axb\", { column: \"x\", op: \"like\", value: \"a\\\\_b\" })).toBe(false);\n+  });\n+\n+  it(\"LIKE with regex metacharacters in pattern\", () => {\n+    expect(matchesFilter(\"hello.world\", { column: \"x\", op: \"like\", value: \"hello.world\" })).toBe(true);\n+    expect(matchesFilter(\"helloXworld\", { column: \"x\", op: \"like\", value: \"hello.world\" })).toBe(false);\n+    expect(matchesFilter(\"(test)\", { column: \"x\", op: \"like\", value: \"(test)\" })).toBe(true);\n+  });\n });\n \n describe(\"bigIntReplacer\", () => {"
+    },
+    {
+      "sha": "3fcca61e57b69018d6f4862fd41bc0afe2328d11",
+      "filename": "src/decode.ts",
+      "status": "modified",
+      "additions": 26,
+      "deletions": 6,
+      "changes": 32,
+      "blob_url": "https://github.com/teamchong/querymode/blob/eb043624ef96c414744440481b3054b971ce2f04/src%2Fdecode.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/eb043624ef96c414744440481b3054b971ce2f04/src%2Fdecode.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fdecode.ts?ref=eb043624ef96c414744440481b3054b971ce2f04",
+      "patch": "@@ -76,9 +76,14 @@ export function canSkipPage(page: PageInfo, filters: QueryDescriptor[\"filters\"],\n         if (typeof filter.value !== \"string\" || typeof min !== \"string\") break;\n         const prefix = extractLikePrefix(filter.value);\n         if (!prefix) break;\n-        // Page max < prefix or page min >= prefix + '\\uffff' \u2192 no match possible\n-        const prefixEnd = prefix.slice(0, -1) + String.fromCharCode(prefix.charCodeAt(prefix.length - 1) + 1);\n-        if ((max as string) < prefix || (min as string) >= prefixEnd) return true;\n+        // Page max < prefix \u2192 no match possible\n+        if ((max as string) < prefix) { return true; }\n+        // Page min >= prefix successor \u2192 no match possible (guard U+FFFF overflow)\n+        const lastCode = prefix.charCodeAt(prefix.length - 1);\n+        if (lastCode < 0xffff) {\n+          const prefixEnd = prefix.slice(0, -1) + String.fromCharCode(lastCode + 1);\n+          if ((min as string) >= prefixEnd) return true;\n+        }\n         break;\n       }\n       // not_like: skip uniform pages where the single value matches the pattern\n@@ -582,9 +587,24 @@ const likeRegexCache = new Map<string, RegExp>();\n export function compileLikeRegex(pattern: string): RegExp {\n   let cached = likeRegexCache.get(pattern);\n   if (cached) return cached;\n-  // Escape regex metacharacters, then replace SQL wildcards\n-  const escaped = pattern.replace(/[.+?^${}()|[\\]\\\\*]/g, \"\\\\$&\");\n-  const re = new RegExp(\"^\" + escaped.replace(/%/g, \".*\").replace(/_/g, \".\") + \"$\", \"s\");\n+  // Walk character-by-character to handle SQL escape sequences (\\%, \\_)\n+  let reStr = \"^\";\n+  for (let i = 0; i < pattern.length; i++) {\n+    const ch = pattern[i];\n+    if (ch === \"\\\\\" && i + 1 < pattern.length) {\n+      // SQL escape: \\% \u2192 literal %, \\_ \u2192 literal _, \\\\ \u2192 literal \\\n+      const next = pattern[++i];\n+      reStr += next.replace(/[.+?^${}()|[\\]\\\\*]/g, \"\\\\$&\");\n+    } else if (ch === \"%\") {\n+      reStr += \".*\";\n+    } else if (ch === \"_\") {\n+      reStr += \".\";\n+    } else {\n+      reStr += ch.replace(/[.+?^${}()|[\\]\\\\*]/g, \"\\\\$&\");\n+    }\n+  }\n+  reStr += \"$\";\n+  const re = new RegExp(reStr, \"s\");\n   likeRegexCache.set(pattern, re);\n   if (likeRegexCache.size > 1000) likeRegexCache.clear(); // prevent unbounded growth\n   return re;"
+    }
+  ]
+}

@@ -1,0 +1,89 @@
+{
+  "message": "Cache TextEncoder/TextDecoder globally, R2 batch delete, parallel tag fetching\n\n- Replace all per-call new TextEncoder/TextDecoder with module-level singletons\n- Use R2 batch delete (array of keys) instead of individual delete calls\n- Batch-fetch tag objects in parallel (50 concurrent) to fix N+1 query",
+  "files": [
+    {
+      "sha": "7a200bf6bde92a17e189169aec309706557c1e0c",
+      "filename": "src/checkout.ts",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 6,
+      "changes": 13,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/78b969b7a641a78a4aaae16651d9cd3df130cc17/src%2Fcheckout.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/78b969b7a641a78a4aaae16651d9cd3df130cc17/src%2Fcheckout.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Fcheckout.ts?ref=78b969b7a641a78a4aaae16651d9cd3df130cc17",
+      "patch": "@@ -14,6 +14,8 @@ import type { Env } from \"./env\";\n import type { ObjectCache } from \"./packfile-reader\";\n import { toHex } from \"./hex\";\n \n+const decoder = new TextDecoder();\n+\n /**\n  * Materialize the tree at `commitSha` into R2 worktree files for `branch`.\n  * If `oldCommitSha` is provided, only writes changed/added files and deletes removed ones.\n@@ -105,7 +107,7 @@ async function getTreeSha(engine: GitEngine, commitSha: string, cache?: ObjectCa\n   if (!commit || commit.type !== OBJ_COMMIT) {\n     throw new Error(`Cannot read commit ${commitSha}`);\n   }\n-  const text = new TextDecoder().decode(commit.content);\n+  const text = decoder.decode(commit.content);\n   const m = text.match(/^tree ([0-9a-f]{40})/m);\n   if (!m) throw new Error(`No tree in commit ${commitSha}`);\n   return m[1];\n@@ -135,8 +137,8 @@ async function walkTree(\n     const nullIdx = data.indexOf(0x00, spaceIdx + 1);\n     if (nullIdx === -1) break;\n \n-    const mode = new TextDecoder().decode(data.subarray(offset, spaceIdx));\n-    const name = new TextDecoder().decode(data.subarray(spaceIdx + 1, nullIdx));\n+    const mode = decoder.decode(data.subarray(offset, spaceIdx));\n+    const name = decoder.decode(data.subarray(spaceIdx + 1, nullIdx));\n     const shaBytes = data.subarray(nullIdx + 1, nullIdx + 21);\n     const sha = toHex(shaBytes);\n \n@@ -175,10 +177,9 @@ async function writeBlobToWorktree(\n  * Delete specific R2 keys.\n  */\n async function deleteKeys(bucket: R2Bucket, keys: string[]): Promise<void> {\n-  // R2 delete supports batches\n+  // R2 delete() accepts an array of up to 1000 keys\n   for (let i = 0; i < keys.length; i += 1000) {\n-    const batch = keys.slice(i, i + 1000);\n-    await Promise.all(batch.map((key) => bucket.delete(key)));\n+    await bucket.delete(keys.slice(i, i + 1000));\n   }\n }\n "
+    },
+    {
+      "sha": "35d5e1c48def931aa5e4c628c52ae866a4308822",
+      "filename": "src/git-engine.ts",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 2,
+      "changes": 7,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/78b969b7a641a78a4aaae16651d9cd3df130cc17/src%2Fgit-engine.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/78b969b7a641a78a4aaae16651d9cd3df130cc17/src%2Fgit-engine.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Fgit-engine.ts?ref=78b969b7a641a78a4aaae16651d9cd3df130cc17",
+      "patch": "@@ -14,6 +14,9 @@ export const OBJ_TREE = 2;\n export const OBJ_COMMIT = 3;\n export const OBJ_TAG = 4;\n \n+const encoder = new TextEncoder();\n+const decoder = new TextDecoder();\n+\n export class GitEngine {\n   private objects: R2Bucket;\n   private repo: string;\n@@ -78,7 +81,7 @@ export class GitEngine {\n   ): { sha1Hex: string; compressed: Uint8Array } {\n     const digest = wasm.hashObject(type, content);\n     const sha1Hex = toHex(digest);\n-    const header = new TextEncoder().encode(\n+    const header = encoder.encode(\n       `${typeToName(type)} ${content.length}\\0`\n     );\n     const full = new Uint8Array(header.length + content.length);\n@@ -156,7 +159,7 @@ export class GitEngine {\n     const nullIdx = raw.indexOf(0x00); // null\n     if (spaceIdx === -1 || nullIdx === -1) return null;\n \n-    const typeStr = new TextDecoder().decode(raw.subarray(0, spaceIdx));\n+    const typeStr = decoder.decode(raw.subarray(0, spaceIdx));\n     const type = nameToType(typeStr);\n     const content = raw.subarray(nullIdx + 1);\n "
+    },
+    {
+      "sha": "03650078f854f4f8729f990e9bdce6d3d71239c9",
+      "filename": "src/git-porcelain.ts",
+      "status": "modified",
+      "additions": 30,
+      "deletions": 17,
+      "changes": 47,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/78b969b7a641a78a4aaae16651d9cd3df130cc17/src%2Fgit-porcelain.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/78b969b7a641a78a4aaae16651d9cd3df130cc17/src%2Fgit-porcelain.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Fgit-porcelain.ts?ref=78b969b7a641a78a4aaae16651d9cd3df130cc17",
+      "patch": "@@ -403,24 +403,37 @@ export class GitPorcelain {\n   /** List all tags. */\n   async listTags(): Promise<TagInfo[]> {\n     const refs = this.engine.listRefs();\n-    const tags: TagInfo[] = [];\n+    const tagRefs: Array<{ name: string; sha: string }> = [];\n     for (const [name, sha] of refs) {\n-      if (!name.startsWith(\"tags/\")) continue;\n-      const tagName = name.slice(5);\n-      const obj = await this.engine.readObject(sha);\n-      if (obj && obj.type === OBJ_TAG) {\n-        const text = decoder.decode(obj.content);\n-        const targetMatch = text.match(/^object ([0-9a-f]{40})/m);\n-        const taggerMatch = text.match(/^tagger (.+?) <.+?>/m);\n-        const msgStart = text.indexOf(\"\\n\\n\");\n-        tags.push({\n-          name: tagName, sha, type: \"annotated\",\n-          target: targetMatch?.[1],\n-          tagger: taggerMatch?.[1],\n-          message: msgStart >= 0 ? text.slice(msgStart + 2) : undefined,\n-        });\n-      } else {\n-        tags.push({ name: tagName, sha, type: \"lightweight\" });\n+      if (name.startsWith(\"tags/\")) {\n+        tagRefs.push({ name: name.slice(5), sha });\n+      }\n+    }\n+    if (tagRefs.length === 0) return [];\n+\n+    // Batch-fetch tag objects in parallel\n+    const CONCURRENCY = 50;\n+    const tags: TagInfo[] = [];\n+    for (let i = 0; i < tagRefs.length; i += CONCURRENCY) {\n+      const batch = tagRefs.slice(i, i + CONCURRENCY);\n+      const fetched = await Promise.all(\n+        batch.map(t => this.engine.readObject(t.sha).then(obj => ({ ...t, obj })))\n+      );\n+      for (const { name, sha, obj } of fetched) {\n+        if (obj && obj.type === OBJ_TAG) {\n+          const text = decoder.decode(obj.content);\n+          const targetMatch = text.match(/^object ([0-9a-f]{40})/m);\n+          const taggerMatch = text.match(/^tagger (.+?) <.+?>/m);\n+          const msgStart = text.indexOf(\"\\n\\n\");\n+          tags.push({\n+            name, sha, type: \"annotated\",\n+            target: targetMatch?.[1],\n+            tagger: taggerMatch?.[1],\n+            message: msgStart >= 0 ? text.slice(msgStart + 2) : undefined,\n+          });\n+        } else {\n+          tags.push({ name, sha, type: \"lightweight\" });\n+        }\n       }\n     }\n     return tags.sort((a, b) => a.name.localeCompare(b.name));"
+    },
+    {
+      "sha": "885f7aa32fd1f2e37aeb7f0e2b2e66a27b154f92",
+      "filename": "src/packfile-reader.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 1,
+      "changes": 4,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/78b969b7a641a78a4aaae16651d9cd3df130cc17/src%2Fpackfile-reader.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/78b969b7a641a78a4aaae16651d9cd3df130cc17/src%2Fpackfile-reader.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Fpackfile-reader.ts?ref=78b969b7a641a78a4aaae16651d9cd3df130cc17",
+      "patch": "@@ -9,6 +9,8 @@\n import type { GitEngine } from \"./git-engine\";\n import { toHex } from \"./hex\";\n \n+const decoder = new TextDecoder();\n+\n // Packfile object types (git pack format)\n const PACK_OBJ_COMMIT = 1;\n const PACK_OBJ_TREE = 2;\n@@ -65,7 +67,7 @@ export async function unpackPackfile(\n \n   // Verify header\n   if (packData.length < 12) throw new Error(\"Packfile too short\");\n-  const sig = new TextDecoder().decode(packData.subarray(0, 4));\n+  const sig = decoder.decode(packData.subarray(0, 4));\n   if (sig !== \"PACK\") throw new Error(\"Invalid packfile signature\");\n \n   const version = readUint32BE(packData, 4);"
+    },
+    {
+      "sha": "5227d233e403b0afbede19a34066267733e8cfed",
+      "filename": "src/repo-store.ts",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 2,
+      "changes": 6,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/78b969b7a641a78a4aaae16651d9cd3df130cc17/src%2Frepo-store.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/78b969b7a641a78a4aaae16651d9cd3df130cc17/src%2Frepo-store.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Frepo-store.ts?ref=78b969b7a641a78a4aaae16651d9cd3df130cc17",
+      "patch": "@@ -15,6 +15,8 @@ import { handleReceivePack } from \"./receive-pack\";\n import { handleInfoRefs } from \"./info-refs\";\n import { GitPorcelain } from \"./git-porcelain\";\n \n+const decoder = new TextDecoder();\n+\n export class RepoStore extends DurableObject<Env> {\n   private sql: SqlStorage;\n \n@@ -205,7 +207,7 @@ async function handleApiAction(\n       const content = await porcelain.catFile(ref, path);\n       if (!content) return Response.json({ error: \"not found\" }, { status: 404 });\n       // Return as base64 for binary safety\n-      const text = new TextDecoder().decode(content);\n+      const text = decoder.decode(content);\n       return Response.json({ content: text, size: content.length });\n     }\n \n@@ -452,7 +454,7 @@ async function handleApiAction(\n       return Response.json({\n         type: typeNames[obj.type] ?? \"unknown\",\n         size: obj.content.length,\n-        content: new TextDecoder().decode(obj.content),\n+        content: decoder.decode(obj.content),\n       });\n     }\n "
+    },
+    {
+      "sha": "26ceb941ebc1ebec2c5a2b67972b28b718cd2d3e",
+      "filename": "src/upload-pack.ts",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/78b969b7a641a78a4aaae16651d9cd3df130cc17/src%2Fupload-pack.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/78b969b7a641a78a4aaae16651d9cd3df130cc17/src%2Fupload-pack.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Fupload-pack.ts?ref=78b969b7a641a78a4aaae16651d9cd3df130cc17",
+      "patch": "@@ -160,7 +160,7 @@ async function collectObjects(\n \n         if (type === 3) {\n           // Commit \u2014 parse tree and parent refs\n-          const text = new TextDecoder().decode(content);\n+          const text = decoder.decode(content);\n           const lines = text.split(\"\\n\");\n           for (const line of lines) {\n             if (line.startsWith(\"tree \")) {\n@@ -188,7 +188,7 @@ async function collectObjects(\n           }\n         } else if (type === 4) {\n           // Tag \u2014 parse object ref\n-          const text = new TextDecoder().decode(content);\n+          const text = decoder.decode(content);\n           const objLine = text.split(\"\\n\").find((l) => l.startsWith(\"object \"));\n           if (objLine) nextFrontier.push(objLine.slice(7, 47));\n         }"
+    },
+    {
+      "sha": "74a669cdb99c28582b047631cc64e4ade795aeda",
+      "filename": "src/wasm-engine.ts",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 3,
+      "changes": 9,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/78b969b7a641a78a4aaae16651d9cd3df130cc17/src%2Fwasm-engine.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/78b969b7a641a78a4aaae16651d9cd3df130cc17/src%2Fwasm-engine.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Fwasm-engine.ts?ref=78b969b7a641a78a4aaae16651d9cd3df130cc17",
+      "patch": "@@ -6,6 +6,9 @@\n import wasmModule from \"./wasm-module\";\n import { toHex } from \"./hex\";\n \n+const textEncoder = new TextEncoder();\n+const textDecoder = new TextDecoder();\n+\n export interface WasmExports {\n   memory: WebAssembly.Memory;\n \n@@ -185,7 +188,7 @@ function createWasiShims() {\n         const ptr = memory.getUint32(iovsPtr + i * 8, true);\n         const len = memory.getUint32(iovsPtr + i * 8 + 4, true);\n         const bytes = memU8.slice(ptr, ptr + len);\n-        const text = new TextDecoder().decode(bytes);\n+        const text = textDecoder.decode(bytes);\n         if (fd === 1 || fd === 2) {\n           console.log(\"[wasm]\", text);\n         }\n@@ -325,7 +328,7 @@ export class WasmEngine {\n   }\n \n   writeString(s: string): { ptr: number; len: number } {\n-    const encoded = new TextEncoder().encode(s);\n+    const encoded = textEncoder.encode(s);\n     const ptr = this.writeBytes(encoded);\n     return { ptr, len: encoded.length };\n   }\n@@ -335,7 +338,7 @@ export class WasmEngine {\n   }\n \n   readString(ptr: number, len: number): string {\n-    return new TextDecoder().decode(\n+    return textDecoder.decode(\n       new Uint8Array(this.exports.memory.buffer, ptr, len)\n     );\n   }"
+    }
+  ]
+}

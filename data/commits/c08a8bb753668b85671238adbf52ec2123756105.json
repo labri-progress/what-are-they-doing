@@ -1,0 +1,41 @@
+{
+  "message": "fix(node): harden cancellation GC, fork detection state tracking, and retroactive hardening level computation\n\nCancellation protocol (cancellation_protocol.rs):\n- Replace push_bounded (which blindly drops the oldest record regardless\n  of state) with a two-phase GC: first retain only non-Finalized records,\n  then if still at capacity drain the oldest active records as a last-resort\n  OOM defense. This prevents dropping in-flight cancellation records that\n  are still being coordinated while preferring to evict completed ones.\n\nFork detection (fork_detection.rs):\n- Update self.last_known to the incoming StateVector before returning\n  RfdGapDetected, so subsequent feed() calls detect gaps relative to the\n  most recent observation rather than the stale pre-gap state. Without\n  this, a detector that saw epoch 1 then 3 would continue reporting\n  gap-from-1 on every subsequent call instead of advancing.\n\nRetroactive hardening (retroactive_hardening.rs):\n- Account for an object's creation_level when computing required\n  protections: use effective_from = max(from_level, creation_level) so\n  objects natively created at a higher hardening level don't receive\n  redundant lower-level artifacts. Applies to both harden() (level\n  escalation) and ensure_protections() (single-level enforcement).\n- Add test_harden_object_already_at_target_creation_level verifying that\n  an Enhanced-creation object produces no artifacts when escalated from\n  Baseline to Standard.\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "ec19d733820356d7de181470ee71f3a6252583c0",
+      "filename": "crates/franken-node/src/control_plane/cancellation_protocol.rs",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 1,
+      "changes": 15,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/c08a8bb753668b85671238adbf52ec2123756105/crates%2Ffranken-node%2Fsrc%2Fcontrol_plane%2Fcancellation_protocol.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/c08a8bb753668b85671238adbf52ec2123756105/crates%2Ffranken-node%2Fsrc%2Fcontrol_plane%2Fcancellation_protocol.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fcontrol_plane%2Fcancellation_protocol.rs?ref=c08a8bb753668b85671238adbf52ec2123756105",
+      "patch": "@@ -488,7 +488,20 @@ impl CancellationProtocol {\n             &format!(\"cancel requested, {} in-flight\", in_flight_count),\n         ));\n \n-        push_bounded(&mut self.records, record, DEFAULT_MAX_RECORDS);\n+        // Garbage collect only finalized records if we are at capacity\n+        if self.records.len() >= DEFAULT_MAX_RECORDS {\n+            // Retain active records, and try to make room\n+            self.records.retain(|r| r.current_phase != CancelPhase::Finalized);\n+            \n+            // If we still have too many (i.e. all active), we are forced to drop the oldest active \n+            // as a last resort DOS defense to prevent OOM\n+            if self.records.len() >= DEFAULT_MAX_RECORDS {\n+                let overflow = self.records.len() - DEFAULT_MAX_RECORDS + 1;\n+                self.records.drain(0..overflow);\n+            }\n+        }\n+        self.records.push(record);\n+\n         self.records\n             .last()\n             .ok_or_else(|| CancelProtocolError::InvariantViolation {"
+    },
+    {
+      "sha": "c716dd6fc9b6964e6db6c1aa0375a04e419de62f",
+      "filename": "crates/franken-node/src/control_plane/fork_detection.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 1,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/c08a8bb753668b85671238adbf52ec2123756105/crates%2Ffranken-node%2Fsrc%2Fcontrol_plane%2Ffork_detection.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/c08a8bb753668b85671238adbf52ec2123756105/crates%2Ffranken-node%2Fsrc%2Fcontrol_plane%2Ffork_detection.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fcontrol_plane%2Ffork_detection.rs?ref=c08a8bb753668b85671238adbf52ec2123756105",
+      "patch": "@@ -579,8 +579,10 @@ impl RollbackDetector {\n                 });\n             }\n             if sv.epoch > last.epoch + 1 {\n+                let local_epoch = last.epoch;\n+                self.last_known = Some(sv.clone());\n                 return Err(ForkDetectionError::RfdGapDetected {\n-                    local_epoch: last.epoch,\n+                    local_epoch,\n                     remote_epoch: sv.epoch,\n                 });\n             }"
+    },
+    {
+      "sha": "9fb5d683d46b871ddc3a49bb8e47f0356d6ba0e1",
+      "filename": "crates/franken-node/src/policy/retroactive_hardening.rs",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 3,
+      "changes": 17,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/c08a8bb753668b85671238adbf52ec2123756105/crates%2Ffranken-node%2Fsrc%2Fpolicy%2Fretroactive_hardening.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/c08a8bb753668b85671238adbf52ec2123756105/crates%2Ffranken-node%2Fsrc%2Fpolicy%2Fretroactive_hardening.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fpolicy%2Fretroactive_hardening.rs?ref=c08a8bb753668b85671238adbf52ec2123756105",
+      "patch": "@@ -258,11 +258,12 @@ impl RetroactiveHardeningPipeline {\n         from_level: HardeningLevel,\n         to_level: HardeningLevel,\n     ) -> Vec<ProtectionArtifact> {\n-        if to_level <= from_level {\n+        let effective_from = from_level.max(object.creation_level);\n+        if to_level <= effective_from {\n             return Vec::new();\n         }\n \n-        let existing = required_protections(from_level);\n+        let existing = required_protections(effective_from);\n         let target = required_protections(to_level);\n \n         // Determine which new protection types are needed\n@@ -397,7 +398,8 @@ impl RetroactiveHardeningPipeline {\n         object: &CanonicalObject,\n         level: HardeningLevel,\n     ) -> Vec<ProtectionArtifact> {\n-        required_protections(level)\n+        let effective_level = level.max(object.creation_level);\n+        required_protections(effective_level)\n             .into_iter()\n             .map(|ptype| {\n                 let data = self.generate_artifact_data(object, ptype);\n@@ -680,6 +682,15 @@ mod tests {\n         assert!(artifacts.is_empty());\n     }\n \n+    #[test]\n+    fn test_harden_object_already_at_target_creation_level() {\n+        let obj = CanonicalObject::new(\"obj-enhanced\", vec![0x00; 32], HardeningLevel::Enhanced);\n+        // Even if the system is at Baseline and escalates to Standard, \n+        // the object was natively created at Enhanced and thus needs no Standard artifacts.\n+        let artifacts = pipeline().harden(&obj, HardeningLevel::Baseline, HardeningLevel::Standard);\n+        assert!(artifacts.is_empty());\n+    }\n+\n     #[test]\n     fn test_harden_artifact_ids_contain_object_id() {\n         let obj = test_object(\"obj-xyz\");"
+    }
+  ]
+}

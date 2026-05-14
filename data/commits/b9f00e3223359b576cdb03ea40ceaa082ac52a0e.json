@@ -1,0 +1,237 @@
+{
+  "message": "fix(ffs-core): harden verify_ext4_integrity against corrupted superblocks\n\nThree real defects exposed by libFuzzer mutating the existing\nfuzz_verify_ext4_integrity corpus on top of new structured seeds:\n\n1. Divide-by-zero panic at lib.rs:19019 when a corrupted superblock\n   advertises inodes_per_group == 0. The per-inode loop divides by\n   it on every iteration. Reproduced by the existing seed_clean\n   input \"verify-ext4-integrity-clean\\n\", which hits CorruptGroupDesc\n   mode and zeros downstream fields.\n\n   Fix: emit a \"inodes_per_group\" failure verdict and skip the\n   inode-checksum scan; the level-1/level-2 verdicts and posterior\n   summary still run.\n\n2. OOM building the per-inode iteration list: ino_list was a Vec\n   eagerly populated with `start..end` where end could approach\n   inodes_count + check_limit \u2248 u32::MAX. Each iteration push()'d a\n   u32, so a malicious image could allocate ~16 GiB before the\n   per-iteration check_limit guard fired.\n\n   Fix: replace the eager Vec<u32> with a chained iterator\n   (`once(2).chain((start..end).filter(|&i| i != 2))`). Same\n   semantics, no upfront allocation.\n\n3. OOM in the group-descriptor scan: `for g in 0..groups_count`\n   pushed up to u32::MAX failure verdicts (each a CheckVerdict\n   with formatted strings, ~150 B). 4 billion iterations OOM'd\n   the verifier itself.\n\n   Fix: cap the scan at MAX_GROUPS_VERIFIED = 65536 (covers a\n   16-PiB filesystem at default 4 KiB-block geometry) and emit a\n   single \"groups_count\" failure verdict when truncating.\n\nAll 7 existing verify_ext4_integrity unit tests still pass.\n\nAdd 20 structured seeds covering each SeedImage mode \u00d7 focused\nmutation kind \u00d7 max_inodes class \u00d7 extra-bool branch, exercising\nthe newly-guarded code paths under fuzz coverage.",
+  "files": [
+    {
+      "sha": "cecf9ca42beb21652b9867bec49e016be251ee6b",
+      "filename": "crates/ffs-core/src/lib.rs",
+      "status": "modified",
+      "additions": 50,
+      "deletions": 16,
+      "changes": 66,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/crates%2Fffs-core%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/crates%2Fffs-core%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/crates%2Fffs-core%2Fsrc%2Flib.rs?ref=b9f00e3223359b576cdb03ea40ceaa082ac52a0e",
+      "patch": "@@ -18885,9 +18885,29 @@ pub fn verify_ext4_integrity(image: &[u8], max_inodes: u32) -> Result<IntegrityR\n \n     // \u2500\u2500 Level 2: Group descriptor checksums \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n     let csum_seed = sb.csum_seed();\n-    let groups_count = sb.groups_count();\n+    let raw_groups_count = sb.groups_count();\n     let desc_size = sb.group_desc_size();\n \n+    // Cap the group-descriptor scan: a corrupted superblock advertising\n+    // u32::MAX groups previously caused this loop to push billions of\n+    // failure verdicts before returning, OOM-ing the integrity checker\n+    // itself. 65536 groups covers a 16-PiB filesystem at default\n+    // 4 KiB-block geometry; anything larger is malformed and the\n+    // truncated scan still surfaces the corruption via the verdict\n+    // added below.\n+    const MAX_GROUPS_VERIFIED: u32 = 65_536;\n+    let groups_count = raw_groups_count.min(MAX_GROUPS_VERIFIED);\n+    if raw_groups_count > MAX_GROUPS_VERIFIED {\n+        verdicts.push(CheckVerdict {\n+            component: \"groups_count\".to_owned(),\n+            passed: false,\n+            detail: format!(\n+                \"superblock advertises {raw_groups_count} groups; capped scan at {MAX_GROUPS_VERIFIED}\"\n+            ),\n+        });\n+        failed = failed.saturating_add(1);\n+    }\n+\n     for g in 0..groups_count {\n         let group = ffs_types::GroupNumber(g);\n         let Some(gd_off) = sb.group_desc_offset(group) else {\n@@ -18995,22 +19015,36 @@ pub fn verify_ext4_integrity(image: &[u8], max_inodes: u32) -> Result<IntegrityR\n     let mut inode_bitmap_cache: std::collections::HashMap<u32, Vec<u8>> =\n         std::collections::HashMap::new();\n \n-    // Check inodes: root (2), then first_ino..first_ino+check_limit\n-    let ino_list: Vec<u32> = {\n-        let mut v = vec![2_u32]; // root inode\n-        let start = first_ino.max(2);\n-        let end = start\n-            .saturating_add(check_limit)\n-            .min(inodes_count.saturating_add(1));\n-        for i in start..end {\n-            if i != 2 {\n-                v.push(i);\n-            }\n-        }\n-        v\n-    };\n+    // Iterate inodes lazily: root (2), then first_ino..first_ino+check_limit.\n+    // Materialising this as a Vec was vulnerable to OOM when a corrupted\n+    // superblock advertised inodes_count near u32::MAX \u2014 the eager push\n+    // allocated ~16 GiB before the per-iteration check_limit guard fired.\n+    let inode_iter_start = first_ino.max(2);\n+    let inode_iter_end = inode_iter_start\n+        .saturating_add(check_limit)\n+        .min(inodes_count.saturating_add(1));\n+    let ino_iter = std::iter::once(2_u32)\n+        .chain((inode_iter_start..inode_iter_end).filter(|&i| i != 2));\n+\n+    // Guard against a corrupted superblock advertising inodes_per_group == 0:\n+    // every per-inode iteration below divides by it, so a malformed image\n+    // would otherwise crash the integrity check itself. Record the failure\n+    // and skip the inode-checksum scan; the posterior summary downstream\n+    // still runs over whatever level-1/level-2 verdicts have been collected.\n+    let inodes_per_group = sb.inodes_per_group;\n+    if inodes_per_group == 0 {\n+        verdicts.push(CheckVerdict {\n+            component: \"inodes_per_group\".to_owned(),\n+            passed: false,\n+            detail: \"superblock advertises zero inodes per group\".to_owned(),\n+        });\n+        failed = failed.saturating_add(1);\n+    }\n \n-    for &ino in &ino_list {\n+    for ino in ino_iter {\n+        if inodes_per_group == 0 {\n+            break;\n+        }\n         if inodes_checked >= u64::from(check_limit) {\n             break;\n         }"
+    },
+    {
+      "sha": "de39cd97b0a77ba419f7932f5d0bcdd9e5363783",
+      "filename": "fuzz/corpus/fuzz_verify_ext4_integrity/struct_clean_each_kind",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_clean_each_kind",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_clean_each_kind",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_clean_each_kind?ref=b9f00e3223359b576cdb03ea40ceaa082ac52a0e"
+    },
+    {
+      "sha": "029072a4beae6f97252aa61ebee150d8f4f3735b",
+      "filename": "fuzz/corpus/fuzz_verify_ext4_integrity/struct_clean_max_focused_byte_mutations",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_clean_max_focused_byte_mutations",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_clean_max_focused_byte_mutations",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_clean_max_focused_byte_mutations?ref=b9f00e3223359b576cdb03ea40ceaa082ac52a0e"
+    },
+    {
+      "sha": "928045f83642f0c85ae748eb0674305c7d774077",
+      "filename": "fuzz/corpus/fuzz_verify_ext4_integrity/struct_clean_max_wide",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_clean_max_wide",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_clean_max_wide",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_clean_max_wide?ref=b9f00e3223359b576cdb03ea40ceaa082ac52a0e"
+    },
+    {
+      "sha": "f66c9cf4c9672fa2832bce76f4082fd97b823506",
+      "filename": "fuzz/corpus/fuzz_verify_ext4_integrity/struct_clean_no_mutations",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_clean_no_mutations",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_clean_no_mutations",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_clean_no_mutations?ref=b9f00e3223359b576cdb03ea40ceaa082ac52a0e"
+    },
+    {
+      "sha": "d93b9341d168f8c2af8cf089fae1a03d048d9d1c",
+      "filename": "fuzz/corpus/fuzz_verify_ext4_integrity/struct_clean_wide_only",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_clean_wide_only",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_clean_wide_only",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_clean_wide_only?ref=b9f00e3223359b576cdb03ea40ceaa082ac52a0e"
+    },
+    {
+      "sha": "86906d2f2176b77221aa6575cf6b92b619fd637d",
+      "filename": "fuzz/corpus/fuzz_verify_ext4_integrity/struct_corrupt_gd_no_muts",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_corrupt_gd_no_muts",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_corrupt_gd_no_muts",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_corrupt_gd_no_muts?ref=b9f00e3223359b576cdb03ea40ceaa082ac52a0e"
+    },
+    {
+      "sha": "59c36c64b0847e574e2d118e7365f446a8f54bf2",
+      "filename": "fuzz/corpus/fuzz_verify_ext4_integrity/struct_corrupt_sb_no_muts",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_corrupt_sb_no_muts",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_corrupt_sb_no_muts",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_corrupt_sb_no_muts?ref=b9f00e3223359b576cdb03ea40ceaa082ac52a0e"
+    },
+    {
+      "sha": "00315ca75a079c44766953b32e401e5f85284b6d",
+      "filename": "fuzz/corpus/fuzz_verify_ext4_integrity/struct_dirty_no_muts_no_set",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_dirty_no_muts_no_set",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_dirty_no_muts_no_set",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_dirty_no_muts_no_set?ref=b9f00e3223359b576cdb03ea40ceaa082ac52a0e"
+    },
+    {
+      "sha": "ba754d9502fa7f8eaff64975e34dc438639f6e21",
+      "filename": "fuzz/corpus/fuzz_verify_ext4_integrity/struct_dirty_no_muts_set_state",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_dirty_no_muts_set_state",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_dirty_no_muts_set_state",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_dirty_no_muts_set_state?ref=b9f00e3223359b576cdb03ea40ceaa082ac52a0e"
+    },
+    {
+      "sha": "eeee6594c7f84378fca7605dea2485ba502aa5bc",
+      "filename": "fuzz/corpus/fuzz_verify_ext4_integrity/struct_max_inodes_medium",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_max_inodes_medium",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_max_inodes_medium",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_max_inodes_medium?ref=b9f00e3223359b576cdb03ea40ceaa082ac52a0e"
+    },
+    {
+      "sha": "3f4526e2d691e5b7c289590aaa0dfa71edb6b592",
+      "filename": "fuzz/corpus/fuzz_verify_ext4_integrity/struct_max_inodes_small",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_max_inodes_small",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_max_inodes_small",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_max_inodes_small?ref=b9f00e3223359b576cdb03ea40ceaa082ac52a0e"
+    },
+    {
+      "sha": "733c3e4f134dd4ce0362e493da7d928a2ff2d291",
+      "filename": "fuzz/corpus/fuzz_verify_ext4_integrity/struct_max_inodes_u32_max",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_max_inodes_u32_max",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_max_inodes_u32_max",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_max_inodes_u32_max?ref=b9f00e3223359b576cdb03ea40ceaa082ac52a0e"
+    },
+    {
+      "sha": "cbc800dddef26c0ef5caf484c694d88deafe19b7",
+      "filename": "fuzz/corpus/fuzz_verify_ext4_integrity/struct_max_inodes_u32_zero",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_max_inodes_u32_zero",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_max_inodes_u32_zero",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_max_inodes_u32_zero?ref=b9f00e3223359b576cdb03ea40ceaa082ac52a0e"
+    },
+    {
+      "sha": "f66c9cf4c9672fa2832bce76f4082fd97b823506",
+      "filename": "fuzz/corpus/fuzz_verify_ext4_integrity/struct_max_inodes_zero",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_max_inodes_zero",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_max_inodes_zero",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_max_inodes_zero?ref=b9f00e3223359b576cdb03ea40ceaa082ac52a0e"
+    },
+    {
+      "sha": "09f370e38f498a462e1ca0faa724559b6630c04f",
+      "filename": "fuzz/corpus/fuzz_verify_ext4_integrity/struct_raw_only_selector",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_raw_only_selector",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_raw_only_selector",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_raw_only_selector?ref=b9f00e3223359b576cdb03ea40ceaa082ac52a0e"
+    },
+    {
+      "sha": "88a1b2c66c5ceca14661d6be409092f862468e5e",
+      "filename": "fuzz/corpus/fuzz_verify_ext4_integrity/struct_raw_tiny_with_magic",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_raw_tiny_with_magic",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_raw_tiny_with_magic",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_raw_tiny_with_magic?ref=b9f00e3223359b576cdb03ea40ceaa082ac52a0e"
+    },
+    {
+      "sha": "55d3307859a0da9380948ebc1016ecd8f97833f3",
+      "filename": "fuzz/corpus/fuzz_verify_ext4_integrity/struct_raw_with_magic_only",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_raw_with_magic_only",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_raw_with_magic_only",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_raw_with_magic_only?ref=b9f00e3223359b576cdb03ea40ceaa082ac52a0e"
+    },
+    {
+      "sha": "df915c0dd58440d6db310cb5ea904a868bd6b786",
+      "filename": "fuzz/corpus/fuzz_verify_ext4_integrity/struct_truncated_to_1024",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_truncated_to_1024",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_truncated_to_1024",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_truncated_to_1024?ref=b9f00e3223359b576cdb03ea40ceaa082ac52a0e"
+    },
+    {
+      "sha": "b3da4f0a76c6f139c923dfa6db9c98cf82b75799",
+      "filename": "fuzz/corpus/fuzz_verify_ext4_integrity/struct_truncated_to_2048",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_truncated_to_2048",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_truncated_to_2048",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_truncated_to_2048?ref=b9f00e3223359b576cdb03ea40ceaa082ac52a0e"
+    },
+    {
+      "sha": "5682a1a36a70c66b188480c60c5bbc261cbd9af3",
+      "filename": "fuzz/corpus/fuzz_verify_ext4_integrity/struct_truncated_to_zero",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_truncated_to_zero",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/b9f00e3223359b576cdb03ea40ceaa082ac52a0e/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_truncated_to_zero",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/fuzz%2Fcorpus%2Ffuzz_verify_ext4_integrity%2Fstruct_truncated_to_zero?ref=b9f00e3223359b576cdb03ea40ceaa082ac52a0e"
+    }
+  ]
+}

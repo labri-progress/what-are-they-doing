@@ -1,0 +1,29 @@
+{
+  "message": "fix(ad): correct Cholesky VJP diagonal factor and back-substitution direction\n\nFix two bugs in the Cholesky backward pass:\n1. The \u03a6 operator was missing the 1/2 diagonal factor from Murray 2016\n   (accounting for L appearing in both L and L^T of A = LL^T). Add\n   explicit diagonal halving after tril(L^T @ G).\n2. The X @ L^{-1} computation used forward substitution with L instead\n   of back-substitution with L^T. Fix to iterate in reverse and use\n   L^T entries.\n\nUn-ignore the cholesky_vjp_numerical_2x2 test and fix its numerical\ngradient: off-diagonal perturbations affect both A[i,j] and A[j,i]\nin the symmetric matrix, so divide by 2 to get the per-element gradient.\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "ffcdaa102b293bd63536839038378720fc9ebd0e",
+      "filename": "crates/fj-ad/src/lib.rs",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 10,
+      "changes": 25,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenjax/blob/6e7900954c726a3b6de4a932147555f0aafb2153/crates%2Ffj-ad%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenjax/raw/6e7900954c726a3b6de4a932147555f0aafb2153/crates%2Ffj-ad%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenjax/contents/crates%2Ffj-ad%2Fsrc%2Flib.rs?ref=6e7900954c726a3b6de4a932147555f0aafb2153",
+      "patch": "@@ -3733,8 +3733,13 @@ fn cholesky_vjp(inputs: &[Value], g: &Value) -> Result<Vec<Value>, AdError> {\n     let lt = transpose_f64(n, n, &l);\n     let lt_g = matmul_f64(n, n, n, &lt, &g_data);\n \n-    // Step 2: tril(L^T @ G)\n-    let lt_g_tril = tril_f64(n, &lt_g);\n+    // Step 2: \u03a6(L^T @ G) where \u03a6 keeps lower triangle and halves diagonal\n+    // (Murray 2016: the diagonal factor of 1/2 accounts for L appearing in both\n+    // L and L^T of A = LL^T)\n+    let mut lt_g_tril = tril_f64(n, &lt_g);\n+    for i in 0..n {\n+        lt_g_tril[i * n + i] *= 0.5;\n+    }\n \n     // Step 3: Solve L^T S = tril(L^T G) for S using triangular solve\n     // Then solve L^T R = S^T for R\n@@ -3754,20 +3759,20 @@ fn cholesky_vjp(inputs: &[Value], g: &Value) -> Result<Vec<Value>, AdError> {\n         }\n     }\n \n-    // Now compute X @ L^{-1} = X @ (L^T)^{-T}\n-    // Solve L Y^T = X^T: forward substitution\n+    // Now compute X @ L^{-1}: solve Z L = X, equivalently L^T Z^T = X^T\n+    // Back substitution with L^T\n     let xt = transpose_f64(n, n, &x);\n-    let mut yt = vec![0.0_f64; n * n];\n+    let mut zt = vec![0.0_f64; n * n];\n     for col in 0..n {\n-        for i in 0..n {\n+        for i in (0..n).rev() {\n             let mut sum = xt[i * n + col];\n-            for k in 0..i {\n-                sum -= l[i * n + k] * yt[k * n + col];\n+            for k in (i + 1)..n {\n+                sum -= lt[i * n + k] * zt[k * n + col];\n             }\n-            yt[i * n + col] = sum / l[i * n + i];\n+            zt[i * n + col] = sum / lt[i * n + i];\n         }\n     }\n-    let result = transpose_f64(n, n, &yt);\n+    let result = transpose_f64(n, n, &zt);\n \n     // Step 4: Symmetrize\n     let da = symmetrize_f64(n, &result);"
+    },
+    {
+      "sha": "d87d87bee88f582f6d9212958c7ee79da0cb62b1",
+      "filename": "crates/fj-conformance/tests/ad_numerical_verification.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 6,
+      "changes": 13,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenjax/blob/6e7900954c726a3b6de4a932147555f0aafb2153/crates%2Ffj-conformance%2Ftests%2Fad_numerical_verification.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenjax/raw/6e7900954c726a3b6de4a932147555f0aafb2153/crates%2Ffj-conformance%2Ftests%2Fad_numerical_verification.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenjax/contents/crates%2Ffj-conformance%2Ftests%2Fad_numerical_verification.rs?ref=6e7900954c726a3b6de4a932147555f0aafb2153",
+      "patch": "@@ -75,12 +75,7 @@ fn assert_gradients_close(analytical: &[f64], numerical: &[f64], tol: f64, conte\n \n // ======================== Cholesky VJP ========================\n \n-/// Cholesky VJP numerical check \u2014 currently shows a discrepancy between analytical\n-/// and numerical gradients. The numerical value matches hand computation, suggesting\n-/// the Cholesky VJP formula may have a symmetrization convention issue.\n-/// Filed as bead frankenjax-cix for investigation.\n #[test]\n-#[ignore]\n #[allow(clippy::needless_range_loop)]\n fn cholesky_vjp_numerical_2x2() {\n     let a_data = [4.0, 2.0, 2.0, 3.0];\n@@ -149,7 +144,13 @@ fn cholesky_vjp_numerical_2x2() {\n             std::slice::from_ref(&g_l),\n             &BTreeMap::new(),\n         );\n-        numerical[idx] = (l_plus - l_minus) / (2.0 * eps);\n+        let mut grad = (l_plus - l_minus) / (2.0 * eps);\n+        // Off-diagonal: we perturbed both A[i,j] and A[j,i], so the numerical\n+        // gradient is 2x the per-element gradient. Divide by 2 to get bar_A[i,j].\n+        if row != col {\n+            grad *= 0.5;\n+        }\n+        numerical[idx] = grad;\n     }\n \n     assert_gradients_close(&analytical, &numerical, 1e-4, \"Cholesky VJP\");"
+    }
+  ]
+}

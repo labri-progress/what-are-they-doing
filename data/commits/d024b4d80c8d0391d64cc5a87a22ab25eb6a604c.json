@@ -1,0 +1,53 @@
+{
+  "message": "fix: 6 correctness bugs \u2014 COUNT(col) nulls, merge offset, GROUP BY types, Welford variance, pipeStages\n\n- sql/executor.ts: COUNT(column) now excludes nulls (was counting all rows)\n- merge.ts: apply offset in unsorted multi-fragment merge path (was ignored)\n- partial-agg.ts: GROUP BY keys use null sentinel to distinguish null from \"\"\n- partial-agg.ts: finalize restores numeric types for group-by column values\n- partial-agg.ts: Welford's online algorithm for variance/stddev (was naive sum-of-squares with catastrophic cancellation)\n- partial-agg.ts: parallel Welford merge (delta^2 * nA * nB / (nA + nB))\n- operators.ts: buildPipeline now applies pipeStages (was only in buildEdgePipeline)",
+  "files": [
+    {
+      "sha": "bfa92ae3de50553f1e2420e6b7f709f04c85b456",
+      "filename": "src/merge.ts",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 11,
+      "changes": 17,
+      "blob_url": "https://github.com/teamchong/querymode/blob/d024b4d80c8d0391d64cc5a87a22ab25eb6a604c/src%2Fmerge.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/d024b4d80c8d0391d64cc5a87a22ab25eb6a604c/src%2Fmerge.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fmerge.ts?ref=d024b4d80c8d0391d64cc5a87a22ab25eb6a604c",
+      "patch": "@@ -158,19 +158,14 @@ export function mergeQueryResults(\n     };\n   }\n \n-  // Unsorted: limit-aware concat with early termination\n+  // Unsorted: concat with offset + limit\n   let rows: Row[];\n-  if (query.limit) {\n-    rows = [];\n-    for (const p of partials) {\n-      for (const row of p.rows) {\n-        rows.push(row);\n-        if (rows.length >= query.limit) break;\n-      }\n-      if (rows.length >= query.limit) break;\n-    }\n+  const allRows = partials.flatMap((p) => p.rows);\n+  const off = query.offset ?? 0;\n+  if (off > 0 || query.limit !== undefined) {\n+    rows = allRows.slice(off, query.limit !== undefined ? off + query.limit : undefined);\n   } else {\n-    rows = partials.flatMap((p) => p.rows);\n+    rows = allRows;\n   }\n \n   return {"
+    },
+    {
+      "sha": "a1ffefaca331e0e34e3a8bd5f280b5bd9766c1f7",
+      "filename": "src/operators.ts",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 0,
+      "changes": 7,
+      "blob_url": "https://github.com/teamchong/querymode/blob/d024b4d80c8d0391d64cc5a87a22ab25eb6a604c/src%2Foperators.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/d024b4d80c8d0391d64cc5a87a22ab25eb6a604c/src%2Foperators.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Foperators.ts?ref=d024b4d80c8d0391d64cc5a87a22ab25eb6a604c",
+      "patch": "@@ -2902,6 +2902,13 @@ export function buildPipeline(\n     pipeline = new ComputedColumnOperator(pipeline, query.computedColumns);\n   }\n \n+  // User-injected pipe stages (inserted after filter/computed, before agg/sort)\n+  if (query.pipeStages) {\n+    for (const stage of query.pipeStages) {\n+      pipeline = stage(pipeline);\n+    }\n+  }\n+\n   // Window functions\n   if (query.windows && query.windows.length > 0) {\n     pipeline = new WindowOperator(pipeline, query.windows);"
+    },
+    {
+      "sha": "26697e782de968371a34624488d4f60f3031570c",
+      "filename": "src/partial-agg.ts",
+      "status": "modified",
+      "additions": 39,
+      "deletions": 18,
+      "changes": 57,
+      "blob_url": "https://github.com/teamchong/querymode/blob/d024b4d80c8d0391d64cc5a87a22ab25eb6a604c/src%2Fpartial-agg.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/d024b4d80c8d0391d64cc5a87a22ab25eb6a604c/src%2Fpartial-agg.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fpartial-agg.ts?ref=d024b4d80c8d0391d64cc5a87a22ab25eb6a604c",
+      "patch": "@@ -25,8 +25,8 @@ export interface PartialAggState {\n   count: number;\n   min: number;\n   max: number;\n-  /** For stddev/variance: sum of squared values (Welford's online algorithm) */\n-  sumSq?: number;\n+  /** For stddev/variance: Welford's M2 = sum of squared deviations from mean */\n+  m2?: number;\n   /** For median/percentile: collected values (exact mode) */\n   values?: number[];\n   /** For count_distinct: set of seen values */\n@@ -41,7 +41,7 @@ export function initPartialAggState(\n   opts?: { percentileTarget?: number },\n ): PartialAggState {\n   const state: PartialAggState = { fn, column, sum: 0, count: 0, min: Infinity, max: -Infinity };\n-  if (fn === \"stddev\" || fn === \"variance\") state.sumSq = 0;\n+  if (fn === \"stddev\" || fn === \"variance\") state.m2 = 0;\n   if (fn === \"median\" || fn === \"percentile\") {\n     state.values = [];\n     if (fn === \"percentile\" && opts?.percentileTarget !== undefined) {\n@@ -57,11 +57,20 @@ export function updatePartialAgg(\n   value: number,\n   rawValue?: unknown,\n ): void {\n-  state.sum += value;\n-  state.count++;\n+  if (state.m2 !== undefined) {\n+    // Welford's online algorithm \u2014 compute before updating sum/count\n+    const oldMean = state.count > 0 ? state.sum / state.count : 0;\n+    const delta = value - oldMean;\n+    state.sum += value;\n+    state.count++;\n+    const newMean = state.sum / state.count;\n+    state.m2 += delta * (value - newMean);\n+  } else {\n+    state.sum += value;\n+    state.count++;\n+  }\n   if (value < state.min) state.min = value;\n   if (value > state.max) state.max = value;\n-  if (state.sumSq !== undefined) state.sumSq += value * value;\n   if (state.values !== undefined) state.values.push(value);\n   if (state.distinctSet !== undefined) {\n     state.distinctSet.add(rawValue !== undefined ? String(rawValue) : String(value));\n@@ -84,14 +93,11 @@ function resolveValue(state: PartialAggState): number {\n       return state.distinctSet?.size ?? 0;\n     case \"stddev\": {\n       if (state.count < 2) return 0;\n-      const mean = state.sum / state.count;\n-      const variance = (state.sumSq ?? 0) / state.count - mean * mean;\n-      return Math.sqrt(Math.max(0, variance));\n+      return Math.sqrt(Math.max(0, (state.m2 ?? 0) / state.count));\n     }\n     case \"variance\": {\n       if (state.count < 2) return 0;\n-      const mean = state.sum / state.count;\n-      return (state.sumSq ?? 0) / state.count - mean * mean;\n+      return (state.m2 ?? 0) / state.count;\n     }\n     case \"median\": {\n       const vals = state.values ?? [];\n@@ -157,7 +163,8 @@ export function computePartialAgg(\n     let key = \"\";\n     for (let g = 0; g < groupCols.length; g++) {\n       if (g > 0) key += \"\\x00\";\n-      key += String(row[groupCols[g]] ?? \"\");\n+      const v = row[groupCols[g]];\n+      key += v === null || v === undefined ? \"\\x01NULL\\x01\" : String(v);\n     }\n     let states = groups.get(key);\n     if (!states) {\n@@ -226,7 +233,8 @@ export function computePartialAggColumnar(\n     for (let g = 0; g < groupCols.length; g++) {\n       if (g > 0) key += \"\\x00\";\n       const vals = batch.columns.get(groupCols[g]);\n-      key += String(vals ? (vals[idx] ?? \"\") : \"\");\n+      const v = vals ? vals[idx] : null;\n+      key += v === null || v === undefined ? \"\\x01NULL\\x01\" : String(v);\n     }\n     let states = groups.get(key);\n     if (!states) {\n@@ -261,14 +269,20 @@ function mergeStates(\n   source: PartialAggState[],\n ): void {\n   for (let i = 0; i < target.length; i++) {\n+    // Parallel Welford merge for m2 (must be computed before sum/count merge)\n+    if (target[i].m2 !== undefined && source[i].m2 !== undefined) {\n+      const nA = target[i].count, nB = source[i].count;\n+      if (nA > 0 && nB > 0) {\n+        const delta = (source[i].sum / nB) - (target[i].sum / nA);\n+        target[i].m2 = target[i].m2! + source[i].m2! + delta * delta * nA * nB / (nA + nB);\n+      } else {\n+        target[i].m2! += source[i].m2!;\n+      }\n+    }\n     target[i].sum += source[i].sum;\n     target[i].count += source[i].count;\n     if (source[i].min < target[i].min) target[i].min = source[i].min;\n     if (source[i].max > target[i].max) target[i].max = source[i].max;\n-    // Extended aggregate state merge\n-    if (target[i].sumSq !== undefined && source[i].sumSq !== undefined) {\n-      target[i].sumSq! += source[i].sumSq!;\n-    }\n     if (target[i].values !== undefined && source[i].values !== undefined) {\n       target[i].values!.push(...source[i].values!);\n     }\n@@ -329,7 +343,14 @@ export function finalizePartialAgg(\n     const row: Row = {};\n     const keyParts = key.split(\"\\x00\");\n     for (let i = 0; i < groupCols.length; i++) {\n-      row[groupCols[i]] = keyParts[i];\n+      const part = keyParts[i];\n+      if (part === \"\\x01NULL\\x01\") {\n+        row[groupCols[i]] = null;\n+      } else {\n+        // Attempt to restore numeric types\n+        const num = Number(part);\n+        row[groupCols[i]] = part !== \"\" && !isNaN(num) && String(num) === part ? num : part;\n+      }\n     }\n     for (let i = 0; i < states.length; i++) {\n       const alias = aliasFor(aggregates[i]);"
+    },
+    {
+      "sha": "2d3424e3bd816ed34b1ad6d03c2873071d0c58b8",
+      "filename": "src/sql/executor.ts",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 1,
+      "changes": 5,
+      "blob_url": "https://github.com/teamchong/querymode/blob/d024b4d80c8d0391d64cc5a87a22ab25eb6a604c/src%2Fsql%2Fexecutor.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/d024b4d80c8d0391d64cc5a87a22ab25eb6a604c/src%2Fsql%2Fexecutor.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fsql%2Fexecutor.ts?ref=d024b4d80c8d0391d64cc5a87a22ab25eb6a604c",
+      "patch": "@@ -182,7 +182,10 @@ function aggregate(rows: Row[], aggregates: AggregateOp[], groupBy?: string[]):\n }\n \n function computeAgg(rows: Row[], agg: AggregateOp): number | bigint | string | boolean | Float32Array | null {\n-  if (agg.fn === \"count\") return rows.length;\n+  if (agg.fn === \"count\") {\n+    if (agg.column === \"*\") return rows.length;\n+    return rows.filter(r => r[agg.column] != null).length;\n+  }\n \n   const values: number[] = [];\n   const seen = new Set<string>();"
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "message": "fix(storage): drain WAL via TRUNCATE checkpoint before reopen-after-rebuild\n\nFollow-up to the post-rebuild reopen fix from the previous commit.\nThe reopen by itself was *necessary* but not always sufficient:\nfsqlite still had committed frames sitting in the WAL when we\nreopened, and the next VACUUM/REINDEX could trip over\n\"database is busy (snapshot conflict on pages: page N >\nsnapshot db_size M)\" again \u2014 because the new connection inherited\nthe half-drained WAL state from the previous session.\n\nsrc/storage/sqlite.rs::SqliteStorage::checkpoint_full\n  New helper that issues `PRAGMA wal_checkpoint(TRUNCATE)` and\n  falls back to `PRAGMA wal_checkpoint(PASSIVE)` if TRUNCATE fails\n  (TRUNCATE requires the DB's internal exclusive lock, which is\n  not always acquirable mid-mutation; PASSIVE is best-effort but\n  always safe). Surfaces a `tracing::debug!` on the TRUNCATE\n  fallback and returns an error only if even PASSIVE fails. The\n  doc-comment is explicit that this is for *quiescent* call sites\n  where the caller already holds the cross-process `.write.lock`,\n  not for the hot path.\n\nsrc/config/mod.rs::rebuild_database_family\n  Insert a `storage.checkpoint_full()` call between\n  `import_from_jsonl` and `storage.reopen_at(...)`. TRUNCATE\n  failure is downgraded to `tracing::warn!` (with the same\n  `db_path` field as the surrounding VACUUM/REINDEX warnings)\n  because the reopen still recovers correctness \u2014 the warn just\n  flags the case for operator visibility. Doc-comment for the\n  block is rewritten to spell out the TRUNCATE-then-reopen pair.\n\nCargo.lock left modified intentionally \u2014 same local-sibling-path\npatch override situation flagged in the previous beads_rust\npasses.",
+  "files": [
+    {
+      "sha": "77a81244b0ab6fb4901e1ebc1c02fef8fe716bf2",
+      "filename": "src/config/mod.rs",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 4,
+      "changes": 17,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_rust/blob/dcf3756a40cb0d2ac74f44da9c0755491e2516ba/src%2Fconfig%2Fmod.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_rust/raw/dcf3756a40cb0d2ac74f44da9c0755491e2516ba/src%2Fconfig%2Fmod.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_rust/contents/src%2Fconfig%2Fmod.rs?ref=dcf3756a40cb0d2ac74f44da9c0755491e2516ba",
+      "patch": "@@ -816,10 +816,19 @@ fn rebuild_database_family(\n     // what was actually written: VACUUM/REINDEX run against an old snapshot\n     // and fail with \"database is busy (snapshot conflict on pages: page N >\n     // snapshot db_size M)\", while the next cursor OpenRead refuses freshly\n-    // allocated root pages as \"invalid transaction-backed root page\". Dropping\n-    // this connection and reopening a fresh one at the same path forces\n-    // fsqlite to reload its view from disk, so the post-rebuild cleanup\n-    // actually runs and subsequent reads succeed.\n+    // allocated root pages as \"invalid transaction-backed root page\". Drain\n+    // the WAL to the main DB file (TRUNCATE checkpoint, safe here because we\n+    // hold the `.write.lock` exclusively) and then reopen a fresh connection\n+    // at the same path so the pager reloads its view from disk. Without this\n+    // pair, the post-rebuild cleanup below silently fails and leaves the DB\n+    // in a state that the next reader cannot open.\n+    if let Err(e) = storage.checkpoint_full() {\n+        tracing::warn!(\n+            error = %e,\n+            db_path = %db_path.display(),\n+            \"Full WAL checkpoint after rebuild failed (non-fatal)\"\n+        );\n+    }\n     storage.reopen_at(db_path, lock_timeout)?;\n \n     // Post-rebuild VACUUM to eliminate freeblock accounting anomalies that"
+    },
+    {
+      "sha": "b67ca6ce3837f43167694dbb31744f7d1281fe52",
+      "filename": "src/storage/sqlite.rs",
+      "status": "modified",
+      "additions": 26,
+      "deletions": 0,
+      "changes": 26,
+      "blob_url": "https://github.com/Dicklesworthstone/beads_rust/blob/dcf3756a40cb0d2ac74f44da9c0755491e2516ba/src%2Fstorage%2Fsqlite.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/beads_rust/raw/dcf3756a40cb0d2ac74f44da9c0755491e2516ba/src%2Fstorage%2Fsqlite.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/beads_rust/contents/src%2Fstorage%2Fsqlite.rs?ref=dcf3756a40cb0d2ac74f44da9c0755491e2516ba",
+      "patch": "@@ -911,6 +911,32 @@ impl SqliteStorage {\n         }\n     }\n \n+    /// Force a full WAL checkpoint that drains every pending frame back into\n+    /// the main database file.\n+    ///\n+    /// Called at quiescent points (post-rebuild, before VACUUM/REINDEX) where\n+    /// we hold the `.write.lock` exclusively and can safely take the DB's\n+    /// internal exclusive lock that TRUNCATE mode requires. The passive\n+    /// checkpoint used during normal mutation can leave WAL frames behind\n+    /// that VACUUM/REINDEX later trip over (\"database is busy (snapshot\n+    /// conflict on pages: page N > snapshot db_size M)\"), so we need a\n+    /// stronger guarantee here.\n+    ///\n+    /// # Errors\n+    ///\n+    /// Returns an error only if even a PASSIVE checkpoint fails. TRUNCATE\n+    /// failure is downgraded to a warning because it is best-effort.\n+    pub fn checkpoint_full(&self) -> Result<()> {\n+        if let Err(e) = self.conn.execute(\"PRAGMA wal_checkpoint(TRUNCATE)\") {\n+            tracing::debug!(\n+                error = %e,\n+                \"TRUNCATE checkpoint failed; falling back to PASSIVE\"\n+            );\n+            self.conn.execute(\"PRAGMA wal_checkpoint(PASSIVE)\")?;\n+        }\n+        Ok(())\n+    }\n+\n     /// Get audit events for a specific issue.\n     ///\n     /// # Errors"
+    }
+  ]
+}

@@ -1,0 +1,53 @@
+{
+  "message": "fix: defense-in-depth for duplicate tool names\n\nTwo additional layers of protection:\n\n1. Anthropic adapter: strip function-type \"web_search\" from tool\n   definitions when WebSearch is enabled, preventing the duplicate\n   even if the caller passes one (defense at the wire-format layer).\n\n2. rebuildToolDefsCache MCP loop: check `included` before adding\n   MCP tools, preventing duplicates when an MCP tool name collides\n   with a profile tool name.\n\nTests:\n- Adapter-level: WebSearch + function \"web_search\" \u2192 no duplicate\n  names in the request body\n- MCP dedup: MCP tool with same name as profile tool \u2192 exactly 1\n  entry in allToolDefinitions\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "1091d830ebe5a970ca9ec27dd0f6f53a89570352",
+      "filename": "agent/session.go",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/87e4c9771673cc825497d26d10c163bc704fe172/agent%2Fsession.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/87e4c9771673cc825497d26d10c163bc704fe172/agent%2Fsession.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/agent%2Fsession.go?ref=87e4c9771673cc825497d26d10c163bc704fe172",
+      "patch": "@@ -2117,7 +2117,7 @@ func (s *Session) rebuildToolDefsCache() {\n \t\t}\n \t}\n \tfor _, td := range s.mcpTools {\n-\t\tif registered[td.Name] {\n+\t\tif registered[td.Name] && !included[td.Name] {\n \t\t\tdefs = append(defs, td)\n \t\t\tincluded[td.Name] = true\n \t\t}"
+    },
+    {
+      "sha": "89b85e263e039b3b8718cc9e02a5e4e59c7173f7",
+      "filename": "agent/session_perf_test.go",
+      "status": "modified",
+      "additions": 36,
+      "deletions": 0,
+      "changes": 36,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/87e4c9771673cc825497d26d10c163bc704fe172/agent%2Fsession_perf_test.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/87e4c9771673cc825497d26d10c163bc704fe172/agent%2Fsession_perf_test.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/agent%2Fsession_perf_test.go?ref=87e4c9771673cc825497d26d10c163bc704fe172",
+      "patch": "@@ -264,6 +264,42 @@ func TestToolDefs_NoDuplicateNames(t *testing.T) {\n \t}\n }\n \n+func TestToolDefs_MCPToolSameNameAsProfileTool_NoDuplicate(t *testing.T) {\n+\t// If an MCP tool has the same name as a profile tool (unlikely due to\n+\t// namespacing, but possible), it should not produce a duplicate in the\n+\t// tool definitions sent to the API.\n+\tdir := t.TempDir()\n+\tc := llm.NewClient()\n+\tc.Register(&fakeAdapter{name: \"anthropic\"})\n+\n+\tsess, err := NewSession(c, NewAnthropicProfile(\"claude-test\"), NewLocalExecutionEnvironment(dir), SessionConfig{})\n+\tif err != nil {\n+\t\tt.Fatalf(\"NewSession: %v\", err)\n+\t}\n+\tdefer sess.Close()\n+\n+\t// Inject an MCP tool with the same name as a profile tool.\n+\tmcpTool := llm.ToolDefinition{\n+\t\tName:        \"shell\",\n+\t\tDescription: \"MCP shell (conflict)\",\n+\t\tParameters:  map[string]any{\"type\": \"object\", \"properties\": map[string]any{}},\n+\t}\n+\tsess.mcpTools = append(sess.mcpTools, mcpTool)\n+\t// The tool is already registered via registerCoreTools, so it's in registered.\n+\tsess.rebuildToolDefsCache()\n+\n+\tdefs := sess.allToolDefinitions(0)\n+\tcount := 0\n+\tfor _, td := range defs {\n+\t\tif td.Name == \"shell\" {\n+\t\t\tcount++\n+\t\t}\n+\t}\n+\tif count != 1 {\n+\t\tt.Errorf(\"expected exactly 1 'shell' tool, got %d\", count)\n+\t}\n+}\n+\n // --- Issue 2: History copy reduction ---\n \n func TestHistoryCopyReduction_ContextAndExpansionShareCopy(t *testing.T) {"
+    },
+    {
+      "sha": "ef92093d7482c30b11a517c37980ef9c390061e9",
+      "filename": "llm/providers/anthropic/adapter.go",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 1,
+      "changes": 15,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/87e4c9771673cc825497d26d10c163bc704fe172/llm%2Fproviders%2Fanthropic%2Fadapter.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/87e4c9771673cc825497d26d10c163bc704fe172/llm%2Fproviders%2Fanthropic%2Fadapter.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/llm%2Fproviders%2Fanthropic%2Fadapter.go?ref=87e4c9771673cc825497d26d10c163bc704fe172",
+      "patch": "@@ -213,7 +213,20 @@ func (a *Adapter) buildRequestBody(req llm.Request) (map[string]any, error) {\n \tif includeTools || req.WebSearch {\n \t\tvar tools []map[string]any\n \t\tif includeTools {\n-\t\t\ttools = toAnthropicTools(req.Tools)\n+\t\t\ttoolDefs := req.Tools\n+\t\t\tif req.WebSearch {\n+\t\t\t\t// Strip any function-type \"web_search\" tool to avoid a\n+\t\t\t\t// duplicate name collision with the server-side web_search\n+\t\t\t\t// tool injected below.\n+\t\t\t\tfiltered := toolDefs[:0:0]\n+\t\t\t\tfor _, td := range toolDefs {\n+\t\t\t\t\tif td.Name != \"web_search\" {\n+\t\t\t\t\t\tfiltered = append(filtered, td)\n+\t\t\t\t\t}\n+\t\t\t\t}\n+\t\t\t\ttoolDefs = filtered\n+\t\t\t}\n+\t\t\ttools = toAnthropicTools(toolDefs)\n \t\t}\n \t\tif req.WebSearch {\n \t\t\ttools = append(tools, map[string]any{"
+    },
+    {
+      "sha": "cbe0b6253eadf7af0ebaff6dbcc096048e7674ba",
+      "filename": "llm/providers/anthropic/adapter_test.go",
+      "status": "modified",
+      "additions": 74,
+      "deletions": 0,
+      "changes": 74,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/87e4c9771673cc825497d26d10c163bc704fe172/llm%2Fproviders%2Fanthropic%2Fadapter_test.go",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/87e4c9771673cc825497d26d10c163bc704fe172/llm%2Fproviders%2Fanthropic%2Fadapter_test.go",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/llm%2Fproviders%2Fanthropic%2Fadapter_test.go?ref=87e4c9771673cc825497d26d10c163bc704fe172",
+      "patch": "@@ -3100,4 +3100,78 @@ func TestAdapter_Complete_ToolResultWithImageData_DefaultMediaType(t *testing.T)\n \t}\n }\n \n+func TestAdapter_Complete_WebSearchWithTools_NoDuplicateNames(t *testing.T) {\n+\t// When WebSearch is true and function tools are present, the adapter\n+\t// injects a server-side web_search tool. If the caller also passes a\n+\t// function tool named \"web_search\", the API rejects with\n+\t// \"Tool names must be unique.\" This test verifies the adapter strips\n+\t// the function-type web_search to prevent the collision.\n+\tvar gotBody map[string]any\n+\n+\tsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n+\t\tb, _ := io.ReadAll(r.Body)\n+\t\t_ = r.Body.Close()\n+\t\t_ = json.Unmarshal(b, &gotBody)\n+\n+\t\tw.Header().Set(\"Content-Type\", \"application/json\")\n+\t\t_, _ = w.Write([]byte(`{\n+  \"id\": \"msg_1\", \"type\": \"message\", \"role\": \"assistant\", \"model\": \"test\",\n+  \"content\": [{\"type\":\"text\",\"text\":\"ok\"}],\n+  \"stop_reason\": \"end_turn\",\n+  \"usage\": {\"input_tokens\": 1, \"output_tokens\": 1}\n+}`))\n+\t}))\n+\tt.Cleanup(srv.Close)\n+\n+\ta := &Adapter{APIKey: \"k\", BaseURL: srv.URL, Client: srv.Client()}\n+\tctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)\n+\tdefer cancel()\n+\n+\t// Simulate a tool list that includes a function-type web_search alongside\n+\t// other function tools, plus WebSearch=true which triggers the adapter to\n+\t// inject its own server-side web_search.\n+\t_, err := a.Complete(ctx, llm.Request{\n+\t\tModel:    \"claude-test\",\n+\t\tMessages: []llm.Message{llm.User(\"search for docs\")},\n+\t\tTools: []llm.ToolDefinition{\n+\t\t\t{Name: \"shell\", Parameters: map[string]any{\"type\": \"object\", \"properties\": map[string]any{}}},\n+\t\t\t{Name: \"web_search\", Description: \"function-type shim\", Parameters: map[string]any{\n+\t\t\t\t\"type\": \"object\", \"properties\": map[string]any{\"query\": map[string]any{\"type\": \"string\"}},\n+\t\t\t}},\n+\t\t},\n+\t\tToolChoice: &llm.ToolChoice{Mode: \"auto\"},\n+\t\tWebSearch:  true,\n+\t\tProviderOptions: map[string]any{\n+\t\t\t\"anthropic\": map[string]any{\"auto_cache\": false},\n+\t\t},\n+\t})\n+\tif err != nil {\n+\t\tt.Fatalf(\"Complete: %v\", err)\n+\t}\n+\n+\ttoolsAny, ok := gotBody[\"tools\"].([]any)\n+\tif !ok {\n+\t\tt.Fatalf(\"tools not array: %#v\", gotBody[\"tools\"])\n+\t}\n+\n+\t// Check for duplicate names.\n+\tseen := make(map[string]bool)\n+\tfor _, tAny := range toolsAny {\n+\t\ttm, _ := tAny.(map[string]any)\n+\t\tname, _ := tm[\"name\"].(string)\n+\t\tif name == \"\" {\n+\t\t\tcontinue\n+\t\t}\n+\t\tif seen[name] {\n+\t\t\tt.Errorf(\"duplicate tool name %q in Anthropic request body\", name)\n+\t\t}\n+\t\tseen[name] = true\n+\t}\n+\n+\t// The server-side web_search should be present.\n+\tif !seen[\"web_search\"] {\n+\t\tt.Error(\"server-side web_search tool not found in request body\")\n+\t}\n+}\n+\n func ptrInt(i int) *int { return &i }"
+    }
+  ]
+}

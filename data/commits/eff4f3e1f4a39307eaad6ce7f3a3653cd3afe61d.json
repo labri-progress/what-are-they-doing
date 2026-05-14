@@ -1,0 +1,77 @@
+{
+  "message": "Fix critical bugs: unsigned overflow, zero-copy Buffer, zlib fallback, batch commits\n\n- readUint32BE: use >>> 0 to avoid signed overflow when high bit is set\n- Buffer.from: zero-copy view (buffer, offset, length) instead of copying\n- decompressObject: add node:zlib fallback matching readObject's behavior\n- indexNewCommits: batch reads via readObjects() instead of N+1 individual reads\n- collectObjects: add 500K object limit to prevent unbounded BFS walks\n- indexNewCommits: add 10K commit limit to prevent unbounded walks\n- Docs: fix endpoint count from \"35+\"/\"30+\" to actual 29",
+  "files": [
+    {
+      "sha": "4ee9b838f65a48c4c1711ac87597c03c93b6427c",
+      "filename": "README.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/eff4f3e1f4a39307eaad6ce7f3a3653cd3afe61d/README.md",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/eff4f3e1f4a39307eaad6ce7f3a3653cd3afe61d/README.md",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/README.md?ref=eff4f3e1f4a39307eaad6ce7f3a3653cd3afe61d",
+      "patch": "@@ -113,7 +113,7 @@ Key optimizations:\n | Diff | Supported |\n | Blame (via libgit2) | Supported |\n | Commit history / log | Supported |\n-| REST API (35+ endpoints) | Supported |\n+| REST API (29 endpoints) | Supported |\n | SSH transport | Supported |\n | Server-side merge (ff + 3-way) | Supported |\n | Cherry-pick / revert / reset | Supported |"
+    },
+    {
+      "sha": "765b8755bcb9958002694978c0cc8359313c63e4",
+      "filename": "docs/src/content/docs/index.mdx",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/eff4f3e1f4a39307eaad6ce7f3a3653cd3afe61d/docs%2Fsrc%2Fcontent%2Fdocs%2Findex.mdx",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/eff4f3e1f4a39307eaad6ce7f3a3653cd3afe61d/docs%2Fsrc%2Fcontent%2Fdocs%2Findex.mdx",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/docs%2Fsrc%2Fcontent%2Fdocs%2Findex.mdx?ref=eff4f3e1f4a39307eaad6ce7f3a3653cd3afe61d",
+      "patch": "@@ -23,7 +23,7 @@ import { Card, CardGrid } from \"@astrojs/starlight/components\";\n     Smart HTTP transport and SSH-to-HTTP proxy. Works with standard `git clone`, `git push`, `git fetch` over both HTTP and SSH.\n   </Card>\n   <Card title=\"REST API\" icon=\"setting\">\n-    30+ endpoints for programmatic access. Init repos, commit files, create branches, merge, cherry-pick, revert \u2014 all via JSON.\n+    29 endpoints for programmatic access. Init repos, commit files, create branches, merge, cherry-pick, revert \u2014 all via JSON.\n   </Card>\n   <Card title=\"Zig WASM Engine\" icon=\"rocket\">\n     SHA-1 hashing, zlib compression, packfile parsing, delta encoding \u2014 all in Zig compiled to WASM with SIMD acceleration."
+    },
+    {
+      "sha": "d3879dd1249347f70640cfd0c35c01b5027da41e",
+      "filename": "src/git-engine.ts",
+      "status": "modified",
+      "additions": 36,
+      "deletions": 12,
+      "changes": 48,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/eff4f3e1f4a39307eaad6ce7f3a3653cd3afe61d/src%2Fgit-engine.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/eff4f3e1f4a39307eaad6ce7f3a3653cd3afe61d/src%2Fgit-engine.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Fgit-engine.ts?ref=eff4f3e1f4a39307eaad6ce7f3a3653cd3afe61d",
+      "patch": "@@ -231,7 +231,7 @@ export class GitEngine {\n             const data = new Uint8Array(await obj.arrayBuffer());\n             for (const e of byChunk.get(key)!) {\n               const compressed = data.subarray(e.offset, e.offset + e.length);\n-              const parsed = this.decompressObject(compressed);\n+              const parsed = await this.decompressObject(compressed);\n               if (parsed) result.set(e.sha, parsed);\n             }\n           }\n@@ -259,23 +259,47 @@ export class GitEngine {\n   }\n \n   /** Decompress a raw git object (zlib compressed full object with header). */\n-  private decompressObject(\n+  private async decompressObject(\n     compressed: Uint8Array\n-  ): { type: number; content: Uint8Array } | null {\n+  ): Promise<{ type: number; content: Uint8Array } | null> {\n     let raw: Uint8Array | null = null;\n \n     if (this.wasm) {\n-      for (const multiplier of [4, 16, 64, 256]) {\n-        const maxSize = Math.min(\n-          Math.max(compressed.length * multiplier, 65536),\n-          32 * 1024 * 1024\n-        );\n-        const result = this.wasm.zlibInflate(compressed, maxSize);\n-        if (result.length > 0) { raw = result; break; }\n+      try {\n+        for (const multiplier of [4, 16, 64, 256]) {\n+          const maxSize = Math.min(\n+            Math.max(compressed.length * multiplier, 65536),\n+            32 * 1024 * 1024\n+          );\n+          const result = this.wasm.zlibInflate(compressed, maxSize);\n+          if (result.length > 0) { raw = result; break; }\n+        }\n+      } catch {\n+        // WASM trap \u2014 fall through to node:zlib\n       }\n     }\n \n-    if (!raw || raw.length === 0) return null;\n+    if (!raw || raw.length === 0) {\n+      try {\n+        const { createInflate } = await import(\"node:zlib\");\n+        raw = await new Promise<Uint8Array>((resolve, reject) => {\n+          const inflate = createInflate();\n+          const chunks: Buffer[] = [];\n+          inflate.on(\"data\", (chunk: Buffer) => chunks.push(chunk));\n+          inflate.on(\"end\", () => {\n+            const totalLen = chunks.reduce((sum, c) => sum + c.length, 0);\n+            const data = new Uint8Array(totalLen);\n+            let pos = 0;\n+            for (const c of chunks) { data.set(c, pos); pos += c.length; }\n+            resolve(data);\n+          });\n+          inflate.on(\"error\", reject);\n+          inflate.end(Buffer.from(compressed.buffer, compressed.byteOffset, compressed.byteLength));\n+        });\n+      } catch {\n+        return null;\n+      }\n+    }\n \n     const spaceIdx = raw.indexOf(0x20);\n     const nullIdx = raw.indexOf(0x00);\n@@ -334,7 +358,7 @@ export class GitEngine {\n           resolve(data);\n         });\n         inflate.on(\"error\", reject);\n-        inflate.end(Buffer.from(compressed));\n+        inflate.end(Buffer.from(compressed.buffer, compressed.byteOffset, compressed.byteLength));\n       });\n     }\n "
+    },
+    {
+      "sha": "f53692496055574937bcd099248f89fd1ad77b04",
+      "filename": "src/packfile-reader.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 3,
+      "changes": 6,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/eff4f3e1f4a39307eaad6ce7f3a3653cd3afe61d/src%2Fpackfile-reader.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/eff4f3e1f4a39307eaad6ce7f3a3653cd3afe61d/src%2Fpackfile-reader.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Fpackfile-reader.ts?ref=eff4f3e1f4a39307eaad6ce7f3a3653cd3afe61d",
+      "patch": "@@ -215,18 +215,18 @@ async function jsInflateTracked(\n       resolve({ data, consumed: inflate.bytesWritten });\n     });\n     inflate.on(\"error\", reject);\n-    inflate.end(Buffer.from(input));\n+    inflate.end(Buffer.from(input.buffer, input.byteOffset, input.byteLength));\n   });\n \n   return result;\n }\n \n function readUint32BE(buf: Uint8Array, offset: number): number {\n   return (\n-    (buf[offset] << 24) |\n+    ((buf[offset] << 24) |\n     (buf[offset + 1] << 16) |\n     (buf[offset + 2] << 8) |\n-    buf[offset + 3]\n+    buf[offset + 3]) >>> 0\n   );\n }\n "
+    },
+    {
+      "sha": "822a2bbf2ba3580b0f4c86d162d91a9c6374cd5d",
+      "filename": "src/receive-pack.ts",
+      "status": "modified",
+      "additions": 36,
+      "deletions": 24,
+      "changes": 60,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/eff4f3e1f4a39307eaad6ce7f3a3653cd3afe61d/src%2Freceive-pack.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/eff4f3e1f4a39307eaad6ce7f3a3653cd3afe61d/src%2Freceive-pack.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Freceive-pack.ts?ref=eff4f3e1f4a39307eaad6ce7f3a3653cd3afe61d",
+      "patch": "@@ -201,32 +201,44 @@ async function indexNewCommits(\n   newSha: string,\n ): Promise<void> {\n   const visited = new Set<string>();\n-  const queue = [newSha];\n+  let frontier = [newSha];\n   const stopAt = oldSha === ZERO_SHA ? null : oldSha;\n+  const MAX_COMMITS = 10000;\n+\n+  while (frontier.length > 0 && visited.size < MAX_COMMITS) {\n+    // Deduplicate frontier\n+    const batch: string[] = [];\n+    for (const sha of frontier) {\n+      if (!visited.has(sha) && sha !== stopAt) {\n+        visited.add(sha);\n+        batch.push(sha);\n+      }\n+    }\n+    if (batch.length === 0) break;\n+\n+    // Batch read commits (up to 500 at a time)\n+    const objects = await engine.readObjects(batch);\n+    const nextFrontier: string[] = [];\n+\n+    for (const sha of batch) {\n+      const obj = objects.get(sha);\n+      if (!obj) continue;\n \n-  while (queue.length > 0) {\n-    const sha = queue.shift()!;\n-    if (visited.has(sha)) continue;\n-    if (stopAt && sha === stopAt) continue;\n-    visited.add(sha);\n-\n-    const obj = await engine.readObject(sha);\n-    if (!obj) continue;\n-\n-    // Parse the commit to extract author/message/timestamp\n-    const raw = decoder.decode(obj.content);\n-    const authorLine = raw.match(/^author (.+?) <(.+?)> (\\d+)/m);\n-    const msgStart = raw.indexOf(\"\\n\\n\");\n-    const message = msgStart >= 0 ? raw.slice(msgStart + 2).trim() : \"\";\n-    const author = authorLine ? `${authorLine[1]} <${authorLine[2]}>` : \"unknown\";\n-    const timestamp = authorLine ? parseInt(authorLine[3], 10) : 0;\n-\n-    engine.indexCommit(sha, author, message, timestamp);\n-\n-    // Walk parents\n-    const parentMatches = raw.matchAll(/^parent ([0-9a-f]{40})/gm);\n-    for (const m of parentMatches) {\n-      queue.push(m[1]);\n+      const raw = decoder.decode(obj.content);\n+      const authorLine = raw.match(/^author (.+?) <(.+?)> (\\d+)/m);\n+      const msgStart = raw.indexOf(\"\\n\\n\");\n+      const message = msgStart >= 0 ? raw.slice(msgStart + 2).trim() : \"\";\n+      const author = authorLine ? `${authorLine[1]} <${authorLine[2]}>` : \"unknown\";\n+      const timestamp = authorLine ? parseInt(authorLine[3], 10) : 0;\n+\n+      engine.indexCommit(sha, author, message, timestamp);\n+\n+      const parentMatches = raw.matchAll(/^parent ([0-9a-f]{40})/gm);\n+      for (const m of parentMatches) {\n+        nextFrontier.push(m[1]);\n+      }\n     }\n+\n+    frontier = nextFrontier;\n   }\n }"
+    },
+    {
+      "sha": "d6c1fb744c3b47f73bf093cb2e8e0ffee86889fd",
+      "filename": "src/upload-pack.ts",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/eff4f3e1f4a39307eaad6ce7f3a3653cd3afe61d/src%2Fupload-pack.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/eff4f3e1f4a39307eaad6ce7f3a3653cd3afe61d/src%2Fupload-pack.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Fupload-pack.ts?ref=eff4f3e1f4a39307eaad6ce7f3a3653cd3afe61d",
+      "patch": "@@ -129,8 +129,9 @@ async function collectObjects(\n   const visited = new Set<string>();\n   const result: string[] = [];\n   let frontier = wants.filter(s => !haves.has(s));\n+  const MAX_OBJECTS = 500_000;\n \n-  while (frontier.length > 0) {\n+  while (frontier.length > 0 && visited.size < MAX_OBJECTS) {\n     // Deduplicate frontier against visited\n     const batch: string[] = [];\n     for (const sha1 of frontier) {"
+    }
+  ]
+}

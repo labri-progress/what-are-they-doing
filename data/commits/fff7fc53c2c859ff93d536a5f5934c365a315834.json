@@ -1,0 +1,77 @@
+{
+  "message": "Fix critical bugs and add missing features from user interview\n\n1. Fix merge data loss: recurse into directories when both sides\n   modified (was taking one side wholesale, dropping the other's files)\n2. Fix concurrent commit lost updates: optimistic locking retries\n   commit if the ref moved between read and write\n3. Add input validation: require ref/message/files on commit,\n   default author to \"unknown\" instead of literal \"undefined\"\n4. Fix empty body crash on POST /init: gracefully default to {}\n5. Add GET /api/repos and GET /api/repos/:owner list-repos endpoints\n6. Fix production wrangler.jsonc: point main to src/worker.ts,\n   remove stale vinext assets config\n7. Fix deploy workflow: add libgit2 WASM build step and binaryen install",
+  "files": [
+    {
+      "sha": "87d6101d1164fa323a5c43db5dea5f58a5754b7f",
+      "filename": ".github/workflows/deploy.yml",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 3,
+      "changes": 10,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/fff7fc53c2c859ff93d536a5f5934c365a315834/.github%2Fworkflows%2Fdeploy.yml",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/fff7fc53c2c859ff93d536a5f5934c365a315834/.github%2Fworkflows%2Fdeploy.yml",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/.github%2Fworkflows%2Fdeploy.yml?ref=fff7fc53c2c859ff93d536a5f5934c365a315834",
+      "patch": "@@ -28,12 +28,16 @@ jobs:\n \n       - run: pnpm install --no-frozen-lockfile\n \n+      - name: Install Binaryen (wasm-opt)\n+        run: |\n+          sudo apt-get update && sudo apt-get install -y binaryen\n+\n+      - name: Build libgit2 for WASM\n+        run: bash wasm/libgit2-wasm/build.sh\n+\n       - name: Build WASM\n         run: pnpm run build:wasm\n \n-      - name: Build\n-        run: pnpm run build\n-\n       - name: Provision R2 bucket\n         uses: cloudflare/wrangler-action@v3\n         with:"
+    },
+    {
+      "sha": "023e002cd2e7ea213e9f4c9e18c061a8826896fc",
+      "filename": "src/git-porcelain.ts",
+      "status": "modified",
+      "additions": 55,
+      "deletions": 29,
+      "changes": 84,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/fff7fc53c2c859ff93d536a5f5934c365a315834/src%2Fgit-porcelain.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/fff7fc53c2c859ff93d536a5f5934c365a315834/src%2Fgit-porcelain.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Fgit-porcelain.ts?ref=fff7fc53c2c859ff93d536a5f5934c365a315834",
+      "patch": "@@ -227,11 +227,14 @@ export class GitPorcelain {\n   async commit(opts: {\n     ref: string;\n     message: string;\n-    author: string;\n-    email: string;\n+    author?: string;\n+    email?: string;\n     files: Array<{ path: string; content: Uint8Array | string | null }>;\n     timestamp?: number;\n   }): Promise<string> {\n+    const author = opts.author || \"unknown\";\n+    const email = opts.email || \"unknown@unknown\";\n+\n     // Auto-init: ensure repo metadata and HEAD exist so first commit works\n     // even without an explicit init call\n     this.engine.ensureRepo();\n@@ -240,37 +243,52 @@ export class GitPorcelain {\n     }\n \n     const ts = opts.timestamp ?? Math.floor(Date.now() / 1000);\n-    const parentSha = await this.resolveRef(opts.ref);\n-\n-    // Get base tree (or empty)\n-    let baseTreeSha: string | null = null;\n-    if (parentSha) {\n-      const commit = await this.engine.readObject(parentSha);\n-      if (commit && commit.type === OBJ_COMMIT) {\n-        baseTreeSha = parseCommit(parentSha, commit.content).tree;\n-      }\n-    }\n \n-    // Apply file changes to tree\n-    const newTreeSha = await this.applyChangesToTree(baseTreeSha, opts.files);\n+    // Retry loop for optimistic concurrency \u2014 if the ref moved between\n+    // reading and writing, re-apply changes on top of the new parent\n+    const MAX_RETRIES = 5;\n+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {\n+      const parentSha = await this.resolveRef(opts.ref);\n+\n+      // Get base tree (or empty)\n+      let baseTreeSha: string | null = null;\n+      if (parentSha) {\n+        const commit = await this.engine.readObject(parentSha);\n+        if (commit && commit.type === OBJ_COMMIT) {\n+          baseTreeSha = parseCommit(parentSha, commit.content).tree;\n+        }\n+      }\n \n-    // Build commit\n-    const lines: string[] = [`tree ${newTreeSha}`];\n-    if (parentSha) lines.push(`parent ${parentSha}`);\n-    lines.push(`author ${opts.author} <${opts.email}> ${ts} +0000`);\n-    lines.push(`committer ${opts.author} <${opts.email}> ${ts} +0000`);\n-    lines.push(\"\");\n-    lines.push(opts.message.endsWith(\"\\n\") ? opts.message : opts.message + \"\\n\");\n-    const commitSha = await this.engine.storeObject(OBJ_COMMIT, encoder.encode(lines.join(\"\\n\")));\n+      // Apply file changes to tree\n+      const newTreeSha = await this.applyChangesToTree(baseTreeSha, opts.files);\n+\n+      // Build commit\n+      const lines: string[] = [`tree ${newTreeSha}`];\n+      if (parentSha) lines.push(`parent ${parentSha}`);\n+      lines.push(`author ${author} <${email}> ${ts} +0000`);\n+      lines.push(`committer ${author} <${email}> ${ts} +0000`);\n+      lines.push(\"\");\n+      lines.push(opts.message.endsWith(\"\\n\") ? opts.message : opts.message + \"\\n\");\n+      const commitSha = await this.engine.storeObject(OBJ_COMMIT, encoder.encode(lines.join(\"\\n\")));\n+\n+      // Optimistic lock: verify ref hasn't moved since we read it\n+      const refName = this.refToStorageName(opts.ref);\n+      if (refName) {\n+        const currentSha = this.engine.getRef(refName);\n+        if (currentSha !== parentSha) {\n+          // Ref moved \u2014 retry with new parent\n+          continue;\n+        }\n+        this.engine.setRef(refName, commitSha);\n+      }\n \n-    // Update ref\n-    const refName = this.refToStorageName(opts.ref);\n-    if (refName) this.engine.setRef(refName, commitSha);\n+      // Index commit metadata\n+      this.engine.indexCommit(commitSha, `${author} <${email}>`, opts.message, ts);\n \n-    // Index commit metadata\n-    this.engine.indexCommit(commitSha, `${opts.author} <${opts.email}>`, opts.message, ts);\n+      return commitSha;\n+    }\n \n-    return commitSha;\n+    throw new Error(\"Failed to commit: ref was concurrently modified (too many retries)\");\n   }\n \n   // === branch ===\n@@ -1048,7 +1066,15 @@ export class GitPorcelain {\n       // Both sides deleted\n       if (!ours && !theirs) continue;\n \n-      // Conflict: both modified differently \u2014 take theirs (agent-friendly default)\n+      // Both sides modified differently from base\n+      // For directories: recurse to merge contents\n+      if (ours && theirs && ours.mode.startsWith(\"40\") && theirs.mode.startsWith(\"40\")) {\n+        const mergedSub = await this.mergeTrees(base?.sha ?? \"\", ours.sha, theirs.sha);\n+        result.push({ mode: \"40000\", name, sha: mergedSub });\n+        continue;\n+      }\n+\n+      // Conflict on files: take theirs (agent-friendly default)\n       if (theirs) {\n         result.push({ mode: theirs.mode, name, sha: theirs.sha });\n       } else if (ours) {"
+    },
+    {
+      "sha": "b9de60304cb106c6b2f697a4f1f104f3c633e364",
+      "filename": "src/repo-store.ts",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 4,
+      "changes": 17,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/fff7fc53c2c859ff93d536a5f5934c365a315834/src%2Frepo-store.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/fff7fc53c2c859ff93d536a5f5934c365a315834/src%2Frepo-store.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Frepo-store.ts?ref=fff7fc53c2c859ff93d536a5f5934c365a315834",
+      "patch": "@@ -181,8 +181,14 @@ async function handleApiAction(\n   switch (action) {\n     // --- init ---\n     case \"init\": {\n-      const body = await request.json() as { defaultBranch?: string };\n-      porcelain.init(body.defaultBranch);\n+      let defaultBranch: string | undefined;\n+      try {\n+        const body = await request.json() as { defaultBranch?: string };\n+        defaultBranch = body.defaultBranch;\n+      } catch {\n+        // Empty body is fine \u2014 use defaults\n+      }\n+      porcelain.init(defaultBranch);\n       return Response.json({ ok: true });\n     }\n \n@@ -215,11 +221,14 @@ async function handleApiAction(\n       const body = await request.json() as {\n         ref: string;\n         message: string;\n-        author: string;\n-        email: string;\n+        author?: string;\n+        email?: string;\n         files: Array<{ path: string; content: string | null }>;\n         timestamp?: number;\n       };\n+      if (!body.ref) throw new Error(\"Missing required field: ref\");\n+      if (!body.message) throw new Error(\"Missing required field: message\");\n+      if (!body.files || !Array.isArray(body.files)) throw new Error(\"Missing required field: files\");\n       const sha = await porcelain.commit({\n         ref: body.ref,\n         message: body.message,"
+    },
+    {
+      "sha": "c4b2e240657042945baec3b0de9e5da819e96591",
+      "filename": "src/worker.ts",
+      "status": "modified",
+      "additions": 32,
+      "deletions": 0,
+      "changes": 32,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/fff7fc53c2c859ff93d536a5f5934c365a315834/src%2Fworker.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/fff7fc53c2c859ff93d536a5f5934c365a315834/src%2Fworker.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Fworker.ts?ref=fff7fc53c2c859ff93d536a5f5934c365a315834",
+      "patch": "@@ -39,6 +39,7 @@ export type { Env };\n \n const GIT_ROUTE = /^\\/([^/]+)\\/([^/]+?)\\.git\\/(.+)$/;\n const API_ROUTE = /^\\/api\\/repos\\/([^/]+)\\/([^/]+)(?:\\/(.*))?$/;\n+const LIST_REPOS_ROUTE = /^\\/api\\/repos(?:\\/([^/]+))?\\/?$/;\n \n function getStore(env: Env, repoPath: string) {\n   const id = env.REPO_STORE.idFromName(repoPath);\n@@ -50,6 +51,18 @@ export default {\n     const url = new URL(request.url);\n     const path = url.pathname;\n \n+    // --- List repos ---\n+    const listMatch = path.match(LIST_REPOS_ROUTE);\n+    if (listMatch && request.method === \"GET\") {\n+      const ownerFilter = listMatch[1];\n+      try {\n+        return await listRepos(env, ownerFilter);\n+      } catch (err) {\n+        console.error(`gitmode list-repos error: ${err}`);\n+        return Response.json({ error: \"Internal error\" }, { status: 500 });\n+      }\n+    }\n+\n     // --- REST API ---\n     const apiMatch = path.match(API_ROUTE);\n     if (apiMatch) {\n@@ -84,6 +97,25 @@ export default {\n   },\n };\n \n+async function listRepos(env: Env, ownerFilter?: string): Promise<Response> {\n+  // Discover repos by listing R2 prefixes: {owner}/{repo}/objects/\n+  const prefix = ownerFilter ? `${ownerFilter}/` : \"\";\n+  const listed = await env.OBJECTS.list({ prefix, delimiter: \"/objects/\" });\n+  const repos: Array<{ owner: string; name: string }> = [];\n+  const seen = new Set<string>();\n+\n+  for (const prefix of listed.delimitedPrefixes) {\n+    // prefix looks like \"owner/repo/objects/\"\n+    const repoPath = prefix.replace(/\\/objects\\/$/, \"\");\n+    if (seen.has(repoPath)) continue;\n+    seen.add(repoPath);\n+    const [owner, name] = repoPath.split(\"/\");\n+    if (owner && name) repos.push({ owner, name });\n+  }\n+\n+  return Response.json({ repos });\n+}\n+\n function forwardToStore(\n   store: Rpc.DurableObjectBranded,\n   request: Request,"
+    },
+    {
+      "sha": "245709cd4e7837953ef11755fda6f3c0351c1d9c",
+      "filename": "test/worker.ts",
+      "status": "modified",
+      "additions": 30,
+      "deletions": 0,
+      "changes": 30,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/fff7fc53c2c859ff93d536a5f5934c365a315834/test%2Fworker.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/fff7fc53c2c859ff93d536a5f5934c365a315834/test%2Fworker.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/test%2Fworker.ts?ref=fff7fc53c2c859ff93d536a5f5934c365a315834",
+      "patch": "@@ -13,6 +13,7 @@ export type { Env };\n \n const GIT_ROUTE = /^\\/([^/]+)\\/([^/]+?)\\.git\\/(.+)$/;\n const API_ROUTE = /^\\/api\\/repos\\/([^/]+)\\/([^/]+)(?:\\/(.*))?$/;\n+const LIST_REPOS_ROUTE = /^\\/api\\/repos(?:\\/([^/]+))?\\/?$/;\n \n function getStore(env: Env, repoPath: string) {\n   const id = env.REPO_STORE.idFromName(repoPath);\n@@ -26,6 +27,18 @@ export default {\n     const url = new URL(request.url);\n     const path = url.pathname;\n \n+    // --- List repos ---\n+    const listMatch = path.match(LIST_REPOS_ROUTE);\n+    if (listMatch && request.method === \"GET\") {\n+      const ownerFilter = listMatch[1];\n+      try {\n+        return await listRepos(env, ownerFilter);\n+      } catch (err) {\n+        console.error(`gitmode list-repos error: ${err}`);\n+        return Response.json({ error: \"Internal error\" }, { status: 500 });\n+      }\n+    }\n+\n     // --- REST API ---\n     const apiMatch = path.match(API_ROUTE);\n     if (apiMatch) {\n@@ -60,6 +73,23 @@ export default {\n   },\n };\n \n+async function listRepos(env: Env, ownerFilter?: string): Promise<Response> {\n+  const prefix = ownerFilter ? `${ownerFilter}/` : \"\";\n+  const listed = await env.OBJECTS.list({ prefix, delimiter: \"/objects/\" });\n+  const repos: Array<{ owner: string; name: string }> = [];\n+  const seen = new Set<string>();\n+\n+  for (const p of listed.delimitedPrefixes) {\n+    const repoPath = p.replace(/\\/objects\\/$/, \"\");\n+    if (seen.has(repoPath)) continue;\n+    seen.add(repoPath);\n+    const [owner, name] = repoPath.split(\"/\");\n+    if (owner && name) repos.push({ owner, name });\n+  }\n+\n+  return Response.json({ repos });\n+}\n+\n function forwardToStore(\n   store: StoreHandle,\n   request: Request,"
+    },
+    {
+      "sha": "c91471eade7c3a61744fd8a2f9017580b36164c7",
+      "filename": "wrangler.jsonc",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 7,
+      "changes": 9,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/fff7fc53c2c859ff93d536a5f5934c365a315834/wrangler.jsonc",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/fff7fc53c2c859ff93d536a5f5934c365a315834/wrangler.jsonc",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/wrangler.jsonc?ref=fff7fc53c2c859ff93d536a5f5934c365a315834",
+      "patch": "@@ -1,7 +1,7 @@\n {\n   \"$schema\": \"node_modules/wrangler/config-schema.json\",\n   \"name\": \"gitmode\",\n-  \"main\": \"./worker/index.ts\",\n+  \"main\": \"./src/worker.ts\",\n   \"compatibility_date\": \"2025-12-01\",\n   \"compatibility_flags\": [\"nodejs_compat\"],\n \n@@ -32,10 +32,5 @@\n       \"globs\": [\"**/*.wasm\"],\n       \"fallthrough\": false\n     }\n-  ],\n-\n-  \"assets\": {\n-    \"directory\": \"./dist/client\",\n-    \"not_found_handling\": \"none\"\n-  }\n+  ]\n }"
+    }
+  ]
+}

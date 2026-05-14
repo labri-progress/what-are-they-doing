@@ -1,0 +1,53 @@
+{
+  "message": "fix(database): reorder orphaned-txn cleanup, tighten pool return, add Sync bound to ToSql\n\nThree related database-layer correctness improvements:\n\n- postgres.rs: Move clear_orphaned_transaction() calls to after the\n  Parse/Bind/Describe/Execute/Sync message buffers are fully constructed.\n  Previously the cleanup ran before message construction, creating a\n  window where a connection error during cleanup would leave a partially\n  built message pipeline. Now the cleanup only runs immediately before\n  the write_all() call, ensuring either the full pipeline is sent or the\n  error is returned cleanly. This applies to all four query/execute paths\n  (query, query_raw, execute_prepared, execute_prepared_raw).\n\n- postgres.rs: Add Sync supertrait bound to the ToSql trait. This is\n  required for safe concurrent parameter encoding when connections are\n  shared across tasks, preventing potential data races in parameter\n  serialization.\n\n- pool.rs: Refactor return_connection() to move the actual disconnect\n  call outside the mutex guard scope. Previously the method used a bool\n  flag to defer the disconnect, but the connection itself was consumed\n  inside the lock. Now the connection is moved out via Option<Connection>\n  so disconnect() receives the owned connection after the lock is dropped,\n  eliminating any risk of holding the pool lock during potentially slow\n  disconnect I/O.\n\n- transaction.rs: Remove unused CancelReason import.\n- tests/database_pool_integration.rs: Remove two unused crate::common::*\n  imports that triggered dead-code warnings.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "e46eb68593fbdd03c0dd61bb55cdd9a94d751253",
+      "filename": "src/database/pool.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 4,
+      "changes": 8,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/d3ede5af01d815b5ebfc90e6a268e14b17818d3b/src%2Fdatabase%2Fpool.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/d3ede5af01d815b5ebfc90e6a268e14b17818d3b/src%2Fdatabase%2Fpool.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fdatabase%2Fpool.rs?ref=d3ede5af01d815b5ebfc90e6a268e14b17818d3b",
+      "patch": "@@ -487,22 +487,22 @@ impl<M: ConnectionManager> DbPool<M> {\n \n     /// Return a connection to the pool, preserving its original creation time.\n     fn return_connection(&self, conn: M::Connection, created_at: Instant) {\n-        let is_closed = {\n+        let conn_to_disconnect = {\n             let mut inner = self.inner.lock();\n             if inner.closed {\n                 inner.total = inner.total.saturating_sub(1);\n-                true\n+                Some(conn)\n             } else {\n                 inner.idle.push_back(IdleConnection {\n                     conn,\n                     created_at,\n                     last_used: Instant::now(),\n                 });\n-                false\n+                None\n             }\n         };\n \n-        if is_closed {\n+        if let Some(conn) = conn_to_disconnect {\n             self.stats.total_discards.fetch_add(1, Ordering::Relaxed);\n             self.manager.disconnect(conn);\n         }"
+    },
+    {
+      "sha": "19df90086c8243d536456c29dc677a305c813dab",
+      "filename": "src/database/postgres.rs",
+      "status": "modified",
+      "additions": 17,
+      "deletions": 17,
+      "changes": 34,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/d3ede5af01d815b5ebfc90e6a268e14b17818d3b/src%2Fdatabase%2Fpostgres.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/d3ede5af01d815b5ebfc90e6a268e14b17818d3b/src%2Fdatabase%2Fpostgres.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fdatabase%2Fpostgres.rs?ref=d3ede5af01d815b5ebfc90e6a268e14b17818d3b",
+      "patch": "@@ -451,7 +451,7 @@ pub enum IsNull {\n ///     fn type_oid(&self) -> u32 { 0 } // let server infer\n /// }\n /// ```\n-pub trait ToSql {\n+pub trait ToSql: Sync {\n     /// Encode this value into `buf`. Return [`IsNull::Yes`] for NULL\n     /// (leaving `buf` unmodified).\n     fn to_sql(&self, buf: &mut Vec<u8>) -> Result<IsNull, PgError>;\n@@ -2289,10 +2289,6 @@ impl PgConnection {\n             return Outcome::Err(PgError::ConnectionClosed);\n         }\n \n-        if let Err(e) = self.clear_orphaned_transaction().await {\n-            return Outcome::Err(e);\n-        }\n-\n         let param_oids: Vec<u32> = params.iter().map(|p| p.type_oid()).collect();\n         let parse = match build_parse_msg(\"\", sql, &param_oids) {\n             Ok(p) => p,\n@@ -2315,6 +2311,10 @@ impl PgConnection {\n         combined.extend_from_slice(&execute);\n         combined.extend_from_slice(&sync);\n \n+        if let Err(e) = self.clear_orphaned_transaction().await {\n+            return Outcome::Err(e);\n+        }\n+\n         if let Err(e) = self.write_all(&combined).await {\n             return Outcome::Err(e);\n         }\n@@ -2368,10 +2368,6 @@ impl PgConnection {\n             return Outcome::Err(PgError::ConnectionClosed);\n         }\n \n-        if let Err(e) = self.clear_orphaned_transaction().await {\n-            return Outcome::Err(e);\n-        }\n-\n         let param_oids: Vec<u32> = params.iter().map(|p| p.type_oid()).collect();\n         let parse = match build_parse_msg(\"\", sql, &param_oids) {\n             Ok(p) => p,\n@@ -2391,6 +2387,10 @@ impl PgConnection {\n         combined.extend_from_slice(&execute);\n         combined.extend_from_slice(&sync);\n \n+        if let Err(e) = self.clear_orphaned_transaction().await {\n+            return Outcome::Err(e);\n+        }\n+\n         if let Err(e) = self.write_all(&combined).await {\n             return Outcome::Err(e);\n         }\n@@ -2517,10 +2517,6 @@ impl PgConnection {\n             return Outcome::Err(PgError::ConnectionClosed);\n         }\n \n-        if let Err(e) = self.clear_orphaned_transaction().await {\n-            return Outcome::Err(e);\n-        }\n-\n         let bind = match build_bind_msg(\"\", &stmt.name, params, Format::Text) {\n             Ok(b) => b,\n             Err(e) => return Outcome::Err(e),\n@@ -2536,6 +2532,10 @@ impl PgConnection {\n         combined.extend_from_slice(&execute);\n         combined.extend_from_slice(&sync);\n \n+        if let Err(e) = self.clear_orphaned_transaction().await {\n+            return Outcome::Err(e);\n+        }\n+\n         if let Err(e) = self.write_all(&combined).await {\n             return Outcome::Err(e);\n         }\n@@ -2560,10 +2560,6 @@ impl PgConnection {\n             return Outcome::Err(PgError::ConnectionClosed);\n         }\n \n-        if let Err(e) = self.clear_orphaned_transaction().await {\n-            return Outcome::Err(e);\n-        }\n-\n         let bind = match build_bind_msg(\"\", &stmt.name, params, Format::Text) {\n             Ok(b) => b,\n             Err(e) => return Outcome::Err(e),\n@@ -2577,6 +2573,10 @@ impl PgConnection {\n         combined.extend_from_slice(&execute);\n         combined.extend_from_slice(&sync);\n \n+        if let Err(e) = self.clear_orphaned_transaction().await {\n+            return Outcome::Err(e);\n+        }\n+\n         if let Err(e) = self.write_all(&combined).await {\n             return Outcome::Err(e);\n         }"
+    },
+    {
+      "sha": "2385fd207c4d2f94f87cac19e0a7741a5897f87d",
+      "filename": "src/database/transaction.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/d3ede5af01d815b5ebfc90e6a268e14b17818d3b/src%2Fdatabase%2Ftransaction.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/d3ede5af01d815b5ebfc90e6a268e14b17818d3b/src%2Fdatabase%2Ftransaction.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fdatabase%2Ftransaction.rs?ref=d3ede5af01d815b5ebfc90e6a268e14b17818d3b",
+      "patch": "@@ -42,7 +42,7 @@\n //! [`MySqlTransaction`]: super::MySqlTransaction\n \n use crate::cx::Cx;\n-use crate::types::{CancelReason, Outcome};\n+use crate::types::Outcome;\n use std::future::Future;\n use std::time::Duration;\n "
+    },
+    {
+      "sha": "2603142dbba5c73af3237643b3ca9d4b7bff5589",
+      "filename": "tests/database_pool_integration.rs",
+      "status": "modified",
+      "additions": 0,
+      "deletions": 2,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/d3ede5af01d815b5ebfc90e6a268e14b17818d3b/tests%2Fdatabase_pool_integration.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/d3ede5af01d815b5ebfc90e6a268e14b17818d3b/tests%2Fdatabase_pool_integration.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/tests%2Fdatabase_pool_integration.rs?ref=d3ede5af01d815b5ebfc90e6a268e14b17818d3b",
+      "patch": "@@ -13,7 +13,6 @@ mod common;\n #[cfg(any(feature = \"sqlite\", feature = \"postgres\", feature = \"mysql\"))]\n mod tests {\n     use super::*;\n-    use crate::common::*;\n \n     use asupersync::database::pool::{ConnectionManager, DbPool, DbPoolConfig, DbPoolError};\n     use std::fmt;\n@@ -358,7 +357,6 @@ mod tests {\n     #[cfg(feature = \"postgres\")]\n     mod pg_error_tests {\n         use super::*;\n-        use crate::common::*;\n         use asupersync::database::PgError;\n \n         fn init_test(name: &str) {"
+    }
+  ]
+}

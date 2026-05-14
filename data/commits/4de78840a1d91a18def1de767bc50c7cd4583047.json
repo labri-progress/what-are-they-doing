@@ -1,0 +1,53 @@
+{
+  "message": "fix(btree,mvcc): resolve content offset sentinel handling and reduce drain CPU usage\n\nTwo distinct fixes across the btree and MVCC layers:\n\nB-tree content offset (fsqlite-btree):\n- Add BtreePageHeader::content_offset() method that correctly resolves\n  the SQLite 65536 sentinel value (raw header stores 0 for 65536) by\n  clamping to usable_size, preventing underflow in free-space calculations\n- Update balance_quick(), insert_cell_into_page(), and BtCursor insert\n  to use the new content_offset() method instead of raw casts\n\nMVCC drain polling (fsqlite-mvcc):\n- Reduce CPU usage during SharedPageLockTable drain by running expensive\n  full-table scans (orphan cleanup + drain_progress) only every ~100\n  iterations instead of every loop iteration\n- Add fast-path quiescence check using a single atomic load of the\n  draining table index, avoiding millions of unnecessary atomic loads\n  per millisecond on large tables\n- Simplify timeout quiescence check to use the same fast path\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "c3c46faa52fa135b96cbd48aa7c2c870c29d676b",
+      "filename": "crates/fsqlite-btree/src/balance.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 2,
+      "changes": 5,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/4de78840a1d91a18def1de767bc50c7cd4583047/crates%2Ffsqlite-btree%2Fsrc%2Fbalance.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/4de78840a1d91a18def1de767bc50c7cd4583047/crates%2Ffsqlite-btree%2Fsrc%2Fbalance.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-btree%2Fsrc%2Fbalance.rs?ref=4de78840a1d91a18def1de767bc50c7cd4583047",
+      "patch": "@@ -202,7 +202,7 @@ pub fn balance_quick<W: PageWriter>(\n         + usize::from(parent_header.page_type.header_size())\n         + (usize::from(parent_header.cell_count) * 2);\n \n-    let free_space = (parent_header.cell_content_offset as usize).saturating_sub(parent_used);\n+    let free_space = parent_header.content_offset(usable_size).saturating_sub(parent_used);\n \n     // We need space for:\n     // 1. The new cell pointer (2 bytes)\n@@ -1098,7 +1098,8 @@ fn insert_cell_into_page<W: PageWriter>(\n     let mut ptrs = read_cell_pointers(&page_data, &header, offset)?;\n \n     let cell_len = cell_data.len();\n-    let new_content_offset = (header.cell_content_offset as usize)\n+    let new_content_offset = header\n+        .content_offset(_usable_size)\n         .checked_sub(cell_len)\n         .ok_or_else(|| FrankenError::internal(\"cell too large for page content area\"))?;\n "
+    },
+    {
+      "sha": "b1dccac137058273ffdc9319fde186b679cd229c",
+      "filename": "crates/fsqlite-btree/src/cell.rs",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 0,
+      "changes": 11,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/4de78840a1d91a18def1de767bc50c7cd4583047/crates%2Ffsqlite-btree%2Fsrc%2Fcell.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/4de78840a1d91a18def1de767bc50c7cd4583047/crates%2Ffsqlite-btree%2Fsrc%2Fcell.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-btree%2Fsrc%2Fcell.rs?ref=4de78840a1d91a18def1de767bc50c7cd4583047",
+      "patch": "@@ -115,6 +115,7 @@ pub struct BtreePageHeader {\n     pub cell_count: u16,\n     /// Byte offset of the first byte of the cell content area.\n     /// A value of 0 means 65536.\n+    /// The raw value from the header. Use `content_offset()` for the usable value.\n     pub cell_content_offset: u32,\n     /// Number of fragmented free bytes in the cell content area.\n     pub fragmented_free_bytes: u8,\n@@ -124,6 +125,16 @@ pub struct BtreePageHeader {\n }\n \n impl BtreePageHeader {\n+    /// Return the resolved content offset, clamping the 65536 sentinel to `usable_size`.\n+    #[must_use]\n+    pub fn content_offset(&self, usable_size: u32) -> usize {\n+        if self.cell_count == 0 || self.cell_content_offset >= 65536 {\n+            usable_size as usize\n+        } else {\n+            self.cell_content_offset as usize\n+        }\n+    }\n+\n     /// Parse a B-tree page header from raw page bytes.\n     ///\n     /// `header_offset` is typically 0, except for page 1 where the database"
+    },
+    {
+      "sha": "3313a889ce8f6c38fa3323c4fe44ffeb6577e94c",
+      "filename": "crates/fsqlite-btree/src/cursor.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/4de78840a1d91a18def1de767bc50c7cd4583047/crates%2Ffsqlite-btree%2Fsrc%2Fcursor.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/4de78840a1d91a18def1de767bc50c7cd4583047/crates%2Ffsqlite-btree%2Fsrc%2Fcursor.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-btree%2Fsrc%2Fcursor.rs?ref=4de78840a1d91a18def1de767bc50c7cd4583047",
+      "patch": "@@ -1372,7 +1372,7 @@ impl<P: PageWriter> BtCursor<P> {\n         let mut header = BtreePageHeader::parse(&page_data, header_offset)?;\n         let mut ptrs = cell::read_cell_pointers(&page_data, &header, header_offset)?;\n \n-        let content_offset = header.cell_content_offset as usize;\n+        let content_offset = header.content_offset(self.usable_size);\n         let Some(new_content_offset) = content_offset.checked_sub(cell_data.len()) else {\n             return Ok(false); // Page full.\n         };"
+    },
+    {
+      "sha": "065500494804be8fd4ae91f6369bc940c499e8fa",
+      "filename": "crates/fsqlite-mvcc/src/shared_lock_table.rs",
+      "status": "modified",
+      "additions": 27,
+      "deletions": 12,
+      "changes": 39,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/4de78840a1d91a18def1de767bc50c7cd4583047/crates%2Ffsqlite-mvcc%2Fsrc%2Fshared_lock_table.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/4de78840a1d91a18def1de767bc50c7cd4583047/crates%2Ffsqlite-mvcc%2Fsrc%2Fshared_lock_table.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-mvcc%2Fsrc%2Fshared_lock_table.rs?ref=4de78840a1d91a18def1de767bc50c7cd4583047",
+      "patch": "@@ -916,27 +916,42 @@ impl SharedPageLockTable {\n \n         // Step 3: Drain with polling.\n         let mut orphaned_cleaned = 0_u32;\n+        let mut loops_since_full_scan = 0_u32;\n         loop {\n-            // Clean orphaned locks.\n-            orphaned_cleaned += self.drain_orphaned(&is_active_txn);\n+            // Run full table scans (orphaned cleanup and exact remaining count)\n+            // only periodically (every ~100ms) to avoid pegging the CPU and\n+            // memory bus with millions of atomic loads per millisecond.\n+            if loops_since_full_scan % 100 == 0 {\n+                orphaned_cleaned += self.drain_orphaned(&is_active_txn);\n \n-            // Check quiescence.\n-            if let Some(status) = self.drain_progress() {\n-                if status.quiescent {\n-                    break;\n+                // Log progress occasionally.\n+                if let Some(status) = self.drain_progress() {\n+                    if status.quiescent {\n+                        break;\n+                    }\n+                    debug!(remaining = status.remaining, \"drain in progress\");\n+                }\n+            } else {\n+                // Fast path: early-return scan. Checks if table is quiescent\n+                // without scanning the whole table if it's not.\n+                let draining_idx = self.draining_table.load(Ordering::Acquire);\n+                if draining_idx != DRAINING_NONE {\n+                    let draining = &self.tables[draining_idx as usize];\n+                    if draining.is_quiescent() {\n+                        break;\n+                    }\n                 }\n-\n-                debug!(remaining = status.remaining, \"drain in progress\");\n             }\n+            loops_since_full_scan += 1;\n \n             // Check timeout.\n             if remaining_budget_ms == 0 {\n                 // Cancel: must still finalize if quiescent, otherwise\n                 // leave drain in progress for next attempt.\n-                if let Some(status) = self.drain_progress() {\n-                    if status.quiescent {\n-                        break;\n-                    }\n+                let draining_idx = self.draining_table.load(Ordering::Acquire);\n+                let quiescent = draining_idx != DRAINING_NONE && self.tables[draining_idx as usize].is_quiescent();\n+                \n+                if !quiescent {\n                     // Release lease but leave draining state for later.\n                     self.rebuild_pid.store(0, Ordering::Release);\n                     return Ok(RebuildResult {"
+    }
+  ]
+}

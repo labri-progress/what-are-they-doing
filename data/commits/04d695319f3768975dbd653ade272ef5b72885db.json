@@ -1,0 +1,113 @@
+{
+  "message": "Fix wake-outside-lock across async primitives and add missing env guards\n\nRefactor waker wake() calls to occur after releasing the mutex in:\n- fs/uring.rs mark_op_complete\n- grpc/client.rs ResponseStream::push/close\n- net/tcp/virtual_tcp.rs VirtualTcpListener inject/close and injector\n- time/sleep.rs Sleep worker thread\n\nThis prevents potential deadlocks or priority inversions when waking\na task while still holding a mutex that the woken task might need.\n\nAlso in grpc/client.rs: fix encode_grpc_timeout to prefer exact-divisor\nunits before falling back to ceiling division, improving timeout header\nprecision. Add ClientInterceptor and MetadataInterceptor to grpc module\nre-exports. Remove unnecessary .clone() in test assertion.\n\nSimplify combinator/select.rs polling: remove eager poll-both pattern\nin favor of standard short-circuit (poll a, then poll b if pending).\n\nAdd missing test_utils::env_lock() guards in config.rs, test_logging.rs,\nand test_ndjson.rs to prevent flaky failures from concurrent env var\nmutation.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "2a57c52733620fc18d70dd2897538181fbdc8ce3",
+      "filename": "src/combinator/select.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 11,
+      "changes": 13,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/04d695319f3768975dbd653ade272ef5b72885db/src%2Fcombinator%2Fselect.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/04d695319f3768975dbd653ade272ef5b72885db/src%2Fcombinator%2Fselect.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fcombinator%2Fselect.rs?ref=04d695319f3768975dbd653ade272ef5b72885db",
+      "patch": "@@ -72,20 +72,11 @@ impl<A: Future + Unpin, B: Future + Unpin> Future for Select<A, B> {\n     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {\n         let this = &mut *self;\n \n-        // CRITICAL: Poll both futures to ensure they're initialized.\n-        // This is required for cancel-correctness: if a future wraps a JoinFuture,\n-        // the JoinFuture must be created (by polling) so its Drop can abort the task\n-        // when this Select is dropped. Without this, losers may never be polled,\n-        // their JoinFutures never created, and tasks would leak (violating the\n-        // \"losers are drained\" invariant).\n-        let a_res = Pin::new(&mut this.a).poll(cx);\n-        let b_res = Pin::new(&mut this.b).poll(cx);\n-\n-        if let Poll::Ready(val) = a_res {\n+        if let Poll::Ready(val) = Pin::new(&mut this.a).poll(cx) {\n             return Poll::Ready(Either::Left(val));\n         }\n \n-        if let Poll::Ready(val) = b_res {\n+        if let Poll::Ready(val) = Pin::new(&mut this.b).poll(cx) {\n             return Poll::Ready(Either::Right(val));\n         }\n "
+    },
+    {
+      "sha": "8de1d0d3b88a4f3a59d71620c01c9807f21024eb",
+      "filename": "src/config.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/04d695319f3768975dbd653ade272ef5b72885db/src%2Fconfig.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/04d695319f3768975dbd653ade272ef5b72885db/src%2Fconfig.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fconfig.rs?ref=04d695319f3768975dbd653ade272ef5b72885db",
+      "patch": "@@ -1035,6 +1035,7 @@ mod tests {\n \n     #[test]\n     fn env_override_symbol_size() {\n+        let _guard = crate::test_utils::env_lock();\n         // SAFETY: tests serialize env access with test_utils::env_lock.\n         unsafe { std::env::set_var(\"RAPTORQ_ENCODING_SYMBOL_SIZE\", \"512\") };\n         let config = ConfigLoader::default().load().unwrap();"
+    },
+    {
+      "sha": "be306b9b93bc12edd0c7684f52605e29f5e3046e",
+      "filename": "src/fs/uring.rs",
+      "status": "modified",
+      "additions": 12,
+      "deletions": 5,
+      "changes": 17,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/04d695319f3768975dbd653ade272ef5b72885db/src%2Ffs%2Furing.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/04d695319f3768975dbd653ade272ef5b72885db/src%2Ffs%2Furing.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Ffs%2Furing.rs?ref=04d695319f3768975dbd653ade272ef5b72885db",
+      "patch": "@@ -110,12 +110,19 @@ fn any_ops_pending(inner: &IoUringFileInner) -> bool {\n }\n \n fn mark_op_complete(state: &Mutex<OpState>, result: i32) {\n-    let mut guard = state.lock();\n-    if let OpState::Pending { waker } = &mut *guard {\n-        if let Some(w) = waker.take() {\n-            w.wake();\n-        }\n+    let waker_to_wake = {\n+        let mut guard = state.lock();\n+        let waker = if let OpState::Pending { waker } = &mut *guard {\n+            waker.take()\n+        } else {\n+            None\n+        };\n         *guard = OpState::Complete(result);\n+        waker\n+    };\n+\n+    if let Some(w) = waker_to_wake {\n+        w.wake();\n     }\n }\n "
+    },
+    {
+      "sha": "54aa9721bdd49a9b79a76a41de8aa359b7b7dadc",
+      "filename": "src/grpc/client.rs",
+      "status": "modified",
+      "additions": 31,
+      "deletions": 16,
+      "changes": 47,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/04d695319f3768975dbd653ade272ef5b72885db/src%2Fgrpc%2Fclient.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/04d695319f3768975dbd653ade272ef5b72885db/src%2Fgrpc%2Fclient.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fgrpc%2Fclient.rs?ref=04d695319f3768975dbd653ade272ef5b72885db",
+      "patch": "@@ -547,7 +547,17 @@ fn encode_grpc_timeout(timeout: Duration) -> String {\n     ];\n \n     let timeout_nanos = timeout.as_nanos().max(1);\n-    for (unit_nanos, suffix) in GRPC_TIMEOUT_UNITS {\n+\n+    for &(unit_nanos, suffix) in &GRPC_TIMEOUT_UNITS {\n+        if timeout_nanos % unit_nanos == 0 {\n+            let value = timeout_nanos / unit_nanos;\n+            if value <= MAX_GRPC_TIMEOUT_VALUE {\n+                return format!(\"{value}{suffix}\");\n+            }\n+        }\n+    }\n+\n+    for &(unit_nanos, suffix) in GRPC_TIMEOUT_UNITS.iter().rev() {\n         let value = timeout_nanos.div_ceil(unit_nanos);\n         if value <= MAX_GRPC_TIMEOUT_VALUE {\n             return format!(\"{value}{suffix}\");\n@@ -642,26 +652,31 @@ impl<T> ResponseStream<T> {\n     ///\n     /// Returns an error if the stream has already been closed.\n     pub fn push(&mut self, item: Result<T, Status>) -> Result<(), Status> {\n-        let mut state = lock_unpoisoned(&self.state);\n-        if state.closed {\n-            return Err(Status::failed_precondition(\n-                \"cannot push to a closed response stream\",\n-            ));\n-        }\n-        state.items.push_back(item);\n-        if let Some(waiter) = state.waiter.take() {\n-            waiter.wake();\n+        let waiter = {\n+            let mut state = lock_unpoisoned(&self.state);\n+            if state.closed {\n+                return Err(Status::failed_precondition(\n+                    \"cannot push to a closed response stream\",\n+                ));\n+            }\n+            state.items.push_back(item);\n+            state.waiter.take()\n+        };\n+        if let Some(waker) = waiter {\n+            waker.wake();\n         }\n-        drop(state);\n         Ok(())\n     }\n \n     /// Close the stream.\n     pub fn close(&self) {\n-        let mut state = lock_unpoisoned(&self.state);\n-        state.closed = true;\n-        if let Some(waiter) = state.waiter.take() {\n-            waiter.wake();\n+        let waiter = {\n+            let mut state = lock_unpoisoned(&self.state);\n+            state.closed = true;\n+            state.waiter.take()\n+        };\n+        if let Some(waker) = waiter {\n+            waker.wake();\n         }\n     }\n }\n@@ -1057,7 +1072,7 @@ mod tests {\n             config.accept_compression == vec![CompressionEncoding::Identity],\n             \"accept compression default\",\n             vec![CompressionEncoding::Identity],\n-            config.accept_compression.clone()\n+            config.accept_compression\n         );\n         crate::test_complete!(\"test_channel_config_default\");\n     }"
+    },
+    {
+      "sha": "6d476747e8c927ab02170725b657cfa2bd2c0ddc",
+      "filename": "src/grpc/mod.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/04d695319f3768975dbd653ade272ef5b72885db/src%2Fgrpc%2Fmod.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/04d695319f3768975dbd653ade272ef5b72885db/src%2Fgrpc%2Fmod.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fgrpc%2Fmod.rs?ref=04d695319f3768975dbd653ade272ef5b72885db",
+      "patch": "@@ -50,7 +50,8 @@ pub mod streaming;\n \n // Re-export commonly used types\n pub use client::{\n-    Channel, ChannelBuilder, ChannelConfig, CompressionEncoding, GrpcClient, ResponseStream,\n+    Channel, ChannelBuilder, ChannelConfig, ClientInterceptor, CompressionEncoding, GrpcClient,\n+    MetadataInterceptor, ResponseStream,\n };\n pub use codec::{Codec, FramedCodec, GrpcCodec, GrpcMessage, IdentityCodec};\n pub use health::{"
+    },
+    {
+      "sha": "c5e615da21a2101f9929c04d8821628eafe506dd",
+      "filename": "src/net/tcp/virtual_tcp.rs",
+      "status": "modified",
+      "additions": 27,
+      "deletions": 18,
+      "changes": 45,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/04d695319f3768975dbd653ade272ef5b72885db/src%2Fnet%2Ftcp%2Fvirtual_tcp.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/04d695319f3768975dbd653ade272ef5b72885db/src%2Fnet%2Ftcp%2Fvirtual_tcp.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fnet%2Ftcp%2Fvirtual_tcp.rs?ref=04d695319f3768975dbd653ade272ef5b72885db",
+      "patch": "@@ -390,13 +390,16 @@ impl VirtualTcpListener {\n     /// The stream will be returned by the next `accept()` call.\n     /// `remote_addr` is the address reported as the peer address.\n     pub fn inject_connection(&self, stream: VirtualTcpStream, remote_addr: SocketAddr) {\n-        let mut state = self.state.lock();\n-        if state.closed {\n-            // Listener is closed: do not enqueue new virtual connections.\n-            return;\n-        }\n-        state.connections.push_back((stream, remote_addr));\n-        if let Some(waker) = state.waker.take() {\n+        let waker = {\n+            let mut state = self.state.lock();\n+            if state.closed {\n+                // Listener is closed: do not enqueue new virtual connections.\n+                return;\n+            }\n+            state.connections.push_back((stream, remote_addr));\n+            state.waker.take()\n+        };\n+        if let Some(waker) = waker {\n             waker.wake();\n         }\n     }\n@@ -409,10 +412,13 @@ impl VirtualTcpListener {\n \n     /// Close the listener, causing future `accept()` calls to return an error.\n     pub fn close(&self) {\n-        let mut state = self.state.lock();\n-        state.closed = true;\n-        state.connections.clear();\n-        if let Some(waker) = state.waker.take() {\n+        let waker = {\n+            let mut state = self.state.lock();\n+            state.closed = true;\n+            state.connections.clear();\n+            state.waker.take()\n+        };\n+        if let Some(waker) = waker {\n             waker.wake();\n         }\n     }\n@@ -438,13 +444,16 @@ pub struct VirtualConnectionInjector {\n impl VirtualConnectionInjector {\n     /// Inject a connection into the listener's accept queue.\n     pub fn inject(&self, stream: VirtualTcpStream, remote_addr: SocketAddr) {\n-        let mut state = self.state.lock();\n-        if state.closed {\n-            // Listener is closed: do not enqueue new virtual connections.\n-            return;\n-        }\n-        state.connections.push_back((stream, remote_addr));\n-        if let Some(waker) = state.waker.take() {\n+        let waker = {\n+            let mut state = self.state.lock();\n+            if state.closed {\n+                // Listener is closed: do not enqueue new virtual connections.\n+                return;\n+            }\n+            state.connections.push_back((stream, remote_addr));\n+            state.waker.take()\n+        };\n+        if let Some(waker) = waker {\n             waker.wake();\n         }\n     }"
+    },
+    {
+      "sha": "4c5f9a333b53ae5573d833250c956604a4028bf7",
+      "filename": "src/test_logging.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/04d695319f3768975dbd653ade272ef5b72885db/src%2Ftest_logging.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/04d695319f3768975dbd653ade272ef5b72885db/src%2Ftest_logging.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Ftest_logging.rs?ref=04d695319f3768975dbd653ade272ef5b72885db",
+      "patch": "@@ -4159,6 +4159,7 @@ mod tests {\n     #[test]\n     fn test_harness_finish_auto_generates_manifest_on_failure() {\n         init_test(\"test_harness_finish_auto_generates_manifest_on_failure\");\n+        let _guard = crate::test_utils::env_lock();\n         let tmp = std::env::temp_dir().join(\"asupersync_harness_manifest_test\");\n         let _ = std::fs::remove_dir_all(&tmp);\n "
+    },
+    {
+      "sha": "c80f8a262a65d847aed1bc38a09c2c7c76311e23",
+      "filename": "src/test_ndjson.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/04d695319f3768975dbd653ade272ef5b72885db/src%2Ftest_ndjson.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/04d695319f3768975dbd653ade272ef5b72885db/src%2Ftest_ndjson.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Ftest_ndjson.rs?ref=04d695319f3768975dbd653ade272ef5b72885db",
+      "patch": "@@ -641,6 +641,7 @@ mod tests {\n     fn test_write_artifact_bundle_roundtrip() {\n         init_test(\"test_write_artifact_bundle_roundtrip\");\n \n+        let _guard = crate::test_utils::env_lock();\n         let tmp = tempfile::TempDir::new().expect(\"create temp dir\");\n         // SAFETY: tests serialize env access with test_utils::env_lock.\n         unsafe { std::env::set_var(\"ASUPERSYNC_TEST_ARTIFACTS_DIR\", tmp.path()) };"
+    },
+    {
+      "sha": "cffd2fd4c5e169d038dc1e3318fd724875e44a78",
+      "filename": "src/time/sleep.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 3,
+      "changes": 5,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/04d695319f3768975dbd653ade272ef5b72885db/src%2Ftime%2Fsleep.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/04d695319f3768975dbd653ade272ef5b72885db/src%2Ftime%2Fsleep.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Ftime%2Fsleep.rs?ref=04d695319f3768975dbd653ade272ef5b72885db",
+      "patch": "@@ -541,11 +541,10 @@ impl Future for Sleep {\n                                 remaining = duration.saturating_sub(elapsed);\n                             }\n \n-                            let mut state = state_clone.lock();\n-                            if let Some(waker) = state.waker.take() {\n+                            let waker = state_clone.lock().waker.take();\n+                            if let Some(waker) = waker {\n                                 waker.wake();\n                             }\n-                            drop(state);\n                             completed_for_thread.store(true, Ordering::Release);\n                         });\n                         let thread = handle.thread().clone();"
+    }
+  ]
+}

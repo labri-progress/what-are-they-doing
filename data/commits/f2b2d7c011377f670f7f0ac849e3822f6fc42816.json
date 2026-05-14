@@ -1,0 +1,53 @@
+{
+  "message": "fix(messaging): improve lock hygiene, correct module feature gate, and gate kafka tests\n\nThree related fixes in the messaging subsystem:\n\n1. Lock hygiene (kafka.rs, kafka_consumer.rs): add explicit drop(state)\n   calls after MutexGuard usage to release parking_lot locks before\n   subsequent operations. In kafka_consumer.rs commit_offsets(), extract\n   subscribed_topics from the lock scope and validate outside the\n   critical section, preventing potential deadlock under contention.\n   Also drops the lock in unsubscribe(), seek(), and next_stub_offset().\n\n2. Module feature gate (lib.rs): change pub mod messaging from\n   #[cfg(all(not(target_arch = \"wasm32\"), feature = \"kafka\"))] to\n   #[cfg(not(target_arch = \"wasm32\"))]. The messaging module contains\n   general-purpose infrastructure beyond Kafka; gating the entire module\n   on the kafka feature was overly restrictive and prevented non-Kafka\n   messaging types from being used.\n\n3. Test feature gates (e2e_messaging.rs): add #[cfg(feature = \"kafka\")]\n   to kafka-specific imports and test functions so the test file compiles\n   without the kafka feature, consistent with the lib.rs gate change.\n\nAlso adds Eq derive to ConsumerRecord (already had PartialEq).\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "c9c313439ed6564fc2ef364636c87afe0cc8c09b",
+      "filename": "src/lib.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/f2b2d7c011377f670f7f0ac849e3822f6fc42816/src%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/f2b2d7c011377f670f7f0ac849e3822f6fc42816/src%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Flib.rs?ref=f2b2d7c011377f670f7f0ac849e3822f6fc42816",
+      "patch": "@@ -219,7 +219,7 @@ pub mod tls;\n pub mod fs;\n #[cfg(not(target_arch = \"wasm32\"))]\n pub mod grpc;\n-#[cfg(all(not(target_arch = \"wasm32\"), feature = \"kafka\"))]\n+#[cfg(not(target_arch = \"wasm32\"))]\n pub mod messaging;\n #[cfg(unix)]\n pub mod process;"
+    },
+    {
+      "sha": "a7f1940e29cac2318009265485e14e7757f70c7c",
+      "filename": "src/messaging/kafka.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/f2b2d7c011377f670f7f0ac849e3822f6fc42816/src%2Fmessaging%2Fkafka.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/f2b2d7c011377f670f7f0ac849e3822f6fc42816/src%2Fmessaging%2Fkafka.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fmessaging%2Fkafka.rs?ref=f2b2d7c011377f670f7f0ac849e3822f6fc42816",
+      "patch": "@@ -24,7 +24,6 @@\n // Phase 0 stubs return errors immediately; async is for API consistency\n // with eventual rdkafka integration.\n \n-\n use crate::cx::Cx;\n use parking_lot::Mutex;\n #[cfg(feature = \"kafka\")]\n@@ -398,6 +397,7 @@ fn next_stub_offset(topic: &str, partition: i32) -> i64 {\n     let entry = offsets.entry((topic.to_string(), partition)).or_insert(0);\n     let offset = *entry;\n     *entry += 1;\n+    drop(offsets);\n     offset\n }\n "
+    },
+    {
+      "sha": "434827944e8adad01dea5fb84f85cbe6f56ceb83",
+      "filename": "src/messaging/kafka_consumer.rs",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 11,
+      "changes": 27,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/f2b2d7c011377f670f7f0ac849e3822f6fc42816/src%2Fmessaging%2Fkafka_consumer.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/f2b2d7c011377f670f7f0ac849e3822f6fc42816/src%2Fmessaging%2Fkafka_consumer.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fmessaging%2Fkafka_consumer.rs?ref=f2b2d7c011377f670f7f0ac849e3822f6fc42816",
+      "patch": "@@ -230,7 +230,7 @@ impl TopicPartitionOffset {\n }\n \n /// A record returned from a Kafka consumer poll.\n-#[derive(Debug, Clone, PartialEq)]\n+#[derive(Debug, Clone, PartialEq, Eq)]\n pub struct ConsumerRecord {\n     /// Topic name.\n     pub topic: String,\n@@ -304,6 +304,7 @@ impl KafkaConsumer {\n             .collect();\n         state.positions.clear();\n         state.committed_offsets.clear();\n+        drop(state);\n         Ok(())\n     }\n \n@@ -344,17 +345,18 @@ impl KafkaConsumer {\n             return Err(KafkaError::Config(\"offsets cannot be empty\".to_string()));\n         }\n \n-        {\n+        let subscribed_topics = {\n             let state = self.state.lock();\n-            for tpo in offsets {\n-                if !state.subscribed_topics.contains(&tpo.topic) {\n-                    return Err(KafkaError::InvalidTopic(tpo.topic.clone()));\n-                }\n-                if tpo.offset < 0 {\n-                    return Err(KafkaError::Config(\n-                        \"offsets must be non-negative\".to_string(),\n-                    ));\n-                }\n+            state.subscribed_topics.clone()\n+        };\n+        for tpo in offsets {\n+            if !subscribed_topics.contains(&tpo.topic) {\n+                return Err(KafkaError::InvalidTopic(tpo.topic.clone()));\n+            }\n+            if tpo.offset < 0 {\n+                return Err(KafkaError::Config(\n+                    \"offsets must be non-negative\".to_string(),\n+                ));\n             }\n         }\n \n@@ -364,6 +366,7 @@ impl KafkaConsumer {\n                 .committed_offsets\n                 .insert((tpo.topic.clone(), tpo.partition), tpo.offset);\n         }\n+        drop(state);\n         Ok(())\n     }\n \n@@ -391,6 +394,7 @@ impl KafkaConsumer {\n         state\n             .positions\n             .insert((tpo.topic.clone(), tpo.partition), tpo.offset);\n+        drop(state);\n         Ok(())\n     }\n \n@@ -405,6 +409,7 @@ impl KafkaConsumer {\n             state.assigned_partitions.clear();\n             state.committed_offsets.clear();\n             state.positions.clear();\n+            drop(state);\n         }\n         Ok(())\n     }"
+    },
+    {
+      "sha": "0e189eb7f0f7265f367acdaf205e30eeef8c4d8b",
+      "filename": "tests/e2e_messaging.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/f2b2d7c011377f670f7f0ac849e3822f6fc42816/tests%2Fe2e_messaging.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/f2b2d7c011377f670f7f0ac849e3822f6fc42816/tests%2Fe2e_messaging.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/tests%2Fe2e_messaging.rs?ref=f2b2d7c011377f670f7f0ac849e3822f6fc42816",
+      "patch": "@@ -7,13 +7,15 @@ use asupersync::channel::mpsc;\n use asupersync::channel::session::tracked_channel;\n use asupersync::cx::Cx;\n use asupersync::lab::{LabConfig, LabRuntime};\n+#[cfg(feature = \"kafka\")]\n use asupersync::messaging::{\n     KafkaConsumer, KafkaConsumerConfig, KafkaError, KafkaProducer, ProducerConfig,\n     TopicPartitionOffset,\n };\n use asupersync::types::{Budget, CancelReason};\n use parking_lot::Mutex;\n use std::sync::Arc;\n+#[cfg(feature = \"kafka\")]\n use std::time::Duration;\n \n // =========================================================================\n@@ -394,6 +396,7 @@ fn e2e_tracked_mpsc_leak_detection_panics() {\n     });\n }\n \n+#[cfg(feature = \"kafka\")]\n #[test]\n fn e2e_kafka_consumer_lifecycle() {\n     common::init_test_logging();\n@@ -452,6 +455,7 @@ fn e2e_kafka_consumer_lifecycle() {\n     });\n }\n \n+#[cfg(feature = \"kafka\")]\n #[test]\n fn e2e_kafka_producer_delivery_ack_metadata() {\n     common::init_test_logging();"
+    }
+  ]
+}

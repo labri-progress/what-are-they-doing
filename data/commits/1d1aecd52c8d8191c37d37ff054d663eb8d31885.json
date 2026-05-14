@@ -1,0 +1,65 @@
+{
+  "message": "feat(fcp-async-core): add Lines, stdin/stdout bridges and migrate MCP stdio to async-core\n\nIntroduce asupersync-tokio-compat integration into fcp-async-core to\nprovide cancel-aware async I/O primitives that are runtime-agnostic.\n\n- Add Lines<R> type with next_line() matching Tokio's API shape but\n  backed by Asupersync's stream-based line reader.\n- Add stdin() / stdout() factory functions bridging Tokio's raw I/O\n  handles through the AsupersyncIo compatibility layer.\n- Extend AsyncBufReadExt with a .lines() method.\n- Migrate fwc serve-mcp stdio transport from direct tokio::io usage\n  to fcp-async-core's runtime and I/O abstractions, decoupling the\n  MCP server from a specific async runtime.\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "6e436d08d6a4407efbf12f9a6bbaaf7c10407894",
+      "filename": "Cargo.lock",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/1d1aecd52c8d8191c37d37ff054d663eb8d31885/Cargo.lock",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/1d1aecd52c8d8191c37d37ff054d663eb8d31885/Cargo.lock",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/Cargo.lock?ref=1d1aecd52c8d8191c37d37ff054d663eb8d31885",
+      "patch": "@@ -2042,6 +2042,7 @@ name = \"fcp-async-core\"\n version = \"0.1.0\"\n dependencies = [\n  \"asupersync\",\n+ \"asupersync-tokio-compat\",\n  \"fcp-async-core-macros\",\n  \"futures-util\",\n  \"thiserror 2.0.18\","
+    },
+    {
+      "sha": "2d8ef5a59a2c324d97d1745ce5b2d1ce1828ba8c",
+      "filename": "crates/fcp-async-core/Cargo.toml",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/1d1aecd52c8d8191c37d37ff054d663eb8d31885/crates%2Ffcp-async-core%2FCargo.toml",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/1d1aecd52c8d8191c37d37ff054d663eb8d31885/crates%2Ffcp-async-core%2FCargo.toml",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-async-core%2FCargo.toml?ref=1d1aecd52c8d8191c37d37ff054d663eb8d31885",
+      "patch": "@@ -13,7 +13,8 @@ workspace = true\n \n [dependencies]\n asupersync = { path = \"/dp/asupersync\", default-features = false, features = [\"tracing-integration\"] }\n+asupersync-tokio-compat = { path = \"/dp/asupersync/asupersync-tokio-compat\", features = [\"tokio-io\"] }\n fcp-async-core-macros = { path = \"../fcp-async-core-macros\" }\n futures-util.workspace = true\n thiserror.workspace = true\n-tokio = { version = \"1\", default-features = false, features = [\"rt\"] }\n+tokio = { version = \"1\", default-features = false, features = [\"io-std\", \"rt\"] }"
+    },
+    {
+      "sha": "4aa413afe24aa726767df9b239facbb7fb21c67f",
+      "filename": "crates/fcp-async-core/src/lib.rs",
+      "status": "modified",
+      "additions": 68,
+      "deletions": 1,
+      "changes": 69,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/1d1aecd52c8d8191c37d37ff054d663eb8d31885/crates%2Ffcp-async-core%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/1d1aecd52c8d8191c37d37ff054d663eb8d31885/crates%2Ffcp-async-core%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-async-core%2Fsrc%2Flib.rs?ref=1d1aecd52c8d8191c37d37ff054d663eb8d31885",
+      "patch": "@@ -1857,9 +1857,55 @@ pub mod task {\n \n /// Async I/O re-exports and compatibility extensions.\n pub mod io {\n+    use asupersync::stream::StreamExt as _;\n+    use std::io;\n+\n     pub use asupersync::io::{\n-        AsyncBufRead, AsyncReadExt, AsyncWriteExt, BufReader, ReadLine, read_line,\n+        AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadLine,\n+        read_line,\n     };\n+    pub use asupersync_tokio_compat::io::AsupersyncIo;\n+\n+    /// Tokio-style line reader backed by Asupersync's stream-based implementation.\n+    #[derive(Debug)]\n+    pub struct Lines<R> {\n+        inner: asupersync::io::Lines<R>,\n+    }\n+\n+    impl<R> Lines<R> {\n+        /// Create a line reader from an async buffered reader.\n+        #[must_use]\n+        pub fn new(reader: R) -> Self {\n+            Self {\n+                inner: asupersync::io::Lines::new(reader),\n+            }\n+        }\n+    }\n+\n+    impl<R> Lines<R>\n+    where\n+        R: AsyncBufRead + Unpin,\n+    {\n+        /// Return the next available line, matching Tokio's `next_line()` shape.\n+        pub async fn next_line(&mut self) -> io::Result<Option<String>> {\n+            match self.inner.next().await {\n+                Some(result) => result.map(Some),\n+                None => Ok(None),\n+            }\n+        }\n+    }\n+\n+    /// Return stdin as an async-core reader through the Tokio compatibility bridge.\n+    #[must_use]\n+    pub fn stdin() -> AsupersyncIo<tokio::io::Stdin> {\n+        AsupersyncIo::new(tokio::io::stdin())\n+    }\n+\n+    /// Return stdout as an async-core writer through the Tokio compatibility bridge.\n+    #[must_use]\n+    pub fn stdout() -> AsupersyncIo<tokio::io::Stdout> {\n+        AsupersyncIo::new(tokio::io::stdout())\n+    }\n \n     /// Extension trait that preserves the Tokio-style `read_line` method shape.\n     pub trait AsyncBufReadExt: AsyncBufRead + Unpin {\n@@ -1870,6 +1916,14 @@ pub mod io {\n         {\n             read_line(self, buf)\n         }\n+\n+        /// Return a cancel-aware line stream, matching Tokio's `lines()` ergonomics.\n+        fn lines(self) -> Lines<Self>\n+        where\n+            Self: Sized,\n+        {\n+            Lines::new(self)\n+        }\n     }\n \n     impl<T> AsyncBufReadExt for T where T: AsyncBufRead + Unpin + ?Sized {}\n@@ -6357,4 +6411,17 @@ mod tests {\n         // Either Ok or Err is valid when sender drops\n         let _ = result;\n     }\n+\n+    #[test]\n+    fn io_async_buf_read_ext_lines_streams_each_line() {\n+        let rt = runtime::Builder::new_current_thread().build().unwrap();\n+        rt.block_on(async {\n+            let reader = io::BufReader::new(std::io::Cursor::new(b\"alpha\\nbeta\\n\".to_vec()));\n+            let mut lines = io::AsyncBufReadExt::lines(reader);\n+\n+            assert_eq!(lines.next_line().await.unwrap().unwrap(), \"alpha\");\n+            assert_eq!(lines.next_line().await.unwrap().unwrap(), \"beta\");\n+            assert!(lines.next_line().await.unwrap().is_none());\n+        });\n+    }\n }"
+    },
+    {
+      "sha": "8a3a50f364868a6cc15c0b7df04ff0d4a7e086e5",
+      "filename": "crates/fwc/src/main.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 3,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/1d1aecd52c8d8191c37d37ff054d663eb8d31885/crates%2Ffwc%2Fsrc%2Fmain.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/1d1aecd52c8d8191c37d37ff054d663eb8d31885/crates%2Ffwc%2Fsrc%2Fmain.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffwc%2Fsrc%2Fmain.rs?ref=1d1aecd52c8d8191c37d37ff054d663eb8d31885",
+      "patch": "@@ -188,6 +188,7 @@ use anyhow::{Context, Result, bail};\n use base64::Engine;\n use chrono::{DateTime, Duration as ChronoDuration, Utc};\n use clap::{Args, Parser, Subcommand, ValueEnum, error::ErrorKind};\n+use fcp_async_core::{io as async_io, runtime as async_runtime};\n use reqwest::blocking::{Client as BlockingClient, ClientBuilder as BlockingClientBuilder};\n use serde::{Deserialize, Serialize, de::DeserializeOwned};\n use serde_json::{Value, json};\n@@ -2574,13 +2575,13 @@ fn execute_serve_mcp(prepared: &PreparedCli, args: &ServeMcpArgs) -> Result<Exec\n \n     let zone = args.zone.clone();\n     let state = serve_mcp::state_from_tools(tools, config);\n-    let runtime = tokio::runtime::Builder::new_current_thread()\n+    let runtime = async_runtime::Builder::new_current_thread()\n         .enable_io()\n         .build()?;\n \n     runtime.block_on(async {\n-        let reader = tokio::io::BufReader::new(tokio::io::stdin());\n-        let writer = tokio::io::stdout();\n+        let reader = async_io::BufReader::new(async_io::stdin());\n+        let writer = async_io::stdout();\n         let host_context = resolved_host.clone();\n         let principal = args.principal.clone();\n         let auth = args.auth.clone();"
+    },
+    {
+      "sha": "b385f268d6a73aec0d2e134f18836ed064f517f0",
+      "filename": "crates/fwc/src/serve_mcp.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 5,
+      "changes": 11,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/1d1aecd52c8d8191c37d37ff054d663eb8d31885/crates%2Ffwc%2Fsrc%2Fserve_mcp.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/1d1aecd52c8d8191c37d37ff054d663eb8d31885/crates%2Ffwc%2Fsrc%2Fserve_mcp.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffwc%2Fsrc%2Fserve_mcp.rs?ref=1d1aecd52c8d8191c37d37ff054d663eb8d31885",
+      "patch": "@@ -8,9 +8,9 @@\n use std::collections::{BTreeMap, BTreeSet};\n \n use anyhow::{Context, Result};\n+use fcp_async_core::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};\n use serde::{Deserialize, Serialize};\n use serde_json::{Value, json};\n-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};\n \n use crate::history::{HistoryFilter, HistoryStore};\n use crate::mcp_resources::{\n@@ -1912,7 +1912,8 @@ fn example_input_from_schema(schema: &Value) -> Value {\n #[cfg(test)]\n mod tests {\n     use super::*;\n-    use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, duplex};\n+    use fcp_async_core::io::{AsupersyncIo, BufReader};\n+    use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader, duplex};\n \n     // \u2500\u2500 Helpers \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n \n@@ -2054,8 +2055,8 @@ mod tests {\n         let task = tokio::spawn(async move {\n             run_stdio_transport(\n                 &state,\n-                BufReader::new(server_input),\n-                server_output,\n+                BufReader::new(AsupersyncIo::new(server_input)),\n+                AsupersyncIo::new(server_output),\n                 callback,\n             )\n             .await\n@@ -2067,7 +2068,7 @@ mod tests {\n         task.await.unwrap();\n \n         let mut output = String::new();\n-        let mut reader = BufReader::new(client_output);\n+        let mut reader = TokioBufReader::new(client_output);\n         reader.read_to_string(&mut output).await.unwrap();\n         output\n     }"
+    }
+  ]
+}

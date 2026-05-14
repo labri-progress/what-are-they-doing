@@ -1,0 +1,53 @@
+{
+  "message": "fix(security): harden AuthKey seed derivation and AuthenticationTag kind-mixing\n\nAuthKey::from_seed previously used DetRng with a special-cased zero-seed\nremap to avoid xorshift lockup. This was fragile \u2014 the magic constant\n0x9e37_79b9_7f4a_7c15 could collide with a real user seed, and the\nderivation depended on DetRng internals.\n\nReplace with domain-separated SHA-256 expansion:\n  SHA-256(\"asupersync::security::AuthKey::from_seed:v1\" || seed_le_bytes)\nThis is self-contained, collision-resistant, and independent of DetRng's\nzero-state normalization behavior.\n\nAuthenticationTag::compute did not mix SymbolKind into the tag, meaning a\nSource symbol and a Repair symbol with identical id/sbn/esi/data would\nproduce the same authentication tag. This violated the expectation that\ntags are domain-specific \u2014 a source tag should never verify against a\nrepair symbol and vice versa.\n\nFix by XOR-mixing a kind-dependent byte (0x53 for Source, 0xA7 for\nRepair) into the final tag byte. The test that previously documented\nthis as a \"known Phase 0 limitation\" now asserts the invariant holds.\n\nChanges:\n- src/security/key.rs: SHA-256 domain-separated seed expansion\n- src/security/tag.rs: SymbolKind byte mixed into tag computation\n- tests/security/key_tests.rs: zero-seed vs legacy-magic collision test\n- tests/security/tag_tests.rs: cross-kind verification rejection test\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "a5486139077406737dafea92119197cfe3e8ac71",
+      "filename": "src/security/key.rs",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 12,
+      "changes": 26,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/090ee318acf7f78b4d822199d72331f1698249a7/src%2Fsecurity%2Fkey.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/090ee318acf7f78b4d822199d72331f1698249a7/src%2Fsecurity%2Fkey.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fsecurity%2Fkey.rs?ref=090ee318acf7f78b4d822199d72331f1698249a7",
+      "patch": "@@ -4,7 +4,7 @@\n \n use crate::util::DetRng;\n use hmac::{Hmac, Mac};\n-use sha2::Sha256;\n+use sha2::{Digest, Sha256};\n use std::fmt;\n \n type HmacSha256 = Hmac<Sha256>;\n@@ -24,19 +24,14 @@ pub struct AuthKey {\n impl AuthKey {\n     /// Creates a new key from a 64-bit seed.\n     ///\n-    /// This uses a deterministic expansion to generate 32 bytes from the seed.\n-    /// Seed 0 is remapped to a fixed non-zero value to keep seed-to-key\n-    /// uniqueness while avoiding the xorshift zero-state lockup.\n+    /// This uses domain-separated SHA-256 to deterministically expand the seed\n+    /// into 32 bytes without depending on `DetRng`'s zero-seed normalization.\n     #[must_use]\n     pub fn from_seed(seed: u64) -> Self {\n-        let seed = if seed == 0 {\n-            0x9e37_79b9_7f4a_7c15\n-        } else {\n-            seed\n-        };\n-        let mut bytes = [0u8; AUTH_KEY_SIZE];\n-        let mut rng = DetRng::new(seed);\n-        rng.fill_bytes(&mut bytes);\n+        let mut hasher = Sha256::new();\n+        hasher.update(b\"asupersync::security::AuthKey::from_seed:v1\");\n+        hasher.update(seed.to_le_bytes());\n+        let bytes: [u8; AUTH_KEY_SIZE] = hasher.finalize().into();\n         Self { bytes }\n     }\n \n@@ -106,6 +101,13 @@ mod tests {\n         assert_ne!(k0, k1);\n     }\n \n+    #[test]\n+    fn test_from_seed_zero_does_not_collide_with_legacy_magic_seed() {\n+        let zero = AuthKey::from_seed(0);\n+        let legacy_magic = AuthKey::from_seed(0x9e37_79b9_7f4a_7c15);\n+        assert_ne!(zero, legacy_magic);\n+    }\n+\n     #[test]\n     fn test_from_rng_produces_unique_keys() {\n         let mut rng = DetRng::new(123);"
+    },
+    {
+      "sha": "fe8993278811424df0d615e3fe6e999fa9a2d6a5",
+      "filename": "src/security/tag.rs",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 7,
+      "changes": 27,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/090ee318acf7f78b4d822199d72331f1698249a7/src%2Fsecurity%2Ftag.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/090ee318acf7f78b4d822199d72331f1698249a7/src%2Fsecurity%2Ftag.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fsecurity%2Ftag.rs?ref=090ee318acf7f78b4d822199d72331f1698249a7",
+      "patch": "@@ -4,7 +4,7 @@\n //! integrity and authenticity of symbols.\n \n use crate::security::key::{AUTH_KEY_SIZE, AuthKey};\n-use crate::types::Symbol;\n+use crate::types::{Symbol, SymbolKind};\n use std::fmt;\n \n /// Size of an authentication tag in bytes.\n@@ -35,6 +35,12 @@ impl AuthenticationTag {\n             tag[i % TAG_SIZE] ^= b;\n         }\n \n+        // Mix symbol kind so source and repair symbols do not authenticate interchangeably.\n+        tag[TAG_SIZE - 1] ^= match symbol.kind() {\n+            SymbolKind::Source => 0x53,\n+            SymbolKind::Repair => 0xA7,\n+        };\n+\n         // Mix SBN and ESI\n         tag[0] ^= symbol.sbn();\n         let esi_bytes = symbol.esi().to_le_bytes();\n@@ -220,7 +226,7 @@ mod tests {\n     /// Invariant: tag differs when symbol kind changes (Source vs Repair)\n     /// even if data and position are identical.\n     #[test]\n-    fn tag_depends_on_symbol_kind_via_id() {\n+    fn tag_depends_on_symbol_kind() {\n         let key = AuthKey::from_seed(42);\n         let data = vec![1, 2, 3];\n         let id_source = SymbolId::new_for_test(1, 0, 0);\n@@ -230,10 +236,17 @@ mod tests {\n         let tag_source = AuthenticationTag::compute(&key, &s_source);\n         let tag_repair = AuthenticationTag::compute(&key, &s_repair);\n \n-        // These may or may not differ since the tag mixes id, sbn, esi, and data\n-        // but does not explicitly mix SymbolKind. This test documents the behavior.\n-        // If they happen to be equal, it means SymbolKind is NOT mixed into the tag \u2014\n-        // which is a known Phase 0 limitation to document.\n-        let _ = (tag_source, tag_repair); // just compute, no assertion on inequality\n+        assert_ne!(\n+            tag_source, tag_repair,\n+            \"source and repair symbols with the same id/data must not share a tag\"\n+        );\n+        assert!(\n+            !tag_source.verify(&key, &s_repair),\n+            \"a source tag must not verify against a repair symbol\"\n+        );\n+        assert!(\n+            !tag_repair.verify(&key, &s_source),\n+            \"a repair tag must not verify against a source symbol\"\n+        );\n     }\n }"
+    },
+    {
+      "sha": "2a7de445bfd575bc22a6375dfc169c4e69c03fdf",
+      "filename": "tests/security/key_tests.rs",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 0,
+      "changes": 15,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/090ee318acf7f78b4d822199d72331f1698249a7/tests%2Fsecurity%2Fkey_tests.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/090ee318acf7f78b4d822199d72331f1698249a7/tests%2Fsecurity%2Fkey_tests.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/tests%2Fsecurity%2Fkey_tests.rs?ref=090ee318acf7f78b4d822199d72331f1698249a7",
+      "patch": "@@ -111,6 +111,21 @@ fn zero_seed_produces_nonzero_key() {\n     test_complete!(\"zero_seed_produces_nonzero_key\");\n }\n \n+#[test]\n+fn zero_seed_does_not_collide_with_legacy_magic_seed() {\n+    init_test_logging();\n+    test_phase!(\"zero_seed_does_not_collide_with_legacy_magic_seed\");\n+    let zero = AuthKey::from_seed(0);\n+    let legacy_magic = AuthKey::from_seed(0x9e37_79b9_7f4a_7c15);\n+    assert_with_log!(\n+        zero != legacy_magic,\n+        \"zero seed should differ from legacy magic remap seed\",\n+        zero,\n+        legacy_magic\n+    );\n+    test_complete!(\"zero_seed_does_not_collide_with_legacy_magic_seed\");\n+}\n+\n #[test]\n fn debug_does_not_leak_full_key_material() {\n     init_test_logging();"
+    },
+    {
+      "sha": "1f415f04391604c1814cad32c16bfddacf0c46bd",
+      "filename": "tests/security/tag_tests.rs",
+      "status": "modified",
+      "additions": 34,
+      "deletions": 1,
+      "changes": 35,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/090ee318acf7f78b4d822199d72331f1698249a7/tests%2Fsecurity%2Ftag_tests.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/090ee318acf7f78b4d822199d72331f1698249a7/tests%2Fsecurity%2Ftag_tests.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/tests%2Fsecurity%2Ftag_tests.rs?ref=090ee318acf7f78b4d822199d72331f1698249a7",
+      "patch": "@@ -1,6 +1,6 @@\n use crate::common::*;\n use asupersync::security::{AuthKey, AuthenticationTag};\n-use asupersync::types::Symbol;\n+use asupersync::types::{Symbol, SymbolId, SymbolKind};\n \n fn symbol_with(data: &[u8]) -> Symbol {\n     Symbol::new_for_test(1, 0, 0, data)\n@@ -89,6 +89,39 @@ fn verify_rejects_different_esi() {\n     test_complete!(\"verify_rejects_different_esi\");\n }\n \n+#[test]\n+fn verify_rejects_different_symbol_kind() {\n+    init_test_logging();\n+    test_phase!(\"verify_rejects_different_symbol_kind\");\n+    let key = AuthKey::from_seed(42);\n+    let id = SymbolId::new_for_test(1, 0, 0);\n+    let source = Symbol::new(id, vec![1, 2, 3, 4], SymbolKind::Source);\n+    let repair = Symbol::new(id, vec![1, 2, 3, 4], SymbolKind::Repair);\n+\n+    let source_tag = AuthenticationTag::compute(&key, &source);\n+    let repair_tag = AuthenticationTag::compute(&key, &repair);\n+\n+    assert_with_log!(\n+        source_tag != repair_tag,\n+        \"source and repair tags should differ\",\n+        source_tag,\n+        repair_tag\n+    );\n+    assert_with_log!(\n+        !source_tag.verify(&key, &repair),\n+        \"source tag should fail against repair symbol\",\n+        false,\n+        source_tag.verify(&key, &repair)\n+    );\n+    assert_with_log!(\n+        !repair_tag.verify(&key, &source),\n+        \"repair tag should fail against source symbol\",\n+        false,\n+        repair_tag.verify(&key, &source)\n+    );\n+    test_complete!(\"verify_rejects_different_symbol_kind\");\n+}\n+\n #[test]\n fn verify_rejects_different_key() {\n     init_test_logging();"
+    }
+  ]
+}

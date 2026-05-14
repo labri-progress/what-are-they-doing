@@ -1,0 +1,41 @@
+{
+  "message": "feat: add membrane instrumentation to sigorset, stdlib, wchar functions\n\nAdd runtime_policy observe calls for:\n- sigorset (signal_abi)\n- stdlib functions with membrane gates\n- wchar path handling\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "54e5268075b1db472b3ecac75885e3b04f599791",
+      "filename": "crates/frankenlibc-abi/src/signal_abi.rs",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 0,
+      "changes": 16,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/c04f4dcd563fbaf2246c115b6a6244244c9a0ecc/crates%2Ffrankenlibc-abi%2Fsrc%2Fsignal_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/c04f4dcd563fbaf2246c115b6a6244244c9a0ecc/crates%2Ffrankenlibc-abi%2Fsrc%2Fsignal_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Fsignal_abi.rs?ref=c04f4dcd563fbaf2246c115b6a6244244c9a0ecc",
+      "patch": "@@ -1416,8 +1416,23 @@ pub unsafe extern \"C\" fn sigorset(\n     left: *const libc::sigset_t,\n     right: *const libc::sigset_t,\n ) -> c_int {\n+    let (_, decision) = runtime_policy::decide(\n+        ApiFamily::Signal,\n+        dest as usize,\n+        std::mem::size_of::<libc::sigset_t>(),\n+        true,\n+        dest.is_null() || left.is_null() || right.is_null(),\n+        0,\n+    );\n+    if matches!(decision.action, MembraneAction::Deny) {\n+        unsafe { set_abi_errno(errno::EPERM) };\n+        runtime_policy::observe(ApiFamily::Signal, decision.profile, 5, true);\n+        return -1;\n+    }\n+\n     if dest.is_null() || left.is_null() || right.is_null() {\n         unsafe { set_abi_errno(errno::EINVAL) };\n+        runtime_policy::observe(ApiFamily::Signal, decision.profile, 5, true);\n         return -1;\n     }\n     // SAFETY: sigset_t on Linux is an array of unsigned longs.\n@@ -1430,6 +1445,7 @@ pub unsafe extern \"C\" fn sigorset(\n             *d.add(i) = *l.add(i) | *r.add(i);\n         }\n     }\n+    runtime_policy::observe(ApiFamily::Signal, decision.profile, 5, false);\n     0\n }\n "
+    },
+    {
+      "sha": "ac56c744d626fd4cd6675d5fbf5a8b13d143836f",
+      "filename": "crates/frankenlibc-abi/src/stdlib_abi.rs",
+      "status": "modified",
+      "additions": 32,
+      "deletions": 3,
+      "changes": 35,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/c04f4dcd563fbaf2246c115b6a6244244c9a0ecc/crates%2Ffrankenlibc-abi%2Fsrc%2Fstdlib_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/c04f4dcd563fbaf2246c115b6a6244244c9a0ecc/crates%2Ffrankenlibc-abi%2Fsrc%2Fstdlib_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Fstdlib_abi.rs?ref=c04f4dcd563fbaf2246c115b6a6244244c9a0ecc",
+      "patch": "@@ -14,6 +14,7 @@ use std::ptr;\n use crate::errno_abi::set_abi_errno;\n use crate::malloc_abi::known_remaining;\n use crate::runtime_policy;\n+use frankenlibc_core::errno;\n use frankenlibc_membrane::runtime_math::{ApiFamily, MembraneAction};\n use libc::{intmax_t, uintmax_t};\n \n@@ -1609,15 +1610,43 @@ unsafe fn mkostemps_inner(template: *mut c_char, suffixlen: c_int, flags: c_int)\n         return (-1, true);\n     }\n \n+    let (mode, decision) = runtime_policy::decide(\n+        ApiFamily::Stdlib,\n+        template as usize,\n+        0,\n+        true,\n+        known_remaining(template as usize).is_none(),\n+        0,\n+    );\n+    if matches!(decision.action, MembraneAction::Deny) {\n+        unsafe { set_abi_errno(errno::EACCES) };\n+        runtime_policy::observe(ApiFamily::Stdlib, decision.profile, 5, true);\n+        return (-1, true);\n+    }\n+\n+    let repair = repair_enabled(mode.heals_enabled(), decision.action);\n+    let bound = if repair {\n+        known_remaining(template as usize)\n+    } else {\n+        None\n+    };\n+\n     // SAFETY: `template` must be a writable, NUL-terminated byte string by ABI contract.\n-    let template_bytes = unsafe { std::ffi::CStr::from_ptr(template) }.to_bytes();\n-    let total_len = template_bytes.len();\n+    let (total_len, terminated) = unsafe { scan_c_string(template, bound) };\n+    if !terminated {\n+        unsafe { set_abi_errno(errno::EINVAL) };\n+        runtime_policy::observe(ApiFamily::Stdlib, decision.profile, 5, true);\n+        return (-1, true);\n+    }\n     let suffix_len = suffixlen as usize;\n     if total_len < MKTEMP_SUFFIX_LEN || suffix_len > total_len.saturating_sub(MKTEMP_SUFFIX_LEN) {\n-        unsafe { set_abi_errno(libc::EINVAL) };\n+        unsafe { set_abi_errno(errno::EINVAL) };\n+        runtime_policy::observe(ApiFamily::Stdlib, decision.profile, 5, true);\n         return (-1, true);\n     }\n \n+    let template_bytes = unsafe { std::slice::from_raw_parts(template as *const u8, total_len) };\n+\n     let x_start = total_len - suffix_len - MKTEMP_SUFFIX_LEN;\n     if !template_bytes[x_start..x_start + MKTEMP_SUFFIX_LEN]\n         .iter()"
+    },
+    {
+      "sha": "2829e14e59e72abf7245ab70cbef40c364d42fa6",
+      "filename": "crates/frankenlibc-abi/src/wchar_abi.rs",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 3,
+      "changes": 11,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/c04f4dcd563fbaf2246c115b6a6244244c9a0ecc/crates%2Ffrankenlibc-abi%2Fsrc%2Fwchar_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/c04f4dcd563fbaf2246c115b6a6244244c9a0ecc/crates%2Ffrankenlibc-abi%2Fsrc%2Fwchar_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Fwchar_abi.rs?ref=c04f4dcd563fbaf2246c115b6a6244244c9a0ecc",
+      "patch": "@@ -1862,18 +1862,23 @@ pub unsafe extern \"C\" fn realpath(\n         return std::ptr::null_mut();\n     }\n \n-    // SAFETY: `path` is non-null and must point to a NUL-terminated C string by ABI contract.\n+    let (_path_len, terminated) = unsafe { scan_c_string(path, known_remaining(path as usize)) };\n+    if !terminated {\n+        unsafe { set_abi_errno(errno::EINVAL) };\n+        runtime_policy::observe(ApiFamily::IoFd, decision.profile, 10, true);\n+        return std::ptr::null_mut();\n+    }\n+\n     // Resolve path using the raw readlink(/proc/self/fd/N) approach via open+readlink.\n     // Cannot use std::fs::canonicalize because it calls libc realpath \u2014 which is\n     // our own interposed symbol, causing infinite recursion.\n-    let path_cstr = unsafe { std::ffi::CStr::from_ptr(path) };\n \n     // Open the path with O_PATH (no actual I/O, just get an fd for the kernel path).\n     let fd = unsafe {\n         libc::syscall(\n             libc::SYS_openat,\n             libc::AT_FDCWD,\n-            path_cstr.as_ptr(),\n+            path,\n             libc::O_PATH | libc::O_CLOEXEC,\n             0,\n         ) as i32"
+    }
+  ]
+}

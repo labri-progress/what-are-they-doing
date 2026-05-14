@@ -1,0 +1,41 @@
+{
+  "message": "fix(core): cache identity resolution, use binary search for name validation, fix sqlite path edge case\n\n- Add 5s TTL OnceLock cache for resolve_project_identity to avoid\n  repeated git subprocess calls on the same path\n- Replace HashMap-based adjective/noun lookups with sorted Vec +\n  binary_search for lower memory and faster validation\n- Handle bare \"/\" as empty in sqlite_file_path_from_database_url\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "384ead311450fb08a14a90ad7caf40bafb164f1b",
+      "filename": "crates/mcp-agent-mail-core/src/disk.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/689bce3f87454d7736b3019640e345c30a246d4b/crates%2Fmcp-agent-mail-core%2Fsrc%2Fdisk.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/689bce3f87454d7736b3019640e345c30a246d4b/crates%2Fmcp-agent-mail-core%2Fsrc%2Fdisk.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-core%2Fsrc%2Fdisk.rs?ref=689bce3f87454d7736b3019640e345c30a246d4b",
+      "patch": "@@ -161,7 +161,7 @@ pub fn is_sqlite_memory_database_url(database_url: &str) -> bool {\n pub fn sqlite_file_path_from_database_url(database_url: &str) -> Option<PathBuf> {\n     let stripped = sqlite_path_component(database_url)?;\n \n-    if stripped.is_empty() {\n+    if stripped.is_empty() || stripped == \"/\" {\n         return None;\n     }\n "
+    },
+    {
+      "sha": "d115f30271cbdc45d4c6f0bda42736412f53225b",
+      "filename": "crates/mcp-agent-mail-core/src/identity.rs",
+      "status": "modified",
+      "additions": 26,
+      "deletions": 6,
+      "changes": 32,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/689bce3f87454d7736b3019640e345c30a246d4b/crates%2Fmcp-agent-mail-core%2Fsrc%2Fidentity.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/689bce3f87454d7736b3019640e345c30a246d4b/crates%2Fmcp-agent-mail-core%2Fsrc%2Fidentity.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-core%2Fsrc%2Fidentity.rs?ref=689bce3f87454d7736b3019640e345c30a246d4b",
+      "patch": "@@ -407,10 +407,24 @@ pub fn compute_project_slug(human_key: &str) -> String {\n     }\n }\n \n+static IDENTITY_CACHE: std::sync::OnceLock<Mutex<std::collections::HashMap<String, (ProjectIdentity, Instant)>>> = std::sync::OnceLock::new();\n+\n /// Resolve identity details for a given `human_key` path.\n #[must_use]\n #[allow(clippy::too_many_lines)]\n pub fn resolve_project_identity(human_key: &str) -> ProjectIdentity {\n+    let target_path = resolve_path(human_key);\n+    let target_str = target_path.to_string_lossy().to_string();\n+\n+    let cache = IDENTITY_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));\n+    if let Ok(guard) = cache.lock() {\n+        if let Some((ident, ts)) = guard.get(&target_str) {\n+            if ts.elapsed() < Duration::from_secs(5) {\n+                return ident.clone();\n+            }\n+        }\n+    }\n+\n     let config = &Config::get();\n     let mode_config = config.project_identity_mode;\n     let mode_used = if config.worktrees_enabled {\n@@ -419,17 +433,14 @@ pub fn resolve_project_identity(human_key: &str) -> ProjectIdentity {\n         \"dir\".to_string()\n     };\n \n-    let target_path = resolve_path(human_key);\n-    let target_str = target_path.to_string_lossy().to_string();\n-\n     if !config.worktrees_enabled {\n         let slug_value = slugify(human_key);\n         let project_uid = short_sha1(&target_str, 20);\n         let resolved_human_key = target_str.clone();\n-        return ProjectIdentity {\n+        let ident = ProjectIdentity {\n             slug: slug_value,\n             identity_mode_used: \"dir\".to_string(),\n-            canonical_path: target_str,\n+            canonical_path: target_str.clone(),\n             human_key: resolved_human_key,\n             repo_root: None,\n             git_common_dir: None,\n@@ -440,6 +451,10 @@ pub fn resolve_project_identity(human_key: &str) -> ProjectIdentity {\n             project_uid,\n             discovery: None,\n         };\n+        if let Ok(mut guard) = cache.lock() {\n+            guard.insert(target_str, (ident.clone(), Instant::now()));\n+        }\n+        return ident;\n     }\n \n     let repo_root = git_cmd(&target_path, &[\"rev-parse\", \"--show-toplevel\"]);\n@@ -594,7 +609,7 @@ pub fn resolve_project_identity(human_key: &str) -> ProjectIdentity {\n \n     let slug_value = compute_project_slug(&target_str);\n \n-    ProjectIdentity {\n+    let ident = ProjectIdentity {\n         slug: slug_value,\n         identity_mode_used: mode_used,\n         canonical_path,\n@@ -607,7 +622,12 @@ pub fn resolve_project_identity(human_key: &str) -> ProjectIdentity {\n         normalized_remote,\n         project_uid: project_uid.unwrap_or_else(|| short_sha1(&target_str, 20)),\n         discovery,\n+    };\n+\n+    if let Ok(mut guard) = cache.lock() {\n+        guard.insert(target_str, (ident.clone(), Instant::now()));\n     }\n+    ident\n }\n \n #[cfg(test)]"
+    },
+    {
+      "sha": "f82a54f059ecc0220f4d91ca02025c199b6a96df",
+      "filename": "crates/mcp-agent-mail-core/src/models.rs",
+      "status": "modified",
+      "additions": 17,
+      "deletions": 17,
+      "changes": 34,
+      "blob_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/blob/689bce3f87454d7736b3019640e345c30a246d4b/crates%2Fmcp-agent-mail-core%2Fsrc%2Fmodels.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/raw/689bce3f87454d7736b3019640e345c30a246d4b/crates%2Fmcp-agent-mail-core%2Fsrc%2Fmodels.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/contents/crates%2Fmcp-agent-mail-core%2Fsrc%2Fmodels.rs?ref=689bce3f87454d7736b3019640e345c30a246d4b",
+      "patch": "@@ -547,21 +547,16 @@ pub const VALID_NOUNS: &[&str] = &[\n     \"fortress\",\n ];\n \n-static VALID_ADJECTIVE_LOOKUP: LazyLock<HashMap<&'static str, &'static str>> =\n-    LazyLock::new(|| {\n-        VALID_ADJECTIVES\n-            .iter()\n-            .copied()\n-            .map(|word| (word, word))\n-            .collect()\n-    });\n+static VALID_ADJECTIVE_LOOKUP: LazyLock<Vec<&'static str>> = LazyLock::new(|| {\n+    let mut v = VALID_ADJECTIVES.to_vec();\n+    v.sort_unstable();\n+    v\n+});\n \n-static VALID_NOUN_LOOKUP: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {\n-    VALID_NOUNS\n-        .iter()\n-        .copied()\n-        .map(|word| (word, word))\n-        .collect()\n+static VALID_NOUN_LOOKUP: LazyLock<Vec<&'static str>> = LazyLock::new(|| {\n+    let mut v = VALID_NOUNS.to_vec();\n+    v.sort_unstable();\n+    v\n });\n \n static VALID_ADJECTIVE_LENGTHS_DESC: LazyLock<Vec<usize>> = LazyLock::new(|| {\n@@ -785,7 +780,7 @@ pub fn looks_like_unix_username(value: &str) -> bool {\n         return false;\n     }\n \n-    !VALID_ADJECTIVE_LOOKUP.contains_key(value) && !VALID_NOUN_LOOKUP.contains_key(value)\n+    !VALID_ADJECTIVE_LOOKUP.contains(&value) && !VALID_NOUN_LOOKUP.contains(&value)\n }\n \n /// Detect common mistakes when agents provide invalid agent names.\n@@ -875,12 +870,17 @@ fn split_valid_agent_name(name: &str) -> Option<(&'static str, &'static str)> {\n         }\n \n         let (adjective_candidate, noun_candidate) = lower_name.split_at(adjective_len);\n-        let Some(adjective) = VALID_ADJECTIVE_LOOKUP.get(adjective_candidate).copied() else {\n+        \n+        let Ok(adj_idx) = VALID_ADJECTIVE_LOOKUP.binary_search(&adjective_candidate) else {\n             continue;\n         };\n-        let Some(noun) = VALID_NOUN_LOOKUP.get(noun_candidate).copied() else {\n+        let adjective = VALID_ADJECTIVE_LOOKUP[adj_idx];\n+        \n+        let Ok(noun_idx) = VALID_NOUN_LOOKUP.binary_search(&noun_candidate) else {\n             continue;\n         };\n+        let noun = VALID_NOUN_LOOKUP[noun_idx];\n+\n         return Some((adjective, noun));\n     }\n "
+    }
+  ]
+}

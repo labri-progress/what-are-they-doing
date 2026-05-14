@@ -1,0 +1,65 @@
+{
+  "message": "fix(runtime): blocking pool retirement CAS, io_driver ordering, reactor cleanup, timer wrapping\n\nblocking_pool.rs: Replace unconditional fetch_add(1) for retirement\nundo with a CAS loop that respects max_threads. Previously, a\nretiring thread that found a queued task would blindly increment\nactive_threads, potentially exceeding the configured maximum. The\nCAS loop now only un-retires if current < max_threads. Also removes\nunreachable 'continue' after task completion signal.\n\nio_driver.rs: Reorder PollingGuard::drop to restore events BEFORE\nclearing is_polling. A concurrent thread could race in via the\nis_polling CAS and observe an empty events buffer while ours was\nstill held in the guard.\n\nepoll.rs + kqueue.rs: Always clean up bookkeeping (tokens/fds/regs\nmaps) regardless of whether the kernel deregister succeeded.\nPreviously, ENOENT/EBADF would clean up but other errors would\nleak map entries, permanently blocking future registration of\nreused FD numbers. Factored out the duplicated per-branch cleanup\ninto a single unconditional block after the match.\n\ntimer.rs: Fix generation comparison overflow by using wrapping_sub\n+ cast_signed instead of direct cmp, so generation counters that\nwrap around u64::MAX are compared correctly.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "166d75c26814e58e5c3572fdc72dc0306532d8cf",
+      "filename": "src/runtime/blocking_pool.rs",
+      "status": "modified",
+      "additions": 29,
+      "deletions": 7,
+      "changes": 36,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/c11c25ebae1045a15312da87a33ffc6018629ac7/src%2Fruntime%2Fblocking_pool.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/c11c25ebae1045a15312da87a33ffc6018629ac7/src%2Fruntime%2Fblocking_pool.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Fblocking_pool.rs?ref=c11c25ebae1045a15312da87a33ffc6018629ac7",
+      "patch": "@@ -754,7 +754,6 @@ fn blocking_worker_loop(inner: &BlockingPoolInner) -> bool {\n             // Always signal completion so waiters are unblocked, even\n             // if the task panicked.\n             task.completion.signal_done();\n-            continue;\n         }\n \n         // No work available, check shutdown\n@@ -790,13 +789,36 @@ fn blocking_worker_loop(inner: &BlockingPoolInner) -> bool {\n                 // We claimed the retirement slot, meaning active_threads was decremented.\n                 // Re-check the queue to ensure we didn't miss a concurrent spawn that\n                 // observed our pre-retirement active_threads count and decided not to spawn.\n-                if !inner.queue.is_empty() {\n-                    // A task was enqueued while we were retiring. Undo the retirement.\n-                    inner.active_threads.fetch_add(1, Ordering::Relaxed);\n-                    continue;\n+                if inner.queue.is_empty() {\n+                    // Retire this thread; active_threads was already decremented atomically.\n+                    return true;\n+                }\n+\n+                // A task was enqueued while we were retiring. Undo the retirement.\n+                {\n+                    let mut current = inner.active_threads.load(Ordering::Relaxed);\n+                    let mut unretired = false;\n+                    loop {\n+                        if current >= inner.max_threads {\n+                            break;\n+                        }\n+                        match inner.active_threads.compare_exchange_weak(\n+                            current,\n+                            current + 1,\n+                            Ordering::Relaxed,\n+                            Ordering::Relaxed,\n+                        ) {\n+                            Ok(_) => {\n+                                unretired = true;\n+                                break;\n+                            }\n+                            Err(next) => current = next,\n+                        }\n+                    }\n+                    if !unretired {\n+                        return true;\n+                    }\n                 }\n-                // Retire this thread; active_threads was already decremented atomically.\n-                return true;\n             }\n         } else {\n             {"
+    },
+    {
+      "sha": "b0ecdcf11dcb42ed2277056cc4bf4bf46ba3da3b",
+      "filename": "src/runtime/io_driver.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 3,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/c11c25ebae1045a15312da87a33ffc6018629ac7/src%2Fruntime%2Fio_driver.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/c11c25ebae1045a15312da87a33ffc6018629ac7/src%2Fruntime%2Fio_driver.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Fio_driver.rs?ref=c11c25ebae1045a15312da87a33ffc6018629ac7",
+      "patch": "@@ -455,13 +455,16 @@ impl<'a> PollingGuard<'a> {\n \n impl Drop for PollingGuard<'_> {\n     fn drop(&mut self) {\n-        if self.clear_poll_flag {\n-            self.handle.is_polling.store(false, Ordering::Release);\n-        }\n+        // Restore events BEFORE clearing is_polling, so that a concurrent\n+        // thread cannot race in via the is_polling CAS and observe an empty\n+        // events buffer while ours is still held in the guard.\n         if let Some(events) = self.events.take() {\n             let mut driver = self.handle.inner.lock();\n             driver.restore_events_only(events);\n         }\n+        if self.clear_poll_flag {\n+            self.handle.is_polling.store(false, Ordering::Release);\n+        }\n     }\n }\n "
+    },
+    {
+      "sha": "1d646df9ae6ee0754c0de2f5b1331a8b52b62464",
+      "filename": "src/runtime/reactor/epoll.rs",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 26,
+      "changes": 42,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/c11c25ebae1045a15312da87a33ffc6018629ac7/src%2Fruntime%2Freactor%2Fepoll.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/c11c25ebae1045a15312da87a33ffc6018629ac7/src%2Fruntime%2Freactor%2Fepoll.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Freactor%2Fepoll.rs?ref=c11c25ebae1045a15312da87a33ffc6018629ac7",
+      "patch": "@@ -349,36 +349,26 @@ impl Reactor for EpollReactor {\n \n         // Remove from epoll. If the fd was already closed or removed by the kernel,\n         // treat it as already deregistered from reactor bookkeeping perspective.\n-        match self.poller.delete(borrowed_fd) {\n-            Ok(()) => {\n-                if let Some(info) = state.tokens.remove(&token) {\n-                    state.fds.remove(&info.raw_fd);\n-                }\n-                drop(state);\n-                Ok(())\n-            }\n+        let result = match self.poller.delete(borrowed_fd) {\n+            Ok(()) => Ok(()),\n             Err(err) => match err.raw_os_error() {\n-                Some(libc::ENOENT) => {\n-                    if let Some(info) = state.tokens.remove(&token) {\n-                        state.fds.remove(&info.raw_fd);\n-                    }\n-                    drop(state);\n-                    Ok(())\n-                }\n+                Some(libc::ENOENT) => Ok(()),\n                 // Treat EBADF as benign only when the target fd itself is closed.\n-                Some(libc::EBADF) if !fd_still_valid => {\n-                    if let Some(info) = state.tokens.remove(&token) {\n-                        state.fds.remove(&info.raw_fd);\n-                    }\n-                    drop(state);\n-                    Ok(())\n-                }\n-                _ => {\n-                    drop(state);\n-                    Err(err)\n-                }\n+                Some(libc::EBADF) if !fd_still_valid => Ok(()),\n+                _ => Err(err),\n             },\n+        };\n+\n+        // Always clean up bookkeeping so the FD number can be reused.\n+        // If the kernel epoll state is out of sync, leaking the map entry\n+        // is worse because it permanently blocks any future registration\n+        // of this OS-reused FD number.\n+        if let Some(info) = state.tokens.remove(&token) {\n+            state.fds.remove(&info.raw_fd);\n         }\n+        drop(state);\n+\n+        result\n     }\n \n     fn poll(&self, events: &mut Events, timeout: Option<Duration>) -> io::Result<usize> {"
+    },
+    {
+      "sha": "2be02a4449e3078e1512ab1906f0e16c4734bbcc",
+      "filename": "src/runtime/reactor/kqueue.rs",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 14,
+      "changes": 24,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/c11c25ebae1045a15312da87a33ffc6018629ac7/src%2Fruntime%2Freactor%2Fkqueue.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/c11c25ebae1045a15312da87a33ffc6018629ac7/src%2Fruntime%2Freactor%2Fkqueue.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Freactor%2Fkqueue.rs?ref=c11c25ebae1045a15312da87a33ffc6018629ac7",
+      "patch": "@@ -244,23 +244,19 @@ impl Reactor for KqueueReactor {\n         let fd_still_valid = unsafe { libc::fcntl(info.raw_fd, libc::F_GETFD) } != -1;\n \n         // Remove from kqueue\n-        match self.poller.delete(&borrowed_fd) {\n-            Ok(()) => {\n-                regs.remove(&token);\n-                Ok(())\n-            }\n+        let result = match self.poller.delete(&borrowed_fd) {\n+            Ok(()) => Ok(()),\n             Err(err) => match err.raw_os_error() {\n-                Some(libc::ENOENT) => {\n-                    regs.remove(&token);\n-                    Ok(())\n-                }\n-                Some(libc::EBADF) if !fd_still_valid => {\n-                    regs.remove(&token);\n-                    Ok(())\n-                }\n+                Some(libc::ENOENT) => Ok(()),\n+                Some(libc::EBADF) if !fd_still_valid => Ok(()),\n                 _ => Err(err),\n             },\n-        }\n+        };\n+\n+        // Always clean up bookkeeping so the FD number can be reused.\n+        regs.remove(&token);\n+\n+        result\n     }\n \n     fn poll(&self, events: &mut Events, timeout: Option<Duration>) -> io::Result<usize> {"
+    },
+    {
+      "sha": "98485a08e9e4ef93863cde21746ad274944a4a6a",
+      "filename": "src/runtime/timer.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 1,
+      "changes": 5,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/c11c25ebae1045a15312da87a33ffc6018629ac7/src%2Fruntime%2Ftimer.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/c11c25ebae1045a15312da87a33ffc6018629ac7/src%2Fruntime%2Ftimer.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Ftimer.rs?ref=c11c25ebae1045a15312da87a33ffc6018629ac7",
+      "patch": "@@ -21,7 +21,10 @@ impl Ord for TimerEntry {\n             .deadline\n             .cmp(&self.deadline)\n             // Lower generation (earlier insertion) wins for equal deadlines.\n-            .then_with(|| other.generation.cmp(&self.generation))\n+            .then_with(|| {\n+                let diff = other.generation.wrapping_sub(self.generation).cast_signed();\n+                diff.cmp(&0)\n+            })\n     }\n }\n "
+    }
+  ]
+}

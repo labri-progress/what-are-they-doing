@@ -1,0 +1,53 @@
+{
+  "message": "fix(store,audit): zone index race, percentile overflow, and timestamp verification\n\n- fcp-store object_store: move zone_index update before dropping objects\n  lock to prevent orphan entries from concurrent delete()\n- fcp-store repair: use u64 arithmetic in percentile_bps() to prevent\n  overflow when len * percentile exceeds usize::MAX\n- fcp-store quarantine: document benign TOCTOU in promote() and clarify\n  error precedence (NotFound before PromotionDenied/SchemaValidationFailed)\n- fcp-audit: add timestamp_regression warning to verify_chain() detecting\n  non-monotonic occurred_at values in audit log chains\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "ddc4821b6334230dbbed701500aa88f0ab7c8d17",
+      "filename": "crates/fcp-audit/src/lib.rs",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 0,
+      "changes": 16,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/d60e1bb181b2ec08ae446640a70bd2d981c3dccf/crates%2Ffcp-audit%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/d60e1bb181b2ec08ae446640a70bd2d981c3dccf/crates%2Ffcp-audit%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-audit%2Fsrc%2Flib.rs?ref=d60e1bb181b2ec08ae446640a70bd2d981c3dccf",
+      "patch": "@@ -948,6 +948,22 @@ pub fn verify_chain(\n                 );\n             }\n \n+            // Timestamps should be non-decreasing along the chain.\n+            // A backwards timestamp indicates clock skew or tampering.\n+            if entry.occurred_at < prev.occurred_at {\n+                issues.push(\n+                    VerifyIssue::new(\n+                        \"audit.timestamp_regression\",\n+                        format!(\n+                            \"timestamp {} is earlier than previous entry timestamp {}\",\n+                            entry.occurred_at, prev.occurred_at\n+                        ),\n+                    )\n+                    .with_seq(entry.seq)\n+                    .with_entry_id(&entry.id),\n+                );\n+            }\n+\n             prev = entry;\n         }\n     }"
+    },
+    {
+      "sha": "35089e7eacf2c49c28769d3a20d0e3aa8b2a5aaf",
+      "filename": "crates/fcp-store/src/object_store.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 2,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/d60e1bb181b2ec08ae446640a70bd2d981c3dccf/crates%2Ffcp-store%2Fsrc%2Fobject_store.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/d60e1bb181b2ec08ae446640a70bd2d981c3dccf/crates%2Ffcp-store%2Fsrc%2Fobject_store.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-store%2Fsrc%2Fobject_store.rs?ref=d60e1bb181b2ec08ae446640a70bd2d981c3dccf",
+      "patch": "@@ -415,10 +415,12 @@ impl ObjectStore for MemoryObjectStore {\n         let id = object.object_id;\n         let zone_id = object.header.zone_id.clone();\n         objects.insert(id, object);\n-        drop(objects);\n \n-        // Maintain zone index for O(1) list_zone().\n+        // Maintain zone index BEFORE releasing the objects lock so that\n+        // a concurrent delete() cannot create orphan zone_index entries.\n         self.zone_index.write().entry(zone_id).or_default().push(id);\n+        drop(objects);\n+\n         self.used_bytes.fetch_add(size, Ordering::SeqCst);\n \n         Ok(())"
+    },
+    {
+      "sha": "5f793568354b3ad18e443f1d41fb20e9520f1097",
+      "filename": "crates/fcp-store/src/quarantine.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 3,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/d60e1bb181b2ec08ae446640a70bd2d981c3dccf/crates%2Ffcp-store%2Fsrc%2Fquarantine.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/d60e1bb181b2ec08ae446640a70bd2d981c3dccf/crates%2Ffcp-store%2Fsrc%2Fquarantine.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-store%2Fsrc%2Fquarantine.rs?ref=d60e1bb181b2ec08ae446640a70bd2d981c3dccf",
+      "patch": "@@ -277,21 +277,25 @@ impl QuarantineStore {\n         reason: &PromotionReason,\n         schema_valid: bool,\n     ) -> Result<QuarantinedObject, QuarantineError> {\n+        // Early exit: NotFound takes precedence over all other errors so\n+        // callers always learn \"object absent\" before \"bad reason/schema\".\n+        // The race between this check and remove() is benign \u2014 if another\n+        // thread removes the object in between, remove() itself returns\n+        // NotFound atomically under its write lock.\n         if !self.contains(object_id) {\n             return Err(QuarantineError::NotFound(*object_id));\n         }\n \n-        // Validate promotion reason\n+        // Validate promotion reason (does not require lock).\n         self.validate_promotion_reason(object_id, reason)?;\n \n-        // Check schema validation if required\n+        // Check schema validation if required.\n         if self.policy.require_schema_validation && !schema_valid {\n             return Err(QuarantineError::SchemaValidationFailed {\n                 reason: \"Schema validation is required but object failed validation\".into(),\n             });\n         }\n \n-        // Remove from quarantine (promotion successful)\n         self.remove(object_id)\n     }\n "
+    },
+    {
+      "sha": "eeb6c28ffa8d1376537674e4635507bc138aa916",
+      "filename": "crates/fcp-store/src/repair.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 4,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/d60e1bb181b2ec08ae446640a70bd2d981c3dccf/crates%2Ffcp-store%2Fsrc%2Frepair.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/d60e1bb181b2ec08ae446640a70bd2d981c3dccf/crates%2Ffcp-store%2Fsrc%2Frepair.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-store%2Fsrc%2Frepair.rs?ref=d60e1bb181b2ec08ae446640a70bd2d981c3dccf",
+      "patch": "@@ -238,10 +238,9 @@ fn percentile_bps(sorted_samples: &[u32], percentile: usize) -> u32 {\n         return 0;\n     }\n \n-    let rank = sorted_samples\n-        .len()\n-        .saturating_mul(percentile)\n-        .div_ceil(100)\n+    // Use u64 arithmetic to avoid overflow when len * percentile exceeds usize::MAX.\n+    let numerator = (sorted_samples.len() as u64).saturating_mul(percentile as u64);\n+    let rank = (numerator.div_ceil(100) as usize)\n         .saturating_sub(1)\n         .min(sorted_samples.len().saturating_sub(1));\n     sorted_samples[rank]"
+    }
+  ]
+}

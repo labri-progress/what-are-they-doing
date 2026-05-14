@@ -1,0 +1,41 @@
+{
+  "message": "fix(test-isolation): include PID + per-process seq in E2E run id and io_alias temp paths\n\nTwo related concurrency bugs surfaced by running the harness in\nparallel cargo-test workers (and by the swarm running multiple\nagents that each kick off cargo test simultaneously).\n\nscripts/e2e_suite.sh + e2e_suite_test.rs (RUN_ID collisions)\n  - RUN_ID was previously\n        e2e-v${SUITE_VERSION}-$(date -u +%Y%m%dT%H%M%SZ)-s${E2E_SEED}\n    so two e2e_suite.sh invocations launched in the same wall-clock\n    second with the same seed (which the deterministic test harness\n    deliberately does) raced on\n    target/e2e_suite/${RUN_ID}/{trace.jsonl,artifact_index.json}.\n  - Add `-p$$` (parent shell PID) into RUN_ID so concurrent runs at\n    the same second + seed land in disjoint output directories.\n  - Update e2e_suite_test.rs to introduce latest_e2e_seed_run_dir(),\n    a seed-suffix-only matcher that finds the most recent\n    e2e-...-s<seed> directory instead of relying on the prefix that\n    no longer uniquely identifies a single run. The\n    e2e_suite_runs_and_produces_jsonl test now pins seed = \"43001\"\n    and uses the seed-keyed lookup, so it remains stable when a\n    sibling test (or another worker) also wrote into target/e2e_suite.\n\nio_abi_test.rs (`make_temp_file_fd` collisions)\n  - The temp-file template was `franken_io_alias_${pid}_${stack-addr}`,\n    but in test threads the stack address is reasonably stable across\n    repeated invocations and PID is by definition shared inside the\n    same test process. So nested make_temp_file_fd() calls in dup/dup2\n    aliasing tests could land on the same path and stomp each other.\n  - Add a static AtomicU64 TEMP_FILE_SEQ that is fetch_add(1)'d on\n    every call and folded into the path as the new middle component\n    `franken_io_alias_${pid}_${seq}_${stack-addr}`. The stack-addr\n    component is preserved so two concurrent processes still\n    differentiate without needing globally-unique seq values.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "491717cf7c94c9221a07ae560cfec2ed8063056d",
+      "filename": "crates/frankenlibc-abi/tests/io_abi_test.rs",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 1,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/d04291d0344ed0b7dfee6a1d779f0ab26206d9d5/crates%2Ffrankenlibc-abi%2Ftests%2Fio_abi_test.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/d04291d0344ed0b7dfee6a1d779f0ab26206d9d5/crates%2Ffrankenlibc-abi%2Ftests%2Fio_abi_test.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Ftests%2Fio_abi_test.rs?ref=d04291d0344ed0b7dfee6a1d779f0ab26206d9d5",
+      "patch": "@@ -3,6 +3,7 @@\n //! Integration tests for POSIX I/O ABI entrypoints.\n \n use std::ffi::{c_int, c_uint};\n+use std::sync::atomic::{AtomicU64, Ordering};\n \n use frankenlibc_abi::io_abi::{\n     __dup3, __pipe2, __pread, __pwrite, __readv, __writev, copy_file_range, dup, dup2, dup3, fcntl,\n@@ -735,9 +736,12 @@ fn under_dup3_works_like_dup3() {\n \n fn make_temp_file_fd() -> c_int {\n     use std::os::unix::ffi::OsStrExt;\n+    static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);\n+    let seq = TEMP_FILE_SEQ.fetch_add(1, Ordering::Relaxed);\n     let path = std::env::temp_dir().join(format!(\n-        \"franken_io_alias_{}_{:p}\",\n+        \"franken_io_alias_{}_{}_{:p}\",\n         std::process::id(),\n+        seq,\n         &0u8 as *const u8\n     ));\n     let path_c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();"
+    },
+    {
+      "sha": "01854e9451037b7e5e765e78b40fcf5b9ce6eab2",
+      "filename": "crates/frankenlibc-harness/tests/e2e_suite_test.rs",
+      "status": "modified",
+      "additions": 23,
+      "deletions": 16,
+      "changes": 39,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/d04291d0344ed0b7dfee6a1d779f0ab26206d9d5/crates%2Ffrankenlibc-harness%2Ftests%2Fe2e_suite_test.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/d04291d0344ed0b7dfee6a1d779f0ab26206d9d5/crates%2Ffrankenlibc-harness%2Ftests%2Fe2e_suite_test.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-harness%2Ftests%2Fe2e_suite_test.rs?ref=d04291d0344ed0b7dfee6a1d779f0ab26206d9d5",
+      "patch": "@@ -42,6 +42,25 @@ fn latest_run_dir(root: &Path, parent: &str, prefix: &str) -> Option<PathBuf> {\n     runs.last().map(|e| e.path())\n }\n \n+fn latest_e2e_seed_run_dir(root: &Path, seed: &str) -> Option<PathBuf> {\n+    let e2e_dir = root.join(\"target/e2e_suite\");\n+    if !e2e_dir.exists() {\n+        return None;\n+    }\n+\n+    let suffix = format!(\"-s{seed}\");\n+    let mut runs: Vec<_> = std::fs::read_dir(&e2e_dir)\n+        .ok()?\n+        .filter_map(|e| e.ok())\n+        .filter(|e| {\n+            let name = e.file_name().to_string_lossy().to_string();\n+            name.starts_with(\"e2e-\") && name.ends_with(&suffix)\n+        })\n+        .collect();\n+    runs.sort_by_key(|e| e.file_name());\n+    runs.last().map(|e| e.path())\n+}\n+\n #[test]\n fn e2e_suite_script_exists() {\n     let root = workspace_root();\n@@ -278,36 +297,24 @@ fn e2e_manifest_validator_and_catalog_exist() {\n #[test]\n fn e2e_suite_runs_and_produces_jsonl() {\n     let root = workspace_root();\n+    let seed = \"43001\";\n \n     // Run just the fault scenario with a very short timeout\n     let output = Command::new(\"bash\")\n         .arg(root.join(\"scripts/e2e_suite.sh\"))\n         .arg(\"fault\")\n         .arg(\"strict\")\n         .env(\"TIMEOUT_SECONDS\", \"2\")\n+        .env(\"FRANKENLIBC_E2E_SEED\", seed)\n         .output()\n         .expect(\"e2e_suite.sh should execute\");\n \n     // The suite may fail (timeouts expected), but it should run\n     let stdout = String::from_utf8_lossy(&output.stdout);\n     assert!(stdout.contains(\"E2E Suite v1\"), \"Should print suite header\");\n \n-    // Find the trace.jsonl in the latest run directory\n-    let e2e_dir = root.join(\"target/e2e_suite\");\n-    if !e2e_dir.exists() {\n-        // Suite didn't produce output (maybe no lib), skip\n-        return;\n-    }\n-\n-    let mut runs: Vec<_> = std::fs::read_dir(&e2e_dir)\n-        .unwrap()\n-        .filter_map(|e| e.ok())\n-        .filter(|e| e.file_name().to_string_lossy().starts_with(\"e2e-\"))\n-        .collect();\n-    runs.sort_by_key(|e| e.file_name());\n-\n-    if let Some(latest) = runs.last() {\n-        let trace_path = latest.path().join(\"trace.jsonl\");\n+    if let Some(latest) = latest_e2e_seed_run_dir(&root, seed) {\n+        let trace_path = latest.join(\"trace.jsonl\");\n         if trace_path.exists() {\n             let content = std::fs::read_to_string(&trace_path).unwrap();\n             let mut valid_lines = 0;"
+    },
+    {
+      "sha": "9d0e0ce6c70628ec37f296859e041a59be12a17d",
+      "filename": "scripts/e2e_suite.sh",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/d04291d0344ed0b7dfee6a1d779f0ab26206d9d5/scripts%2Fe2e_suite.sh",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/d04291d0344ed0b7dfee6a1d779f0ab26206d9d5/scripts%2Fe2e_suite.sh",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/scripts%2Fe2e_suite.sh?ref=d04291d0344ed0b7dfee6a1d779f0ab26206d9d5",
+      "patch": "@@ -46,7 +46,7 @@ PACK_MAX_QUARANTINED_STRESS=\"${FRANKENLIBC_E2E_PACK_MAX_QUARANTINED_STRESS:-2}\"\n PACK_MAX_QUARANTINED_FAULT=\"${FRANKENLIBC_E2E_PACK_MAX_QUARANTINED_FAULT:-2}\"\n PACK_MAX_QUARANTINED_STABILITY=\"${FRANKENLIBC_E2E_PACK_MAX_QUARANTINED_STABILITY:-2}\"\n \n-RUN_ID=\"e2e-v${SUITE_VERSION}-$(date -u +%Y%m%dT%H%M%SZ)-s${E2E_SEED}\"\n+RUN_ID=\"e2e-v${SUITE_VERSION}-$(date -u +%Y%m%dT%H%M%SZ)-p$$-s${E2E_SEED}\"\n OUT_DIR=\"${ROOT}/target/e2e_suite/${RUN_ID}\"\n LOG_FILE=\"${OUT_DIR}/trace.jsonl\"\n INDEX_FILE=\"${OUT_DIR}/artifact_index.json\""
+    }
+  ]
+}

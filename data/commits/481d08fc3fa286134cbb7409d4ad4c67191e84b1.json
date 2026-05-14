@@ -1,0 +1,101 @@
+{
+  "message": "fix(ondisk,extent,repair): add checksum stamping functions and harden integer casts\n\nAdd stamp_dir_block_checksum() and stamp_extent_block_checksum() to\nffs-ondisk for writing CRC32C checksums into directory and extent\ntree block tails \u2014 the write-path counterparts to the existing\nverify_* functions needed for directory/extent mutation operations.\n\nReplace unsafe `as u32` casts throughout ffs-extent with explicit\nu32::try_from().expect() calls that document the invariant being\nrelied upon, preventing silent truncation if values ever exceed u32\nrange. Apply the same pattern to ffs-mvcc WAL writer's append count.\n\nAdditional fixes:\n- Add #[must_use] to trim_extents, hit_rate, ExtentCache::new/with_capacity\n- Fix clippy too_many_lines lint in append_commit with #[expect]\n- Replace unnecessary &mut with & for stream in configure_stream_timeouts\n- Remove unnecessary .clone() on seed_symbols in exchange test\n- Use checked_sub for Instant arithmetic in pipeline tests\n- Use inline format args in autopilot test assertions\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "be3b20a95f39a4a4485c7fe3383e7927a3531395",
+      "filename": "crates/ffs-btree/src/lib.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/481d08fc3fa286134cbb7409d4ad4c67191e84b1/crates%2Fffs-btree%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/481d08fc3fa286134cbb7409d4ad4c67191e84b1/crates%2Fffs-btree%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/crates%2Fffs-btree%2Fsrc%2Flib.rs?ref=481d08fc3fa286134cbb7409d4ad4c67191e84b1",
+      "patch": "@@ -909,6 +909,7 @@ fn maybe_shrink_root(\n \n /// Trim/remove extents that overlap `[start, end)`.\n /// Returns (remaining_extents, freed_ranges).\n+#[must_use]\n pub fn trim_extents(\n     extents: Vec<Ext4Extent>,\n     start: u64,"
+    },
+    {
+      "sha": "7b2a0e3968df8272b64f07aef05c1ad187f75ebf",
+      "filename": "crates/ffs-extent/src/lib.rs",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 10,
+      "changes": 32,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/481d08fc3fa286134cbb7409d4ad4c67191e84b1/crates%2Fffs-extent%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/481d08fc3fa286134cbb7409d4ad4c67191e84b1/crates%2Fffs-extent%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/crates%2Fffs-extent%2Fsrc%2Flib.rs?ref=481d08fc3fa286134cbb7409d4ad4c67191e84b1",
+      "patch": "@@ -64,7 +64,9 @@ pub fn map_logical_to_physical(\n \n     while pos < end {\n         cx_checkpoint(cx)?;\n-        let result = ffs_btree::search(cx, dev, root_bytes, pos as u32)?;\n+        let logical_block =\n+            u32::try_from(pos).expect(\"logical position stays within u32 inode block range\");\n+        let result = ffs_btree::search(cx, dev, root_bytes, logical_block)?;\n         match result {\n             SearchResult::Found {\n                 extent,\n@@ -81,10 +83,12 @@ pub fn map_logical_to_physical(\n                         ),\n                     });\n                 }\n+                let mapping_count =\n+                    u32::try_from(to_map).expect(\"extent mapping chunk length fits in u32\");\n                 mappings.push(ExtentMapping {\n-                    logical_start: pos as u32,\n+                    logical_start: logical_block,\n                     physical_start: extent.physical_start + u64::from(offset_in_extent),\n-                    count: to_map as u32,\n+                    count: mapping_count,\n                     unwritten: extent.is_unwritten(),\n                 });\n                 pos += to_map;\n@@ -99,10 +103,14 @@ pub fn map_logical_to_physical(\n                         ),\n                     });\n                 }\n+                let hole_start = u32::try_from(pos)\n+                    .expect(\"logical position stays within u32 inode block range\");\n+                let hole_count =\n+                    u32::try_from(to_map).expect(\"hole mapping chunk length fits in u32\");\n                 mappings.push(ExtentMapping {\n-                    logical_start: pos as u32,\n+                    logical_start: hole_start,\n                     physical_start: 0,\n-                    count: to_map as u32,\n+                    count: hole_count,\n                     unwritten: false,\n                 });\n                 pos += to_map;\n@@ -171,9 +179,9 @@ pub fn allocate_extent(\n     cx_checkpoint(cx)?;\n \n     if count == 0 || count > u32::from(EXT_INIT_MAX_LEN) {\n-        return Err(FfsError::Format(\n-            format!(\"extent count must be 1..={EXT_INIT_MAX_LEN}\").into(),\n-        ));\n+        return Err(FfsError::Format(format!(\n+            \"extent count must be 1..={EXT_INIT_MAX_LEN}\"\n+        )));\n     }\n     validate_root_header(\"allocate_extent\", root_bytes)?;\n \n@@ -662,6 +670,7 @@ pub struct ExtentCacheStats {\n \n impl ExtentCacheStats {\n     /// Hit rate as a fraction in `[0.0, 1.0]`. Returns 0.0 if no lookups.\n+    #[must_use]\n     pub fn hit_rate(&self) -> f64 {\n         let total = self.hits + self.misses;\n         if total == 0 {\n@@ -674,11 +683,13 @@ impl ExtentCacheStats {\n \n impl ExtentCache {\n     /// Create a new cache with the default capacity (1024 entries).\n+    #[must_use]\n     pub fn new() -> Self {\n         Self::with_capacity(DEFAULT_EXTENT_CACHE_CAPACITY)\n     }\n \n     /// Create a new cache with the given maximum entry count.\n+    #[must_use]\n     pub fn with_capacity(capacity: usize) -> Self {\n         Self {\n             inner: RwLock::new(ExtentCacheInner {\n@@ -783,7 +794,8 @@ impl ExtentCache {\n             return;\n         }\n         let range_end = u64::from(logical_start).saturating_add(count);\n-        let range_end_u32 = range_end.min(u64::from(u32::MAX)) as u32;\n+        let range_end_u32 = u32::try_from(range_end.min(u64::from(u32::MAX)))\n+            .expect(\"range end is explicitly clamped to u32::MAX\");\n         let mut inner = self.inner.write();\n \n         // Collect keys to remove: entries in this namespace whose extent overlaps the range.\n@@ -4288,7 +4300,7 @@ mod tests {\n             capacity: 1024,\n             generation: 0,\n         };\n-        assert_eq!(empty_stats.hit_rate(), 0.0);\n+        assert!(empty_stats.hit_rate().abs() <= f64::EPSILON);\n     }\n \n     #[test]"
+    },
+    {
+      "sha": "10bf1a9140a7b59c5794ce057fe03d61e910d3c9",
+      "filename": "crates/ffs-mvcc/src/wal_writer.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 1,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/481d08fc3fa286134cbb7409d4ad4c67191e84b1/crates%2Fffs-mvcc%2Fsrc%2Fwal_writer.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/481d08fc3fa286134cbb7409d4ad4c67191e84b1/crates%2Fffs-mvcc%2Fsrc%2Fwal_writer.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/crates%2Fffs-mvcc%2Fsrc%2Fwal_writer.rs?ref=481d08fc3fa286134cbb7409d4ad4c67191e84b1",
+      "patch": "@@ -303,6 +303,7 @@ impl WalWriter {\n     ///\n     /// Returns a classified [`WalWriteError`] distinguishing retryable I/O\n     /// failures from fatal format/invariant violations.\n+    #[expect(clippy::too_many_lines)]\n     pub fn append_commit(\n         &mut self,\n         commit: &WalCommit,\n@@ -602,7 +603,8 @@ impl WalWriter {\n         })?;\n \n         // \u2500\u2500 Single sync \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n-        self.appends_since_sync += commits.len() as u32;\n+        self.appends_since_sync +=\n+            u32::try_from(commits.len()).expect(\"coalesced append count fits in u32\");\n         let synced = match self.maybe_sync(op_id, prev_seq) {\n             Ok(s) => s,\n             Err(e) => {"
+    },
+    {
+      "sha": "823c94c51f88c9be19db5d0b49bf39078fa9081b",
+      "filename": "crates/ffs-ondisk/src/ext4.rs",
+      "status": "modified",
+      "additions": 51,
+      "deletions": 0,
+      "changes": 51,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/481d08fc3fa286134cbb7409d4ad4c67191e84b1/crates%2Fffs-ondisk%2Fsrc%2Fext4.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/481d08fc3fa286134cbb7409d4ad4c67191e84b1/crates%2Fffs-ondisk%2Fsrc%2Fext4.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/crates%2Fffs-ondisk%2Fsrc%2Fext4.rs?ref=481d08fc3fa286134cbb7409d4ad4c67191e84b1",
+      "patch": "@@ -1378,6 +1378,28 @@ pub fn verify_dir_block_checksum(\n     Ok(())\n }\n \n+/// Stamp the CRC32C checksum into a directory block's tail entry.\n+///\n+/// The tail structure occupies the last 12 bytes of the block. This\n+/// function recomputes the checksum over `block[0..block_size - 12]`\n+/// using the same per-inode seed as [`verify_dir_block_checksum`], then\n+/// writes the 4-byte result into `block[block_size - 4 .. block_size]`.\n+///\n+/// The caller must ensure the block has a valid tail structure (inode=0,\n+/// rec_len=12, name_len=0, file_type=0xDE) before calling.\n+pub fn stamp_dir_block_checksum(dir_block: &mut [u8], csum_seed: u32, ino: u32, generation: u32) {\n+    let bs = dir_block.len();\n+    if bs < 12 {\n+        return;\n+    }\n+\n+    let seed = ext4_chksum(csum_seed, &ino.to_le_bytes());\n+    let seed = ext4_chksum(seed, &generation.to_le_bytes());\n+    let coverage_end = bs - 12;\n+    let computed = ext4_chksum(seed, &dir_block[..coverage_end]);\n+    dir_block[bs - 4..bs].copy_from_slice(&computed.to_le_bytes());\n+}\n+\n /// Verify the CRC32C checksum of an extent tree block.\n ///\n /// Extent tree blocks (non-root, stored in separate blocks) have a 4-byte\n@@ -1441,6 +1463,35 @@ pub fn verify_extent_block_checksum(\n     Ok(())\n }\n \n+/// Stamp the CRC32C checksum into an extent tree block's tail.\n+///\n+/// Mirrors the logic in [`verify_extent_block_checksum`]: the tail offset\n+/// is `12 + 12 * eh_max`, and the checksum covers `block[0..tail_off]`.\n+pub fn stamp_extent_block_checksum(\n+    extent_block: &mut [u8],\n+    csum_seed: u32,\n+    ino: u32,\n+    generation: u32,\n+) {\n+    let bs = extent_block.len();\n+    if bs < 16 {\n+        return;\n+    }\n+\n+    let eh_max = u16::from_le_bytes([extent_block[4], extent_block[5]]) as usize;\n+    let Some(tail_off) = 12_usize.checked_mul(eh_max).and_then(|v| v.checked_add(12)) else {\n+        return;\n+    };\n+    if tail_off + 4 > bs {\n+        return;\n+    }\n+\n+    let seed = ext4_chksum(csum_seed, &ino.to_le_bytes());\n+    let seed = ext4_chksum(seed, &generation.to_le_bytes());\n+    let computed = ext4_chksum(seed, &extent_block[..tail_off]);\n+    extent_block[tail_off..tail_off + 4].copy_from_slice(&computed.to_le_bytes());\n+}\n+\n /// Verify that an inode bitmap's free-bit count matches the group descriptor.\n ///\n /// `inodes_per_group` is `s_inodes_per_group` from the superblock."
+    },
+    {
+      "sha": "fe934d5065d2f98fd1933017cef851636a5e13e2",
+      "filename": "crates/ffs-ondisk/src/lib.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 2,
+      "changes": 5,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/481d08fc3fa286134cbb7409d4ad4c67191e84b1/crates%2Fffs-ondisk%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/481d08fc3fa286134cbb7409d4ad4c67191e84b1/crates%2Fffs-ondisk%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/crates%2Fffs-ondisk%2Fsrc%2Flib.rs?ref=481d08fc3fa286134cbb7409d4ad4c67191e84b1",
+      "patch": "@@ -25,6 +25,7 @@ pub use ext4::{\n     Ext4IncompatFeatures, Ext4Inode, Ext4RoCompatFeatures, Ext4Superblock, Ext4Xattr, ExtentTree,\n     FeatureDiagnostics, InodeLocation, dx_hash, ext4_chksum, iter_dir_block, lookup_in_dir_block,\n     parse_dir_block, parse_dx_root, parse_extent_tree, parse_ibody_xattrs, parse_inode_extent_tree,\n-    parse_xattr_block, verify_dir_block_checksum, verify_extent_block_checksum,\n-    verify_group_desc_checksum, verify_inode_checksum,\n+    parse_xattr_block, stamp_dir_block_checksum, stamp_extent_block_checksum,\n+    verify_dir_block_checksum, verify_extent_block_checksum, verify_group_desc_checksum,\n+    verify_inode_checksum,\n };"
+    },
+    {
+      "sha": "e1a49c217529fe6e85af5337a9a87d8a42152391",
+      "filename": "crates/ffs-repair/src/autopilot.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 3,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/481d08fc3fa286134cbb7409d4ad4c67191e84b1/crates%2Fffs-repair%2Fsrc%2Fautopilot.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/481d08fc3fa286134cbb7409d4ad4c67191e84b1/crates%2Fffs-repair%2Fsrc%2Fautopilot.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/crates%2Fffs-repair%2Fsrc%2Fautopilot.rs?ref=481d08fc3fa286134cbb7409d4ad4c67191e84b1",
+      "patch": "@@ -708,9 +708,7 @@ mod tests {\n         if base < ap.max_overhead - 0.001 {\n             assert!(\n                 metadata > base,\n-                \"metadata overhead {} should be higher than base {} when cost is doubled\",\n-                metadata,\n-                base\n+                \"metadata overhead {metadata} should be higher than base {base} when cost is doubled\",\n             );\n         }\n     }"
+    },
+    {
+      "sha": "0feb2352d7655b3d3e86f876335465adef5acbc0",
+      "filename": "crates/ffs-repair/src/exchange.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 3,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/481d08fc3fa286134cbb7409d4ad4c67191e84b1/crates%2Fffs-repair%2Fsrc%2Fexchange.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/481d08fc3fa286134cbb7409d4ad4c67191e84b1/crates%2Fffs-repair%2Fsrc%2Fexchange.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/crates%2Fffs-repair%2Fsrc%2Fexchange.rs?ref=481d08fc3fa286134cbb7409d4ad4c67191e84b1",
+      "patch": "@@ -313,7 +313,7 @@ impl Client {\n             })\n         })?;\n \n-        configure_stream_timeouts(cx, &mut stream, self.config.io_timeout)?;\n+        configure_stream_timeouts(cx, &stream, self.config.io_timeout)?;\n         stream.set_nodelay(true).map_err(FfsError::from)?;\n         write_envelope(\n             cx,\n@@ -358,7 +358,7 @@ impl<S: Store> Server<S> {\n     /// Accept and handle a single connection.\n     pub fn serve_once(&self, cx: &Cx) -> Result<()> {\n         let (mut stream, peer_addr) = self.accept(cx)?;\n-        configure_stream_timeouts(cx, &mut stream, self.config.io_timeout)?;\n+        configure_stream_timeouts(cx, &stream, self.config.io_timeout)?;\n         stream.set_nodelay(true).map_err(FfsError::from)?;\n         match self.handle_connection(cx, &mut stream) {\n             Ok(()) => Ok(()),\n@@ -770,7 +770,7 @@ mod tests {\n             fetched,\n             LookupResult::Found(StoredSymbols {\n                 generation: 7,\n-                symbols: seed_symbols.clone(),\n+                symbols: seed_symbols,\n             })\n         );\n "
+    },
+    {
+      "sha": "984e612317f98c0b1908511247e183f5881e31c8",
+      "filename": "crates/ffs-repair/src/pipeline.rs",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 4,
+      "changes": 18,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenfs/blob/481d08fc3fa286134cbb7409d4ad4c67191e84b1/crates%2Fffs-repair%2Fsrc%2Fpipeline.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenfs/raw/481d08fc3fa286134cbb7409d4ad4c67191e84b1/crates%2Fffs-repair%2Fsrc%2Fpipeline.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenfs/contents/crates%2Fffs-repair%2Fsrc%2Fpipeline.rs?ref=481d08fc3fa286134cbb7409d4ad4c67191e84b1",
+      "patch": "@@ -4661,12 +4661,16 @@ mod tests {\n             .refresh_states\n             .get_mut(&0)\n             .expect(\"group 0 state\")\n-            .last_refresh = now - Duration::from_secs(2);\n+            .last_refresh = now\n+            .checked_sub(Duration::from_secs(2))\n+            .expect(\"valid instant math\");\n         pipeline\n             .refresh_states\n             .get_mut(&1)\n             .expect(\"group 1 state\")\n-            .last_refresh = now - Duration::from_secs(5);\n+            .last_refresh = now\n+            .checked_sub(Duration::from_secs(5))\n+            .expect(\"valid instant math\");\n \n         let metrics = pipeline.runtime_metrics();\n         assert!(\n@@ -5902,8 +5906,13 @@ mod tests {\n         let now = Instant::now();\n         let state = pipeline.refresh_states.get_mut(&0).expect(\"group 0 state\");\n         state.dirty = true;\n-        state.dirty_since = Some(now - Duration::from_secs(4));\n-        state.last_refresh = now - Duration::from_secs(7);\n+        state.dirty_since = Some(\n+            now.checked_sub(Duration::from_secs(4))\n+                .expect(\"valid instant math\"),\n+        );\n+        state.last_refresh = now\n+            .checked_sub(Duration::from_secs(7))\n+            .expect(\"valid instant math\");\n         state.writes_since_refresh = 3;\n         pipeline.sync_atomic_staleness_gauge();\n \n@@ -5983,6 +5992,7 @@ mod tests {\n     /// decode \u2192 verify recovery. Exercises the full distributed repair\n     /// pipeline across two simulated hosts using the exchange protocol.\n     #[test]\n+    #[expect(clippy::too_many_lines)]\n     fn distributed_repair_pipeline_e2e() {\n         use crate::codec::{decode_group, encode_group};\n         use crate::exchange::{self, InMemoryStore, LookupResult, Store};"
+    }
+  ]
+}

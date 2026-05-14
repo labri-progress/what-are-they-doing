@@ -1,0 +1,65 @@
+{
+  "message": "fix: prevent focus trap deadlock, sentinel leak, and shutdown hangs\n\n- FocusManager::push_trap() now handles empty/missing focus groups\n  without deadlocking\n- Virtualized scroll API no longer leaks usize::MAX sentinel\n- Subscription stop() and effect-queue shutdown use bounded timeouts\n\nPartially addresses #34, #35\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "1f85f95eb4bb1f098838b850dcedb2dafdb774a3",
+      "filename": "crates/ftui-runtime/src/program.rs",
+      "status": "modified",
+      "additions": 18,
+      "deletions": 0,
+      "changes": 18,
+      "blob_url": "https://github.com/Dicklesworthstone/frankentui/blob/80f39dc92ae68f7b9ae9beb9b9cdbf9b2f5fcdc0/crates%2Fftui-runtime%2Fsrc%2Fprogram.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankentui/raw/80f39dc92ae68f7b9ae9beb9b9cdbf9b2f5fcdc0/crates%2Fftui-runtime%2Fsrc%2Fprogram.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankentui/contents/crates%2Fftui-runtime%2Fsrc%2Fprogram.rs?ref=80f39dc92ae68f7b9ae9beb9b9cdbf9b2f5fcdc0",
+      "patch": "@@ -2463,9 +2463,27 @@ impl<M: Send + 'static> EffectQueue<M> {\n         let _ = self.sender.send(EffectCommand::Enqueue(spec, task));\n     }\n \n+    /// Timeout for the effect-queue thread to finish after sending Shutdown.\n+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);\n+    /// Poll interval when waiting for the effect-queue thread.\n+    const SHUTDOWN_POLL: Duration = Duration::from_millis(10);\n+\n     fn shutdown(&mut self) {\n         let _ = self.sender.send(EffectCommand::Shutdown);\n         if let Some(handle) = self.handle.take() {\n+            // Bounded wait: poll `is_finished` with a timeout so a slow task\n+            // cannot block shutdown indefinitely.\n+            let start = Instant::now();\n+            while !handle.is_finished() {\n+                if start.elapsed() >= Self::SHUTDOWN_TIMEOUT {\n+                    tracing::warn!(\n+                        timeout_ms = Self::SHUTDOWN_TIMEOUT.as_millis() as u64,\n+                        \"Effect-queue thread did not stop within timeout; detaching\"\n+                    );\n+                    return;\n+                }\n+                thread::sleep(Self::SHUTDOWN_POLL);\n+            }\n             let _ = handle.join();\n         }\n     }"
+    },
+    {
+      "sha": "cdf9df50003f1af9c332c271f1c0ecde64ee527c",
+      "filename": "crates/ftui-widgets/src/focus/manager.rs",
+      "status": "modified",
+      "additions": 49,
+      "deletions": 1,
+      "changes": 50,
+      "blob_url": "https://github.com/Dicklesworthstone/frankentui/blob/80f39dc92ae68f7b9ae9beb9b9cdbf9b2f5fcdc0/crates%2Fftui-widgets%2Fsrc%2Ffocus%2Fmanager.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankentui/raw/80f39dc92ae68f7b9ae9beb9b9cdbf9b2f5fcdc0/crates%2Fftui-widgets%2Fsrc%2Ffocus%2Fmanager.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankentui/contents/crates%2Fftui-widgets%2Fsrc%2Ffocus%2Fmanager.rs?ref=80f39dc92ae68f7b9ae9beb9b9cdbf9b2f5fcdc0",
+      "patch": "@@ -243,7 +243,27 @@ impl FocusManager {\n     }\n \n     /// Push focus trap (for modals).\n-    pub fn push_trap(&mut self, group_id: u32) {\n+    ///\n+    /// If the group doesn't exist or has no focusable members, the trap is\n+    /// **not** pushed and the method returns `false`. This prevents a deadlock\n+    /// where `allowed_by_trap` would deny focus to every widget because the\n+    /// group is empty/missing.\n+    pub fn push_trap(&mut self, group_id: u32) -> bool {\n+        // Guard: the group must exist and contain at least one focusable member.\n+        let group_ok = self\n+            .groups\n+            .get(&group_id)\n+            .is_some_and(|g| !g.members.is_empty());\n+\n+        if !group_ok {\n+            #[cfg(feature = \"tracing\")]\n+            tracing::warn!(\n+                group_id,\n+                \"focus.trap_push rejected: group missing or empty\"\n+            );\n+            return false;\n+        }\n+\n         let return_focus = self.current;\n         #[cfg(feature = \"tracing\")]\n         tracing::debug!(\n@@ -259,6 +279,7 @@ impl FocusManager {\n         if !self.is_current_in_group(group_id) {\n             self.focus_first_in_group(group_id);\n         }\n+        true\n     }\n \n     /// Pop focus trap, restore previous focus.\n@@ -1079,6 +1100,33 @@ mod tests {\n         assert!(!fm.pop_trap());\n     }\n \n+    #[test]\n+    fn push_trap_rejects_missing_group() {\n+        let mut fm = FocusManager::new();\n+        fm.graph_mut().insert(node(1, 0));\n+        fm.focus(1);\n+\n+        // Group 999 doesn't exist \u2014 push_trap must refuse.\n+        assert!(!fm.push_trap(999));\n+        assert!(!fm.is_trapped());\n+        // Focus should remain unchanged (no deadlock).\n+        assert_eq!(fm.current(), Some(1));\n+    }\n+\n+    #[test]\n+    fn push_trap_rejects_empty_group() {\n+        let mut fm = FocusManager::new();\n+        fm.graph_mut().insert(node(1, 0));\n+        fm.focus(1);\n+\n+        // Create group with no members.\n+        fm.create_group(42, vec![]);\n+        assert!(!fm.push_trap(42));\n+        assert!(!fm.is_trapped());\n+        // Focus should remain unchanged (no deadlock).\n+        assert_eq!(fm.current(), Some(1));\n+    }\n+\n     // --- Focus events ---\n \n     #[test]"
+    },
+    {
+      "sha": "33e8c1f34f1e818b03b3f42f95e130107b3fa700",
+      "filename": "crates/ftui-widgets/src/modal/focus_integration.rs",
+      "status": "modified",
+      "additions": 12,
+      "deletions": 6,
+      "changes": 18,
+      "blob_url": "https://github.com/Dicklesworthstone/frankentui/blob/80f39dc92ae68f7b9ae9beb9b9cdbf9b2f5fcdc0/crates%2Fftui-widgets%2Fsrc%2Fmodal%2Ffocus_integration.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankentui/raw/80f39dc92ae68f7b9ae9beb9b9cdbf9b2f5fcdc0/crates%2Fftui-widgets%2Fsrc%2Fmodal%2Ffocus_integration.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankentui/contents/crates%2Fftui-widgets%2Fsrc%2Fmodal%2Ffocus_integration.rs?ref=80f39dc92ae68f7b9ae9beb9b9cdbf9b2f5fcdc0",
+      "patch": "@@ -130,12 +130,16 @@ impl FocusAwareModalStack {\n     ) -> ModalId {\n         let group_id = next_focus_group_id();\n \n-        // Create focus group and push trap\n+        // Create focus group and push trap.\n+        // If the group ends up empty (no focusable members), push_trap\n+        // returns false and we record no focus group for this modal so\n+        // that pop() won't try to pop a trap that was never pushed.\n         self.focus_manager.create_group(group_id, focusable_ids);\n-        self.focus_manager.push_trap(group_id);\n+        let trapped = self.focus_manager.push_trap(group_id);\n \n         // Push modal with focus group tracking\n-        self.stack.push_with_focus(modal, Some(group_id))\n+        let focus_group = if trapped { Some(group_id) } else { None };\n+        self.stack.push_with_focus(modal, focus_group)\n     }\n \n     /// Pop the top modal.\n@@ -533,11 +537,13 @@ mod tests {\n     fn empty_focus_group_no_panic() {\n         let mut modals = FocusAwareModalStack::new();\n \n-        // Push modal with empty focus group (edge case)\n+        // Push modal with empty focus group (edge case).\n+        // The trap is NOT pushed because the group has no focusable members,\n+        // preventing a deadlock where no widget could receive focus.\n         modals.push_with_trap(Box::new(WidgetModalEntry::new(StubWidget)), vec![]);\n \n-        // Should not panic, just have no focused element\n-        assert!(modals.is_focus_trapped());\n+        // Should not panic, and focus should NOT be trapped (empty group).\n+        assert!(!modals.is_focus_trapped());\n \n         // Pop should still work\n         modals.pop();"
+    },
+    {
+      "sha": "e87877cde72362fa4aba3ceeff2bc08b22c442bd",
+      "filename": "crates/ftui-widgets/src/modal/stack.rs",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 4,
+      "changes": 12,
+      "blob_url": "https://github.com/Dicklesworthstone/frankentui/blob/80f39dc92ae68f7b9ae9beb9b9cdbf9b2f5fcdc0/crates%2Fftui-widgets%2Fsrc%2Fmodal%2Fstack.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankentui/raw/80f39dc92ae68f7b9ae9beb9b9cdbf9b2f5fcdc0/crates%2Fftui-widgets%2Fsrc%2Fmodal%2Fstack.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankentui/contents/crates%2Fftui-widgets%2Fsrc%2Fmodal%2Fstack.rs?ref=80f39dc92ae68f7b9ae9beb9b9cdbf9b2f5fcdc0",
+      "patch": "@@ -718,11 +718,15 @@ impl<'a> ModalFocusIntegration<'a> {\n                 // Convert ModalFocusId (u64) to FocusId (u64) for the focus manager\n                 let focus_ids: Vec<crate::focus::FocusId> = ids.into_iter().collect();\n \n-                // Create focus group and trap\n+                // Create focus group and trap.\n+                // If the group is empty, push_trap refuses so we don't\n+                // record a focus_group_id (avoids pop mismatch).\n                 self.focus.create_group(group_id, focus_ids);\n-                self.focus.push_trap(group_id);\n-\n-                Some(group_id)\n+                if self.focus.push_trap(group_id) {\n+                    Some(group_id)\n+                } else {\n+                    None\n+                }\n             } else {\n                 None\n             }"
+    },
+    {
+      "sha": "6bf98368e4eddb1db7d4a46ee0aeafb4f03f448c",
+      "filename": "crates/ftui-widgets/src/virtualized.rs",
+      "status": "modified",
+      "additions": 27,
+      "deletions": 3,
+      "changes": 30,
+      "blob_url": "https://github.com/Dicklesworthstone/frankentui/blob/80f39dc92ae68f7b9ae9beb9b9cdbf9b2f5fcdc0/crates%2Fftui-widgets%2Fsrc%2Fvirtualized.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankentui/raw/80f39dc92ae68f7b9ae9beb9b9cdbf9b2f5fcdc0/crates%2Fftui-widgets%2Fsrc%2Fvirtualized.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankentui/contents/crates%2Fftui-widgets%2Fsrc%2Fvirtualized.rs?ref=80f39dc92ae68f7b9ae9beb9b9cdbf9b2f5fcdc0",
+      "patch": "@@ -197,9 +197,13 @@ impl<T> Virtualized<T> {\n     }\n \n     /// Get current scroll offset.\n+    ///\n+    /// The internal sentinel value (`usize::MAX`, used for lazy scroll-to-bottom)\n+    /// is clamped to the actual item count so callers never see it.\n     #[must_use]\n     pub fn scroll_offset(&self) -> usize {\n         self.scroll_offset\n+            .min(self.len().saturating_sub(1).max(0))\n     }\n \n     /// Get current visible count (from last render).\n@@ -897,12 +901,29 @@ impl VirtualizedListState {\n         self.persistence_id.as_deref()\n     }\n \n-    /// Get current scroll offset.\n+    /// Get raw scroll offset.\n+    ///\n+    /// **Warning:** After `scroll_to_bottom`, this may return `usize::MAX`\n+    /// (a lazy sentinel that gets clamped during rendering). Use\n+    /// [`scroll_offset_clamped`] with a known `total_items` to get a\n+    /// safe value for display or indexing.\n     #[must_use]\n     pub fn scroll_offset(&self) -> usize {\n         self.scroll_offset\n     }\n \n+    /// Get scroll offset clamped against a known total item count.\n+    ///\n+    /// Prefer this over [`scroll_offset()`] when the total is available,\n+    /// because `scroll_to_bottom` may store `usize::MAX` internally.\n+    #[must_use]\n+    pub fn scroll_offset_clamped(&self, total_items: usize) -> usize {\n+        if total_items == 0 {\n+            return 0;\n+        }\n+        self.scroll_offset.min(total_items.saturating_sub(1))\n+    }\n+\n     /// Get visible item count (from last render).\n     #[must_use]\n     pub fn visible_count(&self) -> usize {\n@@ -2661,9 +2682,12 @@ mod tests {\n         for i in 0..20 {\n             virt.push(i);\n         }\n-        // visible_count=0 (default), scroll_to_bottom stores a sentinel.\n+        // visible_count=0 (default), scroll_to_bottom stores a sentinel internally.\n         virt.scroll_to_bottom();\n-        assert_eq!(virt.scroll_offset(), usize::MAX);\n+        // Internal field stores MAX sentinel\u2026\n+        assert_eq!(virt.scroll_offset, usize::MAX);\n+        // \u2026but public API clamps to last valid index.\n+        assert_eq!(virt.scroll_offset(), 19);\n     }\n \n     // \u2500\u2500 Virtualized: page navigation edge cases \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
+    }
+  ]
+}

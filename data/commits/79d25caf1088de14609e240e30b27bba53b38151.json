@@ -1,0 +1,41 @@
+{
+  "message": "fix(remote+error): Saga Drop panicking guard + circuit breaker Acquire ordering\n\nTwo cross-cutting safety issues found via systematic codebase analysis:\n\n1. HIGH \u2014 remote.rs Saga Drop: executed user-provided compensation\n   closures without checking std::thread::panicking(). If a closure\n   panicked during an existing unwind, the process would abort.\n   Fix: check panicking() and skip compensations during unwind,\n   matching the pattern used by all other intentional-panic Drop\n   impls in the codebase.\n\n2. MEDIUM \u2014 error/recovery.rs circuit breaker: state() loaded with\n   Ordering::Relaxed but transition() wrote with Ordering::Release.\n   On weakly-ordered architectures (ARM), a thread could miss a\n   state transition and fail to count successes/failures correctly.\n   Fix: state() now uses Acquire, transition() uses AcqRel/Acquire,\n   ensuring proper happens-before between state transitions and\n   subsequent reads.\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "b7c7da9bde3a2cbaf38356e69b062a06cc11c663",
+      "filename": "audit_index.jsonl",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/79d25caf1088de14609e240e30b27bba53b38151/audit_index.jsonl",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/79d25caf1088de14609e240e30b27bba53b38151/audit_index.jsonl",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/audit_index.jsonl?ref=79d25caf1088de14609e240e30b27bba53b38151",
+      "patch": "@@ -1340,3 +1340,5 @@\n {\"file\":\"cross-cutting/unwrap-expect-production\",\"lines\":0,\"batch\":409,\"date\":\"2026-03-21\",\"agent\":\"SapphireHill\",\"verdict\":\"SOUND\",\"bugs\":0,\"notes\":\"368 unwrap/expect in prod code - all protected by structural invariants (token consumption, Option just-constructed, peek-then-pop)\"}\n {\"file\":\"cross-cutting/silent-error-discard\",\"lines\":0,\"batch\":409,\"date\":\"2026-03-21\",\"agent\":\"SapphireHill\",\"verdict\":\"SOUND\",\"bugs\":0,\"notes\":\"263 let_=_ patterns - all fire-and-forget sends to oneshot channels or report formatting writes\"}\n {\"file\":\"src/messaging/policy.rs\",\"lines\":1265,\"batch\":409,\"date\":\"2026-03-21\",\"agent\":\"SapphireHill\",\"verdict\":\"SOUND\",\"bugs\":0,\"notes\":\"re-audit after recent modification - semantic degradation logic unchanged\"}\n+{\"file\":\"src/remote.rs\",\"lines\":3986,\"batch\":410,\"date\":\"2026-03-21\",\"agent\":\"SapphireHill\",\"verdict\":\"FIXED\",\"bugs\":1,\"notes\":\"HIGH: Saga Drop ran user closures without panicking guard - abort risk during unwind. Added std::thread::panicking() check.\"}\n+{\"file\":\"src/error/recovery.rs\",\"lines\":500,\"batch\":410,\"date\":\"2026-03-21\",\"agent\":\"SapphireHill\",\"verdict\":\"FIXED\",\"bugs\":1,\"notes\":\"MEDIUM: CircuitBreaker state() used Relaxed load vs Release CAS - state invisible on ARM. Fixed to Acquire/AcqRel.\"}"
+    },
+    {
+      "sha": "32d1fc990f26b721f542d290970ea189ced1c239",
+      "filename": "src/error/recovery.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/79d25caf1088de14609e240e30b27bba53b38151/src%2Ferror%2Frecovery.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/79d25caf1088de14609e240e30b27bba53b38151/src%2Ferror%2Frecovery.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Ferror%2Frecovery.rs?ref=79d25caf1088de14609e240e30b27bba53b38151",
+      "patch": "@@ -199,7 +199,7 @@ impl CircuitBreaker {\n     }\n \n     fn state(&self) -> CircuitState {\n-        match self.state.load(Ordering::Relaxed) {\n+        match self.state.load(Ordering::Acquire) {\n             0 => CircuitState::Closed,\n             2 => CircuitState::HalfOpen,\n             _ => CircuitState::Open,\n@@ -208,7 +208,7 @@ impl CircuitBreaker {\n \n     fn transition(&self, from: CircuitState, to: CircuitState) -> bool {\n         self.state\n-            .compare_exchange(from as u8, to as u8, Ordering::Release, Ordering::Relaxed)\n+            .compare_exchange(from as u8, to as u8, Ordering::AcqRel, Ordering::Acquire)\n             .is_ok()\n     }\n "
+    },
+    {
+      "sha": "8b1b30b1d5beb5668dca269f23f163eec21b6341",
+      "filename": "src/remote.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 2,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/79d25caf1088de14609e240e30b27bba53b38151/src%2Fremote.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/79d25caf1088de14609e240e30b27bba53b38151/src%2Fremote.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fremote.rs?ref=79d25caf1088de14609e240e30b27bba53b38151",
+      "patch": "@@ -1488,8 +1488,13 @@ impl Default for Saga {\n impl Drop for Saga {\n     fn drop(&mut self) {\n         if self.state == SagaState::Running {\n-            // Unwind or early return: execute compensations to prevent leaks.\n-            // If we are already panicking, running compensations that panic will abort the process.\n+            if std::thread::panicking() {\n+                // Already unwinding \u2014 running user closures that might panic\n+                // would abort the process.  Mark as aborted without running\n+                // compensations; the caller is already handling an error.\n+                self.state = SagaState::Aborted;\n+                return;\n+            }\n             self.run_compensations();\n         }\n     }"
+    }
+  ]
+}

@@ -1,0 +1,53 @@
+{
+  "message": "fix(runtime): guard arena-indexed structures against TaskId slot reuse aliasing\n\nFix a class of correctness bugs where arena slot reuse (after a task\ncompletes and its slot is recycled) could cause one task's state to\nbe confused with a different task that later occupies the same slot index.\n\ndeadline_monitor.rs:\n- check_and_remove(): verify entry.task_id matches before marking violated\n  and before clearing the monitored slot \u2014 prevents a recycled slot's\n  deadline from being attributed to the wrong task\n- register path: clear stale entry if slot is occupied by a different task_id\n  before inserting new monitor entry\n\nlocal.rs (LocalTaskStore):\n- remove(): verify the slot's task_id matches before taking the entry,\n  preventing removal of a different task that recycled the same slot\n- Uses new LocalStoredTask::task_id() getter\n\nobligation_table.rs (ObligationTable):\n- by_holder index changed from Vec<Option<SmallVec<[ObligationId; 4]>>> to\n  Vec<Option<(TaskId, SmallVec<[ObligationId; 4]>)>> \u2014 each slot now tracks\n  which TaskId owns it\n- register_holder(): if slot is occupied by a different task, clear existing\n  obligations before inserting new ones\n- remove_by_index(): only modify holder index if holder matches stored TaskId\n- ids_for_holder(): only return obligations if slot's TaskId matches query\n\nstored_task.rs:\n- Add task_id() getter on LocalStoredTask to support the local.rs guard\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "1e1e30419c140fc6a1629b10e8204c0dc5117fa0",
+      "filename": "src/runtime/deadline_monitor.rs",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 2,
+      "changes": 15,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/57a7405565af7052acc696a4466e5d19a82340bd/src%2Fruntime%2Fdeadline_monitor.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/57a7405565af7052acc696a4466e5d19a82340bd/src%2Fruntime%2Fdeadline_monitor.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Fdeadline_monitor.rs?ref=57a7405565af7052acc696a4466e5d19a82340bd",
+      "patch": "@@ -236,7 +236,7 @@ impl DeadlineMonitor {\n                 .monitored\n                 .get(slot)\n                 .and_then(Option::as_ref)\n-                .is_some_and(|entry| entry.violated);\n+                .is_some_and(|entry| entry.task_id == task_id && entry.violated);\n             if deadline_exceeded && !already_violated {\n                 let over_by = Duration::from_nanos(now.duration_since(deadline));\n                 self.emit_deadline_violation(task_type, over_by);\n@@ -245,7 +245,11 @@ impl DeadlineMonitor {\n \n         let slot = task_id.arena_index().index() as usize;\n         if slot < self.monitored.len() {\n-            self.monitored[slot].take();\n+            if let Some(entry) = &self.monitored[slot] {\n+                if entry.task_id == task_id {\n+                    self.monitored[slot].take();\n+                }\n+            }\n         }\n     }\n \n@@ -375,6 +379,13 @@ impl DeadlineMonitor {\n                 if slot >= self.monitored.len() {\n                     self.monitored.resize_with(slot + 1, || None);\n                 }\n+                \n+                if let Some(existing) = &self.monitored[slot] {\n+                    if existing.task_id != task.id {\n+                        self.monitored[slot] = None;\n+                    }\n+                }\n+                \n                 let entry = self.monitored[slot].get_or_insert_with(|| MonitoredTask {\n                     task_id: task.id,\n                     region_id: task.owner,"
+    },
+    {
+      "sha": "2d1ecbd7354555ec9f3b1e26ce437dbad4c10a26",
+      "filename": "src/runtime/local.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 3,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/57a7405565af7052acc696a4466e5d19a82340bd/src%2Fruntime%2Flocal.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/57a7405565af7052acc696a4466e5d19a82340bd/src%2Fruntime%2Flocal.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Flocal.rs?ref=57a7405565af7052acc696a4466e5d19a82340bd",
+      "patch": "@@ -37,11 +37,14 @@ impl LocalTaskStore {\n \n     fn remove(&mut self, task_id: TaskId) -> Option<LocalStoredTask> {\n         let slot = task_id.arena_index().index() as usize;\n-        let taken = self.slots.get_mut(slot)?.take();\n-        if taken.is_some() {\n+        let slot_ref = self.slots.get_mut(slot)?;\n+        if slot_ref.as_ref()?.task_id() == Some(task_id) {\n+            let taken = slot_ref.take();\n             self.len -= 1;\n+            taken\n+        } else {\n+            None\n         }\n-        taken\n     }\n \n     fn len(&self) -> usize {"
+    },
+    {
+      "sha": "f33e4a91002a81bb0da7e89e425ba63a183d48b6",
+      "filename": "src/runtime/obligation_table.rs",
+      "status": "modified",
+      "additions": 19,
+      "deletions": 12,
+      "changes": 31,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/57a7405565af7052acc696a4466e5d19a82340bd/src%2Fruntime%2Fobligation_table.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/57a7405565af7052acc696a4466e5d19a82340bd/src%2Fruntime%2Fobligation_table.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Fobligation_table.rs?ref=57a7405565af7052acc696a4466e5d19a82340bd",
+      "patch": "@@ -100,7 +100,7 @@ pub struct ObligationCreateArgs {\n pub struct ObligationTable {\n     obligations: Arena<ObligationRecord>,\n     /// Secondary index: task \u2192 obligation IDs, indexed by arena slot.\n-    by_holder: Vec<Option<SmallVec<[ObligationId; 4]>>>,\n+    by_holder: Vec<Option<(TaskId, SmallVec<[ObligationId; 4]>)>>,\n     /// Cached count of pending (Reserved) obligations.\n     ///\n     /// Maintained incrementally: +1 on create, -1 on commit/abort/leak.\n@@ -152,9 +152,12 @@ impl ObligationTable {\n         if slot >= self.by_holder.len() {\n             self.by_holder.resize_with(slot + 1, || None);\n         }\n-        self.by_holder[slot]\n-            .get_or_insert_with(SmallVec::new)\n-            .push(ob_id);\n+        let entry = self.by_holder[slot].get_or_insert_with(|| (holder, SmallVec::new()));\n+        if entry.0 != holder {\n+            entry.0 = holder;\n+            entry.1.clear();\n+        }\n+        entry.1.push(ob_id);\n     }\n \n     /// Inserts a new obligation record produced by `f` into the arena.\n@@ -184,10 +187,12 @@ impl ObligationTable {\n         }\n         let ob_id = ObligationId::from_arena(index);\n         let slot = record.holder.arena_index().index() as usize;\n-        if let Some(Some(ids)) = self.by_holder.get_mut(slot) {\n-            ids.retain(|id| *id != ob_id);\n-            if ids.is_empty() {\n-                self.by_holder[slot] = None;\n+        if let Some(Some((holder, ids))) = self.by_holder.get_mut(slot) {\n+            if *holder == record.holder {\n+                ids.retain(|id| *id != ob_id);\n+                if ids.is_empty() {\n+                    self.by_holder[slot] = None;\n+                }\n             }\n         }\n         Some(record)\n@@ -375,10 +380,12 @@ impl ObligationTable {\n     #[must_use]\n     pub fn ids_for_holder(&self, task_id: TaskId) -> &[ObligationId] {\n         let slot = task_id.arena_index().index() as usize;\n-        self.by_holder\n-            .get(slot)\n-            .and_then(Option::as_ref)\n-            .map_or(&[], SmallVec::as_slice)\n+        if let Some(Some((holder, ids))) = self.by_holder.get(slot) {\n+            if *holder == task_id {\n+                return ids.as_slice();\n+            }\n+        }\n+        &[]\n     }\n \n     /// Collects pending obligation IDs for a task using the holder index."
+    },
+    {
+      "sha": "c4113fdfe024a427fe5d041bf819c4dcf5caa443",
+      "filename": "src/runtime/stored_task.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/57a7405565af7052acc696a4466e5d19a82340bd/src%2Fruntime%2Fstored_task.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/57a7405565af7052acc696a4466e5d19a82340bd/src%2Fruntime%2Fstored_task.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fruntime%2Fstored_task.rs?ref=57a7405565af7052acc696a4466e5d19a82340bd",
+      "patch": "@@ -171,6 +171,12 @@ impl LocalStoredTask {\n         self.task_id = Some(task_id);\n     }\n \n+    /// Returns the task ID associated with this task.\n+    #[must_use]\n+    pub fn task_id(&self) -> Option<TaskId> {\n+        self.task_id\n+    }\n+\n     /// Sets the budget polls remaining.\n     #[inline]\n     pub fn set_polls_remaining(&mut self, remaining: u32) {"
+    }
+  ]
+}

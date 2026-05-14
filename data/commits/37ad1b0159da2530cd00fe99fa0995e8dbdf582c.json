@@ -1,0 +1,41 @@
+{
+  "message": "fix: improve DO broadcast reliability and regional routing\n\n- Master DO: track consecutive broadcast failures per region, auto-remove\n  after 3 failures instead of silently ignoring errors\n- Query DO: retry Master registration on each request until confirmed,\n  extract registerWithMaster into reusable method\n- Worker: pass locationHint to Query DO for proper regional placement",
+  "files": [
+    {
+      "sha": "2de242cf207b8679d0408d2e648b9a3e9d33c96c",
+      "filename": "src/master-do.ts",
+      "status": "modified",
+      "additions": 19,
+      "deletions": 1,
+      "changes": 20,
+      "blob_url": "https://github.com/teamchong/querymode/blob/37ad1b0159da2530cd00fe99fa0995e8dbdf582c/src%2Fmaster-do.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/37ad1b0159da2530cd00fe99fa0995e8dbdf582c/src%2Fmaster-do.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fmaster-do.ts?ref=37ad1b0159da2530cd00fe99fa0995e8dbdf582c",
+      "patch": "@@ -5,6 +5,7 @@ import { parseFooter, parseColumnMetaFromProtobuf, FOOTER_SIZE } from \"./footer.\n export class MasterDO implements DurableObject {\n   private state: DurableObjectState;\n   private env: Env;\n+  private broadcastFailures = new Map<string, number>(); // region \u2192 consecutive failure count\n \n   constructor(state: DurableObjectState, env: Env) {\n     this.state = state;\n@@ -108,15 +109,32 @@ export class MasterDO implements DurableObject {\n       fileSize: footer.fileSize.toString(), timestamp: Date.now(),\n     });\n \n+    const deadRegions: string[] = [];\n     await Promise.allSettled(Object.entries(regions).map(async ([region, doId]) => {\n       try {\n         const queryDo = this.env.QUERY_DO.get(this.env.QUERY_DO.idFromString(doId));\n         await queryDo.fetch(new Request(\"http://internal/invalidate\", {\n           method: \"POST\", body: payload, headers: { \"content-type\": \"application/json\" },\n         }));\n+        this.broadcastFailures.delete(region);\n       } catch {\n-        console.warn(`Broadcast to ${region} failed, will resync`);\n+        const count = (this.broadcastFailures.get(region) ?? 0) + 1;\n+        this.broadcastFailures.set(region, count);\n+        if (count >= 3) {\n+          console.warn(`Broadcast to ${region} failed ${count} times, removing`);\n+          deadRegions.push(region);\n+        } else {\n+          console.warn(`Broadcast to ${region} failed (${count}/3)`);\n+        }\n       }\n     }));\n+\n+    if (deadRegions.length > 0) {\n+      for (const r of deadRegions) {\n+        delete regions[r];\n+        this.broadcastFailures.delete(r);\n+      }\n+      await this.state.storage.put(\"regions\", regions);\n+    }\n   }\n }"
+    },
+    {
+      "sha": "3a6f08cf59c401d6f32f983ab0c24ff785c7001d",
+      "filename": "src/query-do.ts",
+      "status": "modified",
+      "additions": 17,
+      "deletions": 6,
+      "changes": 23,
+      "blob_url": "https://github.com/teamchong/querymode/blob/37ad1b0159da2530cd00fe99fa0995e8dbdf582c/src%2Fquery-do.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/37ad1b0159da2530cd00fe99fa0995e8dbdf582c/src%2Fquery-do.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fquery-do.ts?ref=37ad1b0159da2530cd00fe99fa0995e8dbdf582c",
+      "patch": "@@ -19,6 +19,7 @@ export class QueryDO implements DurableObject {\n   private wasmLoaded = new Map<string, number>(); // table \u2192 updatedAt\n   private queryCount = new Map<string, number>(); // table \u2192 hit count (for VIP pinning)\n   private initialized = false;\n+  private registeredWithMaster = false;\n \n   constructor(state: DurableObjectState, env: Env) {\n     this.state = state;\n@@ -38,6 +39,7 @@ export class QueryDO implements DurableObject {\n       if (!stored) await this.state.storage.put(\"region\", region);\n     }\n     await this.ensureInitialized();\n+    if (!this.registeredWithMaster) this.registerWithMaster();\n \n     switch (new URL(request.url).pathname) {\n       case \"/invalidate\": return this.handleInvalidation(request);\n@@ -61,13 +63,22 @@ export class QueryDO implements DurableObject {\n     }\n \n     // Register with Master for invalidation broadcasts\n+    this.registerWithMaster();\n+  }\n+\n+  private registerWithMaster(): void {\n     const master = this.env.MASTER_DO.get(this.env.MASTER_DO.idFromName(\"master\"));\n-    const region = (await this.state.storage.get<string>(\"region\")) ?? \"unknown\";\n-    master.fetch(new Request(\"http://internal/register\", {\n-      method: \"POST\",\n-      body: JSON.stringify({ queryDoId: this.state.id.toString(), region }),\n-      headers: { \"content-type\": \"application/json\" },\n-    })).catch(() => {});\n+    this.state.storage.get<string>(\"region\").then(region => {\n+      master.fetch(new Request(\"http://internal/register\", {\n+        method: \"POST\",\n+        body: JSON.stringify({ queryDoId: this.state.id.toString(), region: region ?? \"unknown\" }),\n+        headers: { \"content-type\": \"application/json\" },\n+      })).then(() => {\n+        this.registeredWithMaster = true;\n+      }).catch(() => {\n+        console.warn(\"Failed to register with Master DO, will retry on next request\");\n+      });\n+    });\n   }\n \n   private async handleInvalidation(request: Request): Promise<Response> {"
+    },
+    {
+      "sha": "688f26d9ba29346e959b79ebf14f90f17b5d847e",
+      "filename": "src/worker.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/teamchong/querymode/blob/37ad1b0159da2530cd00fe99fa0995e8dbdf582c/src%2Fworker.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/37ad1b0159da2530cd00fe99fa0995e8dbdf582c/src%2Fworker.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fworker.ts?ref=37ad1b0159da2530cd00fe99fa0995e8dbdf582c",
+      "patch": "@@ -46,7 +46,7 @@ export default {\n       const regionName = `query-${datacenter}`;\n \n       const queryId = env.QUERY_DO.idFromName(regionName);\n-      const queryDo = env.QUERY_DO.get(queryId);\n+      const queryDo = env.QUERY_DO.get(queryId, { locationHint: datacenter as DurableObjectLocationHint });\n \n       // Pass region name via header so the Query DO can store it for Master registration\n       const reqWithRegion = new Request(request.url, request);"
+    }
+  ]
+}

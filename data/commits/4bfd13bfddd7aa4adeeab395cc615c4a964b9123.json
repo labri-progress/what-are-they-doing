@@ -1,0 +1,29 @@
+{
+  "message": "fix: topK sorted nulls first while full sort path sorted nulls last\n\nThe topK heap comparator treated null as \"less than\" everything (null\nsorted first), but rowComparator used by the full sort path sorts nulls\nlast. This caused ORDER BY + LIMIT queries to produce different null\nordering depending on whether the limit was small enough to trigger the\ntopK path. Fixed topK to treat nulls as \"greatest\" (nulls-last),\nmatching rowComparator and SQL standard NULLS LAST default.",
+  "files": [
+    {
+      "sha": "f1418c022a68fa62d622515f823222c4a13d12ba",
+      "filename": "src/decode.test.ts",
+      "status": "modified",
+      "additions": 51,
+      "deletions": 1,
+      "changes": 52,
+      "blob_url": "https://github.com/teamchong/querymode/blob/4bfd13bfddd7aa4adeeab395cc615c4a964b9123/src%2Fdecode.test.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/4bfd13bfddd7aa4adeeab395cc615c4a964b9123/src%2Fdecode.test.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fdecode.test.ts?ref=4bfd13bfddd7aa4adeeab395cc615c4a964b9123",
+      "patch": "@@ -1,5 +1,5 @@\n import { describe, it, expect } from \"vitest\";\n-import { decodePage, assembleRows, canSkipPage, canSkipFragment, matchesFilter, bigIntReplacer } from \"./decode.js\";\n+import { decodePage, assembleRows, applySortAndLimit, canSkipPage, canSkipFragment, matchesFilter, bigIntReplacer } from \"./decode.js\";\n import type { ColumnMeta, PageInfo } from \"./types.js\";\n import type { QueryDescriptor } from \"./client.js\";\n import type { WasmEngine } from \"./wasm-engine.js\";\n@@ -442,6 +442,56 @@ describe(\"assembleRows\", () => {\n   });\n });\n \n+describe(\"applySortAndLimit (topK null ordering)\", () => {\n+  it(\"sorts nulls last in ascending topK\", () => {\n+    const rows = [\n+      { v: null }, { v: 3 }, { v: 1 }, { v: null }, { v: 2 }, { v: 5 }, { v: 4 },\n+    ];\n+    const query: QueryDescriptor = {\n+      table: \"t\", filters: [], projections: [\"v\"],\n+      sortColumn: \"v\", sortDirection: \"asc\", limit: 3,\n+    };\n+    const result = applySortAndLimit(rows, query);\n+    expect(result.map(r => r.v)).toEqual([1, 2, 3]);\n+  });\n+\n+  it(\"sorts nulls last in descending topK\", () => {\n+    const rows = [\n+      { v: null }, { v: 3 }, { v: 1 }, { v: null }, { v: 2 }, { v: 5 }, { v: 4 },\n+    ];\n+    const query: QueryDescriptor = {\n+      table: \"t\", filters: [], projections: [\"v\"],\n+      sortColumn: \"v\", sortDirection: \"desc\", limit: 3,\n+    };\n+    const result = applySortAndLimit(rows, query);\n+    expect(result.map(r => r.v)).toEqual([5, 4, 3]);\n+  });\n+\n+  it(\"nulls appear at end when limit exceeds non-null count\", () => {\n+    const rows = [\n+      { v: null }, { v: 2 }, { v: 1 },\n+    ];\n+    const query: QueryDescriptor = {\n+      table: \"t\", filters: [], projections: [\"v\"],\n+      sortColumn: \"v\", sortDirection: \"asc\", limit: 3,\n+    };\n+    const result = applySortAndLimit(rows, query);\n+    expect(result.map(r => r.v)).toEqual([1, 2, null]);\n+  });\n+\n+  it(\"full sort path also puts nulls last\", () => {\n+    const rows = [\n+      { v: null }, { v: 3 }, { v: 1 }, { v: null }, { v: 2 },\n+    ];\n+    const query: QueryDescriptor = {\n+      table: \"t\", filters: [], projections: [\"v\"],\n+      sortColumn: \"v\", sortDirection: \"asc\",\n+    };\n+    const result = applySortAndLimit(rows, query);\n+    expect(result.map(r => r.v)).toEqual([1, 2, 3, null, null]);\n+  });\n+});\n+\n describe(\"matchesFilter\", () => {\n   it(\"matches eq\", () => {\n     expect(matchesFilter(42, { column: \"x\", op: \"eq\", value: 42 })).toBe(true);"
+    },
+    {
+      "sha": "0969326b7c25575b9eebcc01708ea474291aa889",
+      "filename": "src/decode.ts",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 5,
+      "changes": 11,
+      "blob_url": "https://github.com/teamchong/querymode/blob/4bfd13bfddd7aa4adeeab395cc615c4a964b9123/src%2Fdecode.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/4bfd13bfddd7aa4adeeab395cc615c4a964b9123/src%2Fdecode.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fdecode.ts?ref=4bfd13bfddd7aa4adeeab395cc615c4a964b9123",
+      "patch": "@@ -359,17 +359,18 @@ function topK(rows: Row[], k: number, col: string, desc: boolean): Row[] {\n \n   const cmp = (a: Row, b: Row): number => {\n     const av = a[col], bv = b[col];\n-    if (av === null && bv === null) return 0;\n-    if (av === null) return -1;\n-    if (bv === null) return 1;\n+    // Nulls-last: null is \"greatest\" so it sits at the heap root and gets replaced first\n+    if ((av === null || av === undefined) && (bv === null || bv === undefined)) return 0;\n+    if (av === null || av === undefined) return 1;\n+    if (bv === null || bv === undefined) return -1;\n     const c = av < bv ? -1 : av > bv ? 1 : 0;\n     return desc ? -c : c;\n   };\n \n   const shouldReplace = (row: Row): boolean => {\n     const nv = row[col], rv = heap[0][col];\n-    if (nv === null) return false;\n-    if (rv === null) return true;\n+    if (nv === null || nv === undefined) return false;\n+    if (rv === null || rv === undefined) return true;\n     return desc ? nv > rv : nv < rv;\n   };\n "
+    }
+  ]
+}

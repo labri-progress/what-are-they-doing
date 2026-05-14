@@ -1,0 +1,29 @@
+{
+  "message": "feat(ext): add rebuild_documents/rebuild_rows for FTS5 and R-tree rehydration\n\nVirtual table extensions need a way to reconstruct their in-memory state\nfrom persisted backing-table rows after a database is reopened or a\nschema reload occurs. Without this, FTS5 inverted indexes and R-tree\nspatial indexes are empty until the next insert.\n\nFTS5 \u2014 Fts5Table::rebuild_documents(&mut self, rows):\n  Clears the inverted index and document map, then re-inserts each\n  (rowid, columns) pair via insert_document. Tracks next_rowid as\n  max(rowid)+1 across all rows.\n\nR-tree \u2014 RtreeVirtualTable::rebuild_rows(&mut self, rows):\n  Replaces the entry vector with a freshly built index from persisted\n  (rowid, values) pairs. Handles both formats: values with or without\n  a leading id column (validates id matches rowid if present). Returns\n  DatabaseCorrupt errors for mismatched id columns, wrong value counts,\n  or duplicate entry ids.\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "262951b4fdc6152bdf3b040623808fae71bd5269",
+      "filename": "crates/fsqlite-ext-fts5/src/lib.rs",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 0,
+      "changes": 11,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/d09426d15e4896f38ccc5442ec5a6edc8c828b5b/crates%2Ffsqlite-ext-fts5%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/d09426d15e4896f38ccc5442ec5a6edc8c828b5b/crates%2Ffsqlite-ext-fts5%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-ext-fts5%2Fsrc%2Flib.rs?ref=d09426d15e4896f38ccc5442ec5a6edc8c828b5b",
+      "patch": "@@ -1670,6 +1670,17 @@ impl Fts5Table {\n         debug!(rowid, \"fts5: removed document\");\n     }\n \n+    /// Rebuild the in-memory index and rowid allocator from persisted rows.\n+    pub fn rebuild_documents(&mut self, rows: &[(i64, Vec<String>)]) {\n+        self.index = InvertedIndex::new();\n+        self.documents.clear();\n+        self.next_rowid = 1;\n+        for (rowid, columns) in rows {\n+            self.insert_document(*rowid, columns);\n+            self.next_rowid = self.next_rowid.max(rowid.saturating_add(1));\n+        }\n+    }\n+\n     /// Search the FTS5 table with a query, returning matching rowids ranked\n     /// by BM25.\n     pub fn search(&self, query: &str) -> std::result::Result<Vec<(i64, f64)>, Fts5QueryError> {"
+    },
+    {
+      "sha": "6eeda7070e337bf97a52eb81c42a49800137e79c",
+      "filename": "crates/fsqlite-ext-rtree/src/lib.rs",
+      "status": "modified",
+      "additions": 53,
+      "deletions": 0,
+      "changes": 53,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/d09426d15e4896f38ccc5442ec5a6edc8c828b5b/crates%2Ffsqlite-ext-rtree%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/d09426d15e4896f38ccc5442ec5a6edc8c828b5b/crates%2Ffsqlite-ext-rtree%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-ext-rtree%2Fsrc%2Flib.rs?ref=d09426d15e4896f38ccc5442ec5a6edc8c828b5b",
+      "patch": "@@ -555,6 +555,59 @@ impl RtreeVirtualTable {\n     pub fn register_geometry(&mut self, name: &str, geom: Box<dyn RtreeGeometry>) {\n         self.index.register_geometry(name, geom);\n     }\n+\n+    /// Rebuild the in-memory R-tree from persisted row values.\n+    pub fn rebuild_rows(&mut self, rows: &[(i64, Vec<SqliteValue>)]) -> Result<()> {\n+        let config = self.index.config.clone();\n+        let geometry_registry = self.index.geometry_registry.clone();\n+        self.index = RtreeIndex {\n+            config,\n+            entries: Vec::new(),\n+            geometry_registry,\n+        };\n+\n+        for (rowid, values) in rows {\n+            let expected_coord_values = self.index.dimensions() * 2;\n+            let (entry_id, coord_values) = match values.len() {\n+                len if len == expected_coord_values => (*rowid, values.as_slice()),\n+                len if len == expected_coord_values + 1 => {\n+                    let id =\n+                        values[0]\n+                            .as_integer()\n+                            .ok_or_else(|| FrankenError::DatabaseCorrupt {\n+                                detail: format!(\n+                                    \"rtree persisted row {rowid} stores a non-integer id column\"\n+                                ),\n+                            })?;\n+                    if id != *rowid {\n+                        return Err(FrankenError::DatabaseCorrupt {\n+                            detail: format!(\n+                                \"rtree persisted row {rowid} stores mismatched id column {id}\"\n+                            ),\n+                        });\n+                    }\n+                    (id, &values[1..])\n+                }\n+                len => {\n+                    return Err(FrankenError::DatabaseCorrupt {\n+                        detail: format!(\n+                            \"rtree persisted row {rowid} has {len} values; expected {expected_coord_values} or {}\",\n+                            expected_coord_values + 1\n+                        ),\n+                    });\n+                }\n+            };\n+\n+            let bbox = self.parse_bbox_values(coord_values)?;\n+            if !self.index.insert(RtreeEntry { id: entry_id, bbox }) {\n+                return Err(FrankenError::DatabaseCorrupt {\n+                    detail: format!(\"rtree persisted row {rowid} duplicates entry id {entry_id}\"),\n+                });\n+            }\n+        }\n+\n+        Ok(())\n+    }\n }\n \n impl VirtualTable for RtreeVirtualTable {"
+    }
+  ]
+}

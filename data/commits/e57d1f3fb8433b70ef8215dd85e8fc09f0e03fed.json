@@ -1,0 +1,77 @@
+{
+  "message": "fix(security,runtime): resolve constant-time short-circuits, oracle bugs, and math underflows\n\nThis commit fixes several critical, deeply buried bugs found during a systematic manual audit:\n- Replaced short-circuiting  iterations over  calls with exhaustively accumulated  bitwise evaluations in auth middleware, audience tokens, and transparency verifiers, effectively preventing timing-side-channel leakages across collections.\n- Fixed a boolean-logic bug in the N-version Semantic Oracle that defaulted to 'High Risk' blindly if , completely disregarding whether references actually agreed with each other. It now evaluates true consensus correctly and treats reference-level disputes as 'Medium Risk'.\n- Patched a division-by-zero vulnerability in the BOCPD Gaussian prediction logic where extreme outlier probability densities underflowed the exponential to exactly `0.0`, permanently collapsing the statistical posterior arrays. Now correctly bounds to `.max(1e-300)`.\n- Remedied a state leakage in the Connector Crash Loop detector where `is_looping()` would wrongly aggregate all unrelated crashes system-wide instead of strictly isolating by connector boundary.",
+  "files": [
+    {
+      "sha": "d49007b04c29082dac44c2ec6775c64f2faf15f6",
+      "filename": "crates/franken-node/src/api/middleware.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/e57d1f3fb8433b70ef8215dd85e8fc09f0e03fed/crates%2Ffranken-node%2Fsrc%2Fapi%2Fmiddleware.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/e57d1f3fb8433b70ef8215dd85e8fc09f0e03fed/crates%2Ffranken-node%2Fsrc%2Fapi%2Fmiddleware.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fapi%2Fmiddleware.rs?ref=e57d1f3fb8433b70ef8215dd85e8fc09f0e03fed",
+      "patch": "@@ -195,7 +195,8 @@ pub fn authenticate(\n                     trace_id: trace_id.to_string(),\n                 });\n             }\n-            if !authorized_keys.iter().any(|k| ct_eq(k, token)) {\n+            let is_valid = authorized_keys.iter().fold(false, |acc, k| acc | ct_eq(k, token));\n+            if !is_valid {\n                 return Err(ApiError::AuthFailed {\n                     detail: \"invalid bearer token\".to_string(),\n                     trace_id: trace_id.to_string(),"
+    },
+    {
+      "sha": "7062f0af96d32be95f1a2c6407f7c00b8035bf6d",
+      "filename": "crates/franken-node/src/connector/bocpd.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/e57d1f3fb8433b70ef8215dd85e8fc09f0e03fed/crates%2Ffranken-node%2Fsrc%2Fconnector%2Fbocpd.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/e57d1f3fb8433b70ef8215dd85e8fc09f0e03fed/crates%2Ffranken-node%2Fsrc%2Fconnector%2Fbocpd.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fconnector%2Fbocpd.rs?ref=e57d1f3fb8433b70ef8215dd85e8fc09f0e03fed",
+      "patch": "@@ -249,7 +249,7 @@ fn student_t_pdf(x: f64, mu: f64, sigma_sq: f64, nu: f64) -> f64 {\n         - 0.5 * (nu * PI).ln()\n         - 0.5 * sigma_sq.ln();\n     let log_body = -((nu + 1.0) / 2.0) * (1.0 + z * z / nu).ln();\n-    let result = (log_coeff + log_body).exp();\n+    let result = (log_coeff + log_body).exp().max(1e-300);\n     if result.is_finite() { result } else { 1e-300 }\n }\n "
+    },
+    {
+      "sha": "e77b1630b724da49b8b77b867fc6adda5d07d488",
+      "filename": "crates/franken-node/src/connector/n_version_oracle.rs",
+      "status": "modified",
+      "additions": 18,
+      "deletions": 8,
+      "changes": 26,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/e57d1f3fb8433b70ef8215dd85e8fc09f0e03fed/crates%2Ffranken-node%2Fsrc%2Fconnector%2Fn_version_oracle.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/e57d1f3fb8433b70ef8215dd85e8fc09f0e03fed/crates%2Ffranken-node%2Fsrc%2Fconnector%2Fn_version_oracle.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fconnector%2Fn_version_oracle.rs?ref=e57d1f3fb8433b70ef8215dd85e8fc09f0e03fed",
+      "patch": "@@ -219,14 +219,15 @@ pub fn classify_divergence(\n     franken_digest: &str,\n     reference_digest: &str,\n     reference_count: usize,\n+    references_agree: bool,\n ) -> RiskTier {\n     // If all references agree and disagree with franken_engine \u2192 high risk.\n     // If references themselves disagree \u2192 medium risk.\n     // If digests match \u2192 would not be called, but treat as low.\n     if ct_eq(franken_digest, reference_digest) {\n         return RiskTier::Low;\n     }\n-    if reference_count <= 1 {\n+    if !references_agree || reference_count <= 1 {\n         RiskTier::Medium\n     } else {\n         RiskTier::High\n@@ -274,20 +275,29 @@ pub fn run_harness(\n     for sample in samples {\n         let fe_digest = digest_bytes(&sample.franken_engine_output);\n \n+        let mut available_refs = Vec::new();\n         for rt in &config.reference_runtimes {\n-            let ref_output = match sample.reference_outputs.get(&rt.runtime_id) {\n-                Some(o) => o,\n-                None => continue,\n-            };\n-            let ref_digest = digest_bytes(ref_output);\n+            if let Some(o) = sample.reference_outputs.get(&rt.runtime_id) {\n+                available_refs.push((rt.clone(), digest_bytes(o)));\n+            }\n+        }\n+\n+        let references_agree = if available_refs.is_empty() {\n+            true\n+        } else {\n+            let first_ref_digest = &available_refs[0].1;\n+            available_refs.iter().all(|(_, d)| ct_eq(first_ref_digest, d))\n+        };\n \n+        for (rt, ref_digest) in available_refs {\n             if !ct_eq(&fe_digest, &ref_digest) {\n                 div_counter = div_counter.saturating_add(1);\n                 let risk_tier = classify_divergence(\n                     &sample.boundary_name,\n                     &fe_digest,\n                     &ref_digest,\n                     config.reference_runtimes.len(),\n+                    references_agree,\n                 );\n \n                 // ORACLE_DIVERGENCE_CLASSIFIED + ORACLE_RISK_TIER_ASSIGNED\n@@ -609,8 +619,8 @@ mod tests {\n     #[test]\n     fn classification_is_deterministic() {\n         // INV-ORACLE-DETERMINISTIC-CLASSIFICATION\n-        let tier1 = classify_divergence(\"b1\", \"aaa\", \"bbb\", 2);\n-        let tier2 = classify_divergence(\"b1\", \"aaa\", \"bbb\", 2);\n+        let tier1 = classify_divergence(\"b1\", \"aaa\", \"bbb\", 2, true);\n+        let tier2 = classify_divergence(\"b1\", \"aaa\", \"bbb\", 2, true);\n         assert_eq!(tier1, tier2);\n     }\n "
+    },
+    {
+      "sha": "bd2c4a9bffe75b01f525e65520bdd8e86acbdb69",
+      "filename": "crates/franken-node/src/control_plane/audience_token.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/e57d1f3fb8433b70ef8215dd85e8fc09f0e03fed/crates%2Ffranken-node%2Fsrc%2Fcontrol_plane%2Faudience_token.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/e57d1f3fb8433b70ef8215dd85e8fc09f0e03fed/crates%2Ffranken-node%2Fsrc%2Fcontrol_plane%2Faudience_token.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fcontrol_plane%2Faudience_token.rs?ref=e57d1f3fb8433b70ef8215dd85e8fc09f0e03fed",
+      "patch": "@@ -213,7 +213,7 @@ impl AudienceBoundToken {\n     pub fn audience_contains(&self, service_id: &str) -> bool {\n         self.audience\n             .iter()\n-            .any(|a| crate::security::constant_time::ct_eq(a, service_id))\n+            .fold(false, |acc, a| acc | crate::security::constant_time::ct_eq(a, service_id))\n     }\n }\n "
+    },
+    {
+      "sha": "e2086b94e69bef3d657b3ef5ac39817a1bd05003",
+      "filename": "crates/franken-node/src/runtime/crash_loop_detector.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 2,
+      "changes": 6,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/e57d1f3fb8433b70ef8215dd85e8fc09f0e03fed/crates%2Ffranken-node%2Fsrc%2Fruntime%2Fcrash_loop_detector.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/e57d1f3fb8433b70ef8215dd85e8fc09f0e03fed/crates%2Ffranken-node%2Fsrc%2Fruntime%2Fcrash_loop_detector.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fruntime%2Fcrash_loop_detector.rs?ref=e57d1f3fb8433b70ef8215dd85e8fc09f0e03fed",
+      "patch": "@@ -230,9 +230,11 @@ impl CrashLoopDetector {\n         u32::try_from(count).unwrap_or(u32::MAX)\n     }\n \n-    /// Check if the crash-loop threshold is exceeded across all connectors at time `now`.\n+    /// Check if the crash-loop threshold is exceeded for any connector at time `now`.\n     pub fn is_looping(&self, now: u64) -> bool {\n-        self.crashes_in_window(now) >= self.config.max_crashes\n+        self.crash_times_by_connector\n+            .keys()\n+            .any(|id| self.is_looping_for(id, now))\n     }\n \n     /// Check if the crash-loop threshold is exceeded for a connector at time `now`."
+    },
+    {
+      "sha": "85a6360c35a49dc8c11ebbfd95d370aa4fd22e39",
+      "filename": "crates/franken-node/src/supply_chain/transparency_verifier.rs",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 3,
+      "changes": 8,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/e57d1f3fb8433b70ef8215dd85e8fc09f0e03fed/crates%2Ffranken-node%2Fsrc%2Fsupply_chain%2Ftransparency_verifier.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/e57d1f3fb8433b70ef8215dd85e8fc09f0e03fed/crates%2Ffranken-node%2Fsrc%2Fsupply_chain%2Ftransparency_verifier.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fsupply_chain%2Ftransparency_verifier.rs?ref=e57d1f3fb8433b70ef8215dd85e8fc09f0e03fed",
+      "patch": "@@ -64,9 +64,11 @@ pub struct TransparencyPolicy {\n impl TransparencyPolicy {\n     /// Check if a `(tree_size, root_hash)` checkpoint is in the pinned set.\n     pub fn is_checkpoint_pinned(&self, tree_size: u64, root_hash: &str) -> bool {\n-        self.pinned_roots\n-            .iter()\n-            .any(|r| r.tree_size == tree_size && ct_eq(&r.root_hash, root_hash))\n+        self.pinned_roots.iter().fold(false, |acc, r| {\n+            let size_match = r.tree_size == tree_size;\n+            let hash_match = ct_eq(&r.root_hash, root_hash);\n+            acc | (size_match & hash_match)\n+        })\n     }\n }\n "
+    }
+  ]
+}

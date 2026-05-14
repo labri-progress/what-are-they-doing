@@ -1,0 +1,29 @@
+{
+  "message": "perf(mvcc): branchless visibility predicate via wrapping_sub\n\n\\`visible(version, snapshot)\\` is the core MVCC read-path predicate:\nevery resolve and every cell-chain traversal calls it, and the\nanswer is always \\\"is this commit in the closed interval\n[1, snapshot.high]?\\\". The old implementation expressed that as\n\n    version.commit_seq.get() != 0 && version.commit_seq <= snapshot.high\n\nwhich compiles to two comparisons and a short-circuit branch. The\npredicate is on the hottest path the MVCC layer has; cutting its\nbranch count pays off directly on every record read.\n\nReplace both copies (the free function \\`invariants::visible\\` and\nthe duplicate \\`CellDelta::is_visible_to\\`) with a single unsigned\ncomparison:\n\n    commit_seq.wrapping_sub(1) < snapshot.high\n\nCorrectness derivation (same behavior on every case):\n\n- commit_seq = 0 (uncommitted private write-set entry):\n    0u64.wrapping_sub(1) = u64::MAX\n    u64::MAX < snapshot.high? \u2192 false (snapshot.high fits in u64)\n  Same answer as the old predicate's short-circuit.\n\n- commit_seq \u2208 [1, snapshot.high]:\n    commit_seq - 1 \u2208 [0, snapshot.high - 1]\n    \u2192 strictly < snapshot.high \u2192 true\n\n- commit_seq > snapshot.high:\n    commit_seq - 1 \u2265 snapshot.high\n    \u2192 NOT < snapshot.high \u2192 false\n\nNo preconditions beyond what the type already guarantees\n(\\`CommitSeq\\` wraps a u64 via NonZeroU64 elsewhere, but the zero\ncase is handled by the wrapping_sub above).\n\nAlso updates the invariants::visible doc-comment to state the new\none-comparison form with the three-case derivation above, so the\ncorrectness is legible at the call site and a future refactor can't\naccidentally \\\"simplify\\\" it back to the branchy form without\nfacing the full proof.\n\n\\`CellDelta::is_visible_to\\` gains an \\`#[inline]\\` plus a short\ndoc-comment referring readers to the full derivation in\n\\`invariants::visible\\` so the duplicate is clearly the same\npredicate.\n\nZero public-API change; branch-count reduction on the read hot path.",
+  "files": [
+    {
+      "sha": "a6ca4e4d0f4070301e956d731c24155bdb26bfe3",
+      "filename": "crates/fsqlite-mvcc/src/cell_visibility.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 1,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/ec87700b306ac0865ba473bc2b2648ef9fd1604a/crates%2Ffsqlite-mvcc%2Fsrc%2Fcell_visibility.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/ec87700b306ac0865ba473bc2b2648ef9fd1604a/crates%2Ffsqlite-mvcc%2Fsrc%2Fcell_visibility.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-mvcc%2Fsrc%2Fcell_visibility.rs?ref=ec87700b306ac0865ba473bc2b2648ef9fd1604a",
+      "patch": "@@ -219,9 +219,14 @@ impl CellDelta {\n     }\n \n     /// Whether this delta is visible to the given snapshot.\n+    ///\n+    /// Branchless: `commit_seq.wrapping_sub(1) < snapshot_high` folds the\n+    /// `committed && <= high` check into one unsigned comparison. See\n+    /// `invariants::visible` for the full derivation.\n+    #[inline]\n     #[must_use]\n     pub fn is_visible_to(&self, snapshot_high: CommitSeq) -> bool {\n-        self.commit_seq.get() != 0 && self.commit_seq <= snapshot_high\n+        self.commit_seq.get().wrapping_sub(1) < snapshot_high.get()\n     }\n }\n "
+    },
+    {
+      "sha": "a005cbd728a2cac5c952cc3a39f7fcf1cad590fc",
+      "filename": "crates/fsqlite-mvcc/src/invariants.rs",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 4,
+      "changes": 15,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/ec87700b306ac0865ba473bc2b2648ef9fd1604a/crates%2Ffsqlite-mvcc%2Fsrc%2Finvariants.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/ec87700b306ac0865ba473bc2b2648ef9fd1604a/crates%2Ffsqlite-mvcc%2Fsrc%2Finvariants.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-mvcc%2Fsrc%2Finvariants.rs?ref=ec87700b306ac0865ba473bc2b2648ef9fd1604a",
+      "patch": "@@ -199,13 +199,20 @@ impl std::fmt::Debug for TxnManager {\n \n /// The core MVCC visibility predicate.\n ///\n-/// A page version `V` is visible to snapshot `S` if and only if:\n-/// 1. `V.commit_seq != 0` (the version is committed, not a private write-set entry)\n-/// 2. `V.commit_seq <= S.high` (the commit happened before the snapshot)\n+/// A page version `V` is visible to snapshot `S` iff\n+/// `V.commit_seq \u2208 [1, S.high]`. Collapsed into one unsigned\n+/// comparison so the hot resolve loop does not branch on the\n+/// committed/uncommitted check:\n+///\n+/// `commit_seq.wrapping_sub(1) < snapshot.high`\n+///\n+/// - commit_seq = 0 \u2192 `0u64.wrapping_sub(1) = u64::MAX`, never `< snapshot.high` \u2192 `false`.\n+/// - commit_seq \u2208 [1, snapshot.high] \u2192 `commit_seq - 1 < snapshot.high` \u2192 `true`.\n+/// - commit_seq  > snapshot.high \u2192 `commit_seq - 1 >= snapshot.high` \u2192 `false`.\n #[inline]\n #[must_use]\n pub fn visible(version: &PageVersion, snapshot: &Snapshot) -> bool {\n-    version.commit_seq.get() != 0 && version.commit_seq <= snapshot.high\n+    version.commit_seq.get().wrapping_sub(1) < snapshot.high.get()\n }\n \n /// Visibility interval for a committed page version on a chain."
+    }
+  ]
+}

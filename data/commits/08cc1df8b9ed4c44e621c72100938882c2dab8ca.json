@@ -1,0 +1,41 @@
+{
+  "message": "refactor(manifest): consolidate validation into validate.ts and fix topo sort\n\npackages/manifest/src/parser.ts:\n- Replace inline dependency-existence checking loop with a call to\n  validateDependencyExistenceAdvanced() from validate.ts, eliminating\n  duplicated logic between parser.ts and validate.ts\n- Replace local validatePhaseOrdering() function with a call to\n  validatePhaseOrderingAdvanced() from validate.ts, removing ~30 lines\n  of duplicate phase-violation detection code\n- Import validatePhaseOrdering and validateDependencyExistence from\n  validate.ts alongside the existing detectDependencyCycles import\n\npackages/manifest/src/parser.test.ts:\n- Update the unknown-dependency test assertion from \"Unknown dependency\"\n  to \"which does not exist\" to match the error message format used by\n  validateDependencyExistenceAdvanced() in validate.ts\n\npackages/manifest/src/utils.ts:\n- Pre-sort modules by phase number before topological sort traversal\n  in sortModulesByInstallOrder() so that unconnected components (modules\n  with no dependency edges between them) are visited in phase order\n  rather than arbitrary array order; this ensures that phase-1 modules\n  appear before phase-5 modules even when they have no explicit\n  dependency relationship\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "b917214440048c06e95d0ebb7b6aa5300ee214ed",
+      "filename": "packages/manifest/src/parser.test.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/agentic_coding_flywheel_setup/blob/08cc1df8b9ed4c44e621c72100938882c2dab8ca/packages%2Fmanifest%2Fsrc%2Fparser.test.ts",
+      "raw_url": "https://github.com/Dicklesworthstone/agentic_coding_flywheel_setup/raw/08cc1df8b9ed4c44e621c72100938882c2dab8ca/packages%2Fmanifest%2Fsrc%2Fparser.test.ts",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/agentic_coding_flywheel_setup/contents/packages%2Fmanifest%2Fsrc%2Fparser.test.ts?ref=08cc1df8b9ed4c44e621c72100938882c2dab8ca",
+      "patch": "@@ -376,7 +376,7 @@ modules:\n \n     const validationResult = validateManifest(parseResult.data);\n     expect(validationResult.valid).toBe(false);\n-    expect(validationResult.errors.some((e) => e.message.includes('Unknown dependency'))).toBe(\n+    expect(validationResult.errors.some((e) => e.message.includes('which does not exist'))).toBe(\n       true\n     );\n   });"
+    },
+    {
+      "sha": "44c4f3889a524b3e2163b68ba49b0599562076a7",
+      "filename": "packages/manifest/src/parser.ts",
+      "status": "modified",
+      "additions": 18,
+      "deletions": 48,
+      "changes": 66,
+      "blob_url": "https://github.com/Dicklesworthstone/agentic_coding_flywheel_setup/blob/08cc1df8b9ed4c44e621c72100938882c2dab8ca/packages%2Fmanifest%2Fsrc%2Fparser.ts",
+      "raw_url": "https://github.com/Dicklesworthstone/agentic_coding_flywheel_setup/raw/08cc1df8b9ed4c44e621c72100938882c2dab8ca/packages%2Fmanifest%2Fsrc%2Fparser.ts",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/agentic_coding_flywheel_setup/contents/packages%2Fmanifest%2Fsrc%2Fparser.ts?ref=08cc1df8b9ed4c44e621c72100938882c2dab8ca",
+      "patch": "@@ -7,7 +7,11 @@ import { readFileSync, existsSync } from 'node:fs';\n import { parse as parseYaml, YAMLParseError } from 'yaml';\n import { ZodError } from 'zod';\n import { ManifestSchema } from './schema.js';\n-import { detectDependencyCycles as detectDependencyCyclesValidate } from './validate.js';\n+import { \n+  detectDependencyCycles as detectDependencyCyclesValidate,\n+  validatePhaseOrdering as validatePhaseOrderingAdvanced,\n+  validateDependencyExistence as validateDependencyExistenceAdvanced\n+} from './validate.js';\n import type {\n   Manifest,\n   ParseResult,\n@@ -211,19 +215,12 @@ export function validateManifestData(data: Manifest): ValidationResult {\n   }\n \n   // Check for missing dependencies\n-  const moduleIds = new Set(data.modules.map((m) => m.id));\n-  for (const module of data.modules) {\n-    if (module.dependencies) {\n-      for (const dep of module.dependencies) {\n-        if (!moduleIds.has(dep)) {\n-          errors.push({\n-            path: `modules.${module.id}.dependencies`,\n-            message: `Unknown dependency: ${dep}`,\n-            value: dep,\n-          });\n-        }\n-      }\n-    }\n+  const missingDeps = validateDependencyExistenceAdvanced(data);\n+  for (const e of missingDeps) {\n+    errors.push({\n+      path: `modules.${e.moduleId}.dependencies`,\n+      message: e.message,\n+    });\n   }\n \n   // Check for dependency cycles (using consolidated implementation from validate.ts)\n@@ -237,8 +234,13 @@ export function validateManifestData(data: Manifest): ValidationResult {\n \n   // Check for phase ordering violations (deps must be same or earlier phase)\n   // Related: bead mjt.3.2\n-  const phaseErrors = validatePhaseOrdering(data.modules);\n-  errors.push(...phaseErrors);\n+  const phaseResults = validatePhaseOrderingAdvanced(data);\n+  for (const e of phaseResults) {\n+    errors.push({\n+      path: `modules.${e.moduleId}.dependencies`,\n+      message: e.message,\n+    });\n+  }\n \n   // Warnings for web-visible modules missing recommended web metadata fields\n   const recommendedWebFields = [\n@@ -303,38 +305,6 @@ export function validateManifest(manifest: unknown): ValidationResult {\n   return validateManifestData(schemaResult.data as Manifest);\n }\n \n-/**\n- * Validate phase ordering: dependencies must be in same or earlier phase\n- * Related: bead mjt.3.2\n- */\n-function validatePhaseOrdering(modules: Manifest['modules']): ValidationError[] {\n-  const errors: ValidationError[] = [];\n-  const moduleMap = new Map(modules.map((m) => [m.id, m]));\n-\n-  for (const module of modules) {\n-    if (!module.dependencies) continue;\n-\n-    const modulePhase = module.phase ?? 1;\n-\n-    for (const depId of module.dependencies) {\n-      const dep = moduleMap.get(depId);\n-      if (!dep) continue; // Missing dependency is caught by existence check\n-\n-      const depPhase = dep.phase ?? 1;\n-\n-      if (depPhase > modulePhase) {\n-        errors.push({\n-          path: `modules.${module.id}.dependencies`,\n-          message: `Phase violation: \"${module.id}\" (phase ${modulePhase}) depends on \"${depId}\" (phase ${depPhase}). Dependencies must be in same or earlier phase.`,\n-          value: depId,\n-        });\n-      }\n-    }\n-  }\n-\n-  return errors;\n-}\n-\n /**\n  * Format a Zod error into a readable message\n  */"
+    },
+    {
+      "sha": "a13ea3048d7924f4f1fc6551a056f96f29d86654",
+      "filename": "packages/manifest/src/utils.ts",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 1,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/agentic_coding_flywheel_setup/blob/08cc1df8b9ed4c44e621c72100938882c2dab8ca/packages%2Fmanifest%2Fsrc%2Futils.ts",
+      "raw_url": "https://github.com/Dicklesworthstone/agentic_coding_flywheel_setup/raw/08cc1df8b9ed4c44e621c72100938882c2dab8ca/packages%2Fmanifest%2Fsrc%2Futils.ts",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/agentic_coding_flywheel_setup/contents/packages%2Fmanifest%2Fsrc%2Futils.ts?ref=08cc1df8b9ed4c44e621c72100938882c2dab8ca",
+      "patch": "@@ -221,7 +221,14 @@ export function sortModulesByInstallOrder(manifest: Manifest): Module[] {\n     sorted.push(module);\n   }\n \n-  for (const module of manifest.modules) {\n+  // Pre-sort modules by phase to ensure unconnected components are ordered correctly\n+  const modulesToVisit = [...manifest.modules].sort((a, b) => {\n+    const phaseA = a.phase ?? 1;\n+    const phaseB = b.phase ?? 1;\n+    return phaseA - phaseB;\n+  });\n+\n+  for (const module of modulesToVisit) {\n     visit(module.id);\n   }\n "
+    }
+  ]
+}

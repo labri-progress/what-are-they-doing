@@ -1,0 +1,40 @@
+{
+  "message": "fix(vdbe,persist): correct autoindex B-tree type inference for multi-table schemas (#55)\n\nAutoindex root pages (sqlite_autoindex_*) were misidentified as table\nB-trees when MemDatabase::get_table() returned Some for them \u2014 because\ncreate_table_at is called for both table and autoindex roots. In schemas\nwith AUTOINCREMENT + composite UNIQUE constraints, this caused the\nautoindex page to be initialized with LeafTable (0x0D) instead of\nLeafIndex (0x0A), producing \"wrong # of entries in index\" and \"page N:\nnever used\" errors under stock SQLite integrity_check.\n\nRoot cause: zero-page B-tree type inference in VdbeEngine relied solely\non MemDatabase presence, which cannot distinguish autoindex roots from\ntable roots. Fix: check index_desc_flags_by_root_page and\nindex_collations_by_root_page first (populated from schema metadata),\nand only fall back to MemDatabase when the index maps have no entry.\n\nAlso removed the autoindex skip filter in compat_persist so autoindex\nB-tree data is written to the persisted file, preventing missing-page\nerrors.\n\nCloses #55\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "9c2a648ee3425520d6cb68c69b48c81db8ff8654",
+      "filename": ".beads/issues.jsonl",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/f11d1b1fad8c962142a0689bc594d7e8adee5364/.beads%2Fissues.jsonl",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/f11d1b1fad8c962142a0689bc594d7e8adee5364/.beads%2Fissues.jsonl",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/.beads%2Fissues.jsonl?ref=f11d1b1fad8c962142a0689bc594d7e8adee5364"
+    },
+    {
+      "sha": "85dc5b43b8d336bd3955ac76f516eff631a6f086",
+      "filename": "crates/fsqlite-core/src/compat_persist.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 2,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/f11d1b1fad8c962142a0689bc594d7e8adee5364/crates%2Ffsqlite-core%2Fsrc%2Fcompat_persist.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/f11d1b1fad8c962142a0689bc594d7e8adee5364/crates%2Ffsqlite-core%2Fsrc%2Fcompat_persist.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-core%2Fsrc%2Fcompat_persist.rs?ref=f11d1b1fad8c962142a0689bc594d7e8adee5364",
+      "patch": "@@ -194,9 +194,14 @@ pub fn persist_to_sqlite(\n             create_sql,\n         ));\n \n-        // Write index B-trees for explicitly created indexes (not autoindexes).\n+        // Write index B-trees for all indexes including autoindexes.\n+        // Autoindexes (sqlite_autoindex_*) are created for UNIQUE constraints\n+        // and non-IPK PRIMARY KEY columns. Their sqlite_master entries point to\n+        // root pages that must contain valid B-tree data. Skipping them causes\n+        // \"wrong # of entries in index\" and \"page N: never used\" errors when\n+        // stock SQLite runs integrity_check (issue #55).\n         for index in &table.indexes {\n-            if index.name.starts_with(\"sqlite_autoindex_\") || index.columns.is_empty() {\n+            if index.columns.is_empty() {\n                 continue;\n             }\n             // Allocate and initialize root page as leaf index page (0x0A)."
+    },
+    {
+      "sha": "8675ec75542857137b414ed40b94f6b08a2b27b1",
+      "filename": "crates/fsqlite-vdbe/src/engine.rs",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 6,
+      "changes": 28,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/f11d1b1fad8c962142a0689bc594d7e8adee5364/crates%2Ffsqlite-vdbe%2Fsrc%2Fengine.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/f11d1b1fad8c962142a0689bc594d7e8adee5364/crates%2Ffsqlite-vdbe%2Fsrc%2Fengine.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-vdbe%2Fsrc%2Fengine.rs?ref=f11d1b1fad8c962142a0689bc594d7e8adee5364",
+      "patch": "@@ -10762,12 +10762,28 @@ impl VdbeEngine {\n                 // For writable cursors on truly zeroed pages (e.g., freshly\n                 // allocated roots), initialize an empty root page.\n                 if writable && is_zero_page {\n-                    // Infer root kind from MemDatabase when available; default to\n-                    // table for backwards compatibility if MemDatabase is absent.\n-                    let is_table_btree = self\n-                        .db\n-                        .as_ref()\n-                        .is_none_or(|db| db.get_table(root_page).is_some());\n+                    // Infer root kind: check the index metadata map first (it\n+                    // is populated from the schema and correctly identifies all\n+                    // index root pages, including autoindexes). Fall back to\n+                    // MemDatabase only when the index map has no opinion.\n+                    // MemDatabase::get_table() returns Some for BOTH table and\n+                    // autoindex root pages (because create_table_at is called\n+                    // for both), so using it alone would misclassify autoindex\n+                    // pages as tables \u2014 causing \"wrong # of entries\" corruption\n+                    // when stock SQLite reads the file (issue #55).\n+                    let is_known_index = self\n+                        .index_desc_flags_by_root_page\n+                        .contains_key(&root_page)\n+                        || self\n+                            .index_collations_by_root_page\n+                            .contains_key(&root_page);\n+                    let is_table_btree = if is_known_index {\n+                        false\n+                    } else {\n+                        self.db\n+                            .as_ref()\n+                            .is_none_or(|db| db.get_table(root_page).is_some())\n+                    };\n                     let init_page_type = if is_table_btree {\n                         BtreePageType::LeafTable\n                     } else {"
+    }
+  ]
+}

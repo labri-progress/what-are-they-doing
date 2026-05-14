@@ -1,0 +1,53 @@
+{
+  "message": "Fix packfile checksum, skip blob walks, clamp API limits, deduplicate inflate\n\n- Verify packfile SHA-1 trailer on receive to detect corruption\n- collectObjects: skip blob reads in BFS \u2014 blobs don't have children,\n  so add them to result directly without fetching from R2\n- Clamp log/file-log maxCount to 10000 to prevent API abuse\n- readObject: delegate to decompressObject instead of duplicating\n  the WASM-with-retry + node:zlib fallback logic\n- Remove misleading \"base64\" comment in readFile API",
+  "files": [
+    {
+      "sha": "88e583654ba1dfe4a403adcb74fabfd338f97c7e",
+      "filename": "src/git-engine.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 53,
+      "changes": 56,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/304018a4d514be86e7e1d303b6a2403f142a7d01/src%2Fgit-engine.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/304018a4d514be86e7e1d303b6a2403f142a7d01/src%2Fgit-engine.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Fgit-engine.ts?ref=304018a4d514be86e7e1d303b6a2403f142a7d01",
+      "patch": "@@ -319,59 +319,9 @@ export class GitEngine {\n   ): Promise<{ type: number; content: Uint8Array } | null> {\n     const compressed = await this.getObject(sha1Hex);\n     if (!compressed) return null;\n-\n-    const wasm = await this.getWasm();\n-\n-    // Decompress with retry \u2014 compression ratios can exceed 100x for repetitive data.\n-    // Try increasing buffer sizes until decompression succeeds.\n-    // Cap at 32MB to stay within WASM arena (64MB total minus input).\n-    // Decompress: try WASM (libdeflate), fallback to node:zlib\n-    let raw: Uint8Array | null = null;\n-    try {\n-      // libdeflate needs exact or larger output buffer \u2014 try increasing sizes\n-      for (const multiplier of [4, 16, 64, 256]) {\n-        const maxSize = Math.min(\n-          Math.max(compressed.length * multiplier, 65536),\n-          32 * 1024 * 1024\n-        );\n-        const result = wasm.zlibInflate(compressed, maxSize);\n-        if (result.length > 0) {\n-          raw = result;\n-          break;\n-        }\n-      }\n-    } catch {\n-      // WASM trap \u2014 fall through to node:zlib\n-    }\n-    if (!raw || raw.length === 0) {\n-      // WASM decompression failed \u2014 fallback to node:zlib\n-      const { createInflate } = await import(\"node:zlib\");\n-      raw = await new Promise<Uint8Array>((resolve, reject) => {\n-        const inflate = createInflate();\n-        const chunks: Buffer[] = [];\n-        inflate.on(\"data\", (chunk: Buffer) => chunks.push(chunk));\n-        inflate.on(\"end\", () => {\n-          const totalLen = chunks.reduce((sum, c) => sum + c.length, 0);\n-          const data = new Uint8Array(totalLen);\n-          let pos = 0;\n-          for (const c of chunks) { data.set(c, pos); pos += c.length; }\n-          resolve(data);\n-        });\n-        inflate.on(\"error\", reject);\n-        inflate.end(Buffer.from(compressed.buffer, compressed.byteOffset, compressed.byteLength));\n-      });\n-    }\n-\n-    // Parse header to extract type and content\n-    const spaceIdx = raw.indexOf(0x20); // space\n-    const nullIdx = raw.indexOf(0x00); // null\n-    if (spaceIdx === -1 || nullIdx === -1) return null;\n-\n-    const typeStr = decoder.decode(raw.subarray(0, spaceIdx));\n-    const type = nameToType(typeStr);\n-    const content = raw.subarray(nullIdx + 1);\n-\n-    return { type, content };\n+    // Ensure WASM is initialized before calling decompressObject\n+    await this.getWasm();\n+    return this.decompressObject(compressed);\n   }\n \n   // === Refs (DO SQLite) ==="
+    },
+    {
+      "sha": "3fe5febd7f777de49974949479bfa93a6940f146",
+      "filename": "src/packfile-reader.ts",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 1,
+      "changes": 14,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/304018a4d514be86e7e1d303b6a2403f142a7d01/src%2Fpackfile-reader.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/304018a4d514be86e7e1d303b6a2403f142a7d01/src%2Fpackfile-reader.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Fpackfile-reader.ts?ref=304018a4d514be86e7e1d303b6a2403f142a7d01",
+      "patch": "@@ -66,13 +66,25 @@ export async function unpackPackfile(\n   const wasm = await engine.getWasmPublic();\n \n   // Verify header\n-  if (packData.length < 12) throw new Error(\"Packfile too short\");\n+  if (packData.length < 32) throw new Error(\"Packfile too short\");\n   const sig = decoder.decode(packData.subarray(0, 4));\n   if (sig !== \"PACK\") throw new Error(\"Invalid packfile signature\");\n \n   const version = readUint32BE(packData, 4);\n   if (version !== 2) throw new Error(`Unsupported pack version: ${version}`);\n \n+  // Verify SHA-1 trailer (last 20 bytes = SHA-1 of all preceding bytes)\n+  const trailerOffset = packData.length - 20;\n+  const expectedHash = new Uint8Array(\n+    await crypto.subtle.digest(\"SHA-1\", packData.subarray(0, trailerOffset))\n+  );\n+  const actualHash = packData.subarray(trailerOffset);\n+  for (let i = 0; i < 20; i++) {\n+    if (expectedHash[i] !== actualHash[i]) {\n+      throw new Error(\"Packfile checksum mismatch \u2014 data may be corrupted\");\n+    }\n+  }\n+\n   const numObjects = readUint32BE(packData, 8);\n \n   // Object lookup tables for delta resolution (O(1) instead of O(n) find)"
+    },
+    {
+      "sha": "48597a92c369a8d4c7962e51563ac64ba9d1ce03",
+      "filename": "src/repo-store.ts",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 3,
+      "changes": 5,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/304018a4d514be86e7e1d303b6a2403f142a7d01/src%2Frepo-store.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/304018a4d514be86e7e1d303b6a2403f142a7d01/src%2Frepo-store.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Frepo-store.ts?ref=304018a4d514be86e7e1d303b6a2403f142a7d01",
+      "patch": "@@ -221,7 +221,6 @@ async function handleApiAction(\n       const path = url.searchParams.get(\"path\") ?? \"\";\n       const content = await porcelain.catFile(ref, path);\n       if (!content) return Response.json({ error: \"not found\" }, { status: 404 });\n-      // Return as base64 for binary safety\n       const text = decoder.decode(content);\n       return Response.json({ content: text, size: content.length });\n     }\n@@ -331,7 +330,7 @@ async function handleApiAction(\n     // --- log ---\n     case \"log\": {\n       const ref = url.searchParams.get(\"ref\") ?? \"HEAD\";\n-      const maxCount = parseInt(url.searchParams.get(\"max\") ?? \"50\", 10);\n+      const maxCount = Math.min(parseInt(url.searchParams.get(\"max\") ?? \"50\", 10) || 50, 10000);\n       const commits = await porcelain.log(ref, maxCount);\n       return Response.json({ commits });\n     }\n@@ -424,7 +423,7 @@ async function handleApiAction(\n     case \"file-log\": {\n       const ref = url.searchParams.get(\"ref\") ?? \"HEAD\";\n       const path = url.searchParams.get(\"path\") ?? \"\";\n-      const maxCount = parseInt(url.searchParams.get(\"max\") ?? \"50\", 10);\n+      const maxCount = Math.min(parseInt(url.searchParams.get(\"max\") ?? \"50\", 10) || 50, 10000);\n       if (!path) return Response.json({ error: \"path is required\" }, { status: 400 });\n       const commits = await porcelain.fileLog(ref, path, maxCount);\n       return Response.json({ commits });"
+    },
+    {
+      "sha": "80b483c17ad1e09d129e5ca8bba6ab763583a8a6",
+      "filename": "src/upload-pack.ts",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 2,
+      "changes": 12,
+      "blob_url": "https://github.com/teamchong/gitmode/blob/304018a4d514be86e7e1d303b6a2403f142a7d01/src%2Fupload-pack.ts",
+      "raw_url": "https://github.com/teamchong/gitmode/raw/304018a4d514be86e7e1d303b6a2403f142a7d01/src%2Fupload-pack.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/gitmode/contents/src%2Fupload-pack.ts?ref=304018a4d514be86e7e1d303b6a2403f142a7d01",
+      "patch": "@@ -171,15 +171,23 @@ async function collectObjects(\n             }\n           }\n         } else if (type === 2) {\n-          // Tree \u2014 parse entries for subtrees and blobs\n+          // Tree \u2014 parse entries: only walk subtrees, add blobs directly to result\n           let pos = 0;\n           while (pos < content.length) {\n+            const modeStart = pos;\n             while (pos < content.length && content[pos] !== 0x20) pos++;\n+            const isTree = (pos - modeStart >= 5) && content[modeStart] === 0x34 && content[modeStart + 1] === 0x30; // \"40...\"\n             pos++;\n             while (pos < content.length && content[pos] !== 0x00) pos++;\n             pos++;\n             if (pos + 20 <= content.length) {\n-              nextFrontier.push(toHex(content.subarray(pos, pos + 20)));\n+              const entrySha = toHex(content.subarray(pos, pos + 20));\n+              if (isTree) {\n+                nextFrontier.push(entrySha);\n+              } else if (!visited.has(entrySha) && !haves.has(entrySha)) {\n+                visited.add(entrySha);\n+                result.push(entrySha);\n+              }\n               pos += 20;\n             } else {\n               break;"
+    }
+  ]
+}

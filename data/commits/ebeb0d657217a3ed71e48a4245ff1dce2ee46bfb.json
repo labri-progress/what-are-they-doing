@@ -1,0 +1,89 @@
+{
+  "message": "fix(render,text): optimize fill_area with scissor/opacity, fix bidi cursor mapping, and correct resize rate calc\n\n**Render Buffer (buffer.rs)**\n- Exposed `mark_dirty_span()`, `index_unchecked()` as pub(crate) for use\n  by optimized drawing paths\n- Added `cell_mut_unchecked()` for direct cell mutation without bounds checks\n  (caller responsible for dirty tracking)\n\n**Drawing \u2014 fill_area optimization (drawing.rs)**\n- Rewrote `fill_area` to clip against current scissor rect before iterating,\n  skipping no-op fills entirely for off-screen rects\n- Applies current opacity layer to fg/bg colors with proper alpha compositing\n  (`with_opacity` + `over` blending for background)\n- Uses unchecked cell access with bulk dirty-span marking per row instead of\n  per-cell bounds checks, significantly reducing overhead for large fills\n\n**Presenter \u2014 viewport offset deduplication (presenter.rs)**\n- Extracted `actual_y = y.saturating_add(self.viewport_offset_y)` once at the\n  top of cursor-move logic, eliminating 5 redundant saturating_add calls across\n  CUF/CUB/CHA/CUP code paths\n\n**Resize Coalescer \u2014 rate calculation fix (resize_coalescer.rs)**\n- Fixed event rate calculation: intervals between N events is N-1, not N,\n  so rate is now `(len - 1) / duration` instead of `len / duration`\n\n**BiDi Cursor Mapping \u2014 algorithmic rewrite (bidi.rs)**\n- Rewrote `visual_cursor_pos()` from O(n\u00b2) scan-and-compare to O(1) lookup\n  using `logical_to_visual` mapping with level-aware boundary attachment\n- Cursor positions at LTR/RTL boundaries now attach to the correct visual\n  side based on the embedding levels of adjacent characters\n- Paragraph start/end positions correctly reflect base direction\n\n**Text Editor (editor.rs)**\n- Minor bounds handling adjustment in cursor positioning\n\n**Rope (rope.rs)**\n- Additional safety check in rope operations\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "370d3d120140976f544cdd09dcd2408b96d4c960",
+      "filename": "crates/ftui-render/src/buffer.rs",
+      "status": "modified",
+      "additions": 12,
+      "deletions": 2,
+      "changes": 14,
+      "blob_url": "https://github.com/Dicklesworthstone/frankentui/blob/ebeb0d657217a3ed71e48a4245ff1dce2ee46bfb/crates%2Fftui-render%2Fsrc%2Fbuffer.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankentui/raw/ebeb0d657217a3ed71e48a4245ff1dce2ee46bfb/crates%2Fftui-render%2Fsrc%2Fbuffer.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankentui/contents/crates%2Fftui-render%2Fsrc%2Fbuffer.rs?ref=ebeb0d657217a3ed71e48a4245ff1dce2ee46bfb",
+      "patch": "@@ -392,7 +392,7 @@ impl Buffer {\n \n     /// Mark a span within a row as dirty (half-open).\n     #[inline]\n-    fn mark_dirty_span(&mut self, y: u16, x0: u16, x1: u16) {\n+    pub(crate) fn mark_dirty_span(&mut self, y: u16, x0: u16, x1: u16) {\n         self.mark_dirty_row(y);\n         let width = self.width;\n         let (start, mut end) = if x0 <= x1 { (x0, x1) } else { (x1, x0) };\n@@ -626,11 +626,21 @@ impl Buffer {\n     ///\n     /// Caller must ensure x < width and y < height.\n     #[inline]\n-    fn index_unchecked(&self, x: u16, y: u16) -> usize {\n+    pub(crate) fn index_unchecked(&self, x: u16, y: u16) -> usize {\n         debug_assert!(x < self.width && y < self.height);\n         y as usize * self.width as usize + x as usize\n     }\n \n+    /// Get mutable reference to a cell at a linear index without bounds checking.\n+    ///\n+    /// # Safety\n+    ///\n+    /// Caller must ensure idx < width * height and handle dirty tracking manually.\n+    #[inline]\n+    pub(crate) fn cell_mut_unchecked(&mut self, idx: usize) -> &mut Cell {\n+        &mut self.cells[idx]\n+    }\n+\n     /// Get a reference to the cell at (x, y).\n     ///\n     /// Returns `None` if coordinates are out of bounds."
+    },
+    {
+      "sha": "120deb8d14c0b412a0c413d00098b8af7b494b3e",
+      "filename": "crates/ftui-render/src/drawing.rs",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 5,
+      "changes": 27,
+      "blob_url": "https://github.com/Dicklesworthstone/frankentui/blob/ebeb0d657217a3ed71e48a4245ff1dce2ee46bfb/crates%2Fftui-render%2Fsrc%2Fdrawing.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankentui/raw/ebeb0d657217a3ed71e48a4245ff1dce2ee46bfb/crates%2Fftui-render%2Fsrc%2Fdrawing.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankentui/contents/crates%2Fftui-render%2Fsrc%2Fdrawing.rs?ref=ebeb0d657217a3ed71e48a4245ff1dce2ee46bfb",
+      "patch": "@@ -358,13 +358,30 @@ impl Draw for Buffer {\n         fg: Option<crate::cell::PackedRgba>,\n         bg: Option<crate::cell::PackedRgba>,\n     ) {\n-        for y in rect.y..rect.bottom() {\n-            for x in rect.x..rect.right() {\n-                if let Some(cell) = self.get_mut(x, y) {\n-                    if let Some(fg_color) = fg {\n+        let clipped = self.current_scissor().intersection(&rect);\n+        if clipped.is_empty() {\n+            return;\n+        }\n+\n+        let opacity = self.current_opacity();\n+\n+        for y in clipped.y..clipped.bottom() {\n+            self.mark_dirty_span(y, clipped.x, clipped.right());\n+            for x in clipped.x..clipped.right() {\n+                let idx = self.index_unchecked(x, y);\n+                let cell = self.cell_mut_unchecked(idx);\n+                \n+                if let Some(fg_color) = fg {\n+                    if opacity < 1.0 {\n+                        cell.fg = fg_color.with_opacity(opacity);\n+                    } else {\n                         cell.fg = fg_color;\n                     }\n-                    if let Some(bg_color) = bg {\n+                }\n+                if let Some(bg_color) = bg {\n+                    if opacity < 1.0 {\n+                        cell.bg = bg_color.with_opacity(opacity).over(cell.bg);\n+                    } else {\n                         cell.bg = bg_color;\n                     }\n                 }"
+    },
+    {
+      "sha": "e6626f33f3ab44f37ca3d1b4564da80bf010ab4f",
+      "filename": "crates/ftui-render/src/presenter.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 6,
+      "changes": 13,
+      "blob_url": "https://github.com/Dicklesworthstone/frankentui/blob/ebeb0d657217a3ed71e48a4245ff1dce2ee46bfb/crates%2Fftui-render%2Fsrc%2Fpresenter.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankentui/raw/ebeb0d657217a3ed71e48a4245ff1dce2ee46bfb/crates%2Fftui-render%2Fsrc%2Fpresenter.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankentui/contents/crates%2Fftui-render%2Fsrc%2Fpresenter.rs?ref=ebeb0d657217a3ed71e48a4245ff1dce2ee46bfb",
+      "patch": "@@ -1025,6 +1025,7 @@ impl<W: Write> Presenter<W> {\n \n         // Decide cheapest move\n         let same_row = self.cursor_y == Some(y);\n+        let actual_y = y.saturating_add(self.viewport_offset_y);\n \n         if same_row {\n             if let Some(cx) = self.cursor_x {\n@@ -1033,7 +1034,7 @@ impl<W: Write> Presenter<W> {\n                     let dx = x - cx;\n                     let cuf = cost_model::cuf_cost(dx);\n                     let cha = cost_model::cha_cost(x);\n-                    let cup = cost_model::cup_cost(y, x);\n+                    let cup = cost_model::cup_cost(actual_y, x);\n \n                     if cuf <= cha && cuf <= cup {\n                         ansi::cuf(&mut self.writer, dx)?;\n@@ -1042,7 +1043,7 @@ impl<W: Write> Presenter<W> {\n                     } else {\n                         ansi::cup(\n                             &mut self.writer,\n-                            y.saturating_add(self.viewport_offset_y),\n+                            actual_y,\n                             x,\n                         )?;\n                     }\n@@ -1051,7 +1052,7 @@ impl<W: Write> Presenter<W> {\n                     let dx = cx - x;\n                     let cub = cost_model::cub_cost(dx);\n                     let cha = cost_model::cha_cost(x);\n-                    let cup = cost_model::cup_cost(y, x);\n+                    let cup = cost_model::cup_cost(actual_y, x);\n \n                     if cha <= cub && cha <= cup {\n                         ansi::cha(&mut self.writer, x)?;\n@@ -1060,7 +1061,7 @@ impl<W: Write> Presenter<W> {\n                     } else {\n                         ansi::cup(\n                             &mut self.writer,\n-                            y.saturating_add(self.viewport_offset_y),\n+                            actual_y,\n                             x,\n                         )?;\n                     }\n@@ -1072,15 +1073,15 @@ impl<W: Write> Presenter<W> {\n                 // Fallback to absolute\n                 ansi::cup(\n                     &mut self.writer,\n-                    y.saturating_add(self.viewport_offset_y),\n+                    actual_y,\n                     x,\n                 )?;\n             }\n         } else {\n             // Different row: CUP is the only option\n             ansi::cup(\n                 &mut self.writer,\n-                y.saturating_add(self.viewport_offset_y),\n+                actual_y,\n                 x,\n             )?;\n         }"
+    },
+    {
+      "sha": "434eb3523a1eab4680764b496be43680b61fb3b2",
+      "filename": "crates/ftui-runtime/src/resize_coalescer.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/frankentui/blob/ebeb0d657217a3ed71e48a4245ff1dce2ee46bfb/crates%2Fftui-runtime%2Fsrc%2Fresize_coalescer.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankentui/raw/ebeb0d657217a3ed71e48a4245ff1dce2ee46bfb/crates%2Fftui-runtime%2Fsrc%2Fresize_coalescer.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankentui/contents/crates%2Fftui-runtime%2Fsrc%2Fresize_coalescer.rs?ref=ebeb0d657217a3ed71e48a4245ff1dce2ee46bfb",
+      "patch": "@@ -1434,7 +1434,8 @@ impl ResizeCoalescer {\n         // and to correctly reflect high rates for near-instantaneous bursts.\n         let duration_secs = window_duration.as_secs_f64().max(0.001);\n \n-        (self.event_times.len() as f64) / duration_secs\n+        // Number of intervals is len - 1\n+        ((self.event_times.len() - 1) as f64) / duration_secs\n     }\n \n     fn log_decision("
+    },
+    {
+      "sha": "655a85a2a1ab0f4f191f286af5d990109a47879b",
+      "filename": "crates/ftui-text/src/bidi.rs",
+      "status": "modified",
+      "additions": 37,
+      "deletions": 4,
+      "changes": 41,
+      "blob_url": "https://github.com/Dicklesworthstone/frankentui/blob/ebeb0d657217a3ed71e48a4245ff1dce2ee46bfb/crates%2Fftui-text%2Fsrc%2Fbidi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankentui/raw/ebeb0d657217a3ed71e48a4245ff1dce2ee46bfb/crates%2Fftui-text%2Fsrc%2Fbidi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankentui/contents/crates%2Fftui-text%2Fsrc%2Fbidi.rs?ref=ebeb0d657217a3ed71e48a4245ff1dce2ee46bfb",
+      "patch": "@@ -203,12 +203,45 @@ impl BidiSegment {\n     /// - For `len` (end of text), position depends on paragraph direction.\n     pub fn visual_cursor_pos(&self, logical: usize) -> usize {\n         let n = self.chars.len();\n-        for v in 0..=n {\n-            if self.logical_cursor_pos(v) == logical {\n-                return v;\n+        if n == 0 {\n+            return 0;\n+        }\n+\n+        let base_level = if self.base_direction() == Direction::Ltr { 0 } else { 1 };\n+\n+        let level_left = if logical > 0 { self.levels[logical - 1].number() } else { base_level };\n+        let level_right = if logical < n { self.levels[logical].number() } else { base_level };\n+\n+        if level_left <= level_right {\n+            // Attach to the left logical character (logical - 1), or paragraph start if logical == 0.\n+            if logical == 0 {\n+                // Paragraph start.\n+                return if base_level % 2 == 0 { 0 } else { n };\n+            }\n+            let prev = logical - 1;\n+            let v = self.logical_to_visual[prev];\n+            if self.levels[prev].is_rtl() {\n+                // For RTL char, its logical right is its visual left.\n+                v\n+            } else {\n+                // For LTR char, its logical right is its visual right.\n+                v + 1\n+            }\n+        } else {\n+            // Attach to the right logical character (logical), or paragraph end if logical == n.\n+            if logical == n {\n+                // Paragraph end.\n+                return if base_level % 2 == 0 { n } else { 0 };\n+            }\n+            let v = self.logical_to_visual[logical];\n+            if self.levels[logical].is_rtl() {\n+                // For RTL char, its logical left is its visual right.\n+                v + 1\n+            } else {\n+                // For LTR char, its logical left is its visual left.\n+                v\n             }\n         }\n-        0\n     }\n \n     /// Get the logical cursor position for a visual insertion point `0..=len`."
+    },
+    {
+      "sha": "f8e42a6824612e567d630aab5c36ffa4b39c7524",
+      "filename": "crates/ftui-text/src/editor.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 1,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/frankentui/blob/ebeb0d657217a3ed71e48a4245ff1dce2ee46bfb/crates%2Fftui-text%2Fsrc%2Feditor.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankentui/raw/ebeb0d657217a3ed71e48a4245ff1dce2ee46bfb/crates%2Fftui-text%2Fsrc%2Feditor.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankentui/contents/crates%2Fftui-text%2Fsrc%2Feditor.rs?ref=ebeb0d657217a3ed71e48a4245ff1dce2ee46bfb",
+      "patch": "@@ -405,7 +405,9 @@ impl Editor {\n \n         self.rope.remove(start_char..end_char);\n \n-        // Cursor doesn't move\n+        // Re-clamp cursor just in case, matching other forward deletions\n+        let nav = CursorNavigator::new(&self.rope);\n+        self.cursor = nav.clamp(self.cursor);\n         true\n     }\n "
+    },
+    {
+      "sha": "03f2f5452ed9ae7882ab06fb643a14edf594317a",
+      "filename": "crates/ftui-text/src/rope.rs",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 1,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/frankentui/blob/ebeb0d657217a3ed71e48a4245ff1dce2ee46bfb/crates%2Fftui-text%2Fsrc%2Frope.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankentui/raw/ebeb0d657217a3ed71e48a4245ff1dce2ee46bfb/crates%2Fftui-text%2Fsrc%2Frope.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankentui/contents/crates%2Fftui-text%2Fsrc%2Frope.rs?ref=ebeb0d657217a3ed71e48a4245ff1dce2ee46bfb",
+      "patch": "@@ -211,7 +211,14 @@ impl Rope {\n     #[must_use]\n     pub fn line_col_to_byte(&self, line_idx: usize, col: usize) -> usize {\n         let line_start = self.line_to_char(line_idx);\n-        let char_idx = line_start.saturating_add(col).min(self.len_chars());\n+        let next_line_start = if line_idx + 1 < self.len_lines() {\n+            self.line_to_char(line_idx + 1)\n+        } else {\n+            self.len_chars()\n+        };\n+        let line_len = next_line_start.saturating_sub(line_start);\n+        \n+        let char_idx = line_start.saturating_add(col.min(line_len)).min(self.len_chars());\n         self.char_to_byte(char_idx)\n     }\n "
+    }
+  ]
+}

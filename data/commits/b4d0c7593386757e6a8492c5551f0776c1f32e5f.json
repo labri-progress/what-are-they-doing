@@ -1,0 +1,65 @@
+{
+  "message": "perf: optimize vector allocation, dedup, and parallel page fetching\n\n- decode.ts/operators.ts: flat Float32Array + subarray views for vector columns (O(1) vs O(numRows) allocations)\n- hnsw.ts: combine two sqrt calls into one in cosineDistance\n- partition-catalog.ts: O(1) Set-based dedup in register() (was O(n) includes scan)\n- query-do.ts: parallelize EdgeScanOperator page fetches with Promise.all\n- operators.ts: remove dead branch (matchingIndices.length > 0 always true)",
+  "files": [
+    {
+      "sha": "0b1735a3194b3da15cdc85b325cf02ca7837208c",
+      "filename": "src/decode.ts",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 6,
+      "changes": 11,
+      "blob_url": "https://github.com/teamchong/querymode/blob/b4d0c7593386757e6a8492c5551f0776c1f32e5f/src%2Fdecode.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/b4d0c7593386757e6a8492c5551f0776c1f32e5f/src%2Fdecode.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fdecode.ts?ref=b4d0c7593386757e6a8492c5551f0776c1f32e5f",
+      "patch": "@@ -232,13 +232,12 @@ function decodeFixedSizeListPages(pages: ArrayBuffer[], dim: number): Float32Arr\n   if (dim === 0) return [];\n   const result: Float32Array[] = [];\n   for (const pageBuf of pages) {\n-    const view = new DataView(pageBuf);\n     const numRows = Math.floor((pageBuf.byteLength >> 2) / dim);\n-    for (let r = 0; r < numRows; r++) {\n-      const vec = new Float32Array(dim);\n-      for (let d = 0; d < dim; d++) vec[d] = view.getFloat32((r * dim + d) * 4, true);\n-      result.push(vec);\n-    }\n+    // One flat allocation + subarray views \u2014 O(1) allocations per page instead of O(numRows).\n+    const flat = new Float32Array(numRows * dim);\n+    const view = new DataView(pageBuf);\n+    for (let i = 0; i < numRows * dim; i++) flat[i] = view.getFloat32(i * 4, true);\n+    for (let r = 0; r < numRows; r++) result.push(flat.subarray(r * dim, (r + 1) * dim));\n   }\n   return result;\n }"
+    },
+    {
+      "sha": "2d671cae783307e6f81b3efdbcfd5cad290c91a7",
+      "filename": "src/hnsw.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/teamchong/querymode/blob/b4d0c7593386757e6a8492c5551f0776c1f32e5f/src%2Fhnsw.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/b4d0c7593386757e6a8492c5551f0776c1f32e5f/src%2Fhnsw.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fhnsw.ts?ref=b4d0c7593386757e6a8492c5551f0776c1f32e5f",
+      "patch": "@@ -25,7 +25,7 @@ export function cosineDistance(a: Float32Array, b: Float32Array): number {\n     normA += a[i] * a[i];\n     normB += b[i] * b[i];\n   }\n-  const denom = Math.sqrt(normA) * Math.sqrt(normB);\n+  const denom = Math.sqrt(normA * normB);\n   if (denom === 0) return 1;\n   return 1 - dot / denom;\n }"
+    },
+    {
+      "sha": "d58888496c9a1914bdcb964a578dd3042d9fa461",
+      "filename": "src/operators.ts",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 11,
+      "changes": 18,
+      "blob_url": "https://github.com/teamchong/querymode/blob/b4d0c7593386757e6a8492c5551f0776c1f32e5f/src%2Foperators.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/b4d0c7593386757e6a8492c5551f0776c1f32e5f/src%2Foperators.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Foperators.ts?ref=b4d0c7593386757e6a8492c5551f0776c1f32e5f",
+      "patch": "@@ -376,10 +376,7 @@ export class ScanOperator implements Operator {\n           for (const [k, v] of projDecoded) filterDecoded.set(k, v);\n           this.scanMs += Date.now() - scanStart;\n \n-          if (matchingIndices.length > 0) {\n-            return { columns: filterDecoded, rowCount, selection: matchingIndices };\n-          }\n-          continue;\n+          return { columns: filterDecoded, rowCount, selection: matchingIndices };\n         }\n \n         // No filters \u2014 fetch + decode all columns\n@@ -804,14 +801,13 @@ function decodePageBatch(\n     if (col.dtype === \"fixed_size_list\") {\n       const dim = col.listDimension ?? 0;\n       if (dim === 0) continue;\n-      const vecs: Float32Array[] = [];\n-      const view = new DataView(buf);\n       const numRows = Math.floor((buf.byteLength >> 2) / dim);\n-      for (let r = 0; r < numRows; r++) {\n-        const vec = new Float32Array(dim);\n-        for (let d = 0; d < dim; d++) vec[d] = view.getFloat32((r * dim + d) * 4, true);\n-        vecs.push(vec);\n-      }\n+      // One flat allocation + subarray views \u2014 O(1) allocations instead of O(numRows).\n+      const flat = new Float32Array(numRows * dim);\n+      const view = new DataView(buf);\n+      for (let i = 0; i < numRows * dim; i++) flat[i] = view.getFloat32(i * 4, true);\n+      const vecs: Float32Array[] = new Array(numRows);\n+      for (let r = 0; r < numRows; r++) vecs[r] = flat.subarray(r * dim, (r + 1) * dim);\n       result.set(col.name, vecs);\n     } else {\n       const decoded = pi.encoding"
+    },
+    {
+      "sha": "b1b6e66b0ba038f42c0028c8c1b6242f3b86d706",
+      "filename": "src/partition-catalog.ts",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 3,
+      "changes": 13,
+      "blob_url": "https://github.com/teamchong/querymode/blob/b4d0c7593386757e6a8492c5551f0776c1f32e5f/src%2Fpartition-catalog.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/b4d0c7593386757e6a8492c5551f0776c1f32e5f/src%2Fpartition-catalog.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fpartition-catalog.ts?ref=b4d0c7593386757e6a8492c5551f0776c1f32e5f",
+      "patch": "@@ -39,6 +39,8 @@ export class PartitionCatalog {\n   private allFragmentIds: number[] = [];\n   /** O(1) dedup during construction/registration. */\n   private allFragmentIdSet = new Set<number>();\n+  /** O(1) per-key dedup for register() \u2014 avoids O(n) includes() scan on hot ingest path. */\n+  private _indexSets = new Map<string, Set<number>>();\n   /** True when every indexed page has min===max (Hive-style partitioning).\n    *  Only exact-partition catalogs are safe for eq/in lookups. */\n   private exactPartition = true;\n@@ -91,9 +93,14 @@ export class PartitionCatalog {\n     }\n     for (const v of values) {\n       const key = partKey(v);\n-      let entry = this.index.get(key);\n-      if (!entry) { entry = []; this.index.set(key, entry); }\n-      if (!entry.includes(fragmentId)) entry.push(fragmentId);\n+      let setEntry = this._indexSets.get(key);\n+      if (!setEntry) { setEntry = new Set(); this._indexSets.set(key, setEntry); }\n+      if (!setEntry.has(fragmentId)) {\n+        setEntry.add(fragmentId);\n+        let entry = this.index.get(key);\n+        if (!entry) { entry = []; this.index.set(key, entry); }\n+        entry.push(fragmentId);\n+      }\n     }\n   }\n "
+    },
+    {
+      "sha": "b813efbae71154cd43da916955bfdaeb98c3cbb9",
+      "filename": "src/query-do.ts",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 2,
+      "changes": 8,
+      "blob_url": "https://github.com/teamchong/querymode/blob/b4d0c7593386757e6a8492c5551f0776c1f32e5f/src%2Fquery-do.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/b4d0c7593386757e6a8492c5551f0776c1f32e5f/src%2Fquery-do.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fquery-do.ts?ref=b4d0c7593386757e6a8492c5551f0776c1f32e5f",
+      "patch": "@@ -266,8 +266,12 @@ class EdgeScanOperator implements Operator {\n    * registered at once in WASM. NOT used for Parquet (which fetches per-page).\n    */\n   private async fetchAllPages(): Promise<void> {\n-    for (let pi = 0; pi < this.pageCount; pi++) {\n-      const pageData = await this.fetchPageData(pi);\n+    // Fetch all pages in parallel \u2014 each page lands in columnData independently.\n+    // Peak memory is identical to sequential (all pages accumulate either way).\n+    const allPageData = await Promise.all(\n+      Array.from({ length: this.pageCount }, (_, pi) => this.fetchPageData(pi)),\n+    );\n+    for (const pageData of allPageData) {\n       for (const [colName, buf] of pageData) {\n         const arr = this.columnData.get(colName) ?? [];\n         arr.push(buf);"
+    }
+  ]
+}

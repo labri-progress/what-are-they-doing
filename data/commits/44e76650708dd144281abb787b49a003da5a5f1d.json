@@ -1,0 +1,41 @@
+{
+  "message": "refactor(stream/sync): rename Count::count\u2192total, allow clippy lint on notify_one, add lost-baton test\n\nstream/count.rs:\n- Rename the internal counter field from `count` to `total` to avoid\n  shadowing the method name and improve clarity in test assertions\n\nsync/notify.rs:\n- Add #[allow(clippy::significant_drop_tightening)] to notify_one()\n  with explanation: the waiter lock must be held through the\n  stored_notifications increment to prevent a window where a new\n  waiter could register between lock release and notification store,\n  resulting in a lost wakeup\n\nNew test file tests/notify_lost_baton.rs:\n- Reproduces the scenario where a notify_one followed by a broadcast\n  and then a future drop could lose the notify_one baton \u2014 exercises\n  the scan_start optimization added in a previous commit\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "dcef24eb41462630e07d5796b16cfac52e8d3ad3",
+      "filename": "src/stream/count.rs",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 6,
+      "changes": 12,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/44e76650708dd144281abb787b49a003da5a5f1d/src%2Fstream%2Fcount.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/44e76650708dd144281abb787b49a003da5a5f1d/src%2Fstream%2Fcount.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fstream%2Fcount.rs?ref=44e76650708dd144281abb787b49a003da5a5f1d",
+      "patch": "@@ -23,14 +23,14 @@ const COUNT_COOPERATIVE_BUDGET: usize = 1024;\n pub struct Count<S> {\n     #[pin]\n     stream: S,\n-    count: usize,\n+    total: usize,\n     completed: bool,\n }\n \n impl<S> Count<S> {\n     /// Creates a new `Count` future.\n     pub(crate) fn new(stream: S) -> Self {\n-        Self { stream, count: 0, completed: false }\n+        Self { stream, total: 0, completed: false }\n     }\n }\n \n@@ -48,7 +48,7 @@ where\n         loop {\n             match this.stream.as_mut().poll_next(cx) {\n                 Poll::Ready(Some(_)) => {\n-                    *this.count += 1;\n+                    *this.total += 1;\n                     counted_this_poll += 1;\n                     if counted_this_poll >= COUNT_COOPERATIVE_BUDGET {\n                         cx.waker().wake_by_ref();\n@@ -57,7 +57,7 @@ where\n                 }\n                 Poll::Ready(None) => {\n                     *this.completed = true;\n-                    return Poll::Ready(*this.count);\n+                    return Poll::Ready(*this.total);\n                 }\n                 Poll::Pending => return Poll::Pending,\n             }\n@@ -193,10 +193,10 @@ mod tests {\n             first\n         );\n         crate::assert_with_log!(\n-            future.count == COUNT_COOPERATIVE_BUDGET,\n+            future.total == COUNT_COOPERATIVE_BUDGET,\n             \"count preserved across yield\",\n             COUNT_COOPERATIVE_BUDGET,\n-            future.count\n+            future.total\n         );\n         crate::assert_with_log!(\n             future.stream.next == COUNT_COOPERATIVE_BUDGET,"
+    },
+    {
+      "sha": "17fe16db75476e52d75b3f70b6811afde2a07a1b",
+      "filename": "src/sync/notify.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/44e76650708dd144281abb787b49a003da5a5f1d/src%2Fsync%2Fnotify.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/44e76650708dd144281abb787b49a003da5a5f1d/src%2Fsync%2Fnotify.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fsync%2Fnotify.rs?ref=44e76650708dd144281abb787b49a003da5a5f1d",
+      "patch": "@@ -177,6 +177,7 @@ impl Notify {\n     /// will be delivered to the next task that calls `notified().await`.\n     ///\n     /// If multiple tasks are waiting, exactly one will be woken.\n+    #[allow(clippy::significant_drop_tightening)] // Lock must be held through stored_notifications increment to prevent lost wakeups\n     pub fn notify_one(&self) {\n         let mut waiters = self.waiters.lock();\n "
+    },
+    {
+      "sha": "cee42db21ec3513bfda8107c72702fa10f5784c4",
+      "filename": "tests/notify_lost_baton.rs",
+      "status": "added",
+      "additions": 45,
+      "deletions": 0,
+      "changes": 45,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/44e76650708dd144281abb787b49a003da5a5f1d/tests%2Fnotify_lost_baton.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/44e76650708dd144281abb787b49a003da5a5f1d/tests%2Fnotify_lost_baton.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/tests%2Fnotify_lost_baton.rs?ref=44e76650708dd144281abb787b49a003da5a5f1d",
+      "patch": "@@ -0,0 +1,45 @@\n+use asupersync::sync::Notify;\n+use std::future::Future;\n+use std::pin::Pin;\n+use std::sync::Arc;\n+use std::task::{Context, Poll, Waker};\n+\n+struct NoopWaker;\n+impl std::task::Wake for NoopWaker {\n+    fn wake(self: Arc<Self>) {}\n+}\n+fn noop_waker() -> Waker {\n+    Waker::from(Arc::new(NoopWaker))\n+}\n+fn poll_once<F: Future + Unpin>(fut: &mut F) -> Poll<F::Output> {\n+    let waker = noop_waker();\n+    let mut cx = Context::from_waker(&waker);\n+    Pin::new(fut).poll(&mut cx)\n+}\n+\n+#[test]\n+fn notify_one_lost_if_polled_after_broadcast() {\n+    let notify = Notify::new();\n+\n+    let mut waiter_a = notify.notified();\n+    let mut waiter_b = notify.notified();\n+\n+    assert_eq!(poll_once(&mut waiter_a), Poll::Pending);\n+    assert_eq!(poll_once(&mut waiter_b), Poll::Pending);\n+\n+    // notify_one wakes A\n+    notify.notify_one();\n+\n+    // broadcast wakes B\n+    notify.notify_waiters();\n+\n+    // C starts waiting\n+    let mut waiter_c = notify.notified();\n+    assert_eq!(poll_once(&mut waiter_c), Poll::Pending);\n+\n+    // A is polled! It should complete. BUT it must pass the baton to C!\n+    assert_eq!(poll_once(&mut waiter_a), Poll::Ready(()));\n+\n+    // Now C should be ready because A passed the baton to it.\n+    assert_eq!(poll_once(&mut waiter_c), Poll::Ready(()), \"Baton was lost!\");\n+}\n\\ No newline at end of file"
+    }
+  ]
+}

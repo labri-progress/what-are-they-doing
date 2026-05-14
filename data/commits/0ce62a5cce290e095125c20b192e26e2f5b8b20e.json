@@ -1,0 +1,41 @@
+{
+  "message": "feat: extend WASM compute pushdown to edge pipeline\n\nEdgeScanOperator Parquet path (src/query-do.ts):\n- Register decoded columns in WASM and use executeQuery() for SIMD\n  filter/sort instead of JS row-by-row assembly\n- Mark filtersApplied=true so buildEdgePipeline skips FilterOperator\n\nbuildEdgePipeline (src/operators.ts):\n- Check for filtersApplied flag on scan operator, skip FilterOperator\n  when scan already handles filters via WASM\n\nunionIndices (wasm/src/wasm/aggregates.zig):\n- O(n+m) sorted merge (was O(n*m) nested loop with linear search)",
+  "files": [
+    {
+      "sha": "374551e3f2b90177faf22bc5ba64c3df7e15b1c4",
+      "filename": "src/operators.ts",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 1,
+      "changes": 6,
+      "blob_url": "https://github.com/teamchong/querymode/blob/0ce62a5cce290e095125c20b192e26e2f5b8b20e/src%2Foperators.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/0ce62a5cce290e095125c20b192e26e2f5b8b20e/src%2Foperators.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Foperators.ts?ref=0ce62a5cce290e095125c20b192e26e2f5b8b20e",
+      "patch": "@@ -2162,7 +2162,11 @@ export function buildEdgePipeline(\n   let pipeline: Operator = scan;\n   const memBudget = options?.memoryBudgetBytes ?? DEFAULT_MEMORY_BUDGET;\n \n-  if (query.filters.length > 0) {\n+  // Skip FilterOperator if the scan operator already applies filters\n+  // (e.g. EdgeScanOperator Lance path uses WASM SQL with WHERE,\n+  //  EdgeScanOperator Parquet path now uses WASM executeQuery with filters)\n+  const scanHandlesFilters = \"filtersApplied\" in scan && (scan as { filtersApplied: boolean }).filtersApplied;\n+  if (query.filters.length > 0 && !scanHandlesFilters) {\n     pipeline = new FilterOperator(pipeline, query.filters);\n   }\n "
+    },
+    {
+      "sha": "57e20cc14fb56dc17552818808f5bfe5df45bd86",
+      "filename": "src/query-do.ts",
+      "status": "modified",
+      "additions": 38,
+      "deletions": 9,
+      "changes": 47,
+      "blob_url": "https://github.com/teamchong/querymode/blob/0ce62a5cce290e095125c20b192e26e2f5b8b20e/src%2Fquery-do.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/0ce62a5cce290e095125c20b192e26e2f5b8b20e/src%2Fquery-do.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fquery-do.ts?ref=0ce62a5cce290e095125c20b192e26e2f5b8b20e",
+      "patch": "@@ -64,6 +64,8 @@ class EdgeScanOperator implements Operator {\n   edgeCacheMisses = 0;\n   r2ReadMs = 0;\n   wasmExecMs = 0;\n+  /** Filters are applied inside WASM executeQuery \u2014 skip downstream FilterOperator. */\n+  filtersApplied = true;\n \n   constructor(\n     bucket: R2Bucket,\n@@ -328,22 +330,49 @@ class EdgeScanOperator implements Operator {\n       decodedColumns.set(col.name, decoded);\n     }\n \n-    // Assemble rows for this single page\n+    // Try WASM SQL path: register decoded columns \u2192 executeQuery (SIMD filter/sort)\n     let numRows = 0;\n     for (const v of decodedColumns.values()) if (v.length > numRows) numRows = v.length;\n     if (numRows === 0) return this.next(); // skip empty pages\n \n-    const rows: Row[] = [];\n-    for (let i = 0; i < numRows; i++) {\n-      const row: Row = {};\n-      for (const name of colNames) {\n-        const vals = decodedColumns.get(name);\n-        row[name] = vals && i < vals.length ? vals[i] : null;\n+    this.wasmEngine.exports.resetHeap();\n+    const fragTable = `__edge_pq_${pi}`;\n+    let wasmRegistered = true;\n+    for (const col of cols) {\n+      const values = decodedColumns.get(col.name);\n+      if (!values?.length) continue;\n+      if (!this.wasmEngine.registerDecodedColumn(fragTable, col.name, col.dtype, values)) {\n+        wasmRegistered = false;\n+        break;\n       }\n-      rows.push(row);\n     }\n+\n+    let rows: Row[];\n+    if (wasmRegistered) {\n+      const pqQuery: QueryDescriptor = {\n+        ...this.query,\n+        table: fragTable,\n+        sortColumn: undefined, limit: undefined, offset: undefined,\n+        aggregates: undefined, join: undefined,\n+      };\n+      const wasmRows = this.wasmEngine.executeQuery(pqQuery);\n+      this.wasmEngine.clearTable(fragTable);\n+      rows = wasmRows ?? [];\n+    } else {\n+      // Fallback: assemble rows in JS\n+      rows = [];\n+      for (let i = 0; i < numRows; i++) {\n+        const row: Row = {};\n+        for (const name of colNames) {\n+          const vals = decodedColumns.get(name);\n+          row[name] = vals && i < vals.length ? vals[i] : null;\n+        }\n+        rows.push(row);\n+      }\n+    }\n+\n     this.wasmExecMs += Date.now() - wasmStart;\n-    return rows;\n+    return rows.length > 0 ? rows : this.next();\n   }\n \n   async close(): Promise<void> {"
+    },
+    {
+      "sha": "ee07618b12dc97928fc4f652cd76fb41af9bbb15",
+      "filename": "wasm/src/wasm/aggregates.zig",
+      "status": "modified",
+      "additions": 27,
+      "deletions": 10,
+      "changes": 37,
+      "blob_url": "https://github.com/teamchong/querymode/blob/0ce62a5cce290e095125c20b192e26e2f5b8b20e/wasm%2Fsrc%2Fwasm%2Faggregates.zig",
+      "raw_url": "https://github.com/teamchong/querymode/raw/0ce62a5cce290e095125c20b192e26e2f5b8b20e/wasm%2Fsrc%2Fwasm%2Faggregates.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/wasm%2Fsrc%2Fwasm%2Faggregates.zig?ref=0ce62a5cce290e095125c20b192e26e2f5b8b20e",
+      "patch": "@@ -775,6 +775,7 @@ export fn intersectIndices(\n }\n \n /// OR two index arrays (union, deduplicated)\n+/// Uses O(n+m) sorted merge since filter outputs are always in ascending order\n export fn unionIndices(\n     a: [*]const u32,\n     a_len: usize,\n@@ -784,23 +785,39 @@ export fn unionIndices(\n     max_out: usize,\n ) usize {\n     var out_count: usize = 0;\n+    var i: usize = 0;\n+    var j: usize = 0;\n \n-    // Add all from a\n-    for (0..a_len) |i| {\n+    while (i < a_len and j < b_len) {\n         if (out_count >= max_out) break;\n+        if (a[i] == b[j]) {\n+            out[out_count] = a[i];\n+            out_count += 1;\n+            i += 1;\n+            j += 1;\n+        } else if (a[i] < b[j]) {\n+            out[out_count] = a[i];\n+            out_count += 1;\n+            i += 1;\n+        } else {\n+            out[out_count] = b[j];\n+            out_count += 1;\n+            j += 1;\n+        }\n+    }\n+\n+    // Drain remaining from a\n+    while (i < a_len and out_count < max_out) {\n         out[out_count] = a[i];\n         out_count += 1;\n+        i += 1;\n     }\n \n-    // Add from b if not already in out\n-    outer: for (0..b_len) |i| {\n-        if (out_count >= max_out) break;\n-        const b_val = b[i];\n-        for (0..out_count) |j| {\n-            if (out[j] == b_val) continue :outer;\n-        }\n-        out[out_count] = b_val;\n+    // Drain remaining from b\n+    while (j < b_len and out_count < max_out) {\n+        out[out_count] = b[j];\n         out_count += 1;\n+        j += 1;\n     }\n \n     return out_count;"
+    }
+  ]
+}

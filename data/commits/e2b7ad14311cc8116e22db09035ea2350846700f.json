@@ -1,0 +1,101 @@
+{
+  "message": "Implement from_tcp",
+  "files": [
+    {
+      "sha": "93d287fe48d2c7bf3ea1277e693201155a2a6959",
+      "filename": "libtenzir/builtins/operators/from_tcp.cpp",
+      "status": "added",
+      "additions": 249,
+      "deletions": 0,
+      "changes": 249,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/e2b7ad14311cc8116e22db09035ea2350846700f/libtenzir%2Fbuiltins%2Foperators%2Ffrom_tcp.cpp",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/e2b7ad14311cc8116e22db09035ea2350846700f/libtenzir%2Fbuiltins%2Foperators%2Ffrom_tcp.cpp",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/libtenzir%2Fbuiltins%2Foperators%2Ffrom_tcp.cpp?ref=e2b7ad14311cc8116e22db09035ea2350846700f",
+      "patch": "@@ -0,0 +1,249 @@\n+//    _   _____   __________\n+//   | | / / _ | / __/_  __/     Visibility\n+//   | |/ / __ |_\\ \\  / /          Across\n+//   |___/_/ |_/___/ /_/       Space and Time\n+//\n+// SPDX-FileCopyrightText: (c) 2025 The Tenzir Contributors\n+// SPDX-License-Identifier: BSD-3-Clause\n+\n+#include <tenzir/async/tls.hpp>\n+#include <tenzir/compile_ctx.hpp>\n+#include <tenzir/concept/parseable/tenzir/endpoint.hpp>\n+#include <tenzir/concept/parseable/to.hpp>\n+#include <tenzir/endpoint.hpp>\n+#include <tenzir/ir.hpp>\n+#include <tenzir/operator_plugin.hpp>\n+#include <tenzir/plugin.hpp>\n+#include <tenzir/substitute_ctx.hpp>\n+#include <tenzir/tls_options.hpp>\n+#include <tenzir/tql2/eval.hpp>\n+#include <tenzir/tql2/plugin.hpp>\n+\n+#include <folly/SocketAddress.h>\n+#include <folly/coro/Sleep.h>\n+#include <folly/executors/GlobalExecutor.h>\n+#include <folly/io/coro/Transport.h>\n+\n+#include <algorithm>\n+\n+namespace tenzir::plugins::from_tcp {\n+\n+namespace {\n+\n+constexpr auto read_timeout = std::chrono::seconds{1};\n+constexpr auto buffer_size = size_t{65536};\n+constexpr auto connect_timeout = std::chrono::seconds{5};\n+constexpr auto connect_initial_backoff = std::chrono::milliseconds{100};\n+constexpr auto connect_max_backoff = std::chrono::milliseconds{5000};\n+\n+struct FromTcpArgs {\n+  located<std::string> endpoint;\n+  std::optional<located<data>> tls;\n+  located<ir::pipeline> user_pipeline;\n+  let_id peer_info;\n+};\n+\n+class FromTcpConnector final : public Operator<void, table_slice> {\n+public:\n+  explicit FromTcpConnector(FromTcpArgs args)\n+    : user_pipeline_{std::move(args.user_pipeline)},\n+      peer_let_id_{args.peer_info} {\n+    auto ep = to<struct endpoint>(args.endpoint.inner);\n+    TENZIR_ASSERT(ep);\n+    TENZIR_ASSERT(ep->port);\n+    TENZIR_ASSERT(not ep->host.empty());\n+    address_.setFromHostPort(ep->host, ep->port->number());\n+    host_ = ep->host;\n+    if (args.tls) {\n+      tls_ = tls_options{*args.tls, {.is_server = false}};\n+    }\n+  }\n+\n+  FromTcpConnector(const FromTcpConnector&) = delete;\n+  FromTcpConnector& operator=(const FromTcpConnector&) = delete;\n+  FromTcpConnector(FromTcpConnector&&) noexcept = default;\n+  FromTcpConnector& operator=(FromTcpConnector&&) noexcept = default;\n+  ~FromTcpConnector() override = default;\n+\n+  auto start(OpCtx& ctx) -> Task<void> override {\n+    if (tls_ and tls_->get_tls(nullptr).inner) {\n+      auto context = tls_->make_folly_ssl_context(ctx);\n+      if (not context) {\n+        done_ = true;\n+        co_return;\n+      }\n+      tls_context_ = std::move(*context);\n+    }\n+    evb_ = folly::getGlobalIOExecutor()->getEventBase();\n+    TENZIR_ASSERT(evb_);\n+    co_return;\n+  }\n+\n+  auto await_task(diagnostic_handler& dh) const -> Task<Any> override {\n+    while (not done_) {\n+      TENZIR_VERBOSE(\"from_tcp: connecting to {}\", address_.describe());\n+      auto connect_error = std::optional<std::string>{};\n+      try {\n+        auto transport = co_await folly::coro::co_withExecutor(\n+          evb_,\n+          folly::coro::Transport::newConnectedSocket(evb_, address_,\n+                                                     connect_timeout));\n+        reconnect_backoff_ = connect_initial_backoff;\n+        co_return Box<folly::coro::Transport>{std::move(transport)};\n+      } catch (const std::exception& ex) {\n+        connect_error = ex.what();\n+      }\n+      if (connect_error) {\n+        diagnostic::warning(\"from_tcp: failed to connect to {}: {}\",\n+                            address_.describe(), *connect_error)\n+          .emit(dh);\n+        auto backoff = reconnect_backoff_;\n+        reconnect_backoff_\n+          = std::min(reconnect_backoff_ * 2, connect_max_backoff);\n+        co_await folly::coro::sleep(backoff);\n+      }\n+    }\n+    co_return {};\n+  }\n+\n+  auto process_task(Any result, Push<table_slice>& push, OpCtx& ctx)\n+    -> Task<void> override {\n+    TENZIR_UNUSED(push);\n+    if (done_) {\n+      co_return;\n+    }\n+    auto transport = std::move(result).as<Box<folly::coro::Transport>>();\n+    auto* transport_evb = transport->getEventBase();\n+    TENZIR_ASSERT(transport_evb);\n+    if (tls_context_) {\n+      try {\n+        co_await upgrade_transport_to_tls_client(transport, tls_context_, host_);\n+      } catch (const std::exception& ex) {\n+        diagnostic::warning(\"TLS handshake failed with {}: {}\",\n+                            address_.describe(), ex.what())\n+          .emit(ctx);\n+        co_return;\n+      }\n+    }\n+    auto peer_addr = transport->getPeerAddress();\n+    auto peer_record = record{\n+      {\"ip\", peer_addr.getAddressStr()},\n+      {\"port\", int64_t{peer_addr.getPort()}},\n+    };\n+    auto conn_id = next_conn_id_++;\n+    auto pipeline_copy = user_pipeline_.inner;\n+    auto env = substitute_ctx::env_t{};\n+    env[peer_let_id_] = std::move(peer_record);\n+    auto reg = global_registry();\n+    auto b_ctx = base_ctx{ctx, *reg};\n+    auto sub_result\n+      = pipeline_copy.substitute(substitute_ctx{b_ctx, &env}, true);\n+    if (not sub_result) {\n+      co_return;\n+    }\n+    auto sub = co_await ctx.spawn_sub(\n+      data{int64_t(conn_id)}, std::move(pipeline_copy), tag_v<chunk_ptr>);\n+    auto open_pipeline = as<OpenPipeline<chunk_ptr>>(sub);\n+    co_await folly::coro::co_withExecutor(\n+      transport_evb, read_loop(std::move(transport), open_pipeline, ctx.dh()));\n+  }\n+\n+  auto stop(OpCtx& ctx) -> Task<void> override {\n+    TENZIR_UNUSED(ctx);\n+    done_ = true;\n+    co_return;\n+  }\n+\n+  auto state() -> OperatorState override {\n+    return done_ ? OperatorState::done : OperatorState::unspecified;\n+  }\n+\n+private:\n+  static auto read_loop(Box<folly::coro::Transport> transport,\n+                        OpenPipeline<chunk_ptr> pipeline,\n+                        diagnostic_handler& dh) -> Task<void> {\n+    while (true) {\n+      folly::IOBufQueue buf{folly::IOBufQueue::cacheChainLength()};\n+      size_t bytes = 0;\n+      try {\n+        bytes = co_await transport->read(\n+          buf, 1, buffer_size,\n+          std::chrono::duration_cast<std::chrono::milliseconds>(read_timeout));\n+      } catch (const folly::AsyncSocketException& e) {\n+        if (e.getType() == folly::AsyncSocketException::TIMED_OUT) {\n+          continue;\n+        }\n+        diagnostic::warning(\"{}\", e).emit(dh);\n+        co_return;\n+      }\n+      if (bytes == 0) {\n+        break;\n+      }\n+      auto iobuf = buf.move();\n+      auto data = std::vector<std::byte>{};\n+      data.reserve(iobuf->computeChainDataLength());\n+      for (auto& range : *iobuf) {\n+        auto* begin = reinterpret_cast<const std::byte*>(range.data());\n+        data.insert(data.end(), begin, begin + range.size());\n+      }\n+      auto chk = chunk::make(std::move(data));\n+      if ((co_await pipeline.push(std::move(chk))).is_err()) {\n+        co_return;\n+      }\n+    }\n+    co_await pipeline.close();\n+  }\n+\n+  folly::SocketAddress address_;\n+  std::string host_;\n+  located<ir::pipeline> user_pipeline_;\n+  let_id peer_let_id_;\n+  std::optional<tls_options> tls_;\n+  std::shared_ptr<folly::SSLContext> tls_context_;\n+  folly::EventBase* evb_ = nullptr;\n+  bool done_ = false;\n+  mutable std::chrono::milliseconds reconnect_backoff_{connect_initial_backoff};\n+  mutable uint64_t next_conn_id_{0};\n+};\n+\n+class from_tcp_plugin final : public virtual OperatorPlugin {\n+public:\n+  auto name() const -> std::string override {\n+    return \"tql2.from_tcp\";\n+  }\n+\n+  auto describe() const -> Description override {\n+    auto d = Describer<FromTcpArgs, FromTcpConnector>{};\n+    auto endpoint_arg = d.positional(\"endpoint\", &FromTcpArgs::endpoint);\n+    auto tls_arg = d.named(\"tls\", &FromTcpArgs::tls);\n+    d.pipeline(&FromTcpArgs::user_pipeline,\n+               {{\"peer\", &FromTcpArgs::peer_info}});\n+    d.validate([=](ValidateCtx& ctx) -> Empty {\n+      TRY(auto ep_str, ctx.get(endpoint_arg));\n+      auto ep = to<struct endpoint>(ep_str.inner);\n+      auto loc = ctx.get_location(endpoint_arg).value_or(location::unknown);\n+      if (not ep) {\n+        diagnostic::error(\"failed to parse endpoint\").primary(loc).emit(ctx);\n+      } else if (not ep->port) {\n+        diagnostic::error(\"port number is required\").primary(loc).emit(ctx);\n+      } else if (ep->host.empty()) {\n+        diagnostic::error(\"host is required\").primary(loc).emit(ctx);\n+      }\n+      if (auto tls_val = ctx.get(tls_arg)) {\n+        auto tls_opts = tls_options{*tls_val, {.is_server = false}};\n+        if (auto valid = tls_opts.validate(ctx); not valid) {\n+          return {};\n+        }\n+      }\n+      return {};\n+    });\n+\n+    return d.without_optimize();\n+  }\n+};\n+\n+} // namespace\n+\n+} // namespace tenzir::plugins::from_tcp\n+\n+TENZIR_REGISTER_PLUGIN(tenzir::plugins::from_tcp::from_tcp_plugin)"
+    },
+    {
+      "sha": "13aa95173756525767e39155cd44167dfdedf73c",
+      "filename": "test/tests/operators/accept_tcp/tls/error_tls_missing_certfile.txt",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/e2b7ad14311cc8116e22db09035ea2350846700f/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Ferror_tls_missing_certfile.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/e2b7ad14311cc8116e22db09035ea2350846700f/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Ferror_tls_missing_certfile.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Faccept_tcp%2Ftls%2Ferror_tls_missing_certfile.txt?ref=e2b7ad14311cc8116e22db09035ea2350846700f",
+      "patch": "@@ -2,6 +2,6 @@ error: `tls.certfile` is required when `tls.keyfile` is set\n  --> tests/operators/accept_tcp/tls/error_tls_missing_certfile.tql:6:14\n   |\n 6 |          tls={keyfile: \"tests/operators/accept_tcp/test.yaml\"} {\n-  |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ \n+  |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ \n   |\n   = hint: set both `tls.certfile` and `tls.keyfile`"
+    },
+    {
+      "sha": "faeccfbaed249deaaaea2cf16897cf6bd5314472",
+      "filename": "test/tests/operators/from_tcp/test.yaml",
+      "status": "added",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/e2b7ad14311cc8116e22db09035ea2350846700f/test%2Ftests%2Foperators%2Ffrom_tcp%2Ftest.yaml",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/e2b7ad14311cc8116e22db09035ea2350846700f/test%2Ftests%2Foperators%2Ffrom_tcp%2Ftest.yaml",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Ffrom_tcp%2Ftest.yaml?ref=e2b7ad14311cc8116e22db09035ea2350846700f",
+      "patch": "@@ -0,0 +1 @@\n+timeout: 60"
+    },
+    {
+      "sha": "ca193b41d6c837f66c78f4e0f7eb6476f27b93d9",
+      "filename": "test/tests/operators/from_tcp/tls/error_tls_client_ca_server_only.tql",
+      "status": "added",
+      "additions": 8,
+      "deletions": 0,
+      "changes": 8,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/e2b7ad14311cc8116e22db09035ea2350846700f/test%2Ftests%2Foperators%2Ffrom_tcp%2Ftls%2Ferror_tls_client_ca_server_only.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/e2b7ad14311cc8116e22db09035ea2350846700f/test%2Ftests%2Foperators%2Ffrom_tcp%2Ftls%2Ferror_tls_client_ca_server_only.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Ffrom_tcp%2Ftls%2Ferror_tls_client_ca_server_only.tql?ref=e2b7ad14311cc8116e22db09035ea2350846700f",
+      "patch": "@@ -0,0 +1,8 @@\n+---\n+error: true\n+---\n+\n+from_tcp \"127.0.0.1:31337\",\n+         tls={client_ca: \"tests/operators/from_tcp/test.yaml\"} {\n+  read_lines\n+}"
+    },
+    {
+      "sha": "37d4cb28e37ffe5ad62da415a17fef7027001d81",
+      "filename": "test/tests/operators/from_tcp/tls/error_tls_client_ca_server_only.txt",
+      "status": "added",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/e2b7ad14311cc8116e22db09035ea2350846700f/test%2Ftests%2Foperators%2Ffrom_tcp%2Ftls%2Ferror_tls_client_ca_server_only.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/e2b7ad14311cc8116e22db09035ea2350846700f/test%2Ftests%2Foperators%2Ffrom_tcp%2Ftls%2Ferror_tls_client_ca_server_only.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Ffrom_tcp%2Ftls%2Ferror_tls_client_ca_server_only.txt?ref=e2b7ad14311cc8116e22db09035ea2350846700f",
+      "patch": "@@ -0,0 +1,6 @@\n+error: `tls.client_ca` is only valid for server mode\n+ --> tests/operators/from_tcp/tls/error_tls_client_ca_server_only.tql:6:14\n+  |\n+6 |          tls={client_ca: \"tests/operators/from_tcp/test.yaml\"} {\n+  |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ \n+  |"
+    },
+    {
+      "sha": "c3981144ecec442c879379378cafce1a0488e8cf",
+      "filename": "test/tests/operators/from_tcp/tls/error_tls_invalid_option.tql",
+      "status": "added",
+      "additions": 8,
+      "deletions": 0,
+      "changes": 8,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/e2b7ad14311cc8116e22db09035ea2350846700f/test%2Ftests%2Foperators%2Ffrom_tcp%2Ftls%2Ferror_tls_invalid_option.tql",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/e2b7ad14311cc8116e22db09035ea2350846700f/test%2Ftests%2Foperators%2Ffrom_tcp%2Ftls%2Ferror_tls_invalid_option.tql",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Ffrom_tcp%2Ftls%2Ferror_tls_invalid_option.tql?ref=e2b7ad14311cc8116e22db09035ea2350846700f",
+      "patch": "@@ -0,0 +1,8 @@\n+---\n+error: true\n+---\n+\n+from_tcp \"127.0.0.1:31337\",\n+         tls={bogus_option: true} {\n+  read_lines\n+}"
+    },
+    {
+      "sha": "401a04fdbe77ae4daf5ec5a40be4909487394fcb",
+      "filename": "test/tests/operators/from_tcp/tls/error_tls_invalid_option.txt",
+      "status": "added",
+      "additions": 7,
+      "deletions": 0,
+      "changes": 7,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/e2b7ad14311cc8116e22db09035ea2350846700f/test%2Ftests%2Foperators%2Ffrom_tcp%2Ftls%2Ferror_tls_invalid_option.txt",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/e2b7ad14311cc8116e22db09035ea2350846700f/test%2Ftests%2Foperators%2Ffrom_tcp%2Ftls%2Ferror_tls_invalid_option.txt",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Ffrom_tcp%2Ftls%2Ferror_tls_invalid_option.txt?ref=e2b7ad14311cc8116e22db09035ea2350846700f",
+      "patch": "@@ -0,0 +1,7 @@\n+error: unknown key `bogus_option` in `tls` record\n+ --> tests/operators/from_tcp/tls/error_tls_invalid_option.tql:6:14\n+  |\n+6 |          tls={bogus_option: true} {\n+  |              ^^^^^^^^^^^^^^^^^^^^ \n+  |\n+  = hint: valid keys are: skip_peer_verification, cacert, certfile, keyfile, min_version, ciphers, client_ca, require_client_cert"
+    },
+    {
+      "sha": "3d11a6dafe2ab741c52962a20697f2ba27bf4d5d",
+      "filename": "test/tests/operators/from_tcp/tls/test.yaml",
+      "status": "added",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/tenzir/tenzir/blob/e2b7ad14311cc8116e22db09035ea2350846700f/test%2Ftests%2Foperators%2Ffrom_tcp%2Ftls%2Ftest.yaml",
+      "raw_url": "https://github.com/tenzir/tenzir/raw/e2b7ad14311cc8116e22db09035ea2350846700f/test%2Ftests%2Foperators%2Ffrom_tcp%2Ftls%2Ftest.yaml",
+      "contents_url": "https://api.github.com/repos/tenzir/tenzir/contents/test%2Ftests%2Foperators%2Ffrom_tcp%2Ftls%2Ftest.yaml?ref=e2b7ad14311cc8116e22db09035ea2350846700f",
+      "patch": "@@ -0,0 +1,2 @@\n+suite: from-tcp-tls\n+timeout: 60"
+    }
+  ]
+}

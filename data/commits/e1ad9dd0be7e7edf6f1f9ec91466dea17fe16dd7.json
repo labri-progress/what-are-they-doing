@@ -1,0 +1,121 @@
+{
+  "message": "stage 1 phase D.7: banded attention (scores + combine + sinks)\n\nGQA attention kernel with sliding window. Computes only the in-window\ncells (O(T * window) not O(T^2)); window * 2 + 1 keys max per query.\nSink column folded into the softmax denominator before AV combine, so\nprobability mass can shift to the sink without writing a separate slot.\n\nKernel structure:\n- dotBf16F32 helper: 4-wide vector dot product with 4 independent f32\n  accumulators, same pattern as the matmul inner loop. Amortized for\n  head_dim=64.\n- saxpyF32Bf16 helper: p * v + acc, vector over head_dim.\n- Three passes per (t_q, h_q): scores, softmax exp+sum, weighted-V sum.\n  No intermediate [T,T] materialization.\n\nFixture: T=32, H_q=14 (GQA 7:1), head_dim=64, window=4, random Q/K/V\n(Q/K pre-scaled by head_dim^-0.25 per upstream convention). maxRel 5.4e-3\nvs end-to-end PyTorch reference (tolerance 2e-2 \u2014 loose to accommodate\nthe 3-rounding bf16 chain through QK + AV + exp + normalize).",
+  "files": [
+    {
+      "sha": "bcd45d8cd6d20dc0932ecb10c90d0ae82d8abfc7",
+      "filename": "scripts/gen-kernel-fixtures.py",
+      "status": "modified",
+      "additions": 55,
+      "deletions": 0,
+      "changes": 55,
+      "blob_url": "https://github.com/teamchong/textsift/blob/e1ad9dd0be7e7edf6f1f9ec91466dea17fe16dd7/scripts%2Fgen-kernel-fixtures.py",
+      "raw_url": "https://github.com/teamchong/textsift/raw/e1ad9dd0be7e7edf6f1f9ec91466dea17fe16dd7/scripts%2Fgen-kernel-fixtures.py",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/scripts%2Fgen-kernel-fixtures.py?ref=e1ad9dd0be7e7edf6f1f9ec91466dea17fe16dd7",
+      "patch": "@@ -173,6 +173,61 @@ def main() -> int:\n     write(FIXTURES_DIR / \"swiglu_x.f32\", gate_up.numpy().tobytes())\n     write(FIXTURES_DIR / \"swiglu_y.f32\", swiglu_ref.contiguous().numpy().tobytes())\n \n+    # ----- Banded attention fixture -----\n+    # Reference via upstream `eager_attention_forward` on sliding-window mask.\n+    # Shapes picked so boundary queries (near t=0 and t=T-1) have truncated\n+    # windows and mid-sequence queries have full windows \u2014 exercises all paths.\n+    from transformers.masking_utils import create_bidirectional_sliding_window_mask\n+\n+    torch.manual_seed(SEED + 9)\n+    att_T = 32\n+    att_Hq = model.config.num_attention_heads  # 14\n+    att_Hkv = model.config.num_key_value_heads # 2\n+    att_hd = model.config.head_dim             # 64\n+    att_win = 4\n+    att_sliding = att_win + 1  # upstream quirk: sliding_window = config + 1\n+\n+    # Q/K already scaled by head_dim ** -0.25 per upstream convention.\n+    scale = att_hd ** -0.25\n+    Q_in = torch.randn(att_T, att_Hq, att_hd, dtype=torch.bfloat16)\n+    K_in = torch.randn(att_T, att_Hkv, att_hd, dtype=torch.bfloat16)\n+    V_in = torch.randn(att_T, att_Hkv, att_hd, dtype=torch.bfloat16)\n+    sinks = torch.randn(att_Hq, dtype=torch.bfloat16) * 0.5\n+    Q_scaled = (Q_in.float() * scale).to(torch.bfloat16)\n+    K_scaled = (K_in.float() * scale).to(torch.bfloat16)\n+\n+    # Reference: manually replicate eager_attention_forward semantics.\n+    # Inputs reshaped to (1, H, T, head_dim).\n+    Q_b = Q_scaled.unsqueeze(0).transpose(1, 2).contiguous().float()   # (1, Hq, T, hd)\n+    K_b = K_scaled.unsqueeze(0).transpose(1, 2).contiguous().float()   # (1, Hkv, T, hd)\n+    V_b = V_in.unsqueeze(0).transpose(1, 2).contiguous().float()       # (1, Hkv, T, hd)\n+    n_kv_groups = att_Hq // att_Hkv\n+    K_rep = K_b.repeat_interleave(n_kv_groups, dim=1)                  # (1, Hq, T, hd)\n+    V_rep = V_b.repeat_interleave(n_kv_groups, dim=1)\n+    attn_weights = torch.matmul(Q_b, K_rep.transpose(-2, -1))           # (1, Hq, T, T), scaling already applied\n+    # Sliding window mask (additive, 0 inside window, -inf outside).\n+    dtype_big = torch.finfo(torch.float32).min\n+    mask = torch.zeros(att_T, att_T)\n+    for i in range(att_T):\n+        for j in range(att_T):\n+            if abs(i - j) > att_win:\n+                mask[i, j] = dtype_big\n+    attn_weights = attn_weights + mask\n+    sinks_col = sinks.float().view(1, -1, 1, 1).expand(1, att_Hq, att_T, 1)\n+    combined = torch.cat([attn_weights, sinks_col], dim=-1)\n+    combined = combined - combined.max(dim=-1, keepdim=True).values\n+    probs = torch.nn.functional.softmax(combined, dim=-1, dtype=torch.float32)\n+    scores_ref = probs[..., :-1]                                        # drop sink\n+    out_ref = torch.matmul(scores_ref, V_rep)                           # (1, Hq, T, hd)\n+    out_ref = out_ref.squeeze(0).transpose(0, 1).contiguous().to(torch.bfloat16)  # (T, Hq, hd)\n+\n+    # Reshape Q/K/V to [T, H*hd] layout expected by the kernel.\n+    write(FIXTURES_DIR / \"attn_q.bf16\", bf16_bytes(Q_scaled.view(att_T, att_Hq * att_hd)))\n+    write(FIXTURES_DIR / \"attn_k.bf16\", bf16_bytes(K_scaled.view(att_T, att_Hkv * att_hd)))\n+    write(FIXTURES_DIR / \"attn_v.bf16\", bf16_bytes(V_in.view(att_T, att_Hkv * att_hd)))\n+    write(FIXTURES_DIR / \"attn_sinks.bf16\", bf16_bytes(sinks))\n+    write(FIXTURES_DIR / \"attn_out.bf16\", bf16_bytes(out_ref.view(att_T, att_Hq * att_hd)))\n+\n     # ----- Softmax fixture (attention-shape) -----\n     #\n     # Shape picked to exercise both the \"long\" row (attention scores +"
+    },
+    {
+      "sha": "8b9466f9bbcb1cd7dc6cef678666176ffb3a9256",
+      "filename": "scripts/verify-kernels.mjs",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 0,
+      "changes": 22,
+      "blob_url": "https://github.com/teamchong/textsift/blob/e1ad9dd0be7e7edf6f1f9ec91466dea17fe16dd7/scripts%2Fverify-kernels.mjs",
+      "raw_url": "https://github.com/teamchong/textsift/raw/e1ad9dd0be7e7edf6f1f9ec91466dea17fe16dd7/scripts%2Fverify-kernels.mjs",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/scripts%2Fverify-kernels.mjs?ref=e1ad9dd0be7e7edf6f1f9ec91466dea17fe16dd7",
+      "patch": "@@ -188,6 +188,27 @@ async function runEmbed(ex, weights, spec) {\n   return compareU16(ex, outPtr, expected);\n }\n \n+async function runBandedAttention(ex, _weights, spec) {\n+  const q = await loadFixture(spec.q);\n+  const k = await loadFixture(spec.k);\n+  const v = await loadFixture(spec.v);\n+  const sinks = await loadFixture(spec.sinks);\n+  const expected = await loadFixture(spec.expected);\n+  const qPtr = allocAndCopy(ex, q);\n+  const kPtr = allocAndCopy(ex, k);\n+  const vPtr = allocAndCopy(ex, v);\n+  const sinksPtr = allocAndCopy(ex, sinks);\n+  const outPtr = ex.alloc(expected.byteLength);\n+  ex.banded_attention(qPtr, kPtr, vPtr, sinksPtr, outPtr,\n+    spec.T, spec.H_q, spec.H_kv, spec.head_dim, spec.window);\n+  return {\n+    tolerance: { relTol: spec.rel_tol, absTol: spec.abs_tol ?? 0 },\n+    ...compareBf16Tolerance(ex, outPtr, expected, {\n+      relTol: spec.rel_tol, absTol: spec.abs_tol ?? 0,\n+    }),\n+  };\n+}\n+\n async function runMatmulOutF32(ex, weights, spec) {\n   const x = await loadFixture(spec.x);\n   const w = weights.get(spec.weight_tensor);\n@@ -388,6 +409,7 @@ const RUNNERS = {\n   swiglu_clamp_f32: runSwigluF32,\n   matmul_bf16_out_f32: runMatmulOutF32,\n   topk_partial_f32: runTopk,\n+  banded_attention: runBandedAttention,\n };\n \n async function main() {"
+    },
+    {
+      "sha": "b6a834684757541e96c01e48e2873cea6b049274",
+      "filename": "src/js/backends/wasm.ts",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/teamchong/textsift/blob/e1ad9dd0be7e7edf6f1f9ec91466dea17fe16dd7/src%2Fjs%2Fbackends%2Fwasm.ts",
+      "raw_url": "https://github.com/teamchong/textsift/raw/e1ad9dd0be7e7edf6f1f9ec91466dea17fe16dd7/src%2Fjs%2Fbackends%2Fwasm.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/src%2Fjs%2Fbackends%2Fwasm.ts?ref=e1ad9dd0be7e7edf6f1f9ec91466dea17fe16dd7",
+      "patch": "@@ -43,6 +43,10 @@ interface PiiWasmExports {\n   matmul_bf16_x_int4block(x: number, w: number, bias: number, out: number, T: number, N: number, D: number): void;\n   topk_partial_f32(x: number, out_idx: number, out_val: number, rows: number, cols: number, k: number): void;\n   rope_apply(qk: number, cos: number, sin: number, T: number, H: number, head_dim: number): void;\n+  banded_attention(\n+    q: number, k: number, v: number, sinks: number, out: number,\n+    T: number, H_q: number, H_kv: number, head_dim: number, window: number,\n+  ): void;\n   softmax_f32(x: number, out: number, rows: number, cols: number): void;\n   swiglu_clamp_f32(gate_up: number, out: number, T: number, D: number): void;\n   embed_lookup(embed: number, ids: number, out: number, T: number, V: number, D: number): void;\n@@ -114,6 +118,7 @@ export async function loadPiiWasm(url: string | URL): Promise<PiiWasmExports> {\n     \"matmul_bf16_x_int4block\",\n     \"topk_partial_f32\",\n     \"rope_apply\",\n+    \"banded_attention\",\n     \"softmax_f32\",\n     \"swiglu_clamp_f32\",\n     \"embed_lookup\","
+    },
+    {
+      "sha": "9c95b06c9c7386284926cde5b2296011aca5f730",
+      "filename": "src/zig/wasm_exports.zig",
+      "status": "modified",
+      "additions": 167,
+      "deletions": 0,
+      "changes": 167,
+      "blob_url": "https://github.com/teamchong/textsift/blob/e1ad9dd0be7e7edf6f1f9ec91466dea17fe16dd7/src%2Fzig%2Fwasm_exports.zig",
+      "raw_url": "https://github.com/teamchong/textsift/raw/e1ad9dd0be7e7edf6f1f9ec91466dea17fe16dd7/src%2Fzig%2Fwasm_exports.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/src%2Fzig%2Fwasm_exports.zig?ref=e1ad9dd0be7e7edf6f1f9ec91466dea17fe16dd7",
+      "patch": "@@ -935,6 +935,173 @@ export fn softmax_f32(\n     }\n }\n \n+// --------------------------------------------------------------\n+// Kernel: banded GQA attention with sinks\n+// --------------------------------------------------------------\n+//\n+// Implements the upstream `eager_attention_forward` pipeline for a\n+// single batch, restricted to a bidirectional sliding window.\n+// Expects Q and K already scaled by `head_dim^-0.25` (upstream applies\n+// this to Q and K individually before attention \u2014 see\n+// `OpenAIPrivacyFilterAttention.forward`). Our attention call uses\n+// `scaling = 1.0` to avoid a second multiply.\n+//\n+//   for each (t_q, h_q):\n+//     h_kv = h_q / num_kv_groups\n+//     ws = max(0, t_q - window)\n+//     we = min(T, t_q + window + 1)\n+//     scores[i] = dot(Q[t_q, h_q, :], K[ws+i, h_kv, :])   for i in 0..we-ws\n+//     combined = cat(scores, [sinks[h_q]])                 # append sink col\n+//     m = max(combined)\n+//     probs = exp(combined - m) / sum(exp(combined - m))\n+//     scores_drop_sink = probs[..., :-1]                    # drop sink column\n+//     out[t_q, h_q, :] = sum_i scores_drop_sink[i] * V[ws+i, h_kv, :]\n+//\n+// Layouts (all [T, H * head_dim] row-major, NOT transposed to [H, T, ...]):\n+//   q:     bf16 [T, H_q * head_dim]\n+//   k:     bf16 [T, H_kv * head_dim]\n+//   v:     bf16 [T, H_kv * head_dim]\n+//   sinks: bf16 [H_q]\n+//   out:   bf16 [T, H_q * head_dim]\n+//\n+// Constraint: `H_q % H_kv == 0` (GQA). Window is one-sided \u2014 `window=128`\n+// means total attended keys \u2264 `2*window + 1 = 257`.\n+\n+const MAX_WINDOW_TOTAL: usize = 512; // must be \u2265 2*window + 1\n+const MAX_HEAD_DIM: usize = 256;      // stack acc cap\n+\n+inline fn dotBf16F32(a: [*]const u16, b: [*]const u16, n: usize) f32 {\n+    const LANES: usize = 4;\n+    const UNROLL: usize = 4;\n+    var a0: @Vector(4, f32) = @splat(0);\n+    var a1: @Vector(4, f32) = @splat(0);\n+    var a2: @Vector(4, f32) = @splat(0);\n+    var a3: @Vector(4, f32) = @splat(0);\n+\n+    const step: usize = LANES * UNROLL;\n+    var i: usize = 0;\n+    while (i + step <= n) : (i += step) {\n+        const x0: @Vector(4, u16) = a[i ..][0..LANES].*;\n+        const x1: @Vector(4, u16) = a[i + 4 ..][0..LANES].*;\n+        const x2: @Vector(4, u16) = a[i + 8 ..][0..LANES].*;\n+        const x3: @Vector(4, u16) = a[i + 12 ..][0..LANES].*;\n+        const y0: @Vector(4, u16) = b[i ..][0..LANES].*;\n+        const y1: @Vector(4, u16) = b[i + 4 ..][0..LANES].*;\n+        const y2: @Vector(4, u16) = b[i + 8 ..][0..LANES].*;\n+        const y3: @Vector(4, u16) = b[i + 12 ..][0..LANES].*;\n+        a0 += bf16x4ToF32x4(x0) * bf16x4ToF32x4(y0);\n+        a1 += bf16x4ToF32x4(x1) * bf16x4ToF32x4(y1);\n+        a2 += bf16x4ToF32x4(x2) * bf16x4ToF32x4(y2);\n+        a3 += bf16x4ToF32x4(x3) * bf16x4ToF32x4(y3);\n+    }\n+    while (i + LANES <= n) : (i += LANES) {\n+        const xu: @Vector(4, u16) = a[i ..][0..LANES].*;\n+        const yu: @Vector(4, u16) = b[i ..][0..LANES].*;\n+        a0 += bf16x4ToF32x4(xu) * bf16x4ToF32x4(yu);\n+    }\n+    const combined: @Vector(4, f32) = (a0 + a1) + (a2 + a3);\n+    var sum: f32 = combined[0] + combined[1] + combined[2] + combined[3];\n+    while (i < n) : (i += 1) {\n+        sum += bf16ToF32(a[i]) * bf16ToF32(b[i]);\n+    }\n+    return sum;\n+}\n+\n+inline fn saxpyF32Bf16(p: f32, v_ptr: [*]const u16, acc: [*]f32, n: usize) void {\n+    const LANES: usize = 4;\n+    const p_vec: @Vector(4, f32) = @splat(p);\n+    var i: usize = 0;\n+    while (i + LANES <= n) : (i += LANES) {\n+        const vv: @Vector(4, u16) = v_ptr[i ..][0..LANES].*;\n+        const acc_vec: @Vector(4, f32) = acc[i ..][0..LANES].*;\n+        const new_acc = acc_vec + p_vec * bf16x4ToF32x4(vv);\n+        acc[i ..][0..LANES].* = new_acc;\n+    }\n+    while (i < n) : (i += 1) {\n+        acc[i] += p * bf16ToF32(v_ptr[i]);\n+    }\n+}\n+\n+export fn banded_attention(\n+    q_ptr: [*]const u16,\n+    k_ptr: [*]const u16,\n+    v_ptr: [*]const u16,\n+    sinks_ptr: [*]const u16,\n+    out_ptr: [*]u16,\n+    T: u32,\n+    H_q: u32,\n+    H_kv: u32,\n+    head_dim: u32,\n+    window: u32,\n+) void {\n+    const Tz: usize = T;\n+    const Hqz: usize = H_q;\n+    const Hkvz: usize = H_kv;\n+    const Dz: usize = head_dim;\n+    const Wz: usize = window;\n+    const kv_group: usize = Hqz / Hkvz;\n+\n+    const q_stride_t: usize = Hqz * Dz;\n+    const k_stride_t: usize = Hkvz * Dz;\n+\n+    // Per-query scratch: one entry per key in the window, plus the sink.\n+    var scores: [MAX_WINDOW_TOTAL + 1]f32 = undefined;\n+    var acc: [MAX_HEAD_DIM]f32 = undefined;\n+\n+    var t_q: usize = 0;\n+    while (t_q < Tz) : (t_q += 1) {\n+        var h_q: usize = 0;\n+        while (h_q < Hqz) : (h_q += 1) {\n+            const h_kv = h_q / kv_group;\n+            const q_base: usize = t_q * q_stride_t + h_q * Dz;\n+            const out_base: usize = t_q * q_stride_t + h_q * Dz;\n+\n+            const ws: usize = if (t_q > Wz) t_q - Wz else 0;\n+            const we: usize = if (t_q + Wz + 1 < Tz) t_q + Wz + 1 else Tz;\n+            const n_keys: usize = we - ws;\n+\n+            const sink_logit: f32 = bf16ToF32(sinks_ptr[h_q]);\n+            var row_max: f32 = sink_logit;\n+\n+            var t_k: usize = 0;\n+            while (t_k < n_keys) : (t_k += 1) {\n+                const k_base = (ws + t_k) * k_stride_t + h_kv * Dz;\n+                const s = dotBf16F32(q_ptr + q_base, k_ptr + k_base, Dz);\n+                scores[t_k] = s;\n+                if (s > row_max) row_max = s;\n+            }\n+            scores[n_keys] = sink_logit;\n+\n+            // exp(s - max) and running sum (including sink).\n+            var sum: f32 = 0.0;\n+            var i: usize = 0;\n+            while (i <= n_keys) : (i += 1) {\n+                const e = @exp(scores[i] - row_max);\n+                scores[i] = e;\n+                sum += e;\n+            }\n+            const inv_sum: f32 = if (sum > 0.0) 1.0 / sum else 0.0;\n+\n+            // Zero accumulator for this query head.\n+            var d: usize = 0;\n+            while (d < Dz) : (d += 1) acc[d] = 0.0;\n+\n+            // Weighted sum of V over window keys (sink does not contribute).\n+            t_k = 0;\n+            while (t_k < n_keys) : (t_k += 1) {\n+                const p: f32 = scores[t_k] * inv_sum;\n+                const v_base = (ws + t_k) * k_stride_t + h_kv * Dz;\n+                saxpyF32Bf16(p, v_ptr + v_base, &acc, Dz);\n+            }\n+\n+            d = 0;\n+            while (d < Dz) : (d += 1) {\n+                out_ptr[out_base + d] = f32ToBf16(acc[d]);\n+            }\n+        }\n+    }\n+}\n+\n // --------------------------------------------------------------\n // Kernel: RoPE apply (interleaved layout)\n // --------------------------------------------------------------"
+    },
+    {
+      "sha": "e0bea1356ee6e59e06ab92aec9975fd9e0e63ca3",
+      "filename": "tests/fixtures/attn_k.bf16",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/teamchong/textsift/blob/e1ad9dd0be7e7edf6f1f9ec91466dea17fe16dd7/tests%2Ffixtures%2Fattn_k.bf16",
+      "raw_url": "https://github.com/teamchong/textsift/raw/e1ad9dd0be7e7edf6f1f9ec91466dea17fe16dd7/tests%2Ffixtures%2Fattn_k.bf16",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Ffixtures%2Fattn_k.bf16?ref=e1ad9dd0be7e7edf6f1f9ec91466dea17fe16dd7"
+    },
+    {
+      "sha": "3bcc30333d7179d3f0d650244e52e9ccd6695595",
+      "filename": "tests/fixtures/attn_out.bf16",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/teamchong/textsift/blob/e1ad9dd0be7e7edf6f1f9ec91466dea17fe16dd7/tests%2Ffixtures%2Fattn_out.bf16",
+      "raw_url": "https://github.com/teamchong/textsift/raw/e1ad9dd0be7e7edf6f1f9ec91466dea17fe16dd7/tests%2Ffixtures%2Fattn_out.bf16",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Ffixtures%2Fattn_out.bf16?ref=e1ad9dd0be7e7edf6f1f9ec91466dea17fe16dd7"
+    },
+    {
+      "sha": "e7cf327bd7d624de49c9048b1323b2297f223e4a",
+      "filename": "tests/fixtures/attn_q.bf16",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/teamchong/textsift/blob/e1ad9dd0be7e7edf6f1f9ec91466dea17fe16dd7/tests%2Ffixtures%2Fattn_q.bf16",
+      "raw_url": "https://github.com/teamchong/textsift/raw/e1ad9dd0be7e7edf6f1f9ec91466dea17fe16dd7/tests%2Ffixtures%2Fattn_q.bf16",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Ffixtures%2Fattn_q.bf16?ref=e1ad9dd0be7e7edf6f1f9ec91466dea17fe16dd7"
+    },
+    {
+      "sha": "a7975b045db99c15227f5417829bc7e2b6676475",
+      "filename": "tests/fixtures/attn_sinks.bf16",
+      "status": "added",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/teamchong/textsift/blob/e1ad9dd0be7e7edf6f1f9ec91466dea17fe16dd7/tests%2Ffixtures%2Fattn_sinks.bf16",
+      "raw_url": "https://github.com/teamchong/textsift/raw/e1ad9dd0be7e7edf6f1f9ec91466dea17fe16dd7/tests%2Ffixtures%2Fattn_sinks.bf16",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Ffixtures%2Fattn_sinks.bf16?ref=e1ad9dd0be7e7edf6f1f9ec91466dea17fe16dd7",
+      "patch": "@@ -0,0 +1 @@\n+q>\ufffd\ufffdX\ufffd\ufffd=\u023e\ufffd>\f\ufffd\u07fd\ufffd\ufffd\ufffd\ufffd\ufffd>\t?\ufffd>y?\n\\ No newline at end of file"
+    },
+    {
+      "sha": "7d6019530f1bb7c16c38b206524ede5d004984b0",
+      "filename": "tests/fixtures/attn_v.bf16",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/teamchong/textsift/blob/e1ad9dd0be7e7edf6f1f9ec91466dea17fe16dd7/tests%2Ffixtures%2Fattn_v.bf16",
+      "raw_url": "https://github.com/teamchong/textsift/raw/e1ad9dd0be7e7edf6f1f9ec91466dea17fe16dd7/tests%2Ffixtures%2Fattn_v.bf16",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Ffixtures%2Fattn_v.bf16?ref=e1ad9dd0be7e7edf6f1f9ec91466dea17fe16dd7"
+    },
+    {
+      "sha": "4ee7061cfb28aaaabfc84d4cada51e69635ceafc",
+      "filename": "tests/fixtures/manifest.json",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 0,
+      "changes": 16,
+      "blob_url": "https://github.com/teamchong/textsift/blob/e1ad9dd0be7e7edf6f1f9ec91466dea17fe16dd7/tests%2Ffixtures%2Fmanifest.json",
+      "raw_url": "https://github.com/teamchong/textsift/raw/e1ad9dd0be7e7edf6f1f9ec91466dea17fe16dd7/tests%2Ffixtures%2Fmanifest.json",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Ffixtures%2Fmanifest.json?ref=e1ad9dd0be7e7edf6f1f9ec91466dea17fe16dd7",
+      "patch": "@@ -100,6 +100,22 @@\n       \"rel_tol\": 1e-5,\n       \"abs_tol\": 1e-7\n     },\n+    {\n+      \"name\": \"banded_attention\",\n+      \"q\": \"attn_q.bf16\",\n+      \"k\": \"attn_k.bf16\",\n+      \"v\": \"attn_v.bf16\",\n+      \"sinks\": \"attn_sinks.bf16\",\n+      \"expected\": \"attn_out.bf16\",\n+      \"T\": 32,\n+      \"H_q\": 14,\n+      \"H_kv\": 2,\n+      \"head_dim\": 64,\n+      \"window\": 4,\n+      \"rel_tol\": 2e-2,\n+      \"abs_tol\": 5e-3,\n+      \"note\": \"End-to-end attention: QK matmul + mask + sinks + softmax + AV. Tolerance allows for (1) 3-rounding bf16 semantics in the QK and AV matmul chains, (2) exp drift vs libm, (3) order-of-summation effects in the V-weighted sum.\"\n+    },\n     {\n       \"name\": \"rope_apply\",\n       \"qk_in\": \"rope_qk_in.bf16\","
+    }
+  ]
+}

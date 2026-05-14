@@ -1,0 +1,29 @@
+{
+  "message": "fix(core): restore previous hot-path profile state in guard drop and update fast-path test docs\n\nStatementReuseHotPathProfileGuard now saves the pre-guard enabled state\nand restores it on drop instead of unconditionally disabling profiling.\nAdds a test that verifies both the disabled-restore and enabled-preserve\ncases. Updates fast_path_separation doc comments to reflect actual\nsemantics (path metrics vs strict fast/slow dichotomy).\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "2d3e44aaf9f52808d48bc2f894824016fcf9b2c9",
+      "filename": "crates/fsqlite-core/src/connection.rs",
+      "status": "modified",
+      "additions": 32,
+      "deletions": 2,
+      "changes": 34,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/3017d9f94a009714235deb2d9352d88fde5bf91f/crates%2Ffsqlite-core%2Fsrc%2Fconnection.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/3017d9f94a009714235deb2d9352d88fde5bf91f/crates%2Ffsqlite-core%2Fsrc%2Fconnection.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-core%2Fsrc%2Fconnection.rs?ref=3017d9f94a009714235deb2d9352d88fde5bf91f",
+      "patch": "@@ -71904,6 +71904,7 @@ mod pager_routing_tests {\n     #[cfg(test)]\n     struct StatementReuseHotPathProfileGuard {\n         _lock: std::sync::MutexGuard<'static, ()>,\n+        previous_enabled: bool,\n     }\n \n     #[cfg(test)]\n@@ -71913,17 +71914,21 @@ mod pager_routing_tests {\n                 std::sync::OnceLock::new();\n             let lock = HOT_PATH_PROFILE_TEST_LOCK.get_or_init(|| std::sync::Mutex::new(()));\n             let guard = lock_unpoisoned(lock);\n+            let previous_enabled = hot_path_profile_enabled();\n             reset_hot_path_profile();\n             set_hot_path_profile_enabled(true);\n-            Self { _lock: guard }\n+            Self {\n+                _lock: guard,\n+                previous_enabled,\n+            }\n         }\n     }\n \n     #[cfg(test)]\n     impl Drop for StatementReuseHotPathProfileGuard {\n         fn drop(&mut self) {\n-            set_hot_path_profile_enabled(false);\n             reset_hot_path_profile();\n+            set_hot_path_profile_enabled(self.previous_enabled);\n         }\n     }\n \n@@ -71933,6 +71938,31 @@ mod pager_routing_tests {\n         *conn.cached_vdbe_engine.borrow_mut() = None;\n     }\n \n+    #[cfg(test)]\n+    #[test]\n+    fn test_statement_reuse_hot_path_profile_guard_restores_previous_state() {\n+        set_hot_path_profile_enabled(false);\n+        {\n+            let _guard = StatementReuseHotPathProfileGuard::new();\n+            assert!(hot_path_profile_enabled());\n+        }\n+        assert!(\n+            !hot_path_profile_enabled(),\n+            \"guard should restore disabled profiling state after drop\"\n+        );\n+\n+        set_hot_path_profile_enabled(true);\n+        {\n+            let _guard = StatementReuseHotPathProfileGuard::new();\n+            assert!(hot_path_profile_enabled());\n+        }\n+        assert!(\n+            hot_path_profile_enabled(),\n+            \"guard should preserve enabled profiling state after drop\"\n+        );\n+        set_hot_path_profile_enabled(false);\n+    }\n+\n     #[cfg(test)]\n     fn init_statement_reuse_root_tracing() {\n         static TRACING_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();"
+    },
+    {
+      "sha": "234beddee011857af9438911171ad077900446cd",
+      "filename": "crates/fsqlite-core/tests/fast_path_separation.rs",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 7,
+      "changes": 16,
+      "blob_url": "https://github.com/Dicklesworthstone/frankensqlite/blob/3017d9f94a009714235deb2d9352d88fde5bf91f/crates%2Ffsqlite-core%2Ftests%2Ffast_path_separation.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankensqlite/raw/3017d9f94a009714235deb2d9352d88fde5bf91f/crates%2Ffsqlite-core%2Ftests%2Ffast_path_separation.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankensqlite/contents/crates%2Ffsqlite-core%2Ftests%2Ffast_path_separation.rs?ref=3017d9f94a009714235deb2d9352d88fde5bf91f",
+      "patch": "@@ -1,12 +1,14 @@\n //! bd-6eyrg.1: Fast-path vs slow-path execution separation tests.\n //!\n //! Proves:\n-//! 1. Prepared INSERT/SELECT uses the fast path (counter increments).\n-//! 2. CTE/view queries use the slow path.\n-//! 3. DDL invalidation forces slow path, re-stabilization restores fast path.\n-//! 4. Parameterized prepared statements use the fast path.\n+//! 1. Prepared INSERT uses the fast path (counter increments).\n+//! 2. Prepared SELECT / CTE / view queries record path metrics without racing.\n+//! 3. DDL invalidation forces a schema change boundary, then re-preparation\n+//!    restores the fast path.\n+//! 4. Parameterized prepared statements still execute correctly.\n //! 5. Complex queries (JOINs, subqueries) still produce correct results.\n-//! 6. Latency: fast path is not slower than slow path on repeated execution.\n+//! 6. Latency: prepared fast lanes are not catastrophically slower than ad-hoc\n+//!    execution on repeated runs.\n //!\n //! Run:\n //!   cargo test -p fsqlite-core --test fast_path_separation \\\n@@ -86,7 +88,7 @@ fn test_fast_path_simple_insert() {\n     );\n }\n \n-/// T2: Prepared SELECT uses fast path.\n+/// T2: Prepared SELECT records path metrics without double-counting.\n #[test]\n fn test_fast_path_simple_select() {\n     let _profile_guard = FastPathProfileTestGuard::new();\n@@ -248,7 +250,7 @@ fn test_fast_path_parameterized() {\n     );\n }\n \n-/// T6: View query uses slow path (deferred_query_statement).\n+/// T6: View query records path metrics for the deferred-query route.\n #[test]\n fn test_slow_path_view_expansion() {\n     let _profile_guard = FastPathProfileTestGuard::new();"
+    }
+  ]
+}

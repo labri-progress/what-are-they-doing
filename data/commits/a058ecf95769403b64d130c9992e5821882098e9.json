@@ -1,0 +1,41 @@
+{
+  "message": "fix: macaroon preallocation DoS, health watcher atomicity, compress flush deferral\n\ncx/macaroon: MacaroonToken::from_bytes now caps the Vec preallocation\nfor caveats to min(caveat_count, (remaining_bytes) / 3) instead of\ntrusting the wire-format caveat_count directly. A malicious token with\na large caveat_count field but minimal actual data could cause an\nunbounded allocation attempt. Each caveat requires at least 3 bytes\non the wire (1 kind + 2 length), so the clamped capacity is always\nsufficient for valid input.\n\ngrpc/health: watched_status_and_version for the server-level (empty\nservice name) watcher now holds the statuses read lock while reading\nthe global version counter, preventing an interleaving where\nset_status bumps the version between the status read and the version\nread, causing the watcher to pair a stale status with a new version\nand miss the actual transition. The previous code called self.check()\nwhich acquires and releases the lock independently of the version read.\n\nHealthWatcher::status() now returns the last-seen status from the\nwatcher's own snapshot (self.last_status) instead of performing a\nfresh read. This matches the gRPC Watch contract where the stream\nposition is defined by changed()/poll_status() calls, and a bare\nstatus() between those calls should reflect the most recent observation.\n\nhttp/compress: GzipCompressor and DeflateCompressor compress() methods\nno longer call encoder.flush() after write_all. The flate2 write\nencoder buffers internally and emits compressed bytes to the output\nVec as the buffer fills. Calling flush() after every chunk forces a\nsync flush marker into the compressed stream, which inflates the output\nfor small chunks and prevents the encoder from optimizing across chunk\nboundaries. finish() still flushes the final state. Test added:\ngzip_compresses_repetitive_data_chunked verifies that 4000 bytes of\nrepetitive data compressed in 10-byte chunks achieves > 50% compression.\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "942b09956a1837db2edcf84d2808f62ef22fe1bb",
+      "filename": "src/cx/macaroon.rs",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 1,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/a058ecf95769403b64d130c9992e5821882098e9/src%2Fcx%2Fmacaroon.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/a058ecf95769403b64d130c9992e5821882098e9/src%2Fcx%2Fmacaroon.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fcx%2Fmacaroon.rs?ref=a058ecf95769403b64d130c9992e5821882098e9",
+      "patch": "@@ -775,7 +775,9 @@ impl MacaroonToken {\n         let caveat_count = u16::from_le_bytes(data[pos..pos + 2].try_into().ok()?) as usize;\n         pos += 2;\n \n-        let mut caveats = Vec::with_capacity(caveat_count);\n+        // Prevent unbacked preallocation DoS: a caveat takes at least 3 bytes on the wire.\n+        let safe_capacity = caveat_count.min((data.len() - pos) / 3);\n+        let mut caveats = Vec::with_capacity(safe_capacity);\n         for _ in 0..caveat_count {\n             if pos >= data.len() {\n                 return None;"
+    },
+    {
+      "sha": "70a8d0ec6d041a52c75493137359af14332c22ad",
+      "filename": "src/grpc/health.rs",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 4,
+      "changes": 18,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/a058ecf95769403b64d130c9992e5821882098e9/src%2Fgrpc%2Fhealth.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/a058ecf95769403b64d130c9992e5821882098e9/src%2Fgrpc%2Fhealth.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fgrpc%2Fhealth.rs?ref=a058ecf95769403b64d130c9992e5821882098e9",
+      "patch": "@@ -269,10 +269,18 @@ impl HealthService {\n     fn watched_status_and_version(&self, service: &str) -> (ServingStatus, u64) {\n         if service.is_empty() {\n             // Server-level watcher uses the global atomic version.\n-            let status = self\n-                .check(&HealthCheckRequest::server())\n-                .map_or(ServingStatus::ServiceUnknown, |response| response.status);\n+            // MUST hold the statuses lock while reading the version to prevent\n+            // interleaving set_status() from pairing a stale status with a new version.\n+            let statuses = self.statuses.read();\n+            let status = if statuses.is_empty() {\n+                ServingStatus::ServiceUnknown\n+            } else if statuses.values().all(|s| s.is_healthy()) {\n+                ServingStatus::Serving\n+            } else {\n+                ServingStatus::NotServing\n+            };\n             let version = self.version();\n+            drop(statuses);\n             (status, version)\n         } else {\n             // CORRECTNESS: Both locks MUST be held simultaneously so that a\n@@ -428,11 +436,13 @@ impl HealthWatcher {\n \n     /// Returns the current status for the watched service.\n     ///\n+    /// This returns the status snapshotted during the watcher's creation,\n+    /// or during the most recent call to `changed` or `poll_status`.\n     /// Unregistered named services report [`ServingStatus::ServiceUnknown`],\n     /// matching the gRPC health `Watch` contract.\n     #[must_use]\n     pub fn status(&self) -> ServingStatus {\n-        self.service.watched_status(&self.service_name)\n+        self.last_status\n     }\n \n     /// Returns a single-read snapshot: `(changed, current_status)`."
+    },
+    {
+      "sha": "ec9127a81e513eaf5815dd7d008a7d2e4efde314",
+      "filename": "src/http/compress.rs",
+      "status": "modified",
+      "additions": 26,
+      "deletions": 7,
+      "changes": 33,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/a058ecf95769403b64d130c9992e5821882098e9/src%2Fhttp%2Fcompress.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/a058ecf95769403b64d130c9992e5821882098e9/src%2Fhttp%2Fcompress.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fhttp%2Fcompress.rs?ref=a058ecf95769403b64d130c9992e5821882098e9",
+      "patch": "@@ -309,11 +309,11 @@ impl Compressor for GzipCompressor {\n     fn compress(&mut self, input: &[u8], output: &mut Vec<u8>) -> io::Result<()> {\n         use io::Write;\n         self.encoder.write_all(input)?;\n-        // Flush to get compressed bytes so far.\n-        self.encoder.flush()?;\n         let buf = self.encoder.get_mut();\n-        output.extend_from_slice(buf);\n-        buf.clear();\n+        if !buf.is_empty() {\n+            output.extend_from_slice(buf);\n+            buf.clear();\n+        }\n         Ok(())\n     }\n \n@@ -422,10 +422,11 @@ impl Compressor for DeflateCompressor {\n     fn compress(&mut self, input: &[u8], output: &mut Vec<u8>) -> io::Result<()> {\n         use io::Write;\n         self.encoder.write_all(input)?;\n-        self.encoder.flush()?;\n         let buf = self.encoder.get_mut();\n-        output.extend_from_slice(buf);\n-        buf.clear();\n+        if !buf.is_empty() {\n+            output.extend_from_slice(buf);\n+            buf.clear();\n+        }\n         Ok(())\n     }\n \n@@ -1209,4 +1210,22 @@ mod tests {\n             compressed.len()\n         );\n     }\n+\n+    #[cfg(feature = \"compression\")]\n+    #[test]\n+    fn gzip_compresses_repetitive_data_chunked() {\n+        let input: Vec<u8> = \"aaaa\".repeat(1000).into_bytes();\n+        let mut comp = GzipCompressor::new();\n+        let mut compressed = Vec::new();\n+        for chunk in input.chunks(10) {\n+            comp.compress(chunk, &mut compressed).unwrap();\n+        }\n+        comp.finish(&mut compressed).unwrap();\n+        assert!(\n+            compressed.len() < input.len() / 2,\n+            \"gzip should compress chunked repetitive data efficiently: {} -> {}\",\n+            input.len(),\n+            compressed.len()\n+        );\n+    }\n }"
+    }
+  ]
+}

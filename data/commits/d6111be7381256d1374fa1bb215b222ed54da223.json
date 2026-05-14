@@ -1,0 +1,41 @@
+{
+  "message": "fix(backup): split gmail checkpoints by plaintext size",
+  "files": [
+    {
+      "sha": "5b796f7b6830e3a9d02c52096ebdb2cf597d2c8a",
+      "filename": "docs/backup.md",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 6,
+      "changes": 13,
+      "blob_url": "https://github.com/openclaw/gogcli/blob/d6111be7381256d1374fa1bb215b222ed54da223/docs%2Fbackup.md",
+      "raw_url": "https://github.com/openclaw/gogcli/raw/d6111be7381256d1374fa1bb215b222ed54da223/docs%2Fbackup.md",
+      "contents_url": "https://api.github.com/repos/openclaw/gogcli/contents/docs%2Fbackup.md?ref=d6111be7381256d1374fa1bb215b222ed54da223",
+      "patch": "@@ -281,12 +281,13 @@ recipients as normal backup shards, and are committed with messages like\n to use the root `manifest.json` as the authoritative completed backup. This\n keeps long runs crash-tolerant without pretending partial data is a finished\n snapshot. A checkpoint commit can cover many messages, but its encrypted files\n-are split into smaller shard files to stay below normal GitHub blob limits. Tune\n-the commit cadence with `--gmail-checkpoint-rows` / `--gmail-checkpoint-interval`\n-on `gog backup push`, or `--checkpoint-rows` / `--checkpoint-interval` on\n-`gog backup gmail push`; set the interval or rows to `0` to disable that\n-trigger, or use `--no-gmail-checkpoints` / `--no-checkpoints` to disable\n-checkpoint pushes entirely.\n+are split by both row count and a conservative plaintext byte ceiling so large\n+messages do not create GitHub-rejected blobs. Tune the commit cadence with\n+`--gmail-checkpoint-rows` / `--gmail-checkpoint-interval` on `gog backup push`,\n+or `--checkpoint-rows` / `--checkpoint-interval` on `gog backup gmail push`;\n+set the interval or rows to `0` to disable that trigger, or use\n+`--no-gmail-checkpoints` / `--no-checkpoints` to disable checkpoint pushes\n+entirely.\n \n `--include-spam-trash` defaults to true. Use `--query` and `--max` for bounded\n test exports; omit them for a full mailbox scan."
+    },
+    {
+      "sha": "b6569ca780e01fcfa2b7b9afa7167f112c6b036a",
+      "filename": "internal/cmd/backup_gmail.go",
+      "status": "modified",
+      "additions": 49,
+      "deletions": 11,
+      "changes": 60,
+      "blob_url": "https://github.com/openclaw/gogcli/blob/d6111be7381256d1374fa1bb215b222ed54da223/internal%2Fcmd%2Fbackup_gmail.go",
+      "raw_url": "https://github.com/openclaw/gogcli/raw/d6111be7381256d1374fa1bb215b222ed54da223/internal%2Fcmd%2Fbackup_gmail.go",
+      "contents_url": "https://api.github.com/repos/openclaw/gogcli/contents/internal%2Fcmd%2Fbackup_gmail.go?ref=d6111be7381256d1374fa1bb215b222ed54da223",
+      "patch": "@@ -353,6 +353,8 @@ type gmailBackupCheckpointer struct {\n \n const gmailCheckpointShardMaxRows = 250\n \n+var gmailCheckpointShardMaxPlaintextBytes int64 = 32 * 1024 * 1024\n+\n func newGmailBackupCheckpointer(ctx context.Context, opts gmailBackupOptions, total int) *gmailBackupCheckpointer {\n \tenabled := opts.Checkpoints &&\n \t\topts.CacheMessages &&\n@@ -876,21 +878,57 @@ func buildGmailCheckpointShardsFromCache(accountHash, runID string, firstPart in\n \t\treturn nil, nil\n \t}\n \tshards := make([]backup.PlainShard, 0, (len(ids)+gmailCheckpointShardMaxRows-1)/gmailCheckpointShardMaxRows)\n-\tfor start := 0; start < len(ids); start += gmailCheckpointShardMaxRows {\n-\t\tend := start + gmailCheckpointShardMaxRows\n-\t\tif end > len(ids) {\n-\t\t\tend = len(ids)\n+\tchunk := make([]string, 0, gmailCheckpointShardMaxRows)\n+\tvar chunkBytes int64\n+\tcleanup := func() {\n+\t\tfor _, shard := range shards {\n+\t\t\tif strings.TrimSpace(shard.PlaintextPath) != \"\" {\n+\t\t\t\t_ = os.Remove(shard.PlaintextPath)\n+\t\t\t}\n+\t\t}\n+\t}\n+\tflush := func() error {\n+\t\tif len(chunk) == 0 {\n+\t\t\treturn nil\n \t\t}\n-\t\tshard, err := buildGmailCheckpointShardFromCache(accountHash, runID, firstPart+len(shards), ids[start:end])\n+\t\tshard, err := buildGmailCheckpointShardFromCache(accountHash, runID, firstPart+len(shards), chunk)\n \t\tif err != nil {\n-\t\t\tfor _, shard := range shards {\n-\t\t\t\tif strings.TrimSpace(shard.PlaintextPath) != \"\" {\n-\t\t\t\t\t_ = os.Remove(shard.PlaintextPath)\n-\t\t\t\t}\n-\t\t\t}\n-\t\t\treturn nil, err\n+\t\t\tcleanup()\n+\t\t\treturn err\n \t\t}\n \t\tshards = append(shards, shard)\n+\t\tchunk = chunk[:0]\n+\t\tchunkBytes = 0\n+\t\treturn nil\n+\t}\n+\tfor _, id := range ids {\n+\t\tmsg, ok, err := readGmailBackupMessageCache(accountHash, id)\n+\t\tif err != nil {\n+\t\t\tcleanup()\n+\t\t\treturn nil, err\n+\t\t}\n+\t\tif !ok {\n+\t\t\tcleanup()\n+\t\t\treturn nil, fmt.Errorf(\"gmail message %s missing from backup cache\", id)\n+\t\t}\n+\t\tline, err := json.Marshal(msg)\n+\t\tif err != nil {\n+\t\t\tcleanup()\n+\t\t\treturn nil, fmt.Errorf(\"encode gmail backup checkpoint shard estimate: %w\", err)\n+\t\t}\n+\t\tlineBytes := int64(len(line) + 1)\n+\t\toverRows := len(chunk) >= gmailCheckpointShardMaxRows\n+\t\toverBytes := gmailCheckpointShardMaxPlaintextBytes > 0 && len(chunk) > 0 && chunkBytes+lineBytes > gmailCheckpointShardMaxPlaintextBytes\n+\t\tif overRows || overBytes {\n+\t\t\tif err := flush(); err != nil {\n+\t\t\t\treturn nil, err\n+\t\t\t}\n+\t\t}\n+\t\tchunk = append(chunk, id)\n+\t\tchunkBytes += lineBytes\n+\t}\n+\tif err := flush(); err != nil {\n+\t\treturn nil, err\n \t}\n \treturn shards, nil\n }"
+    },
+    {
+      "sha": "f8b3b664b502519c5076818df34229d43feff886",
+      "filename": "internal/cmd/backup_test.go",
+      "status": "modified",
+      "additions": 30,
+      "deletions": 0,
+      "changes": 30,
+      "blob_url": "https://github.com/openclaw/gogcli/blob/d6111be7381256d1374fa1bb215b222ed54da223/internal%2Fcmd%2Fbackup_test.go",
+      "raw_url": "https://github.com/openclaw/gogcli/raw/d6111be7381256d1374fa1bb215b222ed54da223/internal%2Fcmd%2Fbackup_test.go",
+      "contents_url": "https://api.github.com/repos/openclaw/gogcli/contents/internal%2Fcmd%2Fbackup_test.go?ref=d6111be7381256d1374fa1bb215b222ed54da223",
+      "patch": "@@ -454,6 +454,36 @@ func TestBuildGmailCheckpointShardsFromCacheSplitsLargeChunks(t *testing.T) {\n \t}\n }\n \n+func TestBuildGmailCheckpointShardsFromCacheSplitsByPlaintextSize(t *testing.T) {\n+\tt.Setenv(\"HOME\", t.TempDir())\n+\toldLimit := gmailCheckpointShardMaxPlaintextBytes\n+\tgmailCheckpointShardMaxPlaintextBytes = 1\n+\tt.Cleanup(func() { gmailCheckpointShardMaxPlaintextBytes = oldLimit })\n+\taccountHash := \"accthash\"\n+\tids := []string{\"m1\", \"m2\", \"m3\"}\n+\tfor _, id := range ids {\n+\t\tif err := writeGmailBackupMessageCache(accountHash, gmailBackupMessage{ID: id, Raw: strings.Repeat(\"raw-\"+id, 8)}); err != nil {\n+\t\t\tt.Fatalf(\"writeGmailBackupMessageCache: %v\", err)\n+\t\t}\n+\t}\n+\tshards, err := buildGmailCheckpointShardsFromCache(accountHash, \"run-test\", 11, ids)\n+\tif err != nil {\n+\t\tt.Fatalf(\"buildGmailCheckpointShardsFromCache: %v\", err)\n+\t}\n+\tif len(shards) != 3 {\n+\t\tt.Fatalf(\"len(shards) = %d, want 3\", len(shards))\n+\t}\n+\tfor i, shard := range shards {\n+\t\tif shard.Rows != 1 {\n+\t\t\tt.Fatalf(\"shards[%d].Rows = %d, want 1\", i, shard.Rows)\n+\t\t}\n+\t\twant := fmt.Sprintf(\"part-%06d.jsonl.gz.age\", 11+i)\n+\t\tif !strings.HasSuffix(shard.Path, want) {\n+\t\t\tt.Fatalf(\"shards[%d].Path = %q, want suffix %q\", i, shard.Path, want)\n+\t\t}\n+\t}\n+}\n+\n func TestBuildGmailMessageShardsFromCacheWritesPlaintextPaths(t *testing.T) {\n \tt.Setenv(\"HOME\", t.TempDir())\n \taccountHash := \"accthash\""
+    }
+  ]
+}

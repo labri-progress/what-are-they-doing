@@ -1,0 +1,41 @@
+{
+  "message": "fix(compaction,extensions,interactive): heuristic token fallback, module path traversal guard, and config-driven queue modes\n\n- compaction.rs: fall back to heuristic token estimation when the\n  provider returns zero usage metrics, preventing the context-usage\n  estimate from collapsing to 0 and triggering premature compaction\n- extensions_js.rs: validate that dist\u2192src fallback paths stay within\n  the canonical extension roots before returning them, blocking a path\n  traversal vector where a repaired module path could escape the\n  sandboxed extension directory; also refactored object property\n  iteration to use idiomatic enumerate() and added clippy suppression\n  for resolve_module_path length\n- ext_session.rs: replaced hardcoded \"one-at-a-time\" steering and\n  follow-up queue mode strings with config-driven values from\n  Config::steering_queue_mode() and Config::follow_up_queue_mode(),\n  enabling runtime queue mode selection; added test coverage for the\n  new config-driven state reporting\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "a15e11621557c17d002a0dd0b211d5e2d67c1583",
+      "filename": "src/compaction.rs",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 0,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/pi_agent_rust/blob/77a44af417437ea72284862a05ae0adf523e2c86/src%2Fcompaction.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/pi_agent_rust/raw/77a44af417437ea72284862a05ae0adf523e2c86/src%2Fcompaction.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/pi_agent_rust/contents/src%2Fcompaction.rs?ref=77a44af417437ea72284862a05ae0adf523e2c86",
+      "patch": "@@ -294,6 +294,16 @@ fn estimate_context_tokens(messages: &[SessionMessage]) -> ContextUsageEstimate\n     };\n \n     let usage_tokens = calculate_context_tokens(usage);\n+    \n+    // Fall back to heuristic estimation if the provider didn't return usage metrics\n+    if usage_tokens == 0 {\n+        let total = messages.iter().map(estimate_tokens).sum();\n+        return ContextUsageEstimate {\n+            tokens: total,\n+            last_usage_index: None,\n+        };\n+    }\n+\n     let trailing_tokens = messages[usage_index + 1..]\n         .iter()\n         .map(estimate_tokens)"
+    },
+    {
+      "sha": "ed2eac66017535a867b5f133f92c88b9316622bf",
+      "filename": "src/extensions_js.rs",
+      "status": "modified",
+      "additions": 23,
+      "deletions": 4,
+      "changes": 27,
+      "blob_url": "https://github.com/Dicklesworthstone/pi_agent_rust/blob/77a44af417437ea72284862a05ae0adf523e2c86/src%2Fextensions_js.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/pi_agent_rust/raw/77a44af417437ea72284862a05ae0adf523e2c86/src%2Fextensions_js.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/pi_agent_rust/contents/src%2Fextensions_js.rs?ref=77a44af417437ea72284862a05ae0adf523e2c86",
+      "patch": "@@ -487,16 +487,14 @@ fn js_to_json_inner(value: &Value<'_>, depth: usize) -> rquickjs::Result<serde_j\n     }\n     if let Some(obj) = value.as_object() {\n         let mut result = serde_json::Map::new();\n-        let mut count = 0;\n-        for item in obj.props::<String, Value<'_>>() {\n+        for (count, item) in obj.props::<String, Value<'_>>().enumerate() {\n             if count >= 100_000 {\n                 return Err(rquickjs::Error::new_into_js_message(\n                     \"json\",\n                     \"stringify\",\n                     \"Object properties count exceeds maximum allowed limit of 100,000\",\n                 ));\n             }\n-            count += 1;\n             let (k, v) = item?;\n             result.insert(k, js_to_json_inner(&v, depth + 1)?);\n         }\n@@ -5835,6 +5833,7 @@ fn prefix_import_meta_url(module_name: &str, body: &str) -> Vec<u8> {\n     format!(\"import.meta.url = {url_literal};\\n{body}\").into_bytes()\n }\n \n+#[allow(clippy::too_many_lines)]\n fn resolve_module_path(\n     base: &str,\n     specifier: &str,\n@@ -5941,7 +5940,7 @@ fn resolve_module_path(\n     // Pattern 1 (bd-k5q5.8.2): dist/ \u2192 src/ fallback for missing build artifacts.\n     // Gated by repair_mode (bd-k5q5.9.1.2): only static-analysis operations\n     // (path existence checks) happen here \u2014 broken code is never executed.\n-    if repair_mode.should_apply() {\n+    let fallback_resolved = if repair_mode.should_apply() {\n         try_dist_to_src_fallback(&path)\n     } else {\n         if repair_mode == RepairMode::Suggest {\n@@ -5957,7 +5956,27 @@ fn resolve_module_path(\n             }\n         }\n         None\n+    };\n+\n+    if let Some(resolved) = fallback_resolved {\n+        let canonical_resolved = crate::extensions::safe_canonicalize(&resolved);\n+        let allowed = canonical_roots\n+            .iter()\n+            .any(|canonical_root| canonical_resolved.starts_with(canonical_root));\n+\n+        if !allowed {\n+            tracing::warn!(\n+                event = \"pijs.resolve.monotonicity_violation\",\n+                original = %path.display(),\n+                resolved = %resolved.display(),\n+                \"resolution blocked: repaired path escapes extension root\"\n+            );\n+            return None;\n+        }\n+        return Some(resolved);\n     }\n+\n+    None\n }\n \n /// Auto-repair Pattern 1: when a module path contains `/dist/` and the file"
+    },
+    {
+      "sha": "6a464f794d0b641aa52165890374dfb90b8b7efa",
+      "filename": "src/interactive/ext_session.rs",
+      "status": "modified",
+      "additions": 29,
+      "deletions": 2,
+      "changes": 31,
+      "blob_url": "https://github.com/Dicklesworthstone/pi_agent_rust/blob/77a44af417437ea72284862a05ae0adf523e2c86/src%2Finteractive%2Fext_session.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/pi_agent_rust/raw/77a44af417437ea72284862a05ae0adf523e2c86/src%2Finteractive%2Fext_session.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/pi_agent_rust/contents/src%2Finteractive%2Fext_session.rs?ref=77a44af417437ea72284862a05ae0adf523e2c86",
+      "patch": "@@ -224,8 +224,8 @@ impl ExtensionSession for InteractiveExtensionSession {\n             \"thinkingLevel\": thinking_level,\n             \"isStreaming\": self.is_streaming.load(Ordering::SeqCst),\n             \"isCompacting\": self.is_compacting.load(Ordering::SeqCst),\n-            \"steeringMode\": \"one-at-a-time\",\n-            \"followUpMode\": \"one-at-a-time\",\n+            \"steeringMode\": self.config.steering_queue_mode().as_str(),\n+            \"followUpMode\": self.config.follow_up_queue_mode().as_str(),\n             \"sessionFile\": session_file,\n             \"sessionId\": session_id,\n             \"sessionName\": session_name,\n@@ -944,4 +944,31 @@ mod tests {\n             assert_eq!(model_changes, 1);\n         });\n     }\n+\n+    #[test]\n+    fn get_state_reports_configured_queue_modes() {\n+        let runtime = RuntimeBuilder::current_thread()\n+            .build()\n+            .expect(\"runtime build\");\n+\n+        runtime.block_on(async {\n+            let session = Arc::new(Mutex::new(Session::in_memory()));\n+            let ext_session = InteractiveExtensionSession {\n+                session,\n+                model_entry: Arc::new(StdMutex::new(dummy_model_entry())),\n+                is_streaming: Arc::new(AtomicBool::new(false)),\n+                is_compacting: Arc::new(AtomicBool::new(false)),\n+                config: Config {\n+                    steering_mode: Some(\"all\".to_string()),\n+                    follow_up_mode: Some(\"one-at-a-time\".to_string()),\n+                    ..Config::default()\n+                },\n+                save_enabled: false,\n+            };\n+\n+            let state = ext_session.get_state().await;\n+            assert_eq!(state[\"steeringMode\"], \"all\");\n+            assert_eq!(state[\"followUpMode\"], \"one-at-a-time\");\n+        });\n+    }\n }"
+    }
+  ]
+}

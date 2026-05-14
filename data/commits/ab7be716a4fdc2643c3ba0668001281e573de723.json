@@ -1,0 +1,40 @@
+{
+  "message": "feat(fwc): Wire CLI to host-backed inventory, introspection, and live execution\n\nTransforms the fwc CLI from static workspace-manifest discovery to dynamic\nhost-backed operations via a new HostAdminClient that communicates with the\nfcp-host HTTP API over Unix sockets or TCP.\n\nKey additions:\n- HostAdminClient with typed get/post/put/delete JSON methods and auto-detection\n  of unix:// vs http:// vs tcp:// endpoint schemes\n- resolve_host_config() multi-strategy resolver checking --host CLI arg,\n  FWC_HOST / FCP_HOST_ENDPOINT / FCP_HOST_BIND env vars, and\n  ~/.fcp/contexts.toml context files with named contexts and default zones\n- All discovery commands (list, show, ops, schema, examples) gain parallel\n  host-backed dispatch paths that call /rpc/discover and /rpc/introspect\n  while preserving the workspace-manifest fallback when --host is omitted\n- invoke/simulate now run preflight-first against /rpc/preflight then execute\n  via /rpc/invoke, with structured history recording of latency and status\n- New Cancel command dispatches to /rpc/cancel with reason, cleanup behavior,\n  and structured cancellation request\n- New status/pin/unpin admin commands for fleet-wide lifecycle visibility and\n  semver version pinning via /rpc/rollout endpoints\n- InvokeArgs gains --zone, --principal, --idempotency-key, --deadline-ms for\n  richer execution context in multi-zone deployments\n- Unavailable commands (enable/disable/start/stop/restart/install/update/\n  config/logs/events) return structured errors with recovery guidance instead\n  of silent \"planned\" stubs\n- Comprehensive mock HTTP server test infrastructure with integration tests\n  for list/show/ops/schema/examples through actual HTTP round-trips\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "3c45c4922945d6392efe329893cb212262262276",
+      "filename": "crates/fwc/Cargo.toml",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/ab7be716a4fdc2643c3ba0668001281e573de723/crates%2Ffwc%2FCargo.toml",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/ab7be716a4fdc2643c3ba0668001281e573de723/crates%2Ffwc%2FCargo.toml",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffwc%2FCargo.toml?ref=ab7be716a4fdc2643c3ba0668001281e573de723",
+      "patch": "@@ -20,6 +20,7 @@ anyhow.workspace = true\n chrono.workspace = true\n clap = { workspace = true, features = [\"derive\", \"env\"] }\n fcp-core.workspace = true\n+fcp-host.workspace = true\n fcp-manifest.workspace = true\n handlebars.workspace = true\n jaq-core = \"2.2.1\"\n@@ -31,6 +32,7 @@ base64.workspace = true\n serde = { workspace = true, features = [\"derive\"] }\n serde_json.workspace = true\n sha2.workspace = true\n+reqwest = { workspace = true, features = [\"blocking\"] }\n tokio = { version = \"1.49\", features = [\"io-std\", \"io-util\", \"macros\", \"rt\"] }\n toml.workspace = true\n toon = { package = \"tru\", path = \"/dp/toon_rust\" }"
+    },
+    {
+      "sha": "a7f6ad2d6b92c8a307df8a720782a3406b247f36",
+      "filename": "crates/fwc/src/main.rs",
+      "status": "modified",
+      "additions": 2507,
+      "deletions": 238,
+      "changes": 2745,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/ab7be716a4fdc2643c3ba0668001281e573de723/crates%2Ffwc%2Fsrc%2Fmain.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/ab7be716a4fdc2643c3ba0668001281e573de723/crates%2Ffwc%2Fsrc%2Fmain.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffwc%2Fsrc%2Fmain.rs?ref=ab7be716a4fdc2643c3ba0668001281e573de723"
+    },
+    {
+      "sha": "10c8b2143975bc9e56a161060d2370633d7076bb",
+      "filename": "crates/fwc/src/readiness.rs",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 8,
+      "changes": 16,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/ab7be716a4fdc2643c3ba0668001281e573de723/crates%2Ffwc%2Fsrc%2Freadiness.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/ab7be716a4fdc2643c3ba0668001281e573de723/crates%2Ffwc%2Fsrc%2Freadiness.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffwc%2Fsrc%2Freadiness.rs?ref=ab7be716a4fdc2643c3ba0668001281e573de723",
+      "patch": "@@ -983,15 +983,15 @@ pub struct SelectorError {\n }\n \n impl SelectorError {\n-    fn not_found(selector: &str, suggestions: Vec<String>) -> Self {\n+    pub(crate) fn not_found(selector: &str, suggestions: Vec<String>) -> Self {\n         Self {\n             kind: SelectorErrorKind::NotFound,\n             selector: selector.to_owned(),\n             suggestions,\n         }\n     }\n \n-    fn ambiguous(selector: &str, suggestions: Vec<String>) -> Self {\n+    pub(crate) fn ambiguous(selector: &str, suggestions: Vec<String>) -> Self {\n         Self {\n             kind: SelectorErrorKind::Ambiguous,\n             selector: selector.to_owned(),\n@@ -1062,7 +1062,7 @@ fn parse_approval_mode(label: &str) -> Option<ApprovalMode> {\n     }\n }\n \n-const fn risk_level_label(level: fcp_core::RiskLevel) -> &'static str {\n+pub(crate) const fn risk_level_label(level: fcp_core::RiskLevel) -> &'static str {\n     match level {\n         fcp_core::RiskLevel::Low => \"low\",\n         fcp_core::RiskLevel::Medium => \"medium\",\n@@ -1071,7 +1071,7 @@ const fn risk_level_label(level: fcp_core::RiskLevel) -> &'static str {\n     }\n }\n \n-const fn safety_tier_label(tier: fcp_core::SafetyTier) -> &'static str {\n+pub(crate) const fn safety_tier_label(tier: fcp_core::SafetyTier) -> &'static str {\n     match tier {\n         fcp_core::SafetyTier::Safe => \"safe\",\n         fcp_core::SafetyTier::Risky => \"risky\",\n@@ -1081,7 +1081,7 @@ const fn safety_tier_label(tier: fcp_core::SafetyTier) -> &'static str {\n     }\n }\n \n-const fn idempotency_label(idempotency: fcp_core::IdempotencyClass) -> &'static str {\n+pub(crate) const fn idempotency_label(idempotency: fcp_core::IdempotencyClass) -> &'static str {\n     match idempotency {\n         fcp_core::IdempotencyClass::None => \"none\",\n         fcp_core::IdempotencyClass::BestEffort => \"best-effort\",\n@@ -1169,7 +1169,7 @@ fn pluralize_object(object: &str) -> String {\n     }\n }\n \n-fn normalize_connector_selector(selector: &str) -> String {\n+pub(crate) fn normalize_connector_selector(selector: &str) -> String {\n     selector\n         .trim()\n         .to_lowercase()\n@@ -1185,7 +1185,7 @@ fn normalize_zone_selector(selector: &str) -> String {\n     selector.trim().to_lowercase()\n }\n \n-fn normalize_operation_selector(selector: &str) -> String {\n+pub(crate) fn normalize_operation_selector(selector: &str) -> String {\n     selector.trim().to_lowercase().replace('-', \"_\")\n }\n \n@@ -1223,7 +1223,7 @@ fn suggest_operation_selectors(operations: &[DiscoveredOperation], selector: &st\n         .collect()\n }\n \n-fn selector_distance(left: &str, right: &str) -> usize {\n+pub(crate) fn selector_distance(left: &str, right: &str) -> usize {\n     let right_chars = right.chars().collect::<Vec<_>>();\n     let mut costs = (0..=right_chars.len()).collect::<Vec<_>>();\n "
+    }
+  ]
+}

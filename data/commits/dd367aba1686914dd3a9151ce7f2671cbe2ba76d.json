@@ -1,0 +1,53 @@
+{
+  "message": "fcp-{mesh,host,crypto}: unblock workspace build after recent swarm landings\n\nCross-review of pane 3's TOCTOU patch and adjacent recent commits surfaced\nfour build-side regressions that left the workspace unable to compile or\ntest fcp-host. Each is fixed in place; no behavioral changes beyond what\nthe original commit messages already promised.\n\n1. fcp-mesh/gossip.rs\n\n   Commit 81f303c8 (\"fcp-mesh: require Ed25519 peer signatures on\n   gossip summaries, revocation pushes, decode status, and symbol\n   acks\") referenced `CryptoError::VerificationFailed` in two\n   verify_signature paths. That variant does not exist in\n   fcp_crypto::CryptoError. Replace with\n   `CryptoError::MissingField(\"signature\".into())`, which matches the\n   actual condition (the signature Option is None \u2014 the verifying_key\n   never even gets called) and matches the existing\n   \"MissingField(payload)\" pattern in fcp_crypto/cose.rs. The\n   downstream `verifying_key.verify(...)` call still surfaces\n   SignatureVerificationFailed for the present-but-invalid case.\n\n2. fcp-host/Cargo.toml\n\n   fcp_host::{budget,batch,doctor,enforcement} all `use fcp_policy::ZoneId`\n   today, but fcp-host's [dependencies] table never listed fcp-policy.\n   That worked in isolation only because no full workspace build had\n   exercised fcp-host since the policy/evidence carve-out. Add\n   `fcp-policy = { path = \"../fcp-policy\" }` next to the other FCP3\n   owner crates already declared.\n\n3. fcp-host/src/enforcement.rs\n\n   Commit 53323189 changed BudgetCheck so used == limit is Allow\n   (matching BudgetTracker), but only updated `budget_deny_at_limit`\n   \u2192 `budget_allow_at_limit`. Two pipeline-level tests still encode\n   the old \"deny at exact equality\" assumption:\n   * `pipeline_evaluate_deny_at_budget`\n   * `pipeline_deny_budget_before_rate_limit`\n   Bump `budget_used` from 1000 to 1001 (and `rate_count` from 100 to\n   101 in the second test, which depends on both checks being in\n   their Deny branch to validate ordering). Comment cites the commit\n   so the next reader does not chase the same ghost.\n\n4. fcp-crypto/src/cose.rs\n\n   Commit cd16c4a3 added a TOCTOU regression test\n   (`verify_live_request_rejects_token_revoked_in_host_state`) that\n   builds tokens with `.audience(connector_id)` and `.token_id(...)`\n   on `CapabilityTokenBuilder`. Neither method existed \u2014 the\n   underlying `CwtClaims` had them but the builder never re-exported\n   them. Add thin pass-through:\n   * `audience(&str)` \u2192 `CwtClaims::audience` \u2014 needed for\n     audience-based persisted-state matching.\n   * `token_id(&[u8])` \u2192 `CwtClaims::token_id` \u2014 needed to plumb the\n     token-id bytes returned by `issue_capability_token` through to\n     the signed COSE token so revocation can match on `cti`.\n\nVerified locally with rch CARGO_TARGET_DIR=/tmp/fcp-cc1:\n* `cargo build -p fcp-mesh` \u2192 compiles\n* `cargo build -p fcp-host --lib` \u2192 compiles\n* `cargo test -p fcp-host --lib` \u2192 3161 passed, 0 failed\n* `cargo test -p fcp-host --bin fcp-host\n   tests::verify_live_request_rejects_token_revoked_in_host_state`\n   \u2192 passes (binary-skip path)\n* `cargo test -p fcp-crypto --lib` \u2192 496 passed\n* `cargo test -p fcp-raptorq --lib` \u2192 744 passed\n* `cargo clippy -p fcp-crypto --lib -- -D warnings` \u2192 clean\n\nOut of scope for this commit, recorded for follow-up:\n* 11 subprocess tests in `fcp-host` (`tests::subprocess_*`) panic\n  because `fcp-test-connector` is not built alongside the test binary\n  on this machine. The new TOCTOU regression test handles this\n  correctly via `maybe_compiled_test_connector_binary().is_none()`\n  \u2192 graceful return; the older tests should adopt the same skip\n  pattern, but that is pre-existing infrastructure work, not a\n  regression.\n* `clippy -p fcp-raptorq -- -D warnings` flags a manual-div-ceil\n  warning at decode.rs:462 left over from the recent\n  numeric-accumulator hardening commit; pane 5 owns raptorq.\n\nCo-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "ac2476151f091135a31d805b2d08a39acbe17a4f",
+      "filename": "crates/fcp-crypto/src/cose.rs",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 0,
+      "changes": 20,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/dd367aba1686914dd3a9151ce7f2671cbe2ba76d/crates%2Ffcp-crypto%2Fsrc%2Fcose.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/dd367aba1686914dd3a9151ce7f2671cbe2ba76d/crates%2Ffcp-crypto%2Fsrc%2Fcose.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-crypto%2Fsrc%2Fcose.rs?ref=dd367aba1686914dd3a9151ce7f2671cbe2ba76d",
+      "patch": "@@ -697,6 +697,26 @@ impl CapabilityTokenBuilder {\n         self\n     }\n \n+    /// Set the audience (`aud`) claim \u2014 typically the connector ID this\n+    /// token is intended for. Surfaces the underlying `CwtClaims::audience`\n+    /// builder hook so host-side persisted-state verifiers can match\n+    /// `audience` against the inbound `connector_id`.\n+    #[must_use]\n+    pub fn audience(mut self, aud: &str) -> Self {\n+        self.claims = self.claims.audience(aud);\n+        self\n+    }\n+\n+    /// Set the JWT/COSE token ID (`cti`) claim. Required when the host\n+    /// needs to revoke or audit-trace a specific issued token, so the\n+    /// caller can plumb the token-id bytes returned by the issuance API\n+    /// straight into the signed token.\n+    #[must_use]\n+    pub fn token_id(mut self, cti: &[u8]) -> Self {\n+        self.claims = self.claims.token_id(cti);\n+        self\n+    }\n+\n     /// Set validity period.\n     #[must_use]\n     pub fn validity(mut self, not_before: DateTime<Utc>, expires: DateTime<Utc>) -> Self {"
+    },
+    {
+      "sha": "d6af515ab666032d9aee15be6d5e2eff9732d88f",
+      "filename": "crates/fcp-host/Cargo.toml",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/dd367aba1686914dd3a9151ce7f2671cbe2ba76d/crates%2Ffcp-host%2FCargo.toml",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/dd367aba1686914dd3a9151ce7f2671cbe2ba76d/crates%2Ffcp-host%2FCargo.toml",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-host%2FCargo.toml?ref=dd367aba1686914dd3a9151ce7f2671cbe2ba76d",
+      "patch": "@@ -16,6 +16,7 @@ unsafe_code = \"forbid\"\n fcp-core = { path = \"../fcp-core\" }\n fcp-evidence = { path = \"../fcp-evidence\" }\n fcp-kernel = { path = \"../fcp-kernel\" }\n+fcp-policy = { path = \"../fcp-policy\" }\n fcp-async-core = { path = \"../fcp-async-core\" }\n fcp-cbor = { path = \"../fcp-cbor\" }\n fcp-crypto = { path = \"../fcp-crypto\" }"
+    },
+    {
+      "sha": "598949253a9a283164e381f855247236b6a40816",
+      "filename": "crates/fcp-host/src/enforcement.rs",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 3,
+      "changes": 12,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/dd367aba1686914dd3a9151ce7f2671cbe2ba76d/crates%2Ffcp-host%2Fsrc%2Fenforcement.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/dd367aba1686914dd3a9151ce7f2671cbe2ba76d/crates%2Ffcp-host%2Fsrc%2Fenforcement.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-host%2Fsrc%2Fenforcement.rs?ref=dd367aba1686914dd3a9151ce7f2671cbe2ba76d",
+      "patch": "@@ -2871,7 +2871,10 @@ mod tests {\n     fn pipeline_evaluate_deny_at_budget() {\n         let pipeline = EnforcementPipeline::new();\n         let mut ctx = test_context();\n-        ctx.budget_used = Some(1000);\n+        // Commit 53323189 changed BudgetCheck to Allow at exact equality\n+        // (used == limit is the closing request, matching BudgetTracker).\n+        // Use used > limit so this test keeps exercising the Deny branch.\n+        ctx.budget_used = Some(1001);\n         ctx.budget_limit = Some(1000);\n         let decision = pipeline.evaluate(&ctx);\n         assert!(!decision.is_allowed());\n@@ -2897,9 +2900,12 @@ mod tests {\n     fn pipeline_deny_budget_before_rate_limit() {\n         let pipeline = EnforcementPipeline::new();\n         let mut ctx = test_context();\n-        ctx.budget_used = Some(1000);\n+        // Both checks must be in the Deny branch to validate ordering.\n+        // Budget at exact equality is now Allow (commit 53323189), so push\n+        // both budget and rate strictly over their limits.\n+        ctx.budget_used = Some(1001);\n         ctx.budget_limit = Some(1000);\n-        ctx.rate_count = Some(100);\n+        ctx.rate_count = Some(101);\n         ctx.rate_limit = Some(100);\n         let decision = pipeline.evaluate(&ctx);\n         assert!(!decision.is_allowed());"
+    },
+    {
+      "sha": "3a3eca6ea9d964d16c2b3ec0faf2b13dda822cb5",
+      "filename": "crates/fcp-mesh/src/gossip.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/dd367aba1686914dd3a9151ce7f2671cbe2ba76d/crates%2Ffcp-mesh%2Fsrc%2Fgossip.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/dd367aba1686914dd3a9151ce7f2671cbe2ba76d/crates%2Ffcp-mesh%2Fsrc%2Fgossip.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-mesh%2Fsrc%2Fgossip.rs?ref=dd367aba1686914dd3a9151ce7f2671cbe2ba76d",
+      "patch": "@@ -691,7 +691,7 @@ impl GossipSummary {\n         let signature = self\n             .signature\n             .as_ref()\n-            .ok_or(CryptoError::VerificationFailed)?;\n+            .ok_or_else(|| CryptoError::MissingField(\"signature\".into()))?;\n         let signature = Ed25519Signature::from_bytes(&signature.signature);\n         verifying_key.verify(&self.signing_bytes(), &signature)\n     }\n@@ -951,7 +951,7 @@ impl RevocationPushMessage {\n         let signature = self\n             .signature\n             .as_ref()\n-            .ok_or(CryptoError::VerificationFailed)?;\n+            .ok_or_else(|| CryptoError::MissingField(\"signature\".into()))?;\n         let signature = Ed25519Signature::from_bytes(&signature.signature);\n         verifying_key.verify(&self.signing_bytes(), &signature)\n     }"
+    }
+  ]
+}

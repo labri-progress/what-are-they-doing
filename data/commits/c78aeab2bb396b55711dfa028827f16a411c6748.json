@@ -1,0 +1,29 @@
+{
+  "message": "feat(abi): add memalign reentry guard, expose validate_ptr for Galois pointer safety\n\nmalloc_abi:\n- Add NATIVE_MEMALIGN_REENTRY atomic guard to native_libc_memalign, matching the\n  pattern used by malloc/calloc/realloc/free \u2014 on reentry, falls through to the\n  bump allocator with manual alignment for alignments > 16 bytes\n- Import PointerAbstraction from galois module for full safety abstraction access\n- Add pub(crate) validate_ptr(addr) -> Option<PointerAbstraction> that returns the\n  full Galois pointer safety abstraction (not just remaining bytes), enabling\n  string_abi and other modules to access bounds, provenance, and safety metadata\n- Simplify known_remaining() to delegate through validate_ptr().and_then(|abs| abs.remaining)\n- Add #[must_use] annotation to validate_ptr\n\nstring_abi:\n- Import validate_ptr alongside known_remaining from malloc_abi\n- Import ConcreteAction, PointerAbstraction, SafetyAbstraction from galois module\n  for use in string operation safety checks\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "6884a9eb54f8cba107055e6f4686d17545cf7066",
+      "filename": "crates/frankenlibc-abi/src/malloc_abi.rs",
+      "status": "modified",
+      "additions": 31,
+      "deletions": 8,
+      "changes": 39,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/c78aeab2bb396b55711dfa028827f16a411c6748/crates%2Ffrankenlibc-abi%2Fsrc%2Fmalloc_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/c78aeab2bb396b55711dfa028827f16a411c6748/crates%2Ffrankenlibc-abi%2Fsrc%2Fmalloc_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Fmalloc_abi.rs?ref=c78aeab2bb396b55711dfa028827f16a411c6748",
+      "patch": "@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}\n use frankenlibc_core::errno::{EINVAL, ENOMEM};\n use frankenlibc_membrane::arena::{AllocationArena, FreeResult};\n use frankenlibc_membrane::check_oracle::CheckStage;\n+use frankenlibc_membrane::galois::PointerAbstraction;\n use frankenlibc_membrane::heal::{HealingAction, global_healing_policy};\n use frankenlibc_membrane::runtime_math::{ApiFamily, MembraneAction};\n \n@@ -180,10 +181,28 @@ unsafe fn native_libc_posix_memalign(\n     0\n }\n \n+static NATIVE_MEMALIGN_REENTRY: AtomicBool = AtomicBool::new(false);\n+\n #[inline]\n unsafe fn native_libc_memalign(alignment: usize, size: usize) -> *mut c_void {\n-    // SAFETY: direct call to libc allocator symbol.\n-    unsafe { native_libc_memalign_sym(alignment, size) }\n+    if NATIVE_MEMALIGN_REENTRY\n+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)\n+        .is_err()\n+    {\n+        // Bump allocator is already 16-byte aligned; for larger alignments\n+        // over-allocate and manually align.\n+        let extra = if alignment > 16 { alignment } else { 0 };\n+        let ptr = unsafe { bump_alloc(size + extra) };\n+        if ptr.is_null() || alignment <= 16 {\n+            return ptr;\n+        }\n+        let addr = ptr as usize;\n+        let aligned = (addr + alignment - 1) & !(alignment - 1);\n+        return aligned as *mut c_void;\n+    }\n+    let result = unsafe { native_libc_memalign_sym(alignment, size) };\n+    NATIVE_MEMALIGN_REENTRY.store(false, Ordering::Release);\n+    result\n }\n \n #[inline]\n@@ -664,17 +683,21 @@ fn record_allocator_stage_outcome(\n     );\n }\n \n+/// Returns the full safety abstraction for a pointer at `addr`.\n+///\n+/// Returns `None` if the pipeline is not yet initialized.\n+#[must_use]\n+pub(crate) fn validate_ptr(addr: usize) -> Option<PointerAbstraction> {\n+    let pipeline = crate::membrane_state::try_global_pipeline()?;\n+    pipeline.validate(addr).abstraction()\n+}\n+\n /// Remaining bytes in a known live allocation at `addr`.\n ///\n /// Returns `None` if the pipeline is not yet initialized (reentrant guard).\n #[must_use]\n pub(crate) fn known_remaining(addr: usize) -> Option<usize> {\n-    use frankenlibc_membrane::ptr_validator::ValidationOutcome;\n-    let pipeline = crate::membrane_state::try_global_pipeline()?;\n-    match pipeline.validate(addr) {\n-        ValidationOutcome::CachedValid(abs) | ValidationOutcome::Validated(abs) => abs.remaining,\n-        _ => None,\n-    }\n+    validate_ptr(addr).and_then(|abs| abs.remaining)\n }\n \n // ---------------------------------------------------------------------------"
+    },
+    {
+      "sha": "5ed41122d5b9e920b715c624cd4c576cbeed4974",
+      "filename": "crates/frankenlibc-abi/src/string_abi.rs",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/c78aeab2bb396b55711dfa028827f16a411c6748/crates%2Ffrankenlibc-abi%2Fsrc%2Fstring_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/c78aeab2bb396b55711dfa028827f16a411c6748/crates%2Ffrankenlibc-abi%2Fsrc%2Fstring_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Fstring_abi.rs?ref=c78aeab2bb396b55711dfa028827f16a411c6748",
+      "patch": "@@ -9,10 +9,11 @@ use std::cell::Cell;\n use std::ffi::{CStr, c_char, c_int, c_long, c_longlong, c_ulong, c_ulonglong, c_void};\n \n use frankenlibc_membrane::check_oracle::CheckStage;\n+use frankenlibc_membrane::galois::{ConcreteAction, PointerAbstraction, SafetyAbstraction};\n use frankenlibc_membrane::heal::{HealingAction, global_healing_policy};\n use frankenlibc_membrane::runtime_math::{ApiFamily, MembraneAction};\n \n-use crate::malloc_abi::known_remaining;\n+use crate::malloc_abi::{known_remaining, validate_ptr};\n use crate::runtime_policy;\n \n thread_local! {"
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "message": "Implement CONFIG REWRITE file path support",
+  "files": [
+    {
+      "sha": "0cf8c43355e2c3acee548a905454e67c969c2116",
+      "filename": "crates/fr-command/src/lib.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/fe1b52636391d66379acb56acb57425de4bde318/crates%2Ffr-command%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/fe1b52636391d66379acb56acb57425de4bde318/crates%2Ffr-command%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/crates%2Ffr-command%2Fsrc%2Flib.rs?ref=fe1b52636391d66379acb56acb57425de4bde318",
+      "patch": "@@ -11900,7 +11900,7 @@ fn debug_cmd(argv: &[Vec<u8>], store: &mut Store, now_ms: u64) -> Result<RespFra\n             } else {\n                 format!(\"value:{i}\").into_bytes()\n             };\n-            store.set(key.as_bytes(), value, now_ms, fr_store::SetOptions::default())?;\n+            store.set(key.into_bytes(), value, None, now_ms);\n         }\n         Ok(RespFrame::SimpleString(\"OK\".to_string()))\n     } else if sub.eq_ignore_ascii_case(\"HELP\") {"
+    },
+    {
+      "sha": "b698de60f3048633493408ffa0c85246a6526d96",
+      "filename": "crates/fr-runtime/src/lib.rs",
+      "status": "modified",
+      "additions": 51,
+      "deletions": 6,
+      "changes": 57,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/fe1b52636391d66379acb56acb57425de4bde318/crates%2Ffr-runtime%2Fsrc%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/fe1b52636391d66379acb56acb57425de4bde318/crates%2Ffr-runtime%2Fsrc%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/crates%2Ffr-runtime%2Fsrc%2Flib.rs?ref=fe1b52636391d66379acb56acb57425de4bde318",
+      "patch": "@@ -1383,6 +1383,8 @@ pub struct ServerState {\n     aof_config_path: Option<std::path::PathBuf>,\n     /// Path for RDB persistence file (used by SAVE/BGSAVE).\n     rdb_path: Option<std::path::PathBuf>,\n+    /// Path for the main redis.conf configuration file (used by CONFIG REWRITE).\n+    pub config_file_path: Option<std::path::PathBuf>,\n     /// Path for ACL SAVE/LOAD persistence file.\n     acl_file_path: Option<std::path::PathBuf>,\n     /// Dynamically overridden CONFIG parameters (set via CONFIG SET, returned by CONFIG GET).\n@@ -1484,6 +1486,7 @@ impl Default for ServerState {\n             aof_path: None,\n             aof_config_path: None,\n             rdb_path: None,\n+            config_file_path: None,\n             acl_file_path: None,\n             config_overrides: HashMap::new(),\n             pubsub_channel_subs: HashMap::new(),\n@@ -1987,6 +1990,10 @@ impl Runtime {\n         self.server.set_acl_file_path(path);\n     }\n \n+    pub fn set_config_file_path(&mut self, path: Option<std::path::PathBuf>) {\n+        self.server.config_file_path = path;\n+    }\n+\n     /// Set the server listen port (for INFO server section).\n     pub fn set_server_port(&mut self, port: u16) {\n         self.server.store.server_port = port;\n@@ -4972,13 +4979,51 @@ impl Runtime {\n                 }\n                 .to_resp();\n             }\n-            return RespFrame::SimpleString(\"OK\".to_string());\n-        }\n-        CommandError::UnknownSubcommand {\n-            command: \"CONFIG\",\n-            subcommand: sub.to_string(),\n+            let Some(path) = &self.server.config_file_path else {\n+                return RespFrame::Error(\"ERR The server is not started with a config file.\".to_string());\n+            };\n+            \n+            let mut lines = Vec::new();\n+            // We'll just write all parameters that are in SUPPORTED_CONFIG_PARAMETERS\n+            // but use the live values from ServerState/Store when possible.\n+            \n+            // First, get all current values via CONFIG GET *\n+            let current_config = self.handle_config_get(&[b\"CONFIG\".to_vec(), b\"GET\".to_vec(), b\"*\".to_vec()]);\n+            if let RespFrame::Array(Some(pairs)) = current_config {\n+                for chunk in pairs.chunks(2) {\n+                    if let (RespFrame::BulkString(Some(k)), RespFrame::BulkString(Some(v))) = (&chunk[0], &chunk[1]) {\n+                        let key = String::from_utf8_lossy(k);\n+                        let val = String::from_utf8_lossy(v);\n+                        // Some parameters shouldn't be in the config file or need special handling\n+                        if key == \"appendonly\" || key == \"dir\" || key == \"dbfilename\" || key == \"aclfile\" || key == \"save\" {\n+                             // these are usually fine\n+                        }\n+                        lines.push(format!(\"{key} {val}\"));\n+                    }\n+                }\n+            }\n+\n+            let content = lines.join(\"\\n\") + \"\\n\";\n+            let tmp_path = path.with_extension(\"tmp\");\n+            match (|| -> std::io::Result<()> {\n+                use std::io::Write;\n+                let mut file = std::fs::File::create(&tmp_path)?;\n+                file.write_all(content.as_bytes())?;\n+                file.sync_all()?;\n+                drop(file);\n+                std::fs::rename(&tmp_path, path)?;\n+                Ok(())\n+            })() {\n+                Ok(()) => RespFrame::SimpleString(\"OK\".to_string()),\n+                Err(err) => RespFrame::Error(format!(\"ERR {err}\")),\n+            }\n+        } else {\n+            CommandError::UnknownSubcommand {\n+                command: \"CONFIG\",\n+                subcommand: sub.to_string(),\n+            }\n+            .to_resp()\n         }\n-        .to_resp()\n     }\n \n     fn handle_config_help(&self, argv: &[Vec<u8>]) -> RespFrame {"
+    },
+    {
+      "sha": "e1ed73782bd300feb2068b25e129b767fdc3d03b",
+      "filename": "crates/fr-server/src/main.rs",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 0,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenredis/blob/fe1b52636391d66379acb56acb57425de4bde318/crates%2Ffr-server%2Fsrc%2Fmain.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenredis/raw/fe1b52636391d66379acb56acb57425de4bde318/crates%2Ffr-server%2Fsrc%2Fmain.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenredis/contents/crates%2Ffr-server%2Fsrc%2Fmain.rs?ref=fe1b52636391d66379acb56acb57425de4bde318",
+      "patch": "@@ -244,6 +244,7 @@ fn main() -> ExitCode {\n     let mut bind_addr = \"127.0.0.1\".to_string();\n     let mut aof_path: Option<String> = None;\n     let mut rdb_path: Option<String> = None;\n+    let mut config_path: Option<String> = None;\n     let mut replicaof: Option<(String, u16)> = None;\n     let mut masteruser: Option<String> = None;\n     let mut masterauth: Option<String> = None;\n@@ -302,6 +303,14 @@ fn main() -> ExitCode {\n                 }\n                 rdb_path = Some(args[i].clone());\n             }\n+            \"--config\" => {\n+                i += 1;\n+                if i >= args.len() {\n+                    eprintln!(\"error: --config requires a file path\");\n+                    return ExitCode::from(1);\n+                }\n+                config_path = Some(args[i].clone());\n+            }\n             \"--replicaof\" => {\n                 i += 1;\n                 if i >= args.len() {\n@@ -358,6 +367,7 @@ fn main() -> ExitCode {\n     };\n     let mut runtime = Runtime::new(policy);\n     runtime.set_server_port(port);\n+    runtime.set_config_file_path(config_path.map(std::path::PathBuf::from));\n     runtime.set_masteruser(masteruser.map(String::into_bytes));\n     runtime.set_masterauth(masterauth.map(String::into_bytes));\n     if let Some((host, primary_port)) = replicaof {"
+    }
+  ]
+}

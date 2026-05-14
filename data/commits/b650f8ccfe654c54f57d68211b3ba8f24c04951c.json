@@ -1,0 +1,29 @@
+{
+  "message": "refactor(syscall): migrate host_resolve to native syscalls\n\nMigrated 5 libc::syscall calls in host symbol resolution:\n- raw_read, raw_open, raw_close, raw_fstat, mmap\n- Added sys_fstat wrapper for file status queries\n\nbd-h5x EPIC progress: 633->628 libc::syscall calls remaining\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "52cda6c3b0b9d4a30fee3d00789045ac7bf6df63",
+      "filename": "crates/frankenlibc-abi/src/host_resolve.rs",
+      "status": "modified",
+      "additions": 23,
+      "deletions": 14,
+      "changes": 37,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/b650f8ccfe654c54f57d68211b3ba8f24c04951c/crates%2Ffrankenlibc-abi%2Fsrc%2Fhost_resolve.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/b650f8ccfe654c54f57d68211b3ba8f24c04951c/crates%2Ffrankenlibc-abi%2Fsrc%2Fhost_resolve.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Fhost_resolve.rs?ref=b650f8ccfe654c54f57d68211b3ba8f24c04951c",
+      "patch": "@@ -10,6 +10,8 @@ use std::mem::MaybeUninit;\n use std::sync::OnceLock;\n use std::sync::atomic::{AtomicUsize, Ordering};\n \n+use frankenlibc_core::syscall as raw_syscall;\n+\n static HOST_PTHREAD_CREATE: AtomicUsize = AtomicUsize::new(0);\n static HOST_PTHREAD_JOIN: AtomicUsize = AtomicUsize::new(0);\n static HOST_PTHREAD_DETACH: AtomicUsize = AtomicUsize::new(0);\n@@ -62,16 +64,21 @@ pub(crate) unsafe fn host_dlvsym_next_raw(\n }\n \n unsafe fn raw_read(fd: i32, buf: *mut u8, count: usize) -> isize {\n-    unsafe { libc::syscall(libc::SYS_read, fd, buf, count) as isize }\n+    match unsafe { raw_syscall::sys_read(fd, buf, count) } {\n+        Ok(n) => n as isize,\n+        Err(e) => -(e as isize),\n+    }\n }\n unsafe fn raw_open(path: *const u8) -> i32 {\n-    unsafe { libc::syscall(libc::SYS_openat, libc::AT_FDCWD, path, libc::O_RDONLY, 0) as i32 }\n+    unsafe { raw_syscall::sys_openat(libc::AT_FDCWD, path, libc::O_RDONLY, 0) }.unwrap_or(-1)\n }\n unsafe fn raw_close(fd: i32) {\n-    unsafe { libc::syscall(libc::SYS_close, fd) };\n+    let _ = raw_syscall::sys_close(fd);\n }\n unsafe fn raw_fstat(fd: i32, stat: *mut libc::stat) -> i32 {\n-    unsafe { libc::syscall(libc::SYS_fstat, fd, stat) as i32 }\n+    unsafe { raw_syscall::sys_fstat(fd, stat as *mut u8) }\n+        .map(|_| 0)\n+        .unwrap_or(-1)\n }\n \n #[repr(C)]\n@@ -369,22 +376,24 @@ fn load_glibc_image() -> Option<&'static LoadedGlibcImage> {\n     }\n     let len = stat.st_size as usize;\n     // SAFETY: read-only private file mapping for ELF parsing.\n-    // Use raw SYS_mmap syscall to avoid going through our interposed mmap.\n-    let mapped = unsafe {\n-        libc::syscall(\n-            libc::SYS_mmap,\n-            std::ptr::null::<c_void>(),\n+    // Use raw syscall to avoid going through our interposed mmap.\n+    let mapped = match unsafe {\n+        raw_syscall::sys_mmap(\n+            std::ptr::null_mut(),\n             len,\n             libc::PROT_READ,\n             libc::MAP_PRIVATE,\n             fd,\n-            0i64,\n-        ) as *mut c_void\n+            0,\n+        )\n+    } {\n+        Ok(ptr) => ptr as *mut c_void,\n+        Err(_) => {\n+            unsafe { raw_close(fd) };\n+            return None;\n+        }\n     };\n     unsafe { raw_close(fd) };\n-    if std::ptr::eq(mapped, libc::MAP_FAILED) || (mapped as isize) < 0 {\n-        return None;\n-    }\n     let image = LoadedGlibcImage {\n         base,\n         mapped: mapped as usize,"
+    },
+    {
+      "sha": "b4ae50ead1d36d023d35f7a4ab553d5401b1288a",
+      "filename": "crates/frankenlibc-core/src/syscall/mod.rs",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 0,
+      "changes": 13,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/b650f8ccfe654c54f57d68211b3ba8f24c04951c/crates%2Ffrankenlibc-core%2Fsrc%2Fsyscall%2Fmod.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/b650f8ccfe654c54f57d68211b3ba8f24c04951c/crates%2Ffrankenlibc-core%2Fsrc%2Fsyscall%2Fmod.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-core%2Fsrc%2Fsyscall%2Fmod.rs?ref=b650f8ccfe654c54f57d68211b3ba8f24c04951c",
+      "patch": "@@ -352,6 +352,19 @@ pub fn sys_close(fd: i32) -> Result<(), i32> {\n     syscall_result(ret).map(|_| ())\n }\n \n+/// `fstat(fd, statbuf)` \u2014 get file status by file descriptor.\n+///\n+/// # Safety\n+///\n+/// `statbuf` must be a valid pointer to a `stat` structure.\n+#[inline]\n+#[allow(unsafe_code)]\n+pub unsafe fn sys_fstat(fd: i32, statbuf: *mut u8) -> Result<(), i32> {\n+    // SAFETY: caller guarantees statbuf validity.\n+    let ret = unsafe { raw::syscall2(SYS_FSTAT, fd as usize, statbuf as usize) };\n+    syscall_result(ret).map(|_| ())\n+}\n+\n /// `mmap(addr, length, prot, flags, fd, offset)` \u2014 map memory.\n ///\n /// # Safety"
+    }
+  ]
+}

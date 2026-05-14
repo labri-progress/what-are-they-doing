@@ -1,0 +1,41 @@
+{
+  "message": "fix(outbound): prevent replay after ack crash windows (#38668, thanks @Gundam98)\n\nCo-authored-by: Gundam98 <huhanwen98@gmail.com>",
+  "files": [
+    {
+      "sha": "7bfe19d53bd39424dbbbe3d6ec71b84f8ce39c69",
+      "filename": "CHANGELOG.md",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/708187f28c3babfcc80a2fb598668207716535bb/CHANGELOG.md",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/708187f28c3babfcc80a2fb598668207716535bb/CHANGELOG.md",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/CHANGELOG.md?ref=708187f28c3babfcc80a2fb598668207716535bb",
+      "patch": "@@ -298,6 +298,7 @@ Docs: https://docs.openclaw.ai\n - Gateway/password auth startup diagnostics: detect unresolved provider-reference objects in `gateway.auth.password` and fail with a specific bootstrap-secrets error message instead of generic misconfiguration output. (#39230) Thanks @ademczuk.\n - Agents/OpenAI-responses compatibility: strip unsupported `store` payload fields when `supportsStore=false` (including OpenAI-compatible non-OpenAI providers) while preserving server-compaction payload behavior. (#39219) Thanks @ademczuk.\n - Agents/model fallback visibility: warn when configured model IDs cannot be resolved and fallback is applied, with log-safe sanitization of model text to prevent control-sequence injection in warning output. (#39215) Thanks @ademczuk.\n+- Outbound delivery replay safety: use two-phase delivery ACK markers (`.json` -> `.delivered` -> unlink) and startup marker cleanup so crash windows between send and cleanup do not replay already-delivered messages. (#38668) Thanks @Gundam98.\n \n ## 2026.3.2\n "
+    },
+    {
+      "sha": "8a79cc732d5e123c8fb58ea50e16bf3e8ee2b888",
+      "filename": "src/infra/outbound/delivery-queue.ts",
+      "status": "modified",
+      "additions": 43,
+      "deletions": 6,
+      "changes": 49,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/708187f28c3babfcc80a2fb598668207716535bb/src%2Finfra%2Foutbound%2Fdelivery-queue.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/708187f28c3babfcc80a2fb598668207716535bb/src%2Finfra%2Foutbound%2Fdelivery-queue.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Foutbound%2Fdelivery-queue.ts?ref=708187f28c3babfcc80a2fb598668207716535bb",
+      "patch": "@@ -107,20 +107,44 @@ export async function enqueueDelivery(\n   return id;\n }\n \n-/** Remove a successfully delivered entry from the queue. */\n+/** Remove a successfully delivered entry from the queue.\n+ *\n+ * Uses a two-phase approach so that a crash between delivery and cleanup\n+ * does not cause the message to be replayed on the next recovery scan:\n+ *   Phase 1: atomic rename  {id}.json \u2192 {id}.delivered\n+ *   Phase 2: unlink the .delivered marker\n+ * If the process dies between phase 1 and phase 2 the marker is cleaned up\n+ * by {@link loadPendingDeliveries} on the next startup without re-sending.\n+ */\n export async function ackDelivery(id: string, stateDir?: string): Promise<void> {\n-  const filePath = path.join(resolveQueueDir(stateDir), `${id}.json`);\n+  const queueDir = resolveQueueDir(stateDir);\n+  const jsonPath = path.join(queueDir, `${id}.json`);\n+  const deliveredPath = path.join(queueDir, `${id}.delivered`);\n   try {\n-    await fs.promises.unlink(filePath);\n+    // Phase 1: atomic rename marks the delivery as complete.\n+    await fs.promises.rename(jsonPath, deliveredPath);\n   } catch (err) {\n     const code =\n       err && typeof err === \"object\" && \"code\" in err\n         ? String((err as { code?: unknown }).code)\n         : null;\n-    if (code !== \"ENOENT\") {\n-      throw err;\n+    if (code === \"ENOENT\") {\n+      // .json already gone \u2014 may have been renamed by a previous ack attempt.\n+      // Try to clean up a leftover .delivered marker if present.\n+      try {\n+        await fs.promises.unlink(deliveredPath);\n+      } catch {\n+        // marker already gone \u2014 no-op.\n+      }\n+      return;\n     }\n-    // Already removed \u2014 no-op.\n+    throw err;\n+  }\n+  // Phase 2: remove the marker file.\n+  try {\n+    await fs.promises.unlink(deliveredPath);\n+  } catch {\n+    // Best-effort; loadPendingDeliveries will clean it up on next startup.\n   }\n }\n \n@@ -156,6 +180,19 @@ export async function loadPendingDeliveries(stateDir?: string): Promise<QueuedDe\n     }\n     throw err;\n   }\n+  // Clean up .delivered markers left by ackDelivery if the process crashed\n+  // between the rename and the unlink.\n+  for (const file of files) {\n+    if (!file.endsWith(\".delivered\")) {\n+      continue;\n+    }\n+    try {\n+      await fs.promises.unlink(path.join(queueDir, file));\n+    } catch {\n+      // Best-effort cleanup.\n+    }\n+  }\n+\n   const entries: QueuedDelivery[] = [];\n   for (const file of files) {\n     if (!file.endsWith(\".json\")) {"
+    },
+    {
+      "sha": "c6a32522a9291a3e82a698ae80a595b9dd8fe10e",
+      "filename": "src/infra/outbound/outbound.test.ts",
+      "status": "modified",
+      "additions": 33,
+      "deletions": 0,
+      "changes": 33,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/708187f28c3babfcc80a2fb598668207716535bb/src%2Finfra%2Foutbound%2Foutbound.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/708187f28c3babfcc80a2fb598668207716535bb/src%2Finfra%2Foutbound%2Foutbound.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/src%2Finfra%2Foutbound%2Foutbound.test.ts?ref=708187f28c3babfcc80a2fb598668207716535bb",
+      "patch": "@@ -113,6 +113,39 @@ describe(\"delivery-queue\", () => {\n     it(\"ack is idempotent (no error on missing file)\", async () => {\n       await expect(ackDelivery(\"nonexistent-id\", tmpDir)).resolves.toBeUndefined();\n     });\n+\n+    it(\"ack removes .delivered marker so recovery does not replay\", async () => {\n+      const id = await enqueueDelivery(\n+        { channel: \"whatsapp\", to: \"+1\", payloads: [{ text: \"ack-test\" }] },\n+        tmpDir,\n+      );\n+      const queueDir = path.join(tmpDir, \"delivery-queue\");\n+\n+      await ackDelivery(id, tmpDir);\n+\n+      // Neither .json nor .delivered should remain.\n+      expect(fs.existsSync(path.join(queueDir, `${id}.json`))).toBe(false);\n+      expect(fs.existsSync(path.join(queueDir, `${id}.delivered`))).toBe(false);\n+    });\n+\n+    it(\"loadPendingDeliveries cleans up stale .delivered markers without replaying\", async () => {\n+      const id = await enqueueDelivery(\n+        { channel: \"telegram\", to: \"99\", payloads: [{ text: \"stale\" }] },\n+        tmpDir,\n+      );\n+      const queueDir = path.join(tmpDir, \"delivery-queue\");\n+\n+      // Simulate crash between ack phase 1 (rename) and phase 2 (unlink):\n+      // rename .json \u2192 .delivered, then pretend the process died.\n+      fs.renameSync(path.join(queueDir, `${id}.json`), path.join(queueDir, `${id}.delivered`));\n+\n+      const entries = await loadPendingDeliveries(tmpDir);\n+\n+      // The .delivered entry must NOT appear as pending.\n+      expect(entries).toHaveLength(0);\n+      // And the marker file should have been cleaned up.\n+      expect(fs.existsSync(path.join(queueDir, `${id}.delivered`))).toBe(false);\n+    });\n   });\n \n   describe(\"failDelivery\", () => {"
+    }
+  ]
+}

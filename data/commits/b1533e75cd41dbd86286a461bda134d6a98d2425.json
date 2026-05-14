@@ -1,0 +1,53 @@
+{
+  "message": "fix(search,analytics): harden hit dedup hashing, add SQL injection guards, and warn on missing Tantivy index\n\nThree categories of improvements across the search and analytics subsystems:\n\n1. SQL injection prevention in analytics queries (src/analytics/query.rs):\n   - `table_exists()` and `table_has_column()` both interpolate caller-supplied\n     names directly into PRAGMA statements via format!(), which is a classic\n     injection vector. Added alphanumeric+underscore validation on the table\n     and column name parameters, returning false early for any input containing\n     unexpected characters. While these functions are only called with internal\n     constants today, the guard makes the API safe for future callers.\n   - Added a clarifying comment on the mm_coverage_pct calculation to explain\n     why dividing message_metrics.row_count by total_messages is correct (PK\n     on message_id guarantees unique coverage count).\n\n2. Stable hit hash collision fix (src/search/query.rs):\n   - The previous `stable_hit_hash()` had a subtle bug: when content was\n     non-empty, it returned `stable_content_hash(content)` immediately via\n     an early return, discarding the source_path, line_number, and created_at\n     components entirely. This meant two different search hits with identical\n     content but different file paths or line numbers would hash to the same\n     value, causing cross-file deduplication collisions.\n   - Restructured the function so the content hash (when present) is used as\n     the initial seed instead of FNV_OFFSET, and then ALL subsequent fields\n     are always folded in. A separator byte \"|\" is also prepended before\n     source_path to prevent field-boundary ambiguity (e.g., content \"abc\"\n     + path \"def\" vs content \"abcdef\" + path \"\").\n\n3. Missing Tantivy index warnings (src/search/query.rs, src/lib.rs):\n   - Added `has_tantivy()` accessor on SearchClient so callers can check\n     whether the full-text index is available without reaching into internals.\n   - In `SearchClient::open_with_options()`, added a tracing::warn when\n     Tantivy is unavailable but SQLite exists \u2014 this situation means the\n     client will silently fall back to SQL-only search, which is dramatically\n     slower and returns worse results. The warning tells operators exactly\n     how to fix it (`cass index --full`).\n   - In `run_cli_search()` (lib.rs), added an eprintln warning for the same\n     condition so interactive CLI users see the degradation immediately rather\n     than wondering why results are poor.\n\n4. Test update (src/search/tantivy.rs):\n   - Bumped the expected index directory version from v6 to v7 in the\n     `index_dir_creates_versioned_path` test to match the current schema.\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "b84b45668fd783f221469c9ab8c37abd3bf600bc",
+      "filename": "src/analytics/query.rs",
+      "status": "modified",
+      "additions": 12,
+      "deletions": 0,
+      "changes": 12,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/b1533e75cd41dbd86286a461bda134d6a98d2425/src%2Fanalytics%2Fquery.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/b1533e75cd41dbd86286a461bda134d6a98d2425/src%2Fanalytics%2Fquery.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/src%2Fanalytics%2Fquery.rs?ref=b1533e75cd41dbd86286a461bda134d6a98d2425",
+      "patch": "@@ -18,6 +18,10 @@ use super::types::*;\n \n /// Check whether a table exists in the database.\n pub fn table_exists(conn: &Connection, name: &str) -> bool {\n+    // Basic validation to prevent SQL injection in table name.\n+    if !name.chars().all(|c| c.is_alphanumeric() || c == '_') {\n+        return false;\n+    }\n     let rows =\n         match conn.query_map_collect(&format!(\"PRAGMA table_info({})\", name), &[], |row: &Row| {\n             row.get_typed::<String>(1)\n@@ -29,6 +33,12 @@ pub fn table_exists(conn: &Connection, name: &str) -> bool {\n }\n \n fn table_has_column(conn: &Connection, table: &str, column: &str) -> bool {\n+    // Basic validation to prevent SQL injection.\n+    if !table.chars().all(|c| c.is_alphanumeric() || c == '_')\n+        || !column.chars().all(|c| c.is_alphanumeric() || c == '_')\n+    {\n+        return false;\n+    }\n     let rows =\n         match conn.query_map_collect(&format!(\"PRAGMA table_info({table})\"), &[], |row: &Row| {\n             row.get_typed::<String>(1)\n@@ -231,6 +241,8 @@ pub fn query_status(conn: &Connection, _filter: &AnalyticsFilter) -> AnalyticsRe\n     };\n \n     let mm_coverage_pct = if total_messages > 0 {\n+        // total_messages is from messages table, mm.row_count is from message_metrics.\n+        // message_metrics has message_id as PK, so row_count == unique messages covered.\n         (mm.row_count as f64 / total_messages as f64) * 100.0\n     } else {\n         0.0"
+    },
+    {
+      "sha": "9f5f6662b2bc3c3b2668c6c3efd54e19318158e6",
+      "filename": "src/lib.rs",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 0,
+      "changes": 9,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/b1533e75cd41dbd86286a461bda134d6a98d2425/src%2Flib.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/b1533e75cd41dbd86286a461bda134d6a98d2425/src%2Flib.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/src%2Flib.rs?ref=b1533e75cd41dbd86286a461bda134d6a98d2425",
+      "patch": "@@ -6013,6 +6013,15 @@ fn run_cli_search(\n         retryable: true,\n     })?;\n \n+    if !client.has_tantivy() {\n+        eprintln!(\n+            \"Warning: Tantivy search index not found at {}. \\\n+             Results will be severely limited. \\\n+             Run `cass index --full` to rebuild the index.\",\n+            index_path.display()\n+        );\n+    }\n+\n     // Determine effective search mode (default to Lexical)\n     let effective_mode = mode.unwrap_or(SearchMode::Lexical);\n     let approximate = if semantic_opts.approximate && matches!(effective_mode, SearchMode::Lexical)"
+    },
+    {
+      "sha": "9197d61a1a828db1532093b9bb9ae9b8d82d2986",
+      "filename": "src/search/query.rs",
+      "status": "modified",
+      "additions": 21,
+      "deletions": 4,
+      "changes": 25,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/b1533e75cd41dbd86286a461bda134d6a98d2425/src%2Fsearch%2Fquery.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/b1533e75cd41dbd86286a461bda134d6a98d2425/src%2Fsearch%2Fquery.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/src%2Fsearch%2Fquery.rs?ref=b1533e75cd41dbd86286a461bda134d6a98d2425",
+      "patch": "@@ -1134,11 +1134,14 @@ fn stable_hit_hash(\n     line_number: Option<usize>,\n     created_at: Option<i64>,\n ) -> u64 {\n-    if !content.is_empty() {\n-        return stable_content_hash(content);\n-    }\n     const FNV_OFFSET: u64 = 14695981039346656037;\n-    let mut hash = FNV_OFFSET;\n+    let mut hash = if !content.is_empty() {\n+        stable_content_hash(content)\n+    } else {\n+        FNV_OFFSET\n+    };\n+\n+    hash = hash_bytes(hash, b\"|\");\n     hash = hash_bytes(hash, source_path.as_bytes());\n     hash = hash_bytes(hash, b\"|\");\n     if let Some(line) = line_number {\n@@ -2272,6 +2275,15 @@ impl SearchClient {\n \n         let sqlite_path = db_path.map(Path::to_path_buf).filter(|path| path.exists());\n \n+        if tantivy.is_none() && sqlite_path.is_some() {\n+            tracing::warn!(\n+                index_path = %index_path.display(),\n+                \"Tantivy search index not found or incompatible. \\\n+                 Search results will be degraded. \\\n+                 Run `cass index --full` to rebuild the index.\"\n+            );\n+        }\n+\n         if tantivy.is_none() && sqlite_path.is_none() {\n             return Ok(None);\n         }\n@@ -4894,6 +4906,11 @@ impl SearchClient {\n             .unwrap_or(0)\n     }\n \n+    /// Returns `true` if the Tantivy search index is available.\n+    pub fn has_tantivy(&self) -> bool {\n+        self.reader.is_some()\n+    }\n+\n     fn maybe_reload_reader(&self, reader: &IndexReader) -> Result<()> {\n         if !self.reload_on_search {\n             return Ok(());"
+    },
+    {
+      "sha": "a5c0df8593a45e57a025f103fe780b5ef246f6d5",
+      "filename": "src/search/tantivy.rs",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/blob/b1533e75cd41dbd86286a461bda134d6a98d2425/src%2Fsearch%2Ftantivy.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/coding_agent_session_search/raw/b1533e75cd41dbd86286a461bda134d6a98d2425/src%2Fsearch%2Ftantivy.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/contents/src%2Fsearch%2Ftantivy.rs?ref=b1533e75cd41dbd86286a461bda134d6a98d2425",
+      "patch": "@@ -222,7 +222,7 @@ mod tests {\n     fn index_dir_creates_versioned_path() {\n         let dir = TempDir::new().expect(\"temp dir\");\n         let result = index_dir(dir.path()).expect(\"index dir\");\n-        assert!(result.ends_with(\"index/v6\"));\n+        assert!(result.ends_with(\"index/v7\"));\n     }\n \n     #[test]"
+    }
+  ]
+}

@@ -1,0 +1,65 @@
+{
+  "message": "eval tooling: launch metadata, auto-interrogation, doc fixes\n\n- run_full_baseline.sh saves launch metadata to .serf-launches/ so\n  post_run.sh auto-populates model/SHA/branch without manual flags\n- interrogate_failures.sh: auto-interrogates every failure in a run,\n  including all subagent sessions (not just coordinator)\n- task-sets.md: run historically hard tasks in full baselines too\n- .gitignore: exclude .serf-launches/ (local state)\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "a89d0da6a84fc9b3b3ab40e0d963098090daa9fc",
+      "filename": ".gitignore",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/63280c7d2bc1890b0659290cf3973699ce19f7e1/.gitignore",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/63280c7d2bc1890b0659290cf3973699ce19f7e1/.gitignore",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/.gitignore?ref=63280c7d2bc1890b0659290cf3973699ce19f7e1",
+      "patch": "@@ -12,3 +12,4 @@\n /sessions/\n inspo/\n tools/__pycache__/\n+.serf-launches/"
+    },
+    {
+      "sha": "55e49f3beee56d7488bed795eb229c6505213fad",
+      "filename": "docs/experiments/task-sets.md",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/63280c7d2bc1890b0659290cf3973699ce19f7e1/docs%2Fexperiments%2Ftask-sets.md",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/63280c7d2bc1890b0659290cf3973699ce19f7e1/docs%2Fexperiments%2Ftask-sets.md",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/docs%2Fexperiments%2Ftask-sets.md?ref=63280c7d2bc1890b0659290cf3973699ce19f7e1",
+      "patch": "@@ -25,10 +25,10 @@ implementer must read the BGE model README to discover a required Chinese query\n prefix for retrieval. Without prefix: 5th result = HumanEval (wrong). With prefix:\n 5th result = MTEB (correct).\n \n-## Known too-hard tasks\n+## Historically hard tasks\n \n These 16 tasks have >75% failure rate across all 27 agent/model submissions on the\n-public leaderboard. Skip them \u2014 they waste compute without providing signal.\n+public leaderboard. Still run them in full baselines \u2014 any pass is signal.\n \n - dna-assembly\n - make-doom-for-mips"
+    },
+    {
+      "sha": "3045d17bd50b4cdec082b15c10ab61802a523ca1",
+      "filename": "tools/interrogate_failures.sh",
+      "status": "added",
+      "additions": 143,
+      "deletions": 0,
+      "changes": 143,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/63280c7d2bc1890b0659290cf3973699ce19f7e1/tools%2Finterrogate_failures.sh",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/63280c7d2bc1890b0659290cf3973699ce19f7e1/tools%2Finterrogate_failures.sh",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/tools%2Finterrogate_failures.sh?ref=63280c7d2bc1890b0659290cf3973699ce19f7e1",
+      "patch": "@@ -0,0 +1,143 @@\n+#!/usr/bin/env bash\n+# Auto-interrogate all failures in a completed eval run.\n+#\n+# Usage:\n+#   ./tools/interrogate_failures.sh RUN_ID [--question \"custom question\"]\n+#\n+# For each failing rep, runs interrogate_session.py with standard questions\n+# against the coordinator. Outputs a summary of all interrogation results.\n+#\n+# Prerequisites:\n+#   - .env with OPENAI_API_KEY\n+#   - Results already collected (run post_run.sh first)\n+#   - serf binary built (uses local serf for resume)\n+set -euo pipefail\n+\n+REPO_ROOT=\"$(cd \"$(dirname \"$0\")/..\" && pwd)\"\n+cd \"$REPO_ROOT\"\n+\n+RUN_ID=\"${1:?Usage: interrogate_failures.sh RUN_ID [--question \\\"...\\\"]}\"\n+shift\n+\n+CUSTOM_Q=\"\"\n+while [[ $# -gt 0 ]]; do\n+    case \"$1\" in\n+        --question) CUSTOM_Q=\"$2\"; shift 2 ;;\n+        --help|-h)  head -13 \"$0\" | grep '^#' | sed 's/^# \\?//'; exit 0 ;;\n+        *)          echo \"Unknown option: $1\" >&2; exit 1 ;;\n+    esac\n+done\n+\n+# Load env\n+if [[ -f .env ]]; then\n+    set -a; source .env; set +a\n+fi\n+\n+# Build serf for local resume (macOS)\n+echo \"Building serf for interrogation...\"\n+go build -o /tmp/serf-interrogate ./cmd/serf/ 2>&1 | tail -2\n+\n+CACHE_DIR=\"$HOME/.serf-evals/tasks\"\n+OUTPUT_DIR=\"/tmp/interrogation-${RUN_ID}\"\n+mkdir -p \"$OUTPUT_DIR\"\n+\n+echo \"=== Scanning for failures in $RUN_ID ===\"\n+\n+# Find all failing reps from the run metadata\n+RUN_META=\"$REPO_ROOT/docs/experiments/runs/${RUN_ID}.json\"\n+if [[ ! -f \"$RUN_META\" ]]; then\n+    echo \"Error: no run metadata at $RUN_META. Run post_run.sh first.\" >&2\n+    exit 1\n+fi\n+\n+FAILURES=$(python3 -c \"\n+import json\n+with open('$RUN_META') as f:\n+    meta = json.load(f)\n+for task, info in sorted(meta.get('tasks', {}).items()):\n+    reps = info.get('reps', {})\n+    for rep_num, reward in sorted(reps.items()):\n+        if reward == 0:\n+            print(f'{task}\\t{rep_num}')\n+\")\n+\n+if [[ -z \"$FAILURES\" ]]; then\n+    echo \"No failures found in $RUN_ID.\"\n+    exit 0\n+fi\n+\n+FAIL_COUNT=$(echo \"$FAILURES\" | wc -l | tr -d ' ')\n+echo \"  $FAIL_COUNT failing reps to interrogate\"\n+echo \"\"\n+\n+# Standard questions per agent type\n+COORD_Q1=\"What was your plan? Walk me through your decision process step by step.\"\n+COORD_Q2=\"Your prompt says you must spawn an implementer. Did you? If not, why not?\"\n+COORD_Q3=\"What specific changes to your instructions would have made you produce the correct output?\"\n+\n+SUB_Q1=\"Walk me through your approach. What did you try and why?\"\n+SUB_Q2=\"Did you verify your answer was correct? How?\"\n+SUB_Q3=\"What specific changes to your instructions would have made you produce the correct output?\"\n+\n+# Interrogate each failure \u2014 coordinator AND subagents\n+while IFS=$'\\t' read -r task rep; do\n+    echo \"=== $task rep $rep ===\"\n+\n+    # List all sessions for this rep\n+    SESSIONS_OUTPUT=$(python3 tools/interrogate_session.py \\\n+        --run \"$RUN_ID\" --rep \"$rep\" --task \"$task\" --list-sessions 2>&1) || true\n+    echo \"$SESSIONS_OUTPUT\"\n+    echo \"\"\n+\n+    # Interrogate coordinator (session 1, the default)\n+    echo \"--- coordinator ---\"\n+    OUTFILE=\"$OUTPUT_DIR/${task}_rep${rep}_coordinator.txt\"\n+\n+    QUESTIONS=(\"$COORD_Q1\" \"$COORD_Q2\" \"$COORD_Q3\")\n+    if [[ -n \"$CUSTOM_Q\" ]]; then\n+        QUESTIONS+=(\"$CUSTOM_Q\")\n+    fi\n+\n+    Q_ARGS=()\n+    for q in \"${QUESTIONS[@]}\"; do\n+        Q_ARGS+=(--question \"$q\")\n+    done\n+\n+    python3 tools/interrogate_session.py \\\n+        --run \"$RUN_ID\" --rep \"$rep\" --task \"$task\" \\\n+        \"${Q_ARGS[@]}\" \\\n+        2>&1 | tee \"$OUTFILE\" | tail -5\n+    echo \"\"\n+\n+    # Interrogate each subagent (sessions 2+)\n+    SESSION_COUNT=$(echo \"$SESSIONS_OUTPUT\" | grep -c \"^\\s*[0-9]\" || true)\n+    if [[ \"$SESSION_COUNT\" -gt 1 ]]; then\n+        for idx in $(seq 2 \"$SESSION_COUNT\"); do\n+            ROLE=$(echo \"$SESSIONS_OUTPUT\" | awk \"NR==$((idx+1)){print}\" | grep -o 'role=[^ ]*' || echo \"subagent\")\n+            echo \"--- session $idx ($ROLE) ---\"\n+            OUTFILE=\"$OUTPUT_DIR/${task}_rep${rep}_session${idx}.txt\"\n+\n+            Q_ARGS=()\n+            for q in \"$SUB_Q1\" \"$SUB_Q2\" \"$SUB_Q3\"; do\n+                Q_ARGS+=(--question \"$q\")\n+            done\n+            if [[ -n \"$CUSTOM_Q\" ]]; then\n+                Q_ARGS+=(--question \"$CUSTOM_Q\")\n+            fi\n+\n+            python3 tools/interrogate_session.py \\\n+                --run \"$RUN_ID\" --rep \"$rep\" --task \"$task\" \\\n+                --session \"$idx\" \\\n+                \"${Q_ARGS[@]}\" \\\n+                2>&1 | tee \"$OUTFILE\" | tail -5\n+            echo \"\"\n+        done\n+    fi\n+\n+    echo \"\"\n+done <<< \"$FAILURES\"\n+\n+echo \"=== Interrogation complete ===\"\n+echo \"Full outputs saved to: $OUTPUT_DIR/\"\n+echo \"  Coordinator files: *_coordinator.txt\"\n+echo \"  Subagent files:    *_session*.txt\""
+    },
+    {
+      "sha": "69ab71a0d410969e0ef3931e001d5e6b3c81e72d",
+      "filename": "tools/post_run.sh",
+      "status": "modified",
+      "additions": 18,
+      "deletions": 7,
+      "changes": 25,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/63280c7d2bc1890b0659290cf3973699ce19f7e1/tools%2Fpost_run.sh",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/63280c7d2bc1890b0659290cf3973699ce19f7e1/tools%2Fpost_run.sh",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/tools%2Fpost_run.sh?ref=63280c7d2bc1890b0659290cf3973699ce19f7e1",
+      "patch": "@@ -68,15 +68,26 @@ for task in sorted(sb['tasks']):\n     print(f'{task}\\t{score}')\n \" 2>/dev/null || echo \"\")\n \n-# --- Detect git SHA ---\n+# --- Read launch metadata (saved by run_full_baseline.sh) ---\n+LAUNCH_META=\"$REPO_ROOT/.serf-launches/${RUN_ID}.json\"\n GIT_SHA=$(git rev-parse --short HEAD)\n \n-# Try to find the SHA from the run metadata if it exists\n-RUN_META=\"docs/experiments/runs/${RUN_ID}.json\"\n-if [[ -f \"$RUN_META\" ]]; then\n-    META_SHA=$(python3 -c \"import json; print(json.load(open('$RUN_META')).get('git_sha', ''))\" 2>/dev/null || echo \"\")\n-    if [[ -n \"$META_SHA\" ]]; then\n-        GIT_SHA=\"$META_SHA\"\n+if [[ -f \"$LAUNCH_META\" ]]; then\n+    echo \"  Found launch metadata: $LAUNCH_META\"\n+    META_SHA=$(python3 -c \"import json; print(json.load(open('$LAUNCH_META')).get('git_sha', ''))\" 2>/dev/null || echo \"\")\n+    META_MODEL=$(python3 -c \"import json; print(json.load(open('$LAUNCH_META')).get('model', ''))\" 2>/dev/null || echo \"\")\n+    META_BRANCH=$(python3 -c \"import json; print(json.load(open('$LAUNCH_META')).get('branch', ''))\" 2>/dev/null || echo \"\")\n+    if [[ -n \"$META_SHA\" ]]; then GIT_SHA=\"$META_SHA\"; fi\n+    if [[ -n \"$META_MODEL\" ]]; then MODEL=\"$META_MODEL\"; fi\n+    if [[ -n \"$META_BRANCH\" ]]; then\n+        echo \"  Branch: $META_BRANCH  SHA: $GIT_SHA  Model: $MODEL\"\n+    fi\n+else\n+    # Fall back to existing run metadata\n+    RUN_META=\"docs/experiments/runs/${RUN_ID}.json\"\n+    if [[ -f \"$RUN_META\" ]]; then\n+        META_SHA=$(python3 -c \"import json; print(json.load(open('$RUN_META')).get('git_sha', ''))\" 2>/dev/null || echo \"\")\n+        if [[ -n \"$META_SHA\" ]]; then GIT_SHA=\"$META_SHA\"; fi\n     fi\n fi\n "
+    },
+    {
+      "sha": "ed92472f7e74d8f289a1d05f8c92237d4ede9cc3",
+      "filename": "tools/run_full_baseline.sh",
+      "status": "modified",
+      "additions": 21,
+      "deletions": 0,
+      "changes": 21,
+      "blob_url": "https://github.com/prime-radiant-inc/serf/blob/63280c7d2bc1890b0659290cf3973699ce19f7e1/tools%2Frun_full_baseline.sh",
+      "raw_url": "https://github.com/prime-radiant-inc/serf/raw/63280c7d2bc1890b0659290cf3973699ce19f7e1/tools%2Frun_full_baseline.sh",
+      "contents_url": "https://api.github.com/repos/prime-radiant-inc/serf/contents/tools%2Frun_full_baseline.sh?ref=63280c7d2bc1890b0659290cf3973699ce19f7e1",
+      "patch": "@@ -100,6 +100,27 @@ if $DRY_RUN; then\n     exit 0\n fi\n \n+# --- Save launch metadata (post_run.sh reads this) ---\n+LAUNCH_META=\"$REPO_ROOT/.serf-launches/${RUN_ID}.json\"\n+mkdir -p \"$REPO_ROOT/.serf-launches\"\n+python3 -c \"\n+import json, datetime\n+meta = {\n+    'run_id': '$RUN_ID',\n+    'git_sha': '$GIT_SHA',\n+    'branch': '$BRANCH',\n+    'model': '$MODEL',\n+    'reps': $REPS,\n+    'instance_type': '$INSTANCE_TYPE',\n+    'concurrency': $CONCURRENCY,\n+    'task_count': $TASK_COUNT,\n+    'launched_at': datetime.datetime.utcnow().isoformat() + 'Z',\n+}\n+with open('$LAUNCH_META', 'w') as f:\n+    json.dump(meta, f, indent=2)\n+\"\n+echo \"  Launch metadata saved to $LAUNCH_META\"\n+\n # --- Launch ---\n echo \"\"\n cd \"$HARBOR_DIR\""
+    }
+  ]
+}

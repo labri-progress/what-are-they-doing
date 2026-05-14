@@ -1,0 +1,41 @@
+{
+  "message": "fix(time): prevent spurious timeout expiry from wall-clock fallback in manual-time contexts\n\nTimeoutFuture and the service timeout layer now only register wakers\nwith the underlying Sleep future when the sleep has a custom time getter\nor an ambient timer driver is available in the current Cx. Previously,\nafter a poll_with_time check determined the timeout had not yet elapsed,\nthe code unconditionally polled the Sleep to register a waker. Since\nSleep without a custom time getter falls back to wall_now(), this could\ncause the Sleep to fire based on real wall-clock time rather than the\nvirtual/manual time source used by poll_with_time, leading to spurious\ntimeout expiry in test suites that advance time manually.\n\nSleep gains a has_custom_time_getter() const method to allow callers to\ncheck whether the sleep uses an injected time source.\n\nTwo timeout_future tests updated to use with_time_getter and explicit\nset_current_time(0) initialization to ensure they operate in the\nvirtual-time domain and are not affected by the wall-clock state left\nby other tests.\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "beacb123357ecf2c64fb4893e709ef539155273d",
+      "filename": "src/service/timeout.rs",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 2,
+      "changes": 13,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/4a3dfc4569977ff5f1c51b589fe0862c769a0cbf/src%2Fservice%2Ftimeout.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/4a3dfc4569977ff5f1c51b589fe0862c769a0cbf/src%2Fservice%2Ftimeout.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Fservice%2Ftimeout.rs?ref=4a3dfc4569977ff5f1c51b589fe0862c769a0cbf",
+      "patch": "@@ -326,8 +326,17 @@ impl<F> TimeoutFuture<F> {\n                         if sleep.poll_with_time(now).is_ready() {\n                             Poll::Ready(Err(TimeoutError::Elapsed(Elapsed::new(sleep.deadline()))))\n                         } else {\n-                            // Register the waker with the underlying sleep future\n-                            let _ = Pin::new(&mut sleep).poll(cx);\n+                            // Preserve wake registration only when the sleep\n+                            // uses the same time source as the explicit `now`\n+                            // or an ambient timer driver is available. Falling\n+                            // back to wall clock here can spuriously expire a\n+                            // manual-time poll.\n+                            let has_ambient_timer = crate::cx::Cx::current()\n+                                .and_then(|current| current.timer_driver())\n+                                .is_some();\n+                            if time_getter.is_some() || has_ambient_timer {\n+                                let _ = Pin::new(&mut sleep).poll(cx);\n+                            }\n                             self.state = TimeoutFutureState::Running {\n                                 inner,\n                                 sleep,"
+    },
+    {
+      "sha": "ee7b61024d52e1040ceaab326696ee94f7581a35",
+      "filename": "src/time/sleep.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 0,
+      "changes": 7,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/4a3dfc4569977ff5f1c51b589fe0862c769a0cbf/src%2Ftime%2Fsleep.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/4a3dfc4569977ff5f1c51b589fe0862c769a0cbf/src%2Ftime%2Fsleep.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Ftime%2Fsleep.rs?ref=4a3dfc4569977ff5f1c51b589fe0862c769a0cbf",
+      "patch": "@@ -369,6 +369,13 @@ impl Sleep {\n         self.time_getter.map_or_else(wall_now, |getter| getter())\n     }\n \n+    /// Returns whether this sleep uses a custom time source.\n+    #[inline]\n+    #[must_use]\n+    pub const fn has_custom_time_getter(&self) -> bool {\n+        self.time_getter.is_some()\n+    }\n+\n     /// Polls this sleep with an explicit time value.\n     ///\n     /// This is useful when you want to control the time source manually"
+    },
+    {
+      "sha": "92471ca10b93dee104d2c723bfbe0682a3be75a2",
+      "filename": "src/time/timeout_future.rs",
+      "status": "modified",
+      "additions": 21,
+      "deletions": 9,
+      "changes": 30,
+      "blob_url": "https://github.com/Dicklesworthstone/asupersync/blob/4a3dfc4569977ff5f1c51b589fe0862c769a0cbf/src%2Ftime%2Ftimeout_future.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/asupersync/raw/4a3dfc4569977ff5f1c51b589fe0862c769a0cbf/src%2Ftime%2Ftimeout_future.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/asupersync/contents/src%2Ftime%2Ftimeout_future.rs?ref=4a3dfc4569977ff5f1c51b589fe0862c769a0cbf",
+      "patch": "@@ -216,15 +216,25 @@ impl<F: Future + Unpin> TimeoutFuture<F> {\n             return Poll::Ready(Err(Elapsed::new(self.sleep.deadline())));\n         }\n \n-        // Register the waker with the underlying sleep future\n-        match Pin::new(&mut self.sleep).poll(cx) {\n-            Poll::Ready(()) => {\n-                self.completed = true;\n-                self.timed_out = true;\n-                Poll::Ready(Err(Elapsed::new(self.sleep.deadline())))\n+        // Preserve wake registration only when the underlying sleep can use\n+        // the same time domain as the explicit `now`. Falling back to a\n+        // wall-clock sleep here makes manual/virtual-time polls observe an\n+        // unrelated clock and can spuriously expire after long test suites.\n+        let has_ambient_timer = crate::cx::Cx::current()\n+            .and_then(|current| current.timer_driver())\n+            .is_some();\n+        if self.sleep.has_custom_time_getter() || has_ambient_timer {\n+            match Pin::new(&mut self.sleep).poll(cx) {\n+                Poll::Ready(()) => {\n+                    self.completed = true;\n+                    self.timed_out = true;\n+                    return Poll::Ready(Err(Elapsed::new(self.sleep.deadline())));\n+                }\n+                Poll::Pending => {}\n             }\n-            Poll::Pending => Poll::Pending,\n         }\n+\n+        Poll::Pending\n     }\n }\n \n@@ -639,11 +649,12 @@ mod tests {\n \n     #[test]\n     fn poll_with_time_returns_elapsed_after_timeout_until_reset() {\n+        set_current_time(0);\n         let future = CountingFuture {\n             count: 0,\n             ready_at: 3,\n         };\n-        let mut t = TimeoutFuture::new(future, Time::from_secs(5));\n+        let mut t = TimeoutFuture::with_time_getter(future, Time::from_secs(5), test_now);\n         let waker = noop_waker();\n         let mut cx = Context::from_waker(&waker);\n \n@@ -738,9 +749,10 @@ mod tests {\n     #[test]\n     fn simulated_timeout_scenario() {\n         init_test(\"simulated_timeout_scenario\");\n+        set_current_time(0);\n         // Simulate a scenario where we poll multiple times as time advances\n \n-        let mut t = TimeoutFuture::new(pending::<i32>(), Time::from_secs(5));\n+        let mut t = TimeoutFuture::with_time_getter(pending::<i32>(), Time::from_secs(5), test_now);\n         let waker = noop_waker();\n         let mut cx = Context::from_waker(&waker);\n "
+    }
+  ]
+}

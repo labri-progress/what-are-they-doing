@@ -1,0 +1,41 @@
+{
+  "message": "fix(abi): OnceLock deadlocks in allocator, stdio registry, and getauxval\n\nBug: OnceLock::get_or_init uses futex that deadlocks during _dl_init.\n\n- malloc_abi: host_*_fn() accessors use OnceLock::get() (non-blocking)\n  instead of get_or_init(). Bump allocator handles pre-prewarm calls.\n- malloc_abi: GLOBAL_ALLOC_STATS accessor returns Option, skips stats\n  before init.\n- stdio_abi: StreamRegistry uses AtomicPtr manual init instead of OnceLock.\n- stdlib_abi: getauxval reads /proc/self/auxv via raw syscalls instead of\n  libc::getauxval (which recurses through our interposed symbol).\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "143142abbb2e4dcf72d9d0f9402c72cf5d1c592a",
+      "filename": "crates/frankenlibc-abi/src/malloc_abi.rs",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 5,
+      "changes": 18,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/087677f5635fd48ccc970f110147082413be3928/crates%2Ffrankenlibc-abi%2Fsrc%2Fmalloc_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/087677f5635fd48ccc970f110147082413be3928/crates%2Ffrankenlibc-abi%2Fsrc%2Fmalloc_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Fmalloc_abi.rs?ref=087677f5635fd48ccc970f110147082413be3928",
+      "patch": "@@ -575,8 +575,10 @@ thread_local! {\n     static ALLOC_STATS_SLOT_INDEX: Cell<Option<usize>> = const { Cell::new(None) };\n }\n \n-fn global_alloc_stats() -> &'static FlatCombiningStats {\n-    GLOBAL_ALLOC_STATS.get_or_init(FlatCombiningStats::new)\n+fn global_alloc_stats() -> Option<&'static FlatCombiningStats> {\n+    // Use get() not get_or_init() \u2014 OnceLock futex deadlocks during early init.\n+    // Stats are populated after prewarm. Before that, returns None (stats skipped).\n+    GLOBAL_ALLOC_STATS.get()\n }\n \n #[inline]\n@@ -589,20 +591,26 @@ fn record_alloc_stats(size: usize) {\n     if size == 0 {\n         return;\n     }\n-    global_alloc_stats().record_alloc(size, stats_bin_for_size(size));\n+    if let Some(stats) = global_alloc_stats() {\n+        stats.record_alloc(size, stats_bin_for_size(size));\n+    }\n }\n \n #[inline]\n fn record_free_stats(size: usize) {\n     if size == 0 {\n         return;\n     }\n-    global_alloc_stats().record_free(size, stats_bin_for_size(size));\n+    if let Some(stats) = global_alloc_stats() {\n+        stats.record_free(size, stats_bin_for_size(size));\n+    }\n }\n \n #[inline]\n fn snapshot_alloc_stats() -> MallocStatsSnapshot {\n-    global_alloc_stats().snapshot()\n+    global_alloc_stats()\n+        .map(|s| s.snapshot())\n+        .unwrap_or_default()\n }\n \n // Native-fallback allocation tracking."
+    },
+    {
+      "sha": "75e1d5cad90e6b62dc8fa7abcdd691d69a7c5ba7",
+      "filename": "crates/frankenlibc-abi/src/stdio_abi.rs",
+      "status": "modified",
+      "additions": 21,
+      "deletions": 2,
+      "changes": 23,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/087677f5635fd48ccc970f110147082413be3928/crates%2Ffrankenlibc-abi%2Fsrc%2Fstdio_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/087677f5635fd48ccc970f110147082413be3928/crates%2Ffrankenlibc-abi%2Fsrc%2Fstdio_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Fstdio_abi.rs?ref=087677f5635fd48ccc970f110147082413be3928",
+      "patch": "@@ -245,8 +245,27 @@ impl StreamRegistry {\n }\n \n fn registry() -> &'static Mutex<StreamRegistry> {\n-    static REG: OnceLock<Mutex<StreamRegistry>> = OnceLock::new();\n-    REG.get_or_init(|| Mutex::new(StreamRegistry::new()))\n+    use std::sync::atomic::{AtomicPtr, Ordering};\n+    static PTR: AtomicPtr<Mutex<StreamRegistry>> = AtomicPtr::new(std::ptr::null_mut());\n+    static INIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);\n+    let p = PTR.load(Ordering::Acquire);\n+    if !p.is_null() {\n+        return unsafe { &*p };\n+    }\n+    // First call \u2014 initialize without futex.\n+    if INIT.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_ok() {\n+        let reg = Box::new(Mutex::new(StreamRegistry::new()));\n+        PTR.store(Box::into_raw(reg), Ordering::Release);\n+        return unsafe { &*PTR.load(Ordering::Acquire) };\n+    }\n+    // Another thread is initializing \u2014 spin wait (no futex).\n+    loop {\n+        let p = PTR.load(Ordering::Acquire);\n+        if !p.is_null() {\n+            return unsafe { &*p };\n+        }\n+        std::hint::spin_loop();\n+    }\n }\n \n fn alloc_stream_id() -> usize {"
+    },
+    {
+      "sha": "79b1f55c51a037b90e4559ff1764e93dfd141ffe",
+      "filename": "crates/frankenlibc-abi/src/stdlib_abi.rs",
+      "status": "modified",
+      "additions": 30,
+      "deletions": 4,
+      "changes": 34,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenlibc/blob/087677f5635fd48ccc970f110147082413be3928/crates%2Ffrankenlibc-abi%2Fsrc%2Fstdlib_abi.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenlibc/raw/087677f5635fd48ccc970f110147082413be3928/crates%2Ffrankenlibc-abi%2Fsrc%2Fstdlib_abi.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenlibc/contents/crates%2Ffrankenlibc-abi%2Fsrc%2Fstdlib_abi.rs?ref=087677f5635fd48ccc970f110147082413be3928",
+      "patch": "@@ -2606,10 +2606,36 @@ pub unsafe extern \"C\" fn tdestroy(root: *mut c_void, freefn: unsafe extern \"C\" f\n /// `getauxval` \u2014 retrieve a value from the auxiliary vector.\n #[cfg_attr(not(debug_assertions), unsafe(no_mangle))]\n pub unsafe extern \"C\" fn getauxval(type_: c_ulong) -> c_ulong {\n-    // SAFETY: delegate auxv reads to the host libc implementation. The\n-    // previous /proc/self/auxv file-read path allocated and re-entered the\n-    // membrane allocator during strict startup-sensitive workloads.\n-    unsafe { libc::getauxval(type_) }\n+    // Read from /proc/self/auxv using raw syscalls to avoid recursion\n+    // (libc::getauxval goes through our interposed getauxval).\n+    let fd = unsafe {\n+        libc::syscall(libc::SYS_openat, libc::AT_FDCWD, c\"/proc/self/auxv\".as_ptr(), libc::O_RDONLY, 0)\n+    } as c_int;\n+    if fd < 0 {\n+        unsafe { set_abi_errno(libc::ENOENT) };\n+        return 0;\n+    }\n+    // auxv is pairs of (type: ulong, value: ulong)\n+    let entry_size = 2 * std::mem::size_of::<c_ulong>();\n+    let mut buf = [0u8; 4096];\n+    let n = unsafe { libc::syscall(libc::SYS_read, fd, buf.as_mut_ptr(), buf.len()) } as isize;\n+    unsafe { libc::syscall(libc::SYS_close, fd) };\n+    if n <= 0 {\n+        return 0;\n+    }\n+    let entries = n as usize / entry_size;\n+    for i in 0..entries {\n+        let offset = i * entry_size;\n+        let at = c_ulong::from_ne_bytes(buf[offset..offset + 8].try_into().unwrap_or([0; 8]));\n+        let av = c_ulong::from_ne_bytes(buf[offset + 8..offset + 16].try_into().unwrap_or([0; 8]));\n+        if at == type_ {\n+            return av;\n+        }\n+        if at == 0 {\n+            break; // AT_NULL terminates\n+        }\n+    }\n+    0\n }\n \n // ==========================================================================="
+    }
+  ]
+}

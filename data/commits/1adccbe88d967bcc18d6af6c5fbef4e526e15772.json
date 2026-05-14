@@ -1,0 +1,29 @@
+{
+  "message": "fix(connector): cap replay candidates, guard non-finite scores, and add frozen-publisher protection\n\ncontrol_evidence_replay.rs:\n- Cap candidates vector at MAX_CANDIDATES (4096) via push_bounded()\n  to prevent unbounded memory growth during replay\n- Guard raw score calculation against NaN/Inf, returning 0.0 for\n  non-finite values\n\necosystem_reputation.rs:\n- Add PublisherFrozen error variant; update_score() now rejects\n  updates to frozen publishers with a descriptive error\n- is_anomalous_delta() fails closed (returns true) when\n  std_dev_multiplier is non-finite or negative, preventing\n  misconfiguration from silently disabling anomaly detection\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "79a2cc3876014ae404b6ba8749f19664cda35a46",
+      "filename": "crates/franken-node/src/connector/control_evidence_replay.rs",
+      "status": "modified",
+      "additions": 25,
+      "deletions": 14,
+      "changes": 39,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/1adccbe88d967bcc18d6af6c5fbef4e526e15772/crates%2Ffranken-node%2Fsrc%2Fconnector%2Fcontrol_evidence_replay.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/1adccbe88d967bcc18d6af6c5fbef4e526e15772/crates%2Ffranken-node%2Fsrc%2Fconnector%2Fcontrol_evidence_replay.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fconnector%2Fcontrol_evidence_replay.rs?ref=1adccbe88d967bcc18d6af6c5fbef4e526e15772",
+      "patch": "@@ -18,6 +18,7 @@ use std::fmt;\n \n use crate::capacity_defaults::aliases::MAX_EVENTS;\n const MAX_VERDICTS: usize = 4096;\n+const MAX_CANDIDATES: usize = 4096;\n \n use crate::connector::control_evidence::{ControlEvidenceEntry, DecisionKind, DecisionType};\n use crate::observability::evidence_ledger::{DecisionKind as LedgerDecisionKind, EvidenceEntry};\n@@ -111,24 +112,34 @@ pub fn build_replay_context(\n     let mut candidates = Vec::new();\n \n     // Primary candidate (the chosen action)\n-    candidates.push(Candidate {\n-        id: entry.decision_id.clone(),\n-        decision_kind: ledger_kind,\n-        score: 1.0,\n-        metadata: serde_json::json!({\n-            \"chosen_action\": entry.chosen_action,\n-        }),\n-    });\n+    push_bounded(\n+        &mut candidates,\n+        Candidate {\n+            id: entry.decision_id.clone(),\n+            decision_kind: ledger_kind,\n+            score: 1.0,\n+            metadata: serde_json::json!({\n+                \"chosen_action\": entry.chosen_action,\n+            }),\n+        },\n+        MAX_CANDIDATES,\n+    );\n \n     // Other candidates (lower score, same kind for simplicity)\n     for (i, candidate_name) in entry.candidates_considered.iter().enumerate() {\n         if *candidate_name != entry.decision_id {\n-            candidates.push(Candidate {\n-                id: candidate_name.clone(),\n-                decision_kind: ledger_kind,\n-                score: (0.5 - (i as f64 * 0.01)).max(0.0),\n-                metadata: serde_json::json!({}),\n-            });\n+            let raw_score = (0.5 - (i as f64 * 0.01)).max(0.0);\n+            let score = if raw_score.is_finite() { raw_score } else { 0.0 };\n+            push_bounded(\n+                &mut candidates,\n+                Candidate {\n+                    id: candidate_name.clone(),\n+                    decision_kind: ledger_kind,\n+                    score,\n+                    metadata: serde_json::json!({}),\n+                },\n+                MAX_CANDIDATES,\n+            );\n         }\n     }\n "
+    },
+    {
+      "sha": "4c247a96a7163f63168fcaf5de099f870b265339",
+      "filename": "crates/franken-node/src/connector/ecosystem_reputation.rs",
+      "status": "modified",
+      "additions": 12,
+      "deletions": 0,
+      "changes": 12,
+      "blob_url": "https://github.com/Dicklesworthstone/franken_node/blob/1adccbe88d967bcc18d6af6c5fbef4e526e15772/crates%2Ffranken-node%2Fsrc%2Fconnector%2Fecosystem_reputation.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/franken_node/raw/1adccbe88d967bcc18d6af6c5fbef4e526e15772/crates%2Ffranken-node%2Fsrc%2Fconnector%2Fecosystem_reputation.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/franken_node/contents/crates%2Ffranken-node%2Fsrc%2Fconnector%2Fecosystem_reputation.rs?ref=1adccbe88d967bcc18d6af6c5fbef4e526e15772",
+      "patch": "@@ -40,6 +40,8 @@ pub enum ReputationApiError {\n     RateLimitExceeded(String),\n     #[error(\"duplicate publisher identity `{0}` (Sybil rejection)\")]\n     SybilDuplicate(String),\n+    #[error(\"publisher `{0}` is frozen \u2014 score updates are blocked\")]\n+    PublisherFrozen(String),\n }\n \n // -- Input dimensions ----------------------------------------------------------\n@@ -257,6 +259,10 @@ pub fn is_anomalous_delta(delta: f64, history: &[f64], config: &AnomalyConfig) -\n         return delta.abs() > 1e-9;\n     }\n \n+    if !config.std_dev_multiplier.is_finite() || config.std_dev_multiplier < 0.0 {\n+        // Non-finite or negative multiplier \u2014 fail closed (treat as anomalous).\n+        return true;\n+    }\n     delta.abs() > config.std_dev_multiplier * std_dev\n }\n \n@@ -363,6 +369,12 @@ impl EcosystemReputationApi {\n             .get_mut(publisher_id)\n             .ok_or_else(|| ReputationApiError::PublisherNotFound(publisher_id.to_owned()))?;\n \n+        if pub_record.frozen {\n+            return Err(ReputationApiError::PublisherFrozen(\n+                publisher_id.to_owned(),\n+            ));\n+        }\n+\n         let old_score = pub_record.score;\n         let new_score = deterministic_reputation_score(&inputs, &self.weights);\n         let delta = new_score - old_score;"
+    }
+  ]
+}

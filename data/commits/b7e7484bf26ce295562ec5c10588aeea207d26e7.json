@@ -1,0 +1,87 @@
+{
+  "message": "stage 1 phase D.5: swiglu_clamp_f32 kernel\n\nMatches OpenAIPrivacyFilterExperts._apply_gate exactly:\n  gate = clamp(gate, max=7); up = clamp(up, -7, 7)\n  glu = gate * sigmoid(gate * 1.702)\n  out = (up + 1) * glu\n\nf32 throughout \u2014 the upstream expert forward upcasts to fp32 for the\nfull MLP chain. sigmoid uses the numerically-stable branch\n(exp argument kept \u2264 0).\n\nTested on [T=16, D=640] with input spread to hit both clamp branches:\nmaxRel 2.92e-7, well inside the 1e-5 tolerance.",
+  "files": [
+    {
+      "sha": "5cc4746a3d0bd7d321301bace80b03993372a3dc",
+      "filename": "scripts/gen-kernel-fixtures.py",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 0,
+      "changes": 15,
+      "blob_url": "https://github.com/teamchong/textsift/blob/b7e7484bf26ce295562ec5c10588aeea207d26e7/scripts%2Fgen-kernel-fixtures.py",
+      "raw_url": "https://github.com/teamchong/textsift/raw/b7e7484bf26ce295562ec5c10588aeea207d26e7/scripts%2Fgen-kernel-fixtures.py",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/scripts%2Fgen-kernel-fixtures.py?ref=b7e7484bf26ce295562ec5c10588aeea207d26e7",
+      "patch": "@@ -134,6 +134,21 @@ def main() -> int:\n     write(FIXTURES_DIR / \"embed_ids.i32\", ids.numpy().tobytes())\n     write(FIXTURES_DIR / \"embed_out.bf16\", bf16_bytes(y_embed))\n \n+    # ----- SwiGLU-with-clamp fixture -----\n+    # Matches OpenAIPrivacyFilterExperts._apply_gate. Inputs spread in a\n+    # range that exercises both clamp branches (some values > 7 and < -7).\n+    torch.manual_seed(SEED + 7)\n+    swiglu_T = 16\n+    swiglu_D = 640                                # = intermediate_size\n+    gate_up = torch.randn(swiglu_T, 2 * swiglu_D, dtype=torch.float32) * 6.0\n+    gate_ref, up_ref = gate_up.chunk(2, dim=-1)\n+    gate_ref = gate_ref.clamp(min=None, max=7.0)\n+    up_ref = up_ref.clamp(min=-7.0, max=7.0)\n+    glu = gate_ref * torch.sigmoid(gate_ref * 1.702)\n+    swiglu_ref = (up_ref + 1.0) * glu\n+    write(FIXTURES_DIR / \"swiglu_x.f32\", gate_up.numpy().tobytes())\n+    write(FIXTURES_DIR / \"swiglu_y.f32\", swiglu_ref.contiguous().numpy().tobytes())\n+\n     # ----- Softmax fixture (attention-shape) -----\n     #\n     # Shape picked to exercise both the \"long\" row (attention scores +"
+    },
+    {
+      "sha": "4d924955b2432c05d6a750b06c3d9f4a0877c97d",
+      "filename": "scripts/verify-kernels.mjs",
+      "status": "modified",
+      "additions": 34,
+      "deletions": 0,
+      "changes": 34,
+      "blob_url": "https://github.com/teamchong/textsift/blob/b7e7484bf26ce295562ec5c10588aeea207d26e7/scripts%2Fverify-kernels.mjs",
+      "raw_url": "https://github.com/teamchong/textsift/raw/b7e7484bf26ce295562ec5c10588aeea207d26e7/scripts%2Fverify-kernels.mjs",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/scripts%2Fverify-kernels.mjs?ref=b7e7484bf26ce295562ec5c10588aeea207d26e7",
+      "patch": "@@ -188,6 +188,39 @@ async function runEmbed(ex, weights, spec) {\n   return compareU16(ex, outPtr, expected);\n }\n \n+async function runSwigluF32(ex, _weights, spec) {\n+  const x = await loadFixture(spec.x);\n+  const expected = await loadFixture(spec.expected);\n+  const xPtr = allocAndCopy(ex, x);\n+  const outPtr = ex.alloc(expected.byteLength);\n+  ex.swiglu_clamp_f32(xPtr, outPtr, spec.T, spec.D);\n+  const got = new Float32Array(ex.memory.buffer, outPtr, expected.byteLength >>> 2);\n+  const want = new Float32Array(\n+    expected.buffer,\n+    expected.byteOffset,\n+    expected.byteLength >>> 2,\n+  );\n+  let maxAbs = 0, maxRel = 0, sumSq = 0, fails = 0, firstFail = -1;\n+  for (let i = 0; i < want.length; i++) {\n+    const abs = Math.abs(got[i] - want[i]);\n+    const rel = Math.abs(want[i]) > 0 ? abs / Math.abs(want[i]) : abs;\n+    if (abs > maxAbs) maxAbs = abs;\n+    if (rel > maxRel) maxRel = rel;\n+    sumSq += abs * abs;\n+    const tol = Math.max(spec.abs_tol ?? 0, spec.rel_tol * Math.abs(want[i]));\n+    if (abs > tol) {\n+      fails++;\n+      if (firstFail === -1) firstFail = i;\n+    }\n+  }\n+  return {\n+    tolerance: { relTol: spec.rel_tol, absTol: spec.abs_tol ?? 0 },\n+    total: want.length, fails, firstFail, maxAbs, maxRel,\n+    rms: Math.sqrt(sumSq / want.length),\n+    got: new Uint16Array(0), want: new Uint16Array(0),\n+  };\n+}\n+\n async function runSoftmaxF32(ex, _weights, spec) {\n   const x = await loadFixture(spec.x);\n   const expected = await loadFixture(spec.expected);\n@@ -275,6 +308,7 @@ const RUNNERS = {\n   matmul_bf16_x_int4block: runMatmulInt4,\n   rope_apply: runRopeApply,\n   softmax_f32: runSoftmaxF32,\n+  swiglu_clamp_f32: runSwigluF32,\n };\n \n async function main() {"
+    },
+    {
+      "sha": "9650738db042727c6782f15046bb5268d615fc90",
+      "filename": "src/js/backends/wasm.ts",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/teamchong/textsift/blob/b7e7484bf26ce295562ec5c10588aeea207d26e7/src%2Fjs%2Fbackends%2Fwasm.ts",
+      "raw_url": "https://github.com/teamchong/textsift/raw/b7e7484bf26ce295562ec5c10588aeea207d26e7/src%2Fjs%2Fbackends%2Fwasm.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/src%2Fjs%2Fbackends%2Fwasm.ts?ref=b7e7484bf26ce295562ec5c10588aeea207d26e7",
+      "patch": "@@ -42,6 +42,7 @@ interface PiiWasmExports {\n   matmul_bf16_x_int4block(x: number, w: number, bias: number, out: number, T: number, N: number, D: number): void;\n   rope_apply(qk: number, cos: number, sin: number, T: number, H: number, head_dim: number): void;\n   softmax_f32(x: number, out: number, rows: number, cols: number): void;\n+  swiglu_clamp_f32(gate_up: number, out: number, T: number, D: number): void;\n   embed_lookup(embed: number, ids: number, out: number, T: number, V: number, D: number): void;\n }\n \n@@ -110,6 +111,7 @@ export async function loadPiiWasm(url: string | URL): Promise<PiiWasmExports> {\n     \"matmul_bf16_x_int4block\",\n     \"rope_apply\",\n     \"softmax_f32\",\n+    \"swiglu_clamp_f32\",\n     \"embed_lookup\",\n   ];\n   for (const name of required) {"
+    },
+    {
+      "sha": "1460b2ff2ebee09b6cce3efbcb589d6bc2b4487f",
+      "filename": "src/zig/wasm_exports.zig",
+      "status": "modified",
+      "additions": 65,
+      "deletions": 0,
+      "changes": 65,
+      "blob_url": "https://github.com/teamchong/textsift/blob/b7e7484bf26ce295562ec5c10588aeea207d26e7/src%2Fzig%2Fwasm_exports.zig",
+      "raw_url": "https://github.com/teamchong/textsift/raw/b7e7484bf26ce295562ec5c10588aeea207d26e7/src%2Fzig%2Fwasm_exports.zig",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/src%2Fzig%2Fwasm_exports.zig?ref=b7e7484bf26ce295562ec5c10588aeea207d26e7",
+      "patch": "@@ -676,6 +676,71 @@ export fn matmul_bf16_x_int4block(\n     }\n }\n \n+// --------------------------------------------------------------\n+// Kernel: SwiGLU with clamp (privacy-filter variant)\n+// --------------------------------------------------------------\n+//\n+// Matches `OpenAIPrivacyFilterExperts._apply_gate` exactly:\n+//   gate, up = gate_up.chunk(2, dim=-1)\n+//   gate = gate.clamp(max=7.0)\n+//   up   = up.clamp(-7.0, 7.0)\n+//   glu  = gate * sigmoid(gate * 1.702)\n+//   out  = (up + 1.0) * glu\n+//\n+// All compute in f32 \u2014 the upstream expert forward runs in fp32\n+// throughout (`.float()` on every op). Input and output are f32.\n+//\n+// gate_up: [T, 2*D]   f32       (gate concatenated with up)\n+// out:     [T, D]     f32\n+//\n+// Note on the 1.702 constant: this is the GELU-approximation scale\n+// `\u03b1 = 1.702` that makes `x * sigmoid(\u03b1 * x)` \u2248 gelu(x). Combined with\n+// the `+1` on the up branch and the clamps, this is the privacy-filter\n+// specific gate (differs from vanilla SwiGLU's `silu(gate) * up`).\n+\n+const SWIGLU_LIMIT: f32 = 7.0;\n+const SWIGLU_ALPHA: f32 = 1.702;\n+\n+inline fn sigmoidF32(x: f32) f32 {\n+    // Numerically stable: for positive x, \u03c3(x) = 1/(1+exp(-x)); for\n+    // negative x, \u03c3(x) = exp(x)/(1+exp(x)). Keeps the exp argument \u2264 0\n+    // so intermediate values can't overflow.\n+    if (x >= 0.0) {\n+        const e = @exp(-x);\n+        return 1.0 / (1.0 + e);\n+    }\n+    const e = @exp(x);\n+    return e / (1.0 + e);\n+}\n+\n+export fn swiglu_clamp_f32(\n+    gate_up_ptr: [*]const f32,\n+    out_ptr: [*]f32,\n+    T: u32,\n+    D: u32,\n+) void {\n+    const Tz: usize = T;\n+    const Dz: usize = D;\n+    const stride: usize = 2 * Dz;\n+\n+    var t: usize = 0;\n+    while (t < Tz) : (t += 1) {\n+        const row_base = t * stride;\n+        const out_base = t * Dz;\n+\n+        var d: usize = 0;\n+        while (d < Dz) : (d += 1) {\n+            var gate = gate_up_ptr[row_base + d];\n+            var up = gate_up_ptr[row_base + Dz + d];\n+            if (gate > SWIGLU_LIMIT) gate = SWIGLU_LIMIT;\n+            if (up > SWIGLU_LIMIT) up = SWIGLU_LIMIT;\n+            if (up < -SWIGLU_LIMIT) up = -SWIGLU_LIMIT;\n+            const glu = gate * sigmoidF32(gate * SWIGLU_ALPHA);\n+            out_ptr[out_base + d] = (up + 1.0) * glu;\n+        }\n+    }\n+}\n+\n // --------------------------------------------------------------\n // Kernel: row-wise softmax, f32 in / f32 out, numerically stable\n // --------------------------------------------------------------"
+    },
+    {
+      "sha": "22057c40365af7e226d6004ca8ce3c0077c2321a",
+      "filename": "tests/fixtures/manifest.json",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 0,
+      "changes": 9,
+      "blob_url": "https://github.com/teamchong/textsift/blob/b7e7484bf26ce295562ec5c10588aeea207d26e7/tests%2Ffixtures%2Fmanifest.json",
+      "raw_url": "https://github.com/teamchong/textsift/raw/b7e7484bf26ce295562ec5c10588aeea207d26e7/tests%2Ffixtures%2Fmanifest.json",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Ffixtures%2Fmanifest.json?ref=b7e7484bf26ce295562ec5c10588aeea207d26e7",
+      "patch": "@@ -50,6 +50,15 @@\n       \"abs_tol\": 1e-4,\n       \"note\": \"bf16 output of an fp32 matmul over dequantized int4 (block 32, sym, fp16 scale). Expected bounded by bf16 ULP (~4e-3 rel for unit-ish values) plus int4 quant error; 1e-3 rel is tight for this combo.\"\n     },\n+    {\n+      \"name\": \"swiglu_clamp_f32\",\n+      \"x\": \"swiglu_x.f32\",\n+      \"expected\": \"swiglu_y.f32\",\n+      \"T\": 16,\n+      \"D\": 640,\n+      \"rel_tol\": 1e-5,\n+      \"abs_tol\": 1e-6\n+    },\n     {\n       \"name\": \"softmax_f32\",\n       \"x\": \"softmax_att_x.f32\","
+    },
+    {
+      "sha": "9d780e854f7ac9733c9b46cb945bc4bea266253f",
+      "filename": "tests/fixtures/swiglu_x.f32",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/teamchong/textsift/blob/b7e7484bf26ce295562ec5c10588aeea207d26e7/tests%2Ffixtures%2Fswiglu_x.f32",
+      "raw_url": "https://github.com/teamchong/textsift/raw/b7e7484bf26ce295562ec5c10588aeea207d26e7/tests%2Ffixtures%2Fswiglu_x.f32",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Ffixtures%2Fswiglu_x.f32?ref=b7e7484bf26ce295562ec5c10588aeea207d26e7"
+    },
+    {
+      "sha": "f1bed1d4690fd08fd16ebed9ca2958850ac3849a",
+      "filename": "tests/fixtures/swiglu_y.f32",
+      "status": "added",
+      "additions": 0,
+      "deletions": 0,
+      "changes": 0,
+      "blob_url": "https://github.com/teamchong/textsift/blob/b7e7484bf26ce295562ec5c10588aeea207d26e7/tests%2Ffixtures%2Fswiglu_y.f32",
+      "raw_url": "https://github.com/teamchong/textsift/raw/b7e7484bf26ce295562ec5c10588aeea207d26e7/tests%2Ffixtures%2Fswiglu_y.f32",
+      "contents_url": "https://api.github.com/repos/teamchong/textsift/contents/tests%2Ffixtures%2Fswiglu_y.f32?ref=b7e7484bf26ce295562ec5c10588aeea207d26e7"
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "message": "fix(tx): make Failed non-terminal so it can transition to Compensating\n\nFailed was treated as terminal (no further transitions) but should\nallow transition to Compensating. Add is_settled() capturing the\nbroader concept (terminal OR failed-awaiting-compensation). Handle\nPauseSuspended commit outcome: paused tx stays Pending instead of\nbeing marked failed. Update test to assert Failed is NOT terminal\nbut IS settled.\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "1e5c6d67e33a6929f70b365c7b8048d3cb774493",
+      "filename": "crates/frankenterm-core/src/plan.rs",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 8,
+      "changes": 28,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/ee0596aeb38bfdd45a79dc50108193d342d6300d/crates%2Ffrankenterm-core%2Fsrc%2Fplan.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/ee0596aeb38bfdd45a79dc50108193d342d6300d/crates%2Ffrankenterm-core%2Fsrc%2Fplan.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Ffrankenterm-core%2Fsrc%2Fplan.rs?ref=ee0596aeb38bfdd45a79dc50108193d342d6300d",
+      "patch": "@@ -2597,13 +2597,23 @@ pub enum MissionTxState {\n }\n \n impl MissionTxState {\n-    /// Whether this tx state is terminal (no further transitions).\n+    /// Whether this tx state is terminal (no further transitions possible).\n+    ///\n+    /// Note: `Failed` is NOT terminal \u2014 it can transition to `Compensating`.\n+    /// Use `is_settled()` to check for states that are either terminal or\n+    /// require explicit operator intervention to proceed.\n     #[must_use]\n     pub fn is_terminal(self) -> bool {\n-        matches!(\n-            self,\n-            Self::Committed | Self::Compensated | Self::RolledBack | Self::Failed\n-        )\n+        matches!(self, Self::Committed | Self::Compensated | Self::RolledBack)\n+    }\n+\n+    /// Whether this tx state is settled (terminal or failed-awaiting-compensation).\n+    ///\n+    /// `Failed` is settled but not terminal: it can still transition to\n+    /// `Compensating` via explicit operator action or automatic retry.\n+    #[must_use]\n+    pub fn is_settled(self) -> bool {\n+        self.is_terminal() || matches!(self, Self::Failed)\n     }\n }\n \n@@ -3919,7 +3929,9 @@ pub fn validate_tx_idempotency(\n             verdict: TxIdempotencyVerdict::FirstExecution,\n         },\n         Some(rec) => {\n-            // If prior execution is in a terminal state, block.\n+            // If prior execution reached a true terminal state (committed,\n+            // compensated, or rolled back), block re-execution.\n+            // Note: `Failed` is NOT terminal \u2014 it can still be compensated.\n             if rec.lifecycle_state.is_terminal() {\n                 return TxIdempotencyCheck {\n                     verdict: TxIdempotencyVerdict::DoubleExecutionBlocked {\n@@ -4010,10 +4022,10 @@ pub fn reconstruct_tx_resume_state(\n         }\n     }\n \n-    // Also mark commit as completed if a terminal receipt exists.\n+    // Also mark commit as completed if a settled receipt exists (terminal or failed).\n     for receipt_val in &contract.receipts {\n         if let Ok(receipt) = serde_json::from_value::<TxReceipt>(receipt_val.clone()) {\n-            if receipt.state.is_terminal() {\n+            if receipt.state.is_settled() {\n                 commit_phase_completed = true;\n             }\n         }"
+    },
+    {
+      "sha": "ed1ea09ed6622926f88897cb405c0cc6de52d7d3",
+      "filename": "crates/frankenterm-core/src/tx_execution.rs",
+      "status": "modified",
+      "additions": 17,
+      "deletions": 11,
+      "changes": 28,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/ee0596aeb38bfdd45a79dc50108193d342d6300d/crates%2Ffrankenterm-core%2Fsrc%2Ftx_execution.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/ee0596aeb38bfdd45a79dc50108193d342d6300d/crates%2Ffrankenterm-core%2Fsrc%2Ftx_execution.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Ffrankenterm-core%2Fsrc%2Ftx_execution.rs?ref=ee0596aeb38bfdd45a79dc50108193d342d6300d",
+      "patch": "@@ -312,16 +312,16 @@ impl<E: StepExecutor> TxExecutionEngine<E> {\n         contract.outcome = outcome.clone();\n         decision_path.push_str(&format!(\"->final:{final_state}\"));\n \n-        // Transition ledger to terminal phase\n-        let terminal_phase = if final_state == MissionTxState::Committed\n-            || final_state == MissionTxState::Compensated\n-            || final_state == MissionTxState::RolledBack\n-        {\n-            TxPhase::Completed\n-        } else {\n-            TxPhase::Aborted\n-        };\n-        let _ = ledger.transition_phase(terminal_phase);\n+        // Transition ledger to terminal phase (skip if outcome is Pending \u2014\n+        // the tx is suspended, not finished)\n+        if outcome != TxOutcome::Pending {\n+            let terminal_phase = if final_state.is_terminal() {\n+                TxPhase::Completed\n+            } else {\n+                TxPhase::Aborted\n+            };\n+            let _ = ledger.transition_phase(terminal_phase);\n+        }\n \n         // Emit completion event\n         events.push(self.make_event(\n@@ -695,7 +695,6 @@ impl<E: StepExecutor> TxExecutionEngine<E> {\n \n     // \u2500\u2500 Helpers \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n \n-    #[allow(clippy::unused_self)]\n     fn determine_final_outcome(\n         &self,\n         current_state: MissionTxState,\n@@ -706,6 +705,13 @@ impl<E: StepExecutor> TxExecutionEngine<E> {\n             return (MissionTxState::Committed, TxOutcome::Committed);\n         }\n \n+        // Paused: remain in a resumable state, not Failed. The commit was\n+        // suspended before completion \u2014 no steps failed, so this is not a\n+        // failure. The operator can resume later.\n+        if commit_report.outcome == TxCommitOutcome::PauseSuspended {\n+            return (current_state, TxOutcome::Pending);\n+        }\n+\n         if let Some(comp) = compensation_report {\n             if comp.is_fully_rolled_back() {\n                 return (MissionTxState::RolledBack, TxOutcome::Compensated);"
+    },
+    {
+      "sha": "3f58d41c3b606d6eb09d876ad49f372f9bc1b24a",
+      "filename": "crates/frankenterm-core/tests/tx_correctness_suite.rs",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 1,
+      "changes": 10,
+      "blob_url": "https://github.com/Dicklesworthstone/frankenterm/blob/ee0596aeb38bfdd45a79dc50108193d342d6300d/crates%2Ffrankenterm-core%2Ftests%2Ftx_correctness_suite.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/frankenterm/raw/ee0596aeb38bfdd45a79dc50108193d342d6300d/crates%2Ffrankenterm-core%2Ftests%2Ftx_correctness_suite.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/frankenterm/contents/crates%2Ffrankenterm-core%2Ftests%2Ftx_correctness_suite.rs?ref=ee0596aeb38bfdd45a79dc50108193d342d6300d",
+      "patch": "@@ -228,7 +228,15 @@ fn sm_compensation_requires_compensating() {\n fn sm_terminal_states_are_terminal() {\n     assert!(MissionTxState::Committed.is_terminal());\n     assert!(MissionTxState::RolledBack.is_terminal());\n-    assert!(MissionTxState::Failed.is_terminal());\n+    assert!(MissionTxState::Compensated.is_terminal());\n+}\n+\n+#[test]\n+fn sm_failed_is_not_terminal_but_is_settled() {\n+    // Failed can still transition to Compensating, so it's not terminal.\n+    assert!(!MissionTxState::Failed.is_terminal());\n+    // But it IS settled (no automatic forward progress without intervention).\n+    assert!(MissionTxState::Failed.is_settled());\n }\n \n #[test]"
+    }
+  ]
+}

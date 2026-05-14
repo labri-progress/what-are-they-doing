@@ -1,0 +1,41 @@
+{
+  "message": "perf(fcp-crypto,fcp-mesh): reduce allocations in CWT claims, Shamir reconstruct, and gossip signing\n\nThree allocation-reduction improvements in hot cryptographic and gossip paths:\n\nfcp-crypto/cose.rs:\n- CwtClaims::operations(): Replace iterator .map().collect() with\n  pre-allocated Vec::with_capacity(ops.len()) and explicit push loop.\n  Avoids the iterator adapter overhead and ensures a single allocation\n  for the exact number of operations.\n- CwtClaims::grant_objects(): Same pattern \u2014 pre-allocate and push\n  instead of map/collect.\n- CwtClaims::to_cbor(): Pre-allocate Vec::with_capacity(256) instead\n  of Vec::new() for CBOR serialization buffer. Typical CWT claims\n  serialize to 200-300 bytes, so this avoids 2-3 reallocations during\n  ciborium's incremental writes.\n\nfcp-crypto/shamir.rs:\n- reconstruct_secret(): Hoist the GF(256) points buffer outside the\n  per-byte loop. Previously allocated a new Vec<(Gf256, Gf256)> for\n  every byte of the secret via map/collect. Now reuses a single\n  Vec::with_capacity(shares.len()) buffer, calling .clear() each\n  iteration. For a 32-byte secret with 5 shares, this eliminates 31\n  unnecessary allocations.\n\nfcp-mesh/gossip.rs:\n- GossipSummary::signing_bytes(): Pre-allocate Vec::with_capacity()\n  using an estimated size (152 bytes fixed overhead + IBLT length)\n  instead of Vec::new(). Gossip signing happens on every round, so\n  avoiding 3-4 reallocations per summary is meaningful under load.\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "d847ee8b15e9c7f31c1ed3c1e5dd346430f4a490",
+      "filename": "crates/fcp-crypto/src/cose.rs",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 9,
+      "changes": 20,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/3fa9a81a12102180d4534a1d16ca7c7e0e9cf8b7/crates%2Ffcp-crypto%2Fsrc%2Fcose.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/3fa9a81a12102180d4534a1d16ca7c7e0e9cf8b7/crates%2Ffcp-crypto%2Fsrc%2Fcose.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-crypto%2Fsrc%2Fcose.rs?ref=3fa9a81a12102180d4534a1d16ca7c7e0e9cf8b7",
+      "patch": "@@ -171,10 +171,10 @@ impl CwtClaims {\n     /// Set FCP2 allowed operations claim.\n     #[must_use]\n     pub fn operations(mut self, ops: &[&str]) -> Self {\n-        let values: Vec<ciborium::Value> = ops\n-            .iter()\n-            .map(|s| ciborium::Value::Text((*s).into()))\n-            .collect();\n+        let mut values = Vec::with_capacity(ops.len());\n+        for s in ops {\n+            values.push(ciborium::Value::Text((*s).into()));\n+        }\n         self.claims\n             .insert(fcp2_claims::OPERATIONS, ciborium::Value::Array(values));\n         self\n@@ -211,10 +211,10 @@ impl CwtClaims {\n     /// Set FCP2 grant object IDs.\n     #[must_use]\n     pub fn grant_objects(mut self, object_ids: &[&[u8]]) -> Self {\n-        let values: Vec<ciborium::Value> = object_ids\n-            .iter()\n-            .map(|id| ciborium::Value::Bytes(id.to_vec()))\n-            .collect();\n+        let mut values = Vec::with_capacity(object_ids.len());\n+        for id in object_ids {\n+            values.push(ciborium::Value::Bytes(id.to_vec()));\n+        }\n         self.claims.insert(\n             fcp2_claims::GRANT_OBJECT_IDS,\n             ciborium::Value::Array(values),\n@@ -357,7 +357,9 @@ impl CwtClaims {\n     ///\n     /// Returns an error if serialization fails.\n     pub fn to_cbor(&self) -> CryptoResult<Vec<u8>> {\n-        let mut bytes = Vec::new();\n+        // Pre-allocate for typical CWT claims (~200-300 bytes CBOR).\n+        // Avoids 2-3 reallocations during ciborium serialization.\n+        let mut bytes = Vec::with_capacity(256);\n         ciborium::into_writer(&self.claims, &mut bytes)\n             .map_err(|e| CryptoError::SerializationError(e.to_string()))?;\n         Ok(bytes)"
+    },
+    {
+      "sha": "849147ac24efbbbb64d6f7452898adae42f667d4",
+      "filename": "crates/fcp-crypto/src/shamir.rs",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 5,
+      "changes": 12,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/3fa9a81a12102180d4534a1d16ca7c7e0e9cf8b7/crates%2Ffcp-crypto%2Fsrc%2Fshamir.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/3fa9a81a12102180d4534a1d16ca7c7e0e9cf8b7/crates%2Ffcp-crypto%2Fsrc%2Fshamir.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-crypto%2Fsrc%2Fshamir.rs?ref=3fa9a81a12102180d4534a1d16ca7c7e0e9cf8b7",
+      "patch": "@@ -482,14 +482,16 @@ pub fn reconstruct_secret(shares: &[ShamirShare]) -> ShamirResult<ZeroizingSecre\n         return Err(ShamirError::MismatchedLengths);\n     }\n \n-    // Reconstruct each byte of the secret\n+    // Reconstruct each byte of the secret.\n+    // Reuse a single points buffer across all bytes to avoid per-byte allocation.\n     let mut secret = Vec::with_capacity(secret_len);\n+    let mut points = Vec::with_capacity(shares.len());\n \n     for byte_idx in 0..secret_len {\n-        let points: Vec<(Gf256, Gf256)> = shares\n-            .iter()\n-            .map(|s| (Gf256::new(s.index), Gf256::new(s.data[byte_idx])))\n-            .collect();\n+        points.clear();\n+        for s in shares {\n+            points.push((Gf256::new(s.index), Gf256::new(s.data[byte_idx])));\n+        }\n \n         let recovered = lagrange_interpolate_at_zero(&points);\n         secret.push(recovered.value());"
+    },
+    {
+      "sha": "559ad8ce81fc25b36b1d62374d960d4b4b7ef638",
+      "filename": "crates/fcp-mesh/src/gossip.rs",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 1,
+      "changes": 5,
+      "blob_url": "https://github.com/Dicklesworthstone/flywheel_connectors/blob/3fa9a81a12102180d4534a1d16ca7c7e0e9cf8b7/crates%2Ffcp-mesh%2Fsrc%2Fgossip.rs",
+      "raw_url": "https://github.com/Dicklesworthstone/flywheel_connectors/raw/3fa9a81a12102180d4534a1d16ca7c7e0e9cf8b7/crates%2Ffcp-mesh%2Fsrc%2Fgossip.rs",
+      "contents_url": "https://api.github.com/repos/Dicklesworthstone/flywheel_connectors/contents/crates%2Ffcp-mesh%2Fsrc%2Fgossip.rs?ref=3fa9a81a12102180d4534a1d16ca7c7e0e9cf8b7",
+      "patch": "@@ -540,7 +540,10 @@ impl GossipSummary {\n     /// Panics if any field byte length exceeds `u32::MAX`.\n     #[must_use]\n     pub fn signing_bytes(&self) -> Vec<u8> {\n-        let mut bytes = Vec::new();\n+        // Pre-allocate: 22 (prefix) + ~50 (from+zone+epoch with lengths)\n+        // + 64 (digests) + 8 (counts) + iblt.len() + 8 (timestamp)\n+        let estimated = 152 + self.iblt.len();\n+        let mut bytes = Vec::with_capacity(estimated);\n         bytes.extend_from_slice(b\"FCP2-GOSSIP-SUMMARY-V1\");\n \n         let from_bytes = self.from.as_str().as_bytes();"
+    }
+  ]
+}

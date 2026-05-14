@@ -1,0 +1,161 @@
+{
+  "message": "fix: harden codex app-server harness",
+  "files": [
+    {
+      "sha": "f34c6e6d8c8e6316a48b7940cf47590429bf5d16",
+      "filename": "extensions/codex/src/app-server/client.test.ts",
+      "status": "modified",
+      "additions": 32,
+      "deletions": 0,
+      "changes": 32,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/9ac7a0398213977e0d40216c44c0ed61cbb5e785/extensions%2Fcodex%2Fsrc%2Fapp-server%2Fclient.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/9ac7a0398213977e0d40216c44c0ed61cbb5e785/extensions%2Fcodex%2Fsrc%2Fapp-server%2Fclient.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fcodex%2Fsrc%2Fapp-server%2Fclient.test.ts?ref=9ac7a0398213977e0d40216c44c0ed61cbb5e785",
+      "patch": "@@ -47,6 +47,7 @@ describe(\"CodexAppServerClient\", () => {\n \n   afterEach(() => {\n     resetSharedCodexAppServerClientForTests();\n+    vi.useRealTimers();\n     vi.restoreAllMocks();\n     vi.useRealTimers();\n     for (const client of clients) {\n@@ -82,6 +83,37 @@ describe(\"CodexAppServerClient\", () => {\n     } satisfies Partial<CodexAppServerRpcError>);\n   });\n \n+  it(\"rejects timed-out requests and ignores late responses\", async () => {\n+    vi.useFakeTimers();\n+    const harness = createClientHarness();\n+    clients.push(harness.client);\n+\n+    const request = harness.client.request(\"model/list\", {}, { timeoutMs: 1 });\n+    const outbound = JSON.parse(harness.writes[0] ?? \"{}\") as { id?: number };\n+    const assertion = expect(request).rejects.toThrow(\"model/list timed out\");\n+\n+    await vi.advanceTimersByTimeAsync(100);\n+    await assertion;\n+\n+    harness.send({ id: outbound.id, result: { data: [] } });\n+    expect(harness.writes).toHaveLength(1);\n+  });\n+\n+  it(\"rejects aborted requests and ignores late responses\", async () => {\n+    const harness = createClientHarness();\n+    clients.push(harness.client);\n+    const controller = new AbortController();\n+\n+    const request = harness.client.request(\"model/list\", {}, { signal: controller.signal });\n+    const outbound = JSON.parse(harness.writes[0] ?? \"{}\") as { id?: number };\n+    const assertion = expect(request).rejects.toThrow(\"model/list aborted\");\n+    controller.abort();\n+\n+    await assertion;\n+    harness.send({ id: outbound.id, result: { data: [] } });\n+    expect(harness.writes).toHaveLength(1);\n+  });\n+\n   it(\"initializes with the required client version\", async () => {\n     const harness = createClientHarness();\n     clients.push(harness.client);"
+    },
+    {
+      "sha": "b7a30045efb49da0feb7d4cdff26f89890ce15f1",
+      "filename": "extensions/codex/src/app-server/client.ts",
+      "status": "modified",
+      "additions": 58,
+      "deletions": 4,
+      "changes": 62,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/9ac7a0398213977e0d40216c44c0ed61cbb5e785/extensions%2Fcodex%2Fsrc%2Fapp-server%2Fclient.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/9ac7a0398213977e0d40216c44c0ed61cbb5e785/extensions%2Fcodex%2Fsrc%2Fapp-server%2Fclient.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fcodex%2Fsrc%2Fapp-server%2Fclient.ts?ref=9ac7a0398213977e0d40216c44c0ed61cbb5e785",
+      "patch": "@@ -20,6 +20,7 @@ type PendingRequest = {\n   method: string;\n   resolve: (value: unknown) => void;\n   reject: (error: Error) => void;\n+  cleanup: () => void;\n };\n \n export class CodexAppServerRpcError extends Error {\n@@ -113,19 +114,71 @@ export class CodexAppServerClient {\n     this.initialized = true;\n   }\n \n-  request<T = JsonValue | undefined>(method: string, params?: JsonValue): Promise<T> {\n+  request<T = JsonValue | undefined>(\n+    method: string,\n+    params?: JsonValue,\n+    options: { timeoutMs?: number; signal?: AbortSignal } = {},\n+  ): Promise<T> {\n     if (this.closed) {\n       return Promise.reject(new Error(\"codex app-server client is closed\"));\n     }\n+    if (options.signal?.aborted) {\n+      return Promise.reject(new Error(`${method} aborted`));\n+    }\n     const id = this.nextId++;\n     const message: RpcRequest = { id, method, params };\n     return new Promise<T>((resolve, reject) => {\n+      let timeout: ReturnType<typeof setTimeout> | undefined;\n+      let cleanupAbort: (() => void) | undefined;\n+      const cleanup = () => {\n+        if (timeout) {\n+          clearTimeout(timeout);\n+          timeout = undefined;\n+        }\n+        cleanupAbort?.();\n+        cleanupAbort = undefined;\n+      };\n+      const rejectPending = (error: Error) => {\n+        if (!this.pending.has(id)) {\n+          return;\n+        }\n+        this.pending.delete(id);\n+        cleanup();\n+        reject(error);\n+      };\n+      if (options.timeoutMs && Number.isFinite(options.timeoutMs) && options.timeoutMs > 0) {\n+        timeout = setTimeout(\n+          () => rejectPending(new Error(`${method} timed out`)),\n+          Math.max(100, options.timeoutMs),\n+        );\n+        timeout.unref?.();\n+      }\n+      if (options.signal) {\n+        const abortListener = () => rejectPending(new Error(`${method} aborted`));\n+        options.signal.addEventListener(\"abort\", abortListener, { once: true });\n+        cleanupAbort = () => options.signal?.removeEventListener(\"abort\", abortListener);\n+      }\n       this.pending.set(id, {\n         method,\n-        resolve: (value) => resolve(value as T),\n-        reject,\n+        resolve: (value) => {\n+          cleanup();\n+          resolve(value as T);\n+        },\n+        reject: (error) => {\n+          cleanup();\n+          reject(error);\n+        },\n+        cleanup,\n       });\n-      this.writeMessage(message);\n+      if (options.signal?.aborted) {\n+        rejectPending(new Error(`${method} aborted`));\n+        return;\n+      }\n+      try {\n+        this.writeMessage(message);\n+      } catch (error) {\n+        rejectPending(error instanceof Error ? error : new Error(String(error)));\n+      }\n     });\n   }\n \n@@ -252,6 +305,7 @@ export class CodexAppServerClient {\n \n   private rejectPendingRequests(error: Error): void {\n     for (const pending of this.pending.values()) {\n+      pending.cleanup();\n       pending.reject(error);\n     }\n     this.pending.clear();"
+    },
+    {
+      "sha": "2612fc2e3ddda52c103dc87367e167de8c90d73a",
+      "filename": "extensions/codex/src/app-server/compact.test.ts",
+      "status": "modified",
+      "additions": 0,
+      "deletions": 8,
+      "changes": 8,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/9ac7a0398213977e0d40216c44c0ed61cbb5e785/extensions%2Fcodex%2Fsrc%2Fapp-server%2Fcompact.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/9ac7a0398213977e0d40216c44c0ed61cbb5e785/extensions%2Fcodex%2Fsrc%2Fapp-server%2Fcompact.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fcodex%2Fsrc%2Fapp-server%2Fcompact.test.ts?ref=9ac7a0398213977e0d40216c44c0ed61cbb5e785",
+      "patch": "@@ -7,23 +7,15 @@ import { maybeCompactCodexAppServerSession, __testing } from \"./compact.js\";\n import type { CodexServerNotification } from \"./protocol.js\";\n import { writeCodexAppServerBinding } from \"./session-binding.js\";\n \n-const OLD_RUNTIME = process.env.OPENCLAW_AGENT_RUNTIME;\n-\n let tempDir: string;\n \n describe(\"maybeCompactCodexAppServerSession\", () => {\n   beforeEach(async () => {\n     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), \"openclaw-codex-compact-\"));\n-    process.env.OPENCLAW_AGENT_RUNTIME = \"codex-app-server\";\n   });\n \n   afterEach(async () => {\n     __testing.resetCodexAppServerClientFactoryForTests();\n-    if (OLD_RUNTIME === undefined) {\n-      delete process.env.OPENCLAW_AGENT_RUNTIME;\n-    } else {\n-      process.env.OPENCLAW_AGENT_RUNTIME = OLD_RUNTIME;\n-    }\n     await fs.rm(tempDir, { recursive: true, force: true });\n   });\n "
+    },
+    {
+      "sha": "625e3a74cd89c795079c7eedcb4dd419cc90214c",
+      "filename": "extensions/codex/src/app-server/compact.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 14,
+      "changes": 15,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/9ac7a0398213977e0d40216c44c0ed61cbb5e785/extensions%2Fcodex%2Fsrc%2Fapp-server%2Fcompact.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/9ac7a0398213977e0d40216c44c0ed61cbb5e785/extensions%2Fcodex%2Fsrc%2Fapp-server%2Fcompact.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fcodex%2Fsrc%2Fapp-server%2Fcompact.ts?ref=9ac7a0398213977e0d40216c44c0ed61cbb5e785",
+      "patch": "@@ -1,6 +1,5 @@\n import {\n   embeddedAgentLog,\n-  resolveEmbeddedAgentRuntime,\n   type CompactEmbeddedPiSessionParams,\n   type EmbeddedPiCompactResult,\n } from \"openclaw/plugin-sdk/agent-harness\";\n@@ -34,21 +33,9 @@ export async function maybeCompactCodexAppServerSession(\n   options: { pluginConfig?: unknown } = {},\n ): Promise<EmbeddedPiCompactResult | undefined> {\n   const appServer = resolveCodexAppServerRuntimeOptions({ pluginConfig: options.pluginConfig });\n-  const runtime = resolveEmbeddedAgentRuntime();\n-  const provider = params.provider?.trim().toLowerCase();\n-  const shouldUseCodex =\n-    runtime === \"codex\" ||\n-    (runtime === \"auto\" && (provider === \"codex\" || provider === \"openai-codex\"));\n-  if (!shouldUseCodex) {\n-    return undefined;\n-  }\n-\n   const binding = await readCodexAppServerBinding(params.sessionFile);\n   if (!binding?.threadId) {\n-    if (runtime === \"codex\") {\n-      return { ok: false, compacted: false, reason: \"no codex app-server thread binding\" };\n-    }\n-    return undefined;\n+    return { ok: false, compacted: false, reason: \"no codex app-server thread binding\" };\n   }\n \n   const client = await clientFactory(appServer.start);"
+    },
+    {
+      "sha": "4c2e2fc356468023893fd221d4b69c06464fc8b2",
+      "filename": "extensions/codex/src/app-server/event-projector.test.ts",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 0,
+      "changes": 8,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/9ac7a0398213977e0d40216c44c0ed61cbb5e785/extensions%2Fcodex%2Fsrc%2Fapp-server%2Fevent-projector.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/9ac7a0398213977e0d40216c44c0ed61cbb5e785/extensions%2Fcodex%2Fsrc%2Fapp-server%2Fevent-projector.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fcodex%2Fsrc%2Fapp-server%2Fevent-projector.test.ts?ref=9ac7a0398213977e0d40216c44c0ed61cbb5e785",
+      "patch": "@@ -81,6 +81,7 @@ describe(\"CodexAppServerEventProjector\", () => {\n     expect(onAssistantMessageStart).toHaveBeenCalledTimes(1);\n     expect(onPartialReply).toHaveBeenLastCalledWith({ text: \"hello\" });\n     expect(result.assistantTexts).toEqual([\"hello\"]);\n+    expect(result.messagesSnapshot.map((message) => message.role)).toEqual([\"user\", \"assistant\"]);\n     expect(result.lastAssistant?.content).toEqual([{ type: \"text\", text: \"hello\" }]);\n     expect(result.attemptUsage).toMatchObject({ input: 5, output: 7, cacheRead: 2, total: 12 });\n     expect(result.replayMetadata.replaySafe).toBe(true);\n@@ -212,6 +213,13 @@ describe(\"CodexAppServerEventProjector\", () => {\n       }),\n     );\n     expect(result.toolMetas).toEqual([{ toolName: \"sessions_send\", meta: \"completed\" }]);\n+    expect(result.messagesSnapshot.map((message) => message.role)).toEqual([\n+      \"user\",\n+      \"assistant\",\n+      \"assistant\",\n+    ]);\n+    expect(JSON.stringify(result.messagesSnapshot[1])).toContain(\"Codex reasoning\");\n+    expect(JSON.stringify(result.messagesSnapshot[2])).toContain(\"Codex plan\");\n     expect(result.itemLifecycle).toMatchObject({ compactionCount: 1 });\n   });\n });"
+    },
+    {
+      "sha": "e30a4e9cda06895c626861512ab7045ab475822b",
+      "filename": "extensions/codex/src/app-server/event-projector.ts",
+      "status": "modified",
+      "additions": 27,
+      "deletions": 0,
+      "changes": 27,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/9ac7a0398213977e0d40216c44c0ed61cbb5e785/extensions%2Fcodex%2Fsrc%2Fapp-server%2Fevent-projector.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/9ac7a0398213977e0d40216c44c0ed61cbb5e785/extensions%2Fcodex%2Fsrc%2Fapp-server%2Fevent-projector.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fcodex%2Fsrc%2Fapp-server%2Fevent-projector.ts?ref=9ac7a0398213977e0d40216c44c0ed61cbb5e785",
+      "patch": "@@ -121,6 +121,8 @@ export class CodexAppServerEventProjector {\n     options?: { yieldDetected?: boolean },\n   ): EmbeddedRunAttemptResult {\n     const assistantTexts = this.collectAssistantTexts();\n+    const reasoningText = collectTextValues(this.reasoningTextByItem).join(\"\\n\\n\");\n+    const planText = collectTextValues(this.planTextByItem).join(\"\\n\\n\");\n     const lastAssistant =\n       assistantTexts.length > 0\n         ? this.createAssistantMessage(assistantTexts.join(\"\\n\\n\"))\n@@ -132,6 +134,14 @@ export class CodexAppServerEventProjector {\n         timestamp: Date.now(),\n       },\n     ];\n+    // Codex owns the canonical thread. These mirror records keep enough local\n+    // context for OpenClaw history, search, and future harness switching.\n+    if (reasoningText) {\n+      messagesSnapshot.push(this.createAssistantMirrorMessage(\"Codex reasoning\", reasoningText));\n+    }\n+    if (planText) {\n+      messagesSnapshot.push(this.createAssistantMirrorMessage(\"Codex plan\", planText));\n+    }\n     if (lastAssistant) {\n       messagesSnapshot.push(lastAssistant);\n     }\n@@ -447,6 +457,19 @@ export class CodexAppServerEventProjector {\n     };\n   }\n \n+  private createAssistantMirrorMessage(title: string, text: string): AssistantMessage {\n+    return {\n+      role: \"assistant\",\n+      content: [{ type: \"text\", text: `${title}:\\n${text}` }],\n+      api: this.params.model.api ?? \"openai-codex-responses\",\n+      provider: this.params.provider,\n+      model: this.params.modelId,\n+      usage: ZERO_USAGE,\n+      stopReason: \"stop\",\n+      timestamp: Date.now(),\n+    };\n+  }\n+\n   private isNotificationForTurn(params: JsonObject): boolean {\n     const threadId = readString(params, \"threadId\");\n     const turnId = readString(params, \"turnId\");\n@@ -479,6 +502,10 @@ function splitPlanText(text: string): string[] {\n     .filter((line) => line.length > 0);\n }\n \n+function collectTextValues(map: Map<string, string>): string[] {\n+  return [...map.values()].filter((text) => text.trim().length > 0);\n+}\n+\n function itemKind(\n   item: CodexThreadItem,\n ): \"tool\" | \"command\" | \"patch\" | \"search\" | \"analysis\" | undefined {"
+    },
+    {
+      "sha": "ea130aba9ab7ab23b3d63f36ad832b488ead83b3",
+      "filename": "extensions/codex/src/app-server/models.ts",
+      "status": "modified",
+      "additions": 12,
+      "deletions": 5,
+      "changes": 17,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/9ac7a0398213977e0d40216c44c0ed61cbb5e785/extensions%2Fcodex%2Fsrc%2Fapp-server%2Fmodels.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/9ac7a0398213977e0d40216c44c0ed61cbb5e785/extensions%2Fcodex%2Fsrc%2Fapp-server%2Fmodels.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fcodex%2Fsrc%2Fapp-server%2Fmodels.ts?ref=9ac7a0398213977e0d40216c44c0ed61cbb5e785",
+      "patch": "@@ -34,12 +34,19 @@ export async function listCodexAppServerModels(\n   const timeoutMs = options.timeoutMs ?? 2500;\n   return await withTimeout(\n     (async () => {\n-      const client = await getSharedCodexAppServerClient({ startOptions: options.startOptions });\n-      const response = await client.request<JsonObject>(\"model/list\", {\n-        limit: options.limit ?? null,\n-        cursor: options.cursor ?? null,\n-        includeHidden: options.includeHidden ?? null,\n+      const client = await getSharedCodexAppServerClient({\n+        startOptions: options.startOptions,\n+        timeoutMs,\n       });\n+      const response = await client.request<JsonObject>(\n+        \"model/list\",\n+        {\n+          limit: options.limit ?? null,\n+          cursor: options.cursor ?? null,\n+          includeHidden: options.includeHidden ?? null,\n+        },\n+        { timeoutMs },\n+      );\n       return readModelListResult(response);\n     })(),\n     timeoutMs,"
+    },
+    {
+      "sha": "66b0b4bb6a46ca4c7aab7d5bac8ee8d24abd149a",
+      "filename": "extensions/codex/src/app-server/request.ts",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 2,
+      "changes": 7,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/9ac7a0398213977e0d40216c44c0ed61cbb5e785/extensions%2Fcodex%2Fsrc%2Fapp-server%2Frequest.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/9ac7a0398213977e0d40216c44c0ed61cbb5e785/extensions%2Fcodex%2Fsrc%2Fapp-server%2Frequest.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fcodex%2Fsrc%2Fapp-server%2Frequest.ts?ref=9ac7a0398213977e0d40216c44c0ed61cbb5e785",
+      "patch": "@@ -12,8 +12,11 @@ export async function requestCodexAppServerJson<T = JsonValue | undefined>(param\n   const timeoutMs = params.timeoutMs ?? 60_000;\n   return await withTimeout(\n     (async () => {\n-      const client = await getSharedCodexAppServerClient({ startOptions: params.startOptions });\n-      return await client.request<T>(params.method, params.requestParams);\n+      const client = await getSharedCodexAppServerClient({\n+        startOptions: params.startOptions,\n+        timeoutMs,\n+      });\n+      return await client.request<T>(params.method, params.requestParams, { timeoutMs });\n     })(),\n     timeoutMs,\n     `codex app-server ${params.method} timed out`,"
+    },
+    {
+      "sha": "19caed290d061d2c9e1af4a83c70382cbceb2b4b",
+      "filename": "extensions/codex/src/app-server/run-attempt.test.ts",
+      "status": "modified",
+      "additions": 35,
+      "deletions": 0,
+      "changes": 35,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/9ac7a0398213977e0d40216c44c0ed61cbb5e785/extensions%2Fcodex%2Fsrc%2Fapp-server%2Frun-attempt.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/9ac7a0398213977e0d40216c44c0ed61cbb5e785/extensions%2Fcodex%2Fsrc%2Fapp-server%2Frun-attempt.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fcodex%2Fsrc%2Fapp-server%2Frun-attempt.test.ts?ref=9ac7a0398213977e0d40216c44c0ed61cbb5e785",
+      "patch": "@@ -243,6 +243,41 @@ describe(\"runCodexAppServerAttempt\", () => {\n     expect(queueAgentHarnessMessage(\"session-1\", \"after timeout\")).toBe(false);\n   });\n \n+  it(\"times out turn start before the active run handle is installed\", async () => {\n+    const request = vi.fn(\n+      async (method: string, _params?: unknown, options?: { timeoutMs?: number }) => {\n+        if (method === \"thread/start\") {\n+          return { thread: { id: \"thread-1\" }, model: \"gpt-5.4-codex\", modelProvider: \"openai\" };\n+        }\n+        if (method === \"turn/start\") {\n+          return await new Promise<never>((_, reject) => {\n+            setTimeout(\n+              () => reject(new Error(\"turn/start timed out\")),\n+              Math.max(100, options?.timeoutMs ?? 0),\n+            );\n+          });\n+        }\n+        return {};\n+      },\n+    );\n+    __testing.setCodexAppServerClientFactoryForTests(\n+      async () =>\n+        ({\n+          request,\n+          addNotificationHandler: () => () => undefined,\n+          addRequestHandler: () => () => undefined,\n+        }) as never,\n+    );\n+    const params = createParams(\n+      path.join(tempDir, \"session.jsonl\"),\n+      path.join(tempDir, \"workspace\"),\n+    );\n+    params.timeoutMs = 1;\n+\n+    await expect(runCodexAppServerAttempt(params)).rejects.toThrow(\"turn/start timed out\");\n+    expect(queueAgentHarnessMessage(\"session-1\", \"after timeout\")).toBe(false);\n+  });\n+\n   it(\"keeps extended history enabled when resuming a bound Codex thread\", async () => {\n     const sessionFile = path.join(tempDir, \"session.jsonl\");\n     const workspaceDir = path.join(tempDir, \"workspace\");"
+    },
+    {
+      "sha": "10f7c08f3da0b0a432bd1aa53b4ade55a60ed1fd",
+      "filename": "extensions/codex/src/app-server/run-attempt.ts",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 2,
+      "changes": 13,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/9ac7a0398213977e0d40216c44c0ed61cbb5e785/extensions%2Fcodex%2Fsrc%2Fapp-server%2Frun-attempt.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/9ac7a0398213977e0d40216c44c0ed61cbb5e785/extensions%2Fcodex%2Fsrc%2Fapp-server%2Frun-attempt.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fcodex%2Fsrc%2Fapp-server%2Frun-attempt.ts?ref=9ac7a0398213977e0d40216c44c0ed61cbb5e785",
+      "patch": "@@ -127,6 +127,7 @@ export async function runCodexAppServerAttempt(\n   const completion = new Promise<void>((resolve) => {\n     resolveCompletion = resolve;\n   });\n+  let notificationQueue: Promise<void> = Promise.resolve();\n \n   const handleNotification = async (notification: CodexServerNotification) => {\n     if (!projector || !turnId) {\n@@ -142,8 +143,15 @@ export async function runCodexAppServerAttempt(\n       resolveCompletion?.();\n     }\n   };\n+  const enqueueNotification = (notification: CodexServerNotification): Promise<void> => {\n+    notificationQueue = notificationQueue.then(\n+      () => handleNotification(notification),\n+      () => handleNotification(notification),\n+    );\n+    return notificationQueue;\n+  };\n \n-  const notificationCleanup = client.addNotificationHandler(handleNotification);\n+  const notificationCleanup = client.addNotificationHandler(enqueueNotification);\n   const requestCleanup = client.addRequestHandler(async (request) => {\n     if (!turnId) {\n       return undefined;\n@@ -177,6 +185,7 @@ export async function runCodexAppServerAttempt(\n         cwd: effectiveWorkspace,\n         appServer,\n       }),\n+      { timeoutMs: params.timeoutMs, signal: runAbortController.signal },\n     );\n   } catch (error) {\n     notificationCleanup();\n@@ -187,7 +196,7 @@ export async function runCodexAppServerAttempt(\n   turnId = turn.turn.id;\n   projector = new CodexAppServerEventProjector(params, thread.threadId, turnId);\n   for (const notification of pendingNotifications.splice(0)) {\n-    await handleNotification(notification);\n+    await enqueueNotification(notification);\n   }\n   const activeTurnId = turnId;\n   const activeProjector = projector;"
+    },
+    {
+      "sha": "3edee7b50a47ed8f0c397ab70ef3646d7e39790f",
+      "filename": "extensions/codex/src/app-server/shared-client.test.ts",
+      "status": "modified",
+      "additions": 28,
+      "deletions": 0,
+      "changes": 28,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/9ac7a0398213977e0d40216c44c0ed61cbb5e785/extensions%2Fcodex%2Fsrc%2Fapp-server%2Fshared-client.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/9ac7a0398213977e0d40216c44c0ed61cbb5e785/extensions%2Fcodex%2Fsrc%2Fapp-server%2Fshared-client.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fcodex%2Fsrc%2Fapp-server%2Fshared-client.test.ts?ref=9ac7a0398213977e0d40216c44c0ed61cbb5e785",
+      "patch": "@@ -37,6 +37,7 @@ function createClientHarness() {\n describe(\"shared Codex app-server client\", () => {\n   afterEach(() => {\n     resetSharedCodexAppServerClientForTests();\n+    vi.useRealTimers();\n     vi.restoreAllMocks();\n   });\n \n@@ -59,4 +60,31 @@ describe(\"shared Codex app-server client\", () => {\n     expect(harness.process.kill).toHaveBeenCalledTimes(1);\n     startSpy.mockRestore();\n   });\n+\n+  it(\"closes and clears a shared app-server when initialize times out\", async () => {\n+    const first = createClientHarness();\n+    const second = createClientHarness();\n+    const startSpy = vi\n+      .spyOn(CodexAppServerClient, \"start\")\n+      .mockReturnValueOnce(first.client)\n+      .mockReturnValueOnce(second.client);\n+\n+    await expect(listCodexAppServerModels({ timeoutMs: 5 })).rejects.toThrow(\n+      \"codex app-server initialize timed out\",\n+    );\n+    expect(first.process.kill).toHaveBeenCalledTimes(1);\n+\n+    const secondList = listCodexAppServerModels({ timeoutMs: 1000 });\n+    const initialize = JSON.parse(second.writes[0] ?? \"{}\") as { id?: number };\n+    second.send({\n+      id: initialize.id,\n+      result: { userAgent: \"openclaw/0.118.0 (macOS; test)\" },\n+    });\n+    await vi.waitFor(() => expect(second.writes.length).toBeGreaterThanOrEqual(3));\n+    const modelList = JSON.parse(second.writes[2] ?? \"{}\") as { id?: number };\n+    second.send({ id: modelList.id, result: { data: [] } });\n+\n+    await expect(secondList).resolves.toEqual({ models: [] });\n+    expect(startSpy).toHaveBeenCalledTimes(2);\n+  });\n });"
+    },
+    {
+      "sha": "6921ec5b739eb63dae9dc2de683279b11e90fd2a",
+      "filename": "extensions/codex/src/app-server/shared-client.ts",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 4,
+      "changes": 12,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/9ac7a0398213977e0d40216c44c0ed61cbb5e785/extensions%2Fcodex%2Fsrc%2Fapp-server%2Fshared-client.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/9ac7a0398213977e0d40216c44c0ed61cbb5e785/extensions%2Fcodex%2Fsrc%2Fapp-server%2Fshared-client.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fcodex%2Fsrc%2Fapp-server%2Fshared-client.ts?ref=9ac7a0398213977e0d40216c44c0ed61cbb5e785",
+      "patch": "@@ -4,6 +4,7 @@ import {\n   resolveCodexAppServerRuntimeOptions,\n   type CodexAppServerStartOptions,\n } from \"./config.js\";\n+import { withTimeout } from \"./timeout.js\";\n \n type SharedCodexAppServerClientState = {\n   client?: CodexAppServerClient;\n@@ -23,6 +24,7 @@ function getSharedCodexAppServerClientState(): SharedCodexAppServerClientState {\n \n export async function getSharedCodexAppServerClient(options?: {\n   startOptions?: CodexAppServerStartOptions;\n+  timeoutMs?: number;\n }): Promise<CodexAppServerClient> {\n   const state = getSharedCodexAppServerClientState();\n   const startOptions = options?.startOptions ?? resolveCodexAppServerRuntimeOptions().start;\n@@ -46,11 +48,13 @@ export async function getSharedCodexAppServerClient(options?: {\n     }\n   })();\n   try {\n-    return await state.promise;\n+    return await withTimeout(\n+      state.promise,\n+      options?.timeoutMs ?? 0,\n+      \"codex app-server initialize timed out\",\n+    );\n   } catch (error) {\n-    state.client = undefined;\n-    state.promise = undefined;\n-    state.key = undefined;\n+    clearSharedCodexAppServerClient();\n     throw error;\n   }\n }"
+    },
+    {
+      "sha": "adaddf578d4022094e0b6eecff7a239c4b1e07ee",
+      "filename": "extensions/codex/src/app-server/transcript-mirror.test.ts",
+      "status": "modified",
+      "additions": 23,
+      "deletions": 2,
+      "changes": 25,
+      "blob_url": "https://github.com/openclaw/openclaw/blob/9ac7a0398213977e0d40216c44c0ed61cbb5e785/extensions%2Fcodex%2Fsrc%2Fapp-server%2Ftranscript-mirror.test.ts",
+      "raw_url": "https://github.com/openclaw/openclaw/raw/9ac7a0398213977e0d40216c44c0ed61cbb5e785/extensions%2Fcodex%2Fsrc%2Fapp-server%2Ftranscript-mirror.test.ts",
+      "contents_url": "https://api.github.com/repos/openclaw/openclaw/contents/extensions%2Fcodex%2Fsrc%2Fapp-server%2Ftranscript-mirror.test.ts?ref=9ac7a0398213977e0d40216c44c0ed61cbb5e785",
+      "patch": "@@ -25,7 +25,7 @@ describe(\"mirrorCodexAppServerTranscript\", () => {\n         { role: \"user\", content: \"hello\", timestamp: 1 },\n         {\n           role: \"assistant\",\n-          content: [{ type: \"text\", text: \"hi\" }],\n+          content: [{ type: \"text\", text: \"Codex plan:\\ninspect\" }],\n           api: \"openai-codex-responses\",\n           provider: \"openai-codex\",\n           model: \"gpt-5.4-codex\",\n@@ -40,6 +40,23 @@ describe(\"mirrorCodexAppServerTranscript\", () => {\n           stopReason: \"stop\",\n           timestamp: 2,\n         },\n+        {\n+          role: \"assistant\",\n+          content: [{ type: \"text\", text: \"hi\" }],\n+          api: \"openai-codex-responses\",\n+          provider: \"openai-codex\",\n+          model: \"gpt-5.4-codex\",\n+          usage: {\n+            input: 0,\n+            output: 0,\n+            cacheRead: 0,\n+            cacheWrite: 0,\n+            totalTokens: 0,\n+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },\n+          },\n+          stopReason: \"stop\",\n+          timestamp: 3,\n+        },\n       ],\n     });\n \n@@ -48,7 +65,11 @@ describe(\"mirrorCodexAppServerTranscript\", () => {\n       .split(\"\\n\")\n       .map((line) => JSON.parse(line) as { type?: string; message?: { role?: string } });\n     expect(records[0]?.type).toBe(\"session\");\n-    expect(records.slice(1).map((record) => record.message?.role)).toEqual([\"user\", \"assistant\"]);\n+    expect(records.slice(1).map((record) => record.message?.role)).toEqual([\n+      \"user\",\n+      \"assistant\",\n+      \"assistant\",\n+    ]);\n   });\n \n   it(\"deduplicates app-server turn mirrors by idempotency scope\", async () => {"
+    }
+  ]
+}

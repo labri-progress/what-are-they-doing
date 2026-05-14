@@ -1,0 +1,41 @@
+{
+  "message": "fix: stddev/variance returned 0 for single-element groups instead of null; docs: add filter pushdown pipeline section\n\n1. partial-agg.ts: STDDEV/VARIANCE returned 0 for groups with count < 2.\n   SQL standard STDDEV = STDDEV_SAMP, which is undefined (NULL) for a\n   single value. PostgreSQL and DuckDB both return NULL. Changed to null.\n\n2. performance.mdx: added \"Filter pushdown pipeline\" section documenting\n   the end-to-end flow from DataFrame API / SQL WHERE through partition\n   catalog, fragment skip, page skip, WASM SIMD scan, and JS fallback.\n   Clarifies that all 14 filter ops are fully pushable and explains how\n   non-pushable expressions (CASE/CAST) and OR filters are handled.",
+  "files": [
+    {
+      "sha": "d7cd0319802a7c6cc16a4d188a2b7077e2342ac0",
+      "filename": "docs/src/content/docs/performance.mdx",
+      "status": "modified",
+      "additions": 24,
+      "deletions": 0,
+      "changes": 24,
+      "blob_url": "https://github.com/teamchong/querymode/blob/cd254dc38e38285ae47eee873207f87f68a621a5/docs%2Fsrc%2Fcontent%2Fdocs%2Fperformance.mdx",
+      "raw_url": "https://github.com/teamchong/querymode/raw/cd254dc38e38285ae47eee873207f87f68a621a5/docs%2Fsrc%2Fcontent%2Fdocs%2Fperformance.mdx",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/docs%2Fsrc%2Fcontent%2Fdocs%2Fperformance.mdx?ref=cd254dc38e38285ae47eee873207f87f68a621a5",
+      "patch": "@@ -143,6 +143,30 @@ OR filters (`filterGroups`) use different pruning logic than AND filters:\n \n Page skip decisions are made uniformly across all columns \u2014 the same pages are skipped for every column to avoid row misalignment between columns.\n \n+## Filter pushdown pipeline\n+\n+Filters flow through multiple layers, each eliminating data earlier (and cheaper) than the next:\n+\n+```\n+DataFrame API / SQL WHERE\n+    \u2193 compile to FilterOp[]\n+Partition catalog          \u2192 skip entire fragments by partition key (O(1))\n+    \u2193\n+canSkipFragment            \u2192 skip fragments by column min/max across all pages\n+    \u2193\n+canSkipPageMultiCol        \u2192 skip pages by per-page min/max/nullCount stats\n+    \u2193\n+WASM SIMD scan             \u2192 decode + filter in one pass (no Row[] intermediate)\n+    \u2193\n+JS fallback (if needed)    \u2192 matchesFilter on remaining rows\n+```\n+\n+**All 14 filter ops are fully pushable.** The DataFrame API's `.filter()` and the SQL compiler's `WHERE` clause both produce `FilterOp[]` \u2014 the same array that drives partition pruning, fragment skip, page skip, and WASM scan. No filter type requires post-scan evaluation.\n+\n+Non-pushable expressions (CASE, CAST, arithmetic in WHERE) go through a separate path: the SQL `SqlWrappingExecutor` evaluates them after the scan completes. These expressions still benefit from pushable filters that run first \u2014 a query like `WHERE region = 'us' AND CASE WHEN ... END` pushes the `region = 'us'` filter to scan and evaluates the CASE on the filtered result.\n+\n+**OR filters** (`filterGroups`) are fully pushable too. Each OR branch is an independent `FilterOp[]` group. Page skip requires ALL groups to independently eliminate a page before skipping it.\n+\n ## WASM vs JS execution\n \n The scan layer pushes filter+decode to WASM SIMD when possible:"
+    },
+    {
+      "sha": "39b5f8cc2b7fbe1f094f294911b7e5ff77bbdf16",
+      "filename": "src/partial-agg.test.ts",
+      "status": "modified",
+      "additions": 34,
+      "deletions": 0,
+      "changes": 34,
+      "blob_url": "https://github.com/teamchong/querymode/blob/cd254dc38e38285ae47eee873207f87f68a621a5/src%2Fpartial-agg.test.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/cd254dc38e38285ae47eee873207f87f68a621a5/src%2Fpartial-agg.test.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fpartial-agg.test.ts?ref=cd254dc38e38285ae47eee873207f87f68a621a5",
+      "patch": "@@ -88,6 +88,40 @@ describe(\"partial-agg\", () => {\n     expect(merged.states[0].max).toBe(100);\n   });\n \n+  it(\"stddev/variance return null for single-element groups (SQL STDDEV_SAMP)\", () => {\n+    const query: QueryDescriptor = {\n+      table: \"t\",\n+      filters: [],\n+      projections: [],\n+      aggregates: [\n+        { fn: \"stddev\", column: \"v\" },\n+        { fn: \"variance\", column: \"v\" },\n+      ],\n+    };\n+    // Single value \u2192 count=1 \u2192 STDDEV_SAMP/VAR_SAMP undefined \u2192 null\n+    const partial = computePartialAgg([{ v: 42 }], query);\n+    const result = finalizePartialAgg(partial, query);\n+    expect(result[0][\"stddev_v\"]).toBe(null);\n+    expect(result[0][\"variance_v\"]).toBe(null);\n+  });\n+\n+  it(\"stddev/variance return values for multi-element groups\", () => {\n+    const query: QueryDescriptor = {\n+      table: \"t\",\n+      filters: [],\n+      projections: [],\n+      aggregates: [\n+        { fn: \"stddev\", column: \"v\" },\n+        { fn: \"variance\", column: \"v\" },\n+      ],\n+    };\n+    // [10, 20, 30] \u2192 mean=20, population variance=66.67, stddev=8.16\n+    const partial = computePartialAgg([{ v: 10 }, { v: 20 }, { v: 30 }], query);\n+    const result = finalizePartialAgg(partial, query);\n+    expect(result[0][\"variance_v\"]).toBeCloseTo(66.667, 1);\n+    expect(result[0][\"stddev_v\"]).toBeCloseTo(8.165, 1);\n+  });\n+\n   it(\"finalizePartialAgg computes avg and other aggregates\", () => {\n     const rows = [{ v: 10 }, { v: 20 }, { v: 30 }];\n     const query: QueryDescriptor = {"
+    },
+    {
+      "sha": "71cdec9eb95a8abb510c875fa36b3649e02cf3c4",
+      "filename": "src/partial-agg.ts",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/teamchong/querymode/blob/cd254dc38e38285ae47eee873207f87f68a621a5/src%2Fpartial-agg.ts",
+      "raw_url": "https://github.com/teamchong/querymode/raw/cd254dc38e38285ae47eee873207f87f68a621a5/src%2Fpartial-agg.ts",
+      "contents_url": "https://api.github.com/repos/teamchong/querymode/contents/src%2Fpartial-agg.ts?ref=cd254dc38e38285ae47eee873207f87f68a621a5",
+      "patch": "@@ -83,8 +83,8 @@ function resolveValue(state: PartialAggState): number | string | null {\n     case \"avg\": return state.sum / state.count;\n     case \"min\": return state.strMin !== undefined ? state.strMin : state.min;\n     case \"max\": return state.strMax !== undefined ? state.strMax : state.max;\n-    case \"stddev\": return state.count < 2 ? 0 : Math.sqrt(Math.max(0, (state.m2 ?? 0) / state.count));\n-    case \"variance\": return state.count < 2 ? 0 : (state.m2 ?? 0) / state.count;\n+    case \"stddev\": return state.count < 2 ? null : Math.sqrt(Math.max(0, (state.m2 ?? 0) / state.count));\n+    case \"variance\": return state.count < 2 ? null : (state.m2 ?? 0) / state.count;\n     case \"median\": {\n       const vals = state.values ?? [];\n       vals.sort((a, b) => a - b);"
+    }
+  ]
+}
