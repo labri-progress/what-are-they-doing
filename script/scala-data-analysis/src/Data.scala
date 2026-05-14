@@ -3,6 +3,8 @@ package whataretheydoing
 import com.github.plokhotnyuk.jsoniter_scala.core.*
 import com.github.plokhotnyuk.jsoniter_scala.macros.*
 
+import java.time.LocalDate
+
 given codecMapDayData: JsonValueCodec[Map[String, DayData]] = JsonCodecMaker.make
 
 given codecMonthlySnapshot: JsonValueCodec[MonthlySnapshot] =
@@ -20,7 +22,7 @@ case class MonthlySnapshot(
     developer: String,
     month: String,
     repos: Option[List[String]],
-    days: Map[String, DayData]
+    days: Map[LocalDate, DayData]
 )
 
 case class DayData(

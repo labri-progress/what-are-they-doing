@@ -59,8 +59,6 @@ object DataAnalysis {
     result
   }
 
-
-
   // Load developers
   lazy val developers: List[DevSummary] = time("load devs"):
       val developersJson = Files.readAllBytes(devFile)
@@ -100,7 +98,7 @@ object DataAnalysis {
     allCommits.to(ParVector).map { c => (c.sha, getCommitDetails(c)) }.to(Map)
   }
 
-  lazy val allDays: Seq[LocalDate] = aggregateData.flatMap(_.data.days.keysIterator.map(LocalDate.parse(_).nn))
+  lazy val allDays: Seq[LocalDate] = aggregateData.flatMap(_.data.days.keysIterator)
 
   private val conventionalCommitPattern =
     "^([a-z]+)(?:\\([^\\r\\n()]+\\))?(!)?:\\s+(.+)$".r
@@ -154,8 +152,7 @@ object DataAnalysis {
     )
   }
 
-  def weekStart(day: LocalDate): LocalDate =
-    day.`with`(DayOfWeek.MONDAY)
+  def weekStart(day: LocalDate): LocalDate = day.`with`(DayOfWeek.MONDAY)
 
   private lazy val periodRows: Vector[PeriodCsvRow] = {
     time("build weekly period rows") {
@@ -163,7 +160,7 @@ object DataAnalysis {
         aggregateData.iterator
           .flatMap { case (developer, _, _, snapshot) =>
             snapshot.days.iterator.map { case (day, dayData) =>
-              ((developer, weekStart(LocalDate.parse(day))), dayData.total_count)
+              ((developer, weekStart(day)), dayData.total_count)
             }
           }
           .toVector
@@ -173,7 +170,7 @@ object DataAnalysis {
         aggregateData.iterator
           .flatMap { case (developer, _, _, snapshot) =>
             snapshot.days.iterator.map { case (day, dayData) =>
-              ((developer, weekStart(LocalDate.parse(day))), dayData.commits.size)
+              ((developer, weekStart(day)), dayData.commits.size)
             }
           }
           .toVector
@@ -183,7 +180,7 @@ object DataAnalysis {
         aggregateData.iterator
           .flatMap { case (developer, _, _, snapshot) =>
             snapshot.days.iterator.flatMap { case (day, dayData) =>
-              val week = weekStart(LocalDate.parse(day))
+              val week = weekStart(day)
               dayData.commits.iterator.flatMap { commit =>
                 val agents = commitSignals.get(commit.sha).map(_.agents).getOrElse(Set.empty)
                 val labels = if agents.nonEmpty then agents else Set("no agent")
@@ -209,74 +206,69 @@ object DataAnalysis {
     }
   }
 
-  def commitTypeSeriesForDeveloper(handle: String): TimeSeriesData = {
-    val totalsByWeek =
-      aggregateData.iterator
-        .filter(_.dev == handle)
-        .flatMap { case (_, _, _, snapshot) =>
-          snapshot.days.iterator.map { case (day, dayData) =>
-            (weekStart(LocalDate.parse(day)), dayData.total_count)
+  lazy val dailyData: Vector[(developer: String, day: LocalDate, dayData: DayData)] =
+    aggregateData.iterator.flatMap { case (developer, _, _, snapshot) =>
+      snapshot.days.iterator.map { case (day, dayData) => (developer, day, dayData) }
+    }.toVector
+
+  lazy val weeklyData: Map[(String, LocalDate), Vector[DayData]] =
+    dailyData.groupBy(e => (e.developer, weekStart(e.day))).map((k, v) => k -> v.map(_.dayData))
+
+  private lazy val commitTypeTotalsByDeveloperWeek: Map[(String, LocalDate), Int] =
+    weeklyData.view.mapValues(_.map(_.total_count).sum).toMap
+
+  private lazy val commitTypeSampledByDeveloperWeek: Map[(String, LocalDate), Int] =
+    weeklyData.view.mapValues(_.map(_.commits.size).sum).toMap
+
+  private lazy val commitTypeCountsByDeveloperWeekType: Map[(String, LocalDate, CommitType), Int] =
+    weeklyData.iterator
+      .flatMap { case ((developer, week), dayDataVector) =>
+        dayDataVector.iterator.flatMap { dayData =>
+          dayData.commits.iterator.map { commit =>
+            val commitType = commitSignals.get(commit.sha).map(_.commitType).getOrElse(CommitType.Unknown)
+            ((developer, week, commitType), 1)
           }
         }
-        .toVector
-        .groupMapReduce(_._1)(_._2)(_ + _)
+      }
+      .toVector
+      .groupMapReduce(_._1)(_._2)(_ + _)
 
-    val sampledByWeek =
-      aggregateData.iterator
-        .filter(_.dev == handle)
-        .flatMap { case (_, _, _, snapshot) =>
-          snapshot.days.iterator.map { case (day, dayData) =>
-            (weekStart(LocalDate.parse(day)), dayData.commits.size)
-          }
-        }
-        .toVector
-        .groupMapReduce(_._1)(_._2)(_ + _)
-
-    val countsByWeekType =
-      aggregateData.iterator
-        .filter(_.dev == handle)
-        .flatMap { case (_, _, _, snapshot) =>
-          snapshot.days.iterator.flatMap { case (day, dayData) =>
-            val week = weekStart(LocalDate.parse(day))
-            dayData.commits.iterator.map { commit =>
-              val commitType = commitSignals.get(commit.sha).map(_.commitType).getOrElse(CommitType.Unknown)
-              ((week, commitType), 1)
+  lazy val commitTypeSeriesForDeveloper: Map[String, TimeSeriesData] =
+    trackedHandles.iterator.map { handle =>
+      val weeks =
+        commitTypeTotalsByDeveloperWeek.keys.collect { case (dev, week) if dev == handle => week }.toVector.sorted
+      handle -> TimeSeriesData(
+        points = weeks.map { week =>
+          SVGGraphLib.StackedBarPoint(
+            xLabel = week.toString,
+            values = commitTypeCountsByDeveloperWeekType.collect {
+              case ((dev, w, commitType), count) if dev == handle && w == week =>
+                commitType.toString.toLowerCase -> count
             }
-          }
-        }
-        .toVector
-        .groupMapReduce(_._1)(_._2)(_ + _)
+          )
+        },
+        totalCommits = weeks.map(week => commitTypeTotalsByDeveloperWeek((handle, week))),
+        sampledCommits = weeks.map(week => commitTypeSampledByDeveloperWeek.getOrElse((handle, week), 0))
+      )
+    }.toMap
 
-    val weeks = totalsByWeek.keys.toVector.sorted
-    TimeSeriesData(
-      points = weeks.map { week =>
-        SVGGraphLib.StackedBarPoint(
-          xLabel = week.toString,
-          values = countsByWeekType.collect {
-            case ((w, commitType), count) if w == week => commitType.toString.toLowerCase -> count
-          }
-        )
-      },
-      totalCommits = weeks.map(totalsByWeek),
-      sampledCommits = weeks.map(week => sampledByWeek.getOrElse(week, 0))
-    )
-  }
-
-  def agentSeriesForDeveloper(handle: String): TimeSeriesData = {
-    val rows     = periodRows.filter(_.developer == handle)
-    val weekKeys = rows.map(_.period_iso).distinct.sorted
-    TimeSeriesData(
-      points = weekKeys.map { week =>
-        val weekRows = rows.filter(_.period_iso == week)
-        SVGGraphLib.StackedBarPoint(
-          xLabel = week,
-          values = weekRows.map(row => row.agent -> row.count).toMap
-        )
-      }.toVector,
-      totalCommits = weekKeys.map(week => rows.find(_.period_iso == week).map(_.total_commits).getOrElse(0)).toVector,
-      sampledCommits =
-        weekKeys.map(week => rows.find(_.period_iso == week).map(_.sampled_commits).getOrElse(0)).toVector
-    )
+  lazy val agentSeriesForDeveloper: Map[String, TimeSeriesData] = {
+    val rows = periodRows.groupBy(_.developer)
+    rows.map { (handle, rows) =>
+      val weekKeys = rows.map(_.period_iso).distinct.sorted
+      handle -> TimeSeriesData(
+        points = weekKeys.map { week =>
+          val weekRows = rows.filter(_.period_iso == week)
+          SVGGraphLib.StackedBarPoint(
+            xLabel = week,
+            values = weekRows.map(row => row.agent -> row.count).toMap
+          )
+        },
+        totalCommits = weekKeys.map(week => rows.find(_.period_iso == week).map(_.total_commits).getOrElse(0)).toVector,
+        sampledCommits =
+          weekKeys.map(week => rows.find(_.period_iso == week).map(_.sampled_commits).getOrElse(0)).toVector
+      )
+    }
   }
 
 }
