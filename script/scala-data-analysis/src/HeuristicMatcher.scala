@@ -1,10 +1,12 @@
 package whataretheydoing
 
 import com.github.plokhotnyuk.jsoniter_scala.core.readFromArray
-import os.Path
 import whataretheydoing.HeuristicJson
 
+import java.nio.file.Files
+import java.nio.file.Path
 import scala.collection.mutable
+import scala.jdk.CollectionConverters.*
 import scala.util.matching.Regex
 import Codecs.given
 
@@ -62,21 +64,27 @@ object HeuristicMatcher {
 
   def loadHeuristics(agentsDir: Path): Map[String, List[Heuristic]] =
       val result = mutable.Map[String, List[Heuristic]]()
-      os.list(agentsDir).filter(_.ext == "json").foreach { file =>
-        val jsonBytes      = os.read.bytes(file)
-        val heuristicsJson = readFromArray[List[HeuristicJson]](jsonBytes)
-        val agentName      = file.last.stripSuffix(".json")
-        val heuristics     = heuristicsJson.map { hj =>
-          Heuristic(
-            agentName = agentName,
-            authorNames = hj.author_names,
-            authorMails = hj.author_mails,
-            files = hj.files,
-            commitMessagePrefix = hj.commit_message_prefix
-          )
-        }
-        result(agentName) = heuristics
-      }
+      val stream = Files.list(agentsDir)
+      try
+          stream.iterator().asScala
+            .filter(path => Files.isRegularFile(path) && path.getFileName.toString.endsWith(".json"))
+            .foreach { file =>
+              val jsonBytes      = Files.readAllBytes(file)
+              val heuristicsJson = readFromArray[List[HeuristicJson]](jsonBytes)
+              val agentName      = file.getFileName.toString.stripSuffix(".json")
+              val heuristics     = heuristicsJson.map { hj =>
+                Heuristic(
+                  agentName = agentName,
+                  authorNames = hj.author_names,
+                  authorMails = hj.author_mails,
+                  files = hj.files,
+                  commitMessagePrefix = hj.commit_message_prefix
+                )
+              }
+              result(agentName) = heuristics
+            }
+      finally
+          stream.close()
       result.toMap
 
   def detectAgents(

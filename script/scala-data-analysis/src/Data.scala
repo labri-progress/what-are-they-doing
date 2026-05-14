@@ -2,13 +2,6 @@ package whataretheydoing
 
 import com.github.plokhotnyuk.jsoniter_scala.core.*
 import com.github.plokhotnyuk.jsoniter_scala.macros.*
-import os.Path
-import scala.collection.mutable
-import java.time.LocalDate
-import java.time.format.DateTimeFormatter
-import java.time.temporal.WeekFields
-import java.util.Locale
-import scala.util.matching.Regex
 
 object Codecs {
   given codecMapDayData: JsonValueCodec[Map[String, DayData]] = JsonCodecMaker.make

@@ -8,4 +8,3 @@
 //> using dep "org.jsoup:jsoup:1.22.2"
 //> using dep "pt.kcry::blake3:3.1.2"
 //> using dep com.github.tototoshi::scala-csv::2.0.0
-//> using dep com.lihaoyi::os-lib:0.11.8
