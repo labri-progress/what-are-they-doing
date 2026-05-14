@@ -160,6 +160,7 @@ keyring.set_password("login2", "github_token", "<your-token>")
 | `collect-commits-per-day.py` | Collects all commits for a developer in a given month via the GitHub GraphQL API. Writes `data/{developer}-{YYYY-MM}.json`. Usage: `python script/collect-commits-per-day.py --developer steipete --month 2025-12` |
 | `collect-commit-per-month.py` | Collects monthly commit counts for every developer in `developers.json` by iterating over their non-fork repos (avoids fork inflation). Writes results back to `developers.json`. |
 | `list_repos_by_user_with_events.py` | Fetches all repos where a developer committed in the last 3 months via the GitHub GraphQL  API. |
+| `collect-individual-commits.py` | Downloads per-commit file-level details for every commit SHA in `data/*.json` that is not yet cached in `data/commits/{sha}.json`. Also removes stale cache entries. Usage: `python script/collect-individual-commits.py` (optionally `--developer steipete --month 2025-12`) |
 | `collect-tentative-names.py` | Searches GitHub commits for `noreply@anthropic.com` to discover candidate AI-heavy users; filters by commit count and repo count. |
 
 ### Analysis
@@ -180,7 +181,10 @@ keyring.set_password("login2", "github_token", "<your-token>")
 # 1. Collect monthly commit data
 python script/collect-commits-per-day.py --developer steipete --month 2025-12
 
-# 2. Analyse the collected data
+# 2. Download per-commit details
+python script/collect-individual-commits.py
+
+# 3. Analyse the collected data
 python script/analyze-commits.py        data/steipete-2025-12.json
 python script/analyze-commit-quality.py data/steipete-2025-12.json
 python script/detect-agents.py          data/steipete-2025-12.json
