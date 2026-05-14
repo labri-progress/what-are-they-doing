@@ -5,12 +5,21 @@ import com.github.tototoshi.csv.CSVWriter
 
 import java.nio.file.{Files, Path}
 import java.time.{DayOfWeek, LocalDate, YearMonth}
-import java.time.format.DateTimeFormatter
-import scala.collection.parallel.immutable.{ParMap, ParVector}
+import scala.collection.parallel.immutable.ParVector
 import scala.jdk.CollectionConverters.*
 import scala.util.Using
 
 object DevData {
+
+  enum CommitType:
+      case Build, Chore, Ci, Docs, Feat, Fix, Perf, Refactor, Revert, Style, Test, Unknown
+
+  case class ClassifiedCommit(
+      agents: Set[String],
+      commitType: CommitType,
+      message: String,
+      files: List[String]
+  )
 
   case class PeriodCsvRow(
       developer: String,
@@ -75,38 +84,61 @@ object DevData {
 
   def allCommits = aggregateData.iterator.flatMap(_.data.days.valuesIterator.flatMap(_.commits))
 
-  lazy val commitSignals: ParMap[String, Set[String]] = time("compute commit signals") {
-    allCommits.to(ParVector).map { c => (c.sha, getCommitDetails(c)) }.toMap
+  lazy val commitSignals: Map[String, ClassifiedCommit] = time("compute commit signals") {
+    allCommits.to(ParVector).map { c => (c.sha, getCommitDetails(c)) }.to(Map)
   }
 
   lazy val allDays: Seq[LocalDate] = aggregateData.flatMap(_.data.days.keysIterator.map(LocalDate.parse(_).nn))
 
-  private def getCommitDetails(commit: CommitEntry): Set[String] = {
-    val detailFile                   = commitsPath.resolve(s"${commit.sha}.json")
-    val (detailMessage, detailFiles) =
+  private val conventionalCommitPattern =
+    "^([a-z]+)(?:\\([^\\r\\n()]+\\))?(!)?:\\s+(.+)$".r
+
+  def classifyCommitMessage(message: String): CommitType =
+    message.linesIterator.nextOption() match
+        case Some(conventionalCommitPattern(rawType, _, _)) =>
+          rawType.nn.toLowerCase match
+              case "build"    => CommitType.Build
+              case "chore"    => CommitType.Chore
+              case "ci"       => CommitType.Ci
+              case "docs"     => CommitType.Docs
+              case "feat"     => CommitType.Feat
+              case "fix"      => CommitType.Fix
+              case "perf"     => CommitType.Perf
+              case "refactor" => CommitType.Refactor
+              case "revert"   => CommitType.Revert
+              case "style"    => CommitType.Style
+              case "test"     => CommitType.Test
+              case _          => CommitType.Unknown
+        case _ => CommitType.Unknown
+
+  private def getCommitDetails(commit: CommitEntry): ClassifiedCommit = {
+    val detailFile = commitsPath.resolve(s"${commit.sha}.json")
+    val detail     =
       if Files.exists(detailFile) then
           val bytes = Files.readAllBytes(detailFile)
-          // Try new format {message, files} first, fall back to old bare array format
-          val detail = try
-              readFromArray[CommitDetail](bytes)
+          try readFromArray[CommitDetail](bytes)
           catch
               case _: Exception =>
                 val files = readFromArray[List[CommitFile]](bytes)
                 CommitDetail(message = Some(commit.commit.message), files = Some(files))
-          (
-            detail.message.getOrElse(commit.commit.message),
-            detail.files.getOrElse(Nil).map(_.filename)
-          )
-      else
-          (commit.commit.message, Nil)
+      else CommitDetail(message = Some(commit.commit.message), files = Some(Nil))
 
+    val message      = detail.message.getOrElse(commit.commit.message)
+    val changedFiles = detail.files.getOrElse(Nil).map(_.filename)
     val author       = commit.commit.author
     val commitAuthor = s"${author.name} <${author.email}>"
-    HeuristicMatcher.detectAgents(
-      detailMessage,
+    val agents       = HeuristicMatcher.detectAgents(
+      message,
       commitAuthor,
-      detailFiles,
+      changedFiles,
       heuristicsByAgent
+    )
+
+    ClassifiedCommit(
+      agents = agents,
+      commitType = classifyCommitMessage(message),
+      message = message,
+      files = changedFiles
     )
   }
 
@@ -131,7 +163,7 @@ object DevData {
             snapshot.days.iterator.flatMap { case (day, dayData) =>
               val week = weekStart(LocalDate.parse(day))
               dayData.commits.iterator.flatMap { commit =>
-                val agents = commitSignals.getOrElse(commit.sha, Set.empty)
+                val agents = commitSignals.get(commit.sha).map(_.agents).getOrElse(Set.empty)
                 val labels = if agents.nonEmpty then agents else Set("no agent")
                 labels.iterator.map(agent => ((developer, week, agent), 1))
               }
