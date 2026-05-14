@@ -186,9 +186,6 @@ object SVGGraphLib {
     s"<text x='${fmt(layout.width / 2.0)}' y='${fmt(layout.height - 12.0)}' text-anchor='middle' font-size='12' fill='#212529'>${svgEscape(footer)}</text>"
   }
 
-  def trimLeadingEmptyWeeks(rows: Vector[StackedTimeRow]): Vector[StackedTimeRow] =
-    rows.dropWhile(row => row.totalCommits == 0 && row.counts.values.sum == 0)
-
   def activeKeys(rows: Vector[StackedTimeRow], stackOrder: Vector[String]): Vector[String] = {
     val present: Set[String] = rows.iterator.flatMap(_.counts.iterator.collect { case (key, value) if value > 0 => key }).toSet
     val known = stackOrder.filter(present.contains)
@@ -201,13 +198,12 @@ object SVGGraphLib {
 
   def renderStackedTimeSeriesSvg(
       title: String,
-      rows0: Vector[StackedTimeRow],
+      rows: Vector[StackedTimeRow],
       stackOrder: Vector[String],
       colors: Map[String, String],
       topLabel: String,
       lineSeries: Vector[LineSeries]
   ): String = {
-    val rows = trimLeadingEmptyWeeks(rows0)
     val active = activeKeys(rows, stackOrder)
     val activeLines = activeLineSeries(rows, lineSeries)
     val layout = ChartLayout(

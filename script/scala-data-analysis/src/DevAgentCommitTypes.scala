@@ -43,40 +43,6 @@ object DevAgentCommitTypes {
       countsByType: Map[CommitType, Int]
   )
 
-  val agentColorOrder = Vector(
-    "claude_code",
-    "cursor",
-    "copilot",
-    "codex",
-    "aider",
-    "devin",
-    "opencode",
-    "windsurf",
-    "amp",
-    "gemini",
-    "qwen_code",
-    "roo_code",
-    "sweep",
-    "no agent"
-  )
-
-  val agentColors: Map[String, String] = Map(
-    "claude_code" -> "#e76f51",
-    "cursor" -> "#2a9d8f",
-    "copilot" -> "#264653",
-    "codex" -> "#f4a261",
-    "aider" -> "#9b5de5",
-    "devin" -> "#00bbf9",
-    "opencode" -> "#fee440",
-    "windsurf" -> "#00f5d4",
-    "amp" -> "#577590",
-    "gemini" -> "#adb5bd",
-    "qwen_code" -> "#43aa8b",
-    "roo_code" -> "#90be6d",
-    "sweep" -> "#6c757d",
-    "no agent" -> "#e9ecef"
-  )
-
 // ── Shared output helpers ──────────────────────────────────────────────────
 
   inline def time[A](label: String)(inline body: A): A = {
