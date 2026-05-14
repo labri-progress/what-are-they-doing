@@ -10,6 +10,13 @@ import scala.util.Using
 
 object DataAnalysis {
 
+  val repoRoot: Path    = Path.of("").toAbsolutePath.normalize.getParent.getParent
+  val dataPath: Path    = repoRoot.resolve("data")
+  val heuristics: Path  = repoRoot.resolve("agent-mining/agents")
+  val commitsPath: Path = repoRoot.resolve("data/commits")
+  val devFile: Path     = repoRoot.resolve("developers.json")
+  val outputPath: Path  = repoRoot.resolve("figures").resolve("rq2")
+
   enum CommitType:
       case Build, Chore, Ci, Docs, Feat, Fix, Perf, Refactor, Revert, Style, Test, Unknown
 
@@ -52,15 +59,7 @@ object DataAnalysis {
     result
   }
 
-  val granularity       = "auto"
-  val repoRoot: Path    = Path.of("").toAbsolutePath.normalize.getParent.getParent
-  val dataPath: Path    = repoRoot.resolve("data")
-  val heuristics: Path  = repoRoot.resolve("agent-mining/agents")
-  val commitsPath: Path = repoRoot.resolve("data/commits")
-  val devFile: Path     = repoRoot.resolve("developers.json")
-  val outputPath: Path  = repoRoot.resolve("figures").resolve("rq2")
-  val startDate         = ""
-  val endDate           = ""
+
 
   // Load developers
   lazy val developers: List[DevSummary] = time("load devs"):
