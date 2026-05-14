@@ -2,7 +2,6 @@ package whataretheydoing
 
 import com.github.plokhotnyuk.jsoniter_scala.core.*
 import com.github.plokhotnyuk.jsoniter_scala.macros.*
-import whataretheydoing.DevData.*
 
 given codecMapDayData: JsonValueCodec[Map[String, DayData]] = JsonCodecMaker.make
 
@@ -108,8 +107,6 @@ case class AgentHeuristic(
     period_start: String,
     period_end: Option[String]
 )
-
-
 
 case class DevSummary(
     handle: String,

@@ -5,7 +5,6 @@ import whataretheydoing.AgentHeuristic
 
 import java.nio.file.Files
 import java.nio.file.Path
-import scala.collection.mutable
 import scala.jdk.CollectionConverters.*
 import scala.util.matching.Regex
 
@@ -19,32 +18,23 @@ object HeuristicMatcher {
   def matchPattern(pattern: String, text: String): Boolean =
       val patNorm  = normalize(pattern)
       val textNorm = normalize(text)
-      if patNorm.isEmpty then return false
-
-      // Regex mode via explicit prefix
-      if patNorm.startsWith("re:") then
-          try
-              val regex = patNorm.substring(3).r
-              regex.findFirstIn(textNorm).isDefined
-          catch
-              case _: Exception => textNorm.contains(patNorm)
-      // Glob mode
-      else if patNorm.exists(ch => "*?[]".contains(ch)) then
-          globMatch(patNorm, textNorm)
-      // Default: substring
-      else
-          textNorm.contains(patNorm)
+      if patNorm.isEmpty then false
+      else if patNorm.startsWith("re:") then patNorm.substring(3).r.findFirstIn(textNorm).isDefined
+      else globMatch(patNorm, textNorm)
 
   private def globMatch(pattern: String, text: String): Boolean =
-      // Simple glob to regex conversion
-      val regex = pattern
-        .replace(".", "\\.")
-        .replace("*", ".*")
-        .replace("?", ".")
-      try
-          ("^" + regex + "$").r.findFirstIn(text).isDefined
-      catch
-          case _: Exception => text.contains(pattern)
+      pattern
+        .split("\\*", -1)
+        .iterator
+        .filter(_.nonEmpty)
+        .foldLeft(0 -> true) { case ((fromIndex, matched), part) =>
+          if !matched then (fromIndex, false)
+          else
+              val nextIndex = text.indexOf(part, fromIndex)
+              if nextIndex < 0 then (fromIndex, false)
+              else (nextIndex + part.length, true)
+        }
+        ._2
 
   def loadHeuristics(agentsDir: Path): Map[String, List[AgentHeuristic]] =
       val stream = Files.list(agentsDir)
@@ -70,22 +60,13 @@ object HeuristicMatcher {
       filenames: List[String],
       heuristicsByAgent: Map[String, List[AgentHeuristic]]
   ): Set[String] =
-      val matched = mutable.ListBuffer[String]()
-      for (agentName, heuristics) <- heuristicsByAgent do
-          var found = false
-          for h <- heuristics if !found do
-              // Check author identity and message prefixes
-              if matchCommitHeuristic(commitMessage, commitAuthor, h) then
-                  matched += agentName
-                  found = true
-              else if filenames.nonEmpty && !found then
-                  // Check file patterns
-                  for pat <- h.files do
-                      for fn <- filenames do
-                          if matchPattern(pat, fn) then
-                              matched += agentName
-                              found = true
-      matched.toSet
+      heuristicsByAgent.iterator.collect {
+        case (agentName, heuristics)
+            if heuristics.exists(h =>
+              matchCommitHeuristic(commitMessage, commitAuthor, h) ||
+                (filenames.nonEmpty && h.files.exists(pat => filenames.exists(fn => matchPattern(pat, fn))))
+            ) => agentName
+      }.toSet
 
   private def matchCommitHeuristic(
       commitMessage: String,
