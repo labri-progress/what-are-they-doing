@@ -1,6 +1,6 @@
 import com.github.plokhotnyuk.jsoniter_scala.core.*
 import com.github.plokhotnyuk.jsoniter_scala.macros.*
-import os.{Path, /}
+import os.Path
 import scala.collection.mutable
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
@@ -228,21 +228,18 @@ object HeuristicMatcher {
       val cm = commitMessage
 
       // 1) Author identity
-      for name <- h.authorNames do
-          if matchPattern(name, ca) then return true
-      for mail <- h.authorMails do
-          if matchPattern(mail, ca) then return true
+      if h.authorNames.exists(n => matchPattern(n, ca)) then return true
+      if h.authorMails.exists(m => matchPattern(m, ca)) then return true
 
       // 2) Co-authors in message
-      for (coName, coMail) <- iterCoauthors(cm) do
-          for name <- h.authorNames do
-              if matchPattern(name, coName) then return true
-          for mail <- h.authorMails do
-              if matchPattern(mail, coMail) then return true
+      val coauthors = iterCoauthors(cm)
+      if coauthors.exists { case (coName, coMail) =>
+          h.authorNames.exists(n => matchPattern(n, coName)) ||
+          h.authorMails.exists(m => matchPattern(m, coMail))
+      } then return true
 
       // 3) Commit message prefixes
-      for prefix <- h.commitMessagePrefix do
-          if matchPattern(prefix, cm) then return true
+      if h.commitMessagePrefix.exists(p => matchPattern(p, cm)) then return true
 
       false
 }
