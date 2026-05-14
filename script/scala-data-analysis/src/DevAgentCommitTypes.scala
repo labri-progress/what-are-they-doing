@@ -36,11 +36,10 @@ object DevAgentCommitTypes {
       countsByAgent: Map[String, Int]
   )
 
-  case class CommitTypePeriodRow(
-      periodIso: String,
-      totalCommits: Int,
-      sampledCommits: Int,
-      countsByType: Map[CommitType, Int]
+  case class TimeSeriesData(
+      points: Vector[SVGGraphLib.StackedBarPoint],
+      totalCommits: Vector[Int],
+      sampledCommits: Vector[Int]
   )
 
 // ── Shared output helpers ──────────────────────────────────────────────────
@@ -156,23 +155,6 @@ object DevAgentCommitTypes {
     )
   }
 
-  val commitTypeOrder = Vector(
-    CommitType.Feat,
-    CommitType.Fix,
-    CommitType.Refactor,
-    CommitType.Docs,
-    CommitType.Test,
-    CommitType.Perf,
-    CommitType.Build,
-    CommitType.Ci,
-    CommitType.Style,
-    CommitType.Chore,
-    CommitType.Revert,
-    CommitType.Unknown
-  )
-
-
-
   def weekStart(day: LocalDate): LocalDate =
     day.`with`(DayOfWeek.MONDAY)
 
@@ -228,7 +210,7 @@ object DevAgentCommitTypes {
     }
 
 
-  def commitTypeRowsForDeveloper(handle: String): Vector[CommitTypePeriodRow] = {
+  def commitTypeSeriesForDeveloper(handle: String): TimeSeriesData = {
     val totalsByWeek =
       aggregateData.iterator
         .filter(_.dev == handle)
@@ -266,28 +248,33 @@ object DevAgentCommitTypes {
         .toVector
         .groupMapReduce(_._1)(_._2)(_ + _)
 
-    totalsByWeek.keys.toVector.sorted.map { week =>
-      CommitTypePeriodRow(
-        periodIso = week.toString,
-        totalCommits = totalsByWeek(week),
-        sampledCommits = sampledByWeek.getOrElse(week, 0),
-        countsByType = commitTypeOrder.map(t => t -> countsByWeekType.getOrElse((week, t), 0)).toMap
-      )
-    }
+    val weeks = totalsByWeek.keys.toVector.sorted
+    TimeSeriesData(
+      points = weeks.map { week =>
+        SVGGraphLib.StackedBarPoint(
+          xLabel = week.toString,
+          values = countsByWeekType.collect { case ((w, commitType), count) if w == week => commitType.toString.toLowerCase -> count }
+        )
+      },
+      totalCommits = weeks.map(totalsByWeek),
+      sampledCommits = weeks.map(week => sampledByWeek.getOrElse(week, 0))
+    )
   }
 
-  def agentPeriodRowsForDeveloper(handle: String): Vector[AgentPeriodRow] = {
+  def agentSeriesForDeveloper(handle: String): TimeSeriesData = {
     val rows = periodRows.filter(_.developer == handle)
     val weekKeys = rows.map(_.period_iso).distinct.sorted
-    weekKeys.map { week =>
-      val weekRows = rows.filter(_.period_iso == week)
-      AgentPeriodRow(
-        periodIso = week,
-        totalCommits = weekRows.headOption.map(_.total_commits).getOrElse(0),
-        sampledCommits = weekRows.headOption.map(_.sampled_commits).getOrElse(0),
-        countsByAgent = weekRows.map(row => row.agent -> row.count).toMap
-      )
-    }.toVector.dropWhile(row => row.totalCommits == 0 && row.sampledCommits == 0 && row.countsByAgent.values.sum == 0)
+    TimeSeriesData(
+      points = weekKeys.map { week =>
+        val weekRows = rows.filter(_.period_iso == week)
+        SVGGraphLib.StackedBarPoint(
+          xLabel = week,
+          values = weekRows.map(row => row.agent -> row.count).toMap
+        )
+      }.toVector,
+      totalCommits = weekKeys.map(week => rows.find(_.period_iso == week).map(_.total_commits).getOrElse(0)).toVector,
+      sampledCommits = weekKeys.map(week => rows.find(_.period_iso == week).map(_.sampled_commits).getOrElse(0)).toVector
+    )
   }
 
 

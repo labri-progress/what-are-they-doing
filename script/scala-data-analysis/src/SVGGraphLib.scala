@@ -5,11 +5,9 @@ import java.nio.file.Files
 import java.util.Locale
 
 object SVGGraphLib {
-  case class StackedTimeRow(
-      periodIso: String,
-      totalCommits: Int,
-      sampledCommits: Int,
-      counts: Map[String, Int]
+  case class StackedBarPoint(
+      xLabel: String,
+      values: Map[String, Int]
   )
 
   case class LineSeries(
@@ -17,7 +15,7 @@ object SVGGraphLib {
       stroke: String,
       dashArray: String,
       markerFill: String,
-      valueOf: StackedTimeRow => Int
+      values: Vector[Int]
   )
 
   case class ChartLayout(
@@ -57,9 +55,19 @@ object SVGGraphLib {
           else 10
         math.max(1, math.ceil(niceNormalized * magnitude).toInt)
 
-  private def computeScale(rows: Vector[StackedTimeRow], lines: Vector[LineSeries]): ChartScale = {
-    val maxStack = rows.map(_.counts.values.sum).maxOption.getOrElse(0)
-    val maxLine = lines.flatMap(line => rows.map(row => line.valueOf(row))).maxOption.getOrElse(0)
+  def activeStackKeys(points: Vector[StackedBarPoint], stackOrder: Vector[String]): Vector[String] = {
+    val present: Set[String] = points.iterator.flatMap(_.values.iterator.collect { case (key, value) if value > 0 => key }).toSet
+    val known = stackOrder.filter(present.contains)
+    val extra = present.diff(stackOrder.toSet).toVector.sorted.filterNot(_ == "no agent")
+    known.filterNot(_ == "no agent") ++ extra ++ (if present.contains("no agent") then Vector("no agent") else Vector.empty)
+  }
+
+  def activeLineSeries(lines: Vector[LineSeries]): Vector[LineSeries] =
+    lines.filter(_.values.exists(_ > 0))
+
+  private def computeScale(points: Vector[StackedBarPoint], lines: Vector[LineSeries]): ChartScale = {
+    val maxStack = points.map(_.values.values.sum).maxOption.getOrElse(0)
+    val maxLine = lines.flatMap(_.values).maxOption.getOrElse(0)
     val yMaxRaw = math.max(maxStack, maxLine)
     val yStep = niceStep(yMaxRaw, 6)
     val yMax = math.max(yStep, ((yMaxRaw + yStep - 1) / yStep) * yStep)
@@ -72,8 +80,8 @@ object SVGGraphLib {
   private def barWidth(layout: ChartLayout, count: Int): Double =
     slotWidth(layout, count) * 0.78
 
-  private def xForBar(layout: ChartLayout, rowCount: Int, index: Int): Double =
-    layout.plotX + slotWidth(layout, rowCount) * index + (slotWidth(layout, rowCount) - barWidth(layout, rowCount)) / 2.0
+  private def xForBar(layout: ChartLayout, pointCount: Int, index: Int): Double =
+    layout.plotX + slotWidth(layout, pointCount) * index + (slotWidth(layout, pointCount) - barWidth(layout, pointCount)) / 2.0
 
   private def yForValue(layout: ChartLayout, scale: ChartScale, value: Double): Double =
     layout.plotY + layout.plotHeight - (value / scale.yMax) * layout.plotHeight
@@ -101,16 +109,16 @@ object SVGGraphLib {
   private def renderStackedBar(
       layout: ChartLayout,
       scale: ChartScale,
-      rowCount: Int,
+      pointCount: Int,
       index: Int,
-      row: StackedTimeRow,
+      point: StackedBarPoint,
       activeKeys: Vector[String],
       colors: Map[String, String]
   ): String = {
-    val x = xForBar(layout, rowCount, index)
-    val width = barWidth(layout, rowCount)
+    val x = xForBar(layout, pointCount, index)
+    val width = barWidth(layout, pointCount)
     activeKeys.foldLeft((0.0, Vector.empty[String])) { case ((bottomValue, acc), key) =>
-      val count = row.counts.getOrElse(key, 0)
+      val count = point.values.getOrElse(key, 0)
       if count <= 0 then (bottomValue, acc)
       else
           val yTop = yForValue(layout, scale, bottomValue + count)
@@ -119,31 +127,29 @@ object SVGGraphLib {
     }._2.mkString("\n")
   }
 
-  private def renderBarLabels(layout: ChartLayout, rows: Vector[StackedTimeRow]): String =
-    rows.zipWithIndex.map { case (row, index) =>
-      val x = xForBar(layout, rows.size, index) + barWidth(layout, rows.size) / 2.0
+  private def renderBarLabels(layout: ChartLayout, points: Vector[StackedBarPoint]): String =
+    points.zipWithIndex.map { case (point, index) =>
+      val x = xForBar(layout, points.size, index) + barWidth(layout, points.size) / 2.0
       val y = layout.plotY + layout.plotHeight + 28.0
-      s"<text x='${fmt(x)}' y='${fmt(y)}' transform='rotate(45 ${fmt(x)} ${fmt(y)})' text-anchor='start' font-size='11' fill='#495057'>${svgEscape(row.periodIso)}</text>"
+      s"<text x='${fmt(x)}' y='${fmt(y)}' transform='rotate(45 ${fmt(x)} ${fmt(y)})' text-anchor='start' font-size='11' fill='#495057'>${svgEscape(point.xLabel)}</text>"
     }.mkString("\n")
 
-  private def renderLineSeries(layout: ChartLayout, scale: ChartScale, rows: Vector[StackedTimeRow], line: LineSeries): String = {
-    val points = rows.zipWithIndex.map { case (row, index) =>
-      val cx = xForBar(layout, rows.size, index) + barWidth(layout, rows.size) / 2.0
-      val cy = yForValue(layout, scale, line.valueOf(row).toDouble)
+  private def renderLineSeries(layout: ChartLayout, scale: ChartScale, points: Vector[StackedBarPoint], line: LineSeries): String = {
+    val lineValues = line.values.padTo(points.size, 0).take(points.size)
+    val polyPoints = lineValues.zipWithIndex.map { case (value, index) =>
+      val cx = xForBar(layout, points.size, index) + barWidth(layout, points.size) / 2.0
+      val cy = yForValue(layout, scale, value.toDouble)
       s"${fmt(cx)},${fmt(cy)}"
     }.mkString(" ")
 
-    val markers = rows.zipWithIndex.map { case (row, index) =>
-      val cx = xForBar(layout, rows.size, index) + barWidth(layout, rows.size) / 2.0
-      val cy = yForValue(layout, scale, line.valueOf(row).toDouble)
+    val markers = lineValues.zipWithIndex.map { case (value, index) =>
+      val cx = xForBar(layout, points.size, index) + barWidth(layout, points.size) / 2.0
+      val cy = yForValue(layout, scale, value.toDouble)
       s"<rect x='${fmt(cx - 2.5)}' y='${fmt(cy - 2.5)}' width='5' height='5' fill='${line.markerFill}' transform='rotate(45 ${fmt(cx)} ${fmt(cy)})' />"
     }.mkString("\n")
 
-    s"<polyline fill='none' stroke='${line.stroke}' stroke-width='2' stroke-dasharray='${line.dashArray}' points='$points' />\n$markers"
+    s"<polyline fill='none' stroke='${line.stroke}' stroke-width='2' stroke-dasharray='${line.dashArray}' points='$polyPoints' />\n$markers"
   }
-
-  private def renderOverlayLines(layout: ChartLayout, scale: ChartScale, rows: Vector[StackedTimeRow], lines: Vector[LineSeries]): String =
-    lines.map(renderLineSeries(layout, scale, rows, _)).mkString("\n")
 
   private def renderLegend(
       layout: ChartLayout,
@@ -156,7 +162,7 @@ object SVGGraphLib {
     val box =
       s"<rect x='${fmt(layout.legendX)}' y='${fmt(layout.legendY)}' width='${fmt(layout.legendWidth)}' height='${fmt(boxHeight)}' rx='4' ry='4' fill='white' fill-opacity='0.92' stroke='#ced4da' stroke-width='1' />"
 
-    val lines = entries.zipWithIndex.map {
+    val legendItems = entries.reverse.zipWithIndex.map {
       case (Left(key), idx) =>
         val y = layout.legendY + 18 + idx * 20
         s"<rect x='${fmt(layout.legendX + 10)}' y='${fmt(y - 10)}' width='18' height='12' fill='${colors.getOrElse(key, "#adb5bd")}' stroke='#ffffff' stroke-width='0.6' />" +
@@ -168,7 +174,7 @@ object SVGGraphLib {
           s"<text x='${fmt(layout.legendX + 38)}' y='${fmt(y)}' font-size='12' fill='#212529'>${svgEscape(line.label)}</text>"
     }.mkString("\n")
 
-    box + "\n" + lines
+    box + "\n" + legendItems
   }
 
   private def renderTitles(layout: ChartLayout, title: String): String =
@@ -176,38 +182,27 @@ object SVGGraphLib {
       s"\n<text x='20' y='${fmt(layout.plotY + layout.plotHeight / 2.0)}' transform='rotate(-90 20 ${fmt(layout.plotY + layout.plotHeight / 2.0)})' text-anchor='middle' font-size='14' fill='#212529'>Commits</text>" +
       s"\n<text x='${fmt(layout.plotX + layout.plotWidth / 2.0)}' y='${fmt(layout.height - 40.0)}' text-anchor='middle' font-size='14' fill='#212529'>Period</text>"
 
-  private def renderFooter(layout: ChartLayout, rows: Vector[StackedTimeRow], activeKeys: Vector[String], topLabel: String): String = {
-    val totalSnapshot = rows.map(_.totalCommits).sum
-    val sampledCommits = rows.map(_.sampledCommits).sum
-    val embeddedRecords = rows.map(_.counts.values.sum).sum
-    val totalsByKey = activeKeys.map(key => key -> rows.map(_.counts.getOrElse(key, 0)).sum).filter(_._2 > 0)
+  private def renderFooter(layout: ChartLayout, points: Vector[StackedBarPoint], activeKeys: Vector[String], topLabel: String, activeLines: Vector[LineSeries]): String = {
+    val embeddedRecords = points.map(_.values.values.sum).sum
+    val totalsByKey = activeKeys.map(key => key -> points.map(_.values.getOrElse(key, 0)).sum).filter(_._2 > 0)
     val dominant = totalsByKey.sortBy(-_._2).headOption.map { case (key, c) => s"$topLabel: $key ($c)" }.getOrElse(s"$topLabel: -")
-    val footer = s"Total snapshot commits: $totalSnapshot  |  Sampled commits: $sampledCommits  |  Embedded records: $embeddedRecords  |  Periods: ${rows.size}  |  $dominant"
+    val lineSummaries = activeLines.map(line => s"${line.label}: ${line.values.sum}")
+    val footer = (lineSummaries :+ s"Embedded records: $embeddedRecords" :+ s"Periods: ${points.size}" :+ dominant).mkString("  |  ")
     s"<text x='${fmt(layout.width / 2.0)}' y='${fmt(layout.height - 12.0)}' text-anchor='middle' font-size='12' fill='#212529'>${svgEscape(footer)}</text>"
   }
 
-  def activeKeys(rows: Vector[StackedTimeRow], stackOrder: Vector[String]): Vector[String] = {
-    val present: Set[String] = rows.iterator.flatMap(_.counts.iterator.collect { case (key, value) if value > 0 => key }).toSet
-    val known = stackOrder.filter(present.contains)
-    val extra = present.diff(stackOrder.toSet).toVector.sorted.filterNot(_ == "no agent")
-    known.filterNot(_ == "no agent") ++ extra ++ (if present.contains("no agent") then Vector("no agent") else Vector.empty)
-  }
-
-  def activeLineSeries(rows: Vector[StackedTimeRow], lines: Vector[LineSeries]): Vector[LineSeries] =
-    lines.filter(line => rows.exists(row => line.valueOf(row) > 0))
-
   def renderStackedTimeSeriesSvg(
       title: String,
-      rows: Vector[StackedTimeRow],
+      points: Vector[StackedBarPoint],
       stackOrder: Vector[String],
       colors: Map[String, String],
       topLabel: String,
       lineSeries: Vector[LineSeries]
   ): String = {
-    val active = activeKeys(rows, stackOrder)
-    val activeLines = activeLineSeries(rows, lineSeries)
+    val activeStacks = activeStackKeys(points, stackOrder)
+    val activeLines = activeLineSeries(lineSeries)
     val layout = ChartLayout(
-      width = math.max(1200, rows.size * 48 + 240),
+      width = math.max(1200, points.size * 48 + 240),
       height = 620,
       left = 64,
       right = 24,
@@ -215,21 +210,23 @@ object SVGGraphLib {
       bottom = 132,
       legendWidth = 190
     )
-    val scale = computeScale(rows, activeLines)
+    val scale = computeScale(points, activeLines)
 
-    val bars = rows.zipWithIndex.map { case (row, index) =>
-      renderStackedBar(layout, scale, rows.size, index, row, active, colors)
+    val bars = points.zipWithIndex.map { case (point, index) =>
+      renderStackedBar(layout, scale, points.size, index, point, activeStacks, colors)
     }.mkString("\n")
+
+    val lines = activeLines.map(renderLineSeries(layout, scale, points, _)).mkString("\n")
 
     s"""<svg xmlns='http://www.w3.org/2000/svg' width='${layout.width}' height='${layout.height}' viewBox='0 0 ${layout.width} ${layout.height}'>
 ${renderBackground()}
 ${renderGridAndAxes(layout, scale)}
 ${renderTitles(layout, title)}
 $bars
-${renderOverlayLines(layout, scale, rows, activeLines)}
-${renderBarLabels(layout, rows)}
-${renderLegend(layout, active, colors, activeLines)}
-${renderFooter(layout, rows, active, topLabel)}
+$lines
+${renderBarLabels(layout, points)}
+${renderLegend(layout, activeStacks, colors, activeLines)}
+${renderFooter(layout, points, activeStacks, topLabel, activeLines)}
 </svg>
 """
   }

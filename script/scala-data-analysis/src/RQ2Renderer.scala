@@ -7,24 +7,25 @@ import java.nio.file.Files
 import java.time.LocalDate
 
 object RQ2Renderer {
+  private val commitTypeOrder: Vector[String] =
+    CommitType.values.toVector.sortBy(_.ordinal).map(_.toString.toLowerCase)
 
-  val commitTypeColors: Map[CommitType, String] = Map(
-    CommitType.Feat     -> "#e76f51",
-    CommitType.Fix      -> "#f4a261",
+  private val commitTypeColors: Map[String, String] = Map(
+    CommitType.Build -> "#4d908e",
+    CommitType.Chore -> "#adb5bd",
+    CommitType.Ci -> "#277da1",
+    CommitType.Docs -> "#577590",
+    CommitType.Feat -> "#e76f51",
+    CommitType.Fix -> "#f4a261",
+    CommitType.Perf -> "#43aa8b",
     CommitType.Refactor -> "#2a9d8f",
-    CommitType.Docs     -> "#577590",
-    CommitType.Test     -> "#9b5de5",
-    CommitType.Perf     -> "#43aa8b",
-    CommitType.Build    -> "#4d908e",
-    CommitType.Ci       -> "#277da1",
-    CommitType.Style    -> "#90be6d",
-    CommitType.Chore    -> "#adb5bd",
-    CommitType.Revert   -> "#6c757d",
-    CommitType.Unknown  -> "#e9ecef"
-  )
+    CommitType.Revert -> "#6c757d",
+    CommitType.Style -> "#90be6d",
+    CommitType.Test -> "#9b5de5",
+    CommitType.Unknown -> "#e9ecef"
+  ).map((k, v) => k.toString.toLowerCase -> v)
 
-
-  val agentColorOrder = Vector(
+  private val agentColorOrder = Vector(
     "claude_code",
     "cursor",
     "copilot",
@@ -41,7 +42,7 @@ object RQ2Renderer {
     "no agent"
   )
 
-  val agentColors: Map[String, String] = Map(
+  private val agentColors: Map[String, String] = Map(
     "claude_code" -> "#e76f51",
     "cursor" -> "#2a9d8f",
     "copilot" -> "#264653",
@@ -58,45 +59,13 @@ object RQ2Renderer {
     "no agent" -> "#e9ecef"
   )
 
-  private val totalCommitsLine = LineSeries(
-    label = "total commits (snapshot)",
-    stroke = "#343a40",
-    dashArray = "6 4",
-    markerFill = "#343a40",
-    valueOf = _.totalCommits
-  )
-
-  private val sampledCommitsLine = LineSeries(
-    label = "sampled commits",
-    stroke = "#1d4ed8",
-    dashArray = "3 3",
-    markerFill = "#1d4ed8",
-    valueOf = _.sampledCommits
-  )
-
-  private val defaultLines = Vector(sampledCommitsLine, totalCommitsLine)
-
-  private def toStackedCommitTypeRows(rows: Vector[CommitTypePeriodRow]): Vector[StackedTimeRow] =
-    rows.map(row =>
-      StackedTimeRow(
-        periodIso = row.periodIso,
-        totalCommits = row.totalCommits,
-        sampledCommits = row.sampledCommits,
-        counts = row.countsByType.map { case (k, v) => k.toString.toLowerCase -> v }
-      )
+  private def defaultLines(data: TimeSeriesData): Vector[LineSeries] =
+    Vector(
+      LineSeries("sampled commits", "#1d4ed8", "3 3", "#1d4ed8", data.sampledCommits),
+      LineSeries("total commits (snapshot)", "#343a40", "6 4", "#343a40", data.totalCommits)
     )
 
-  private def toStackedAgentRows(rows: Vector[AgentPeriodRow]): Vector[StackedTimeRow] =
-    rows.map(row =>
-      StackedTimeRow(
-        periodIso = row.periodIso,
-        totalCommits = row.totalCommits,
-        sampledCommits = row.sampledCommits,
-        counts = row.countsByAgent
-      )
-    )
-
-  private def commitTypeRowsForAgent(agent: String): Vector[CommitTypePeriodRow] = {
+  private def commitTypeSeriesForAgent(agent: String): TimeSeriesData = {
     val agentCommitsByWeek: Vector[(LocalDate, CommitType)] =
       aggregateData.iterator
         .flatMap { case (_, _, _, snapshot) =>
@@ -111,20 +80,18 @@ object RQ2Renderer {
         }
         .toVector
 
-    val totalsByWeek: Map[LocalDate, Int] =
-      agentCommitsByWeek.groupMapReduce(_._1)(_ => 1)(_ + _)
-
     val countsByWeekType: Map[(LocalDate, CommitType), Int] =
       agentCommitsByWeek.groupMapReduce(identity)(_ => 1)(_ + _)
 
-    totalsByWeek.keys.toVector.sorted.map { week =>
-      CommitTypePeriodRow(
-        periodIso = week.toString,
-        totalCommits = totalsByWeek(week),
-        sampledCommits = totalsByWeek(week),
-        countsByType = commitTypeOrder.map(t => t -> countsByWeekType.getOrElse((week, t), 0)).toMap
+    val weeks = agentCommitsByWeek.map(_._1).distinct.sorted
+    val points = weeks.map { week =>
+      StackedBarPoint(
+        xLabel = week.toString,
+        values = countsByWeekType.collect { case ((w, commitType), count) if w == week => commitType.toString.toLowerCase -> count }
       )
-    }
+    }.toVector
+    val totals = points.map(_.values.values.sum)
+    TimeSeriesData(points = points, totalCommits = totals, sampledCommits = totals)
   }
 
   @main def makeWeeklyPlotSvgs(): Unit = {
@@ -134,18 +101,18 @@ object RQ2Renderer {
     println(s"Loaded ${heuristicsByAgent.size} agent definitions")
 
     trackedHandles.toVector.sorted.foreach { handle =>
-      val rows = agentPeriodRowsForDeveloper(handle)
-      if rows.nonEmpty then
+      val data = agentSeriesForDeveloper(handle)
+      if data.points.nonEmpty then
           val outputFile = outputPath.resolve(s"rq2-agent-use-$handle.svg")
           writeSvg(
             outputFile,
             renderStackedTimeSeriesSvg(
               s"Agent Usage Over Time — @$handle",
-              toStackedAgentRows(rows),
+              data.points,
               agentColorOrder,
               agentColors,
               "Top agent",
-              defaultLines
+              defaultLines(data)
             )
           )
           println(s"Wrote agent-use SVG for @$handle to $outputFile")
@@ -158,22 +125,19 @@ object RQ2Renderer {
     println(s"Tracked developers: ${trackedHandles.mkString(", ")}")
     println(s"Loaded ${heuristicsByAgent.size} agent definitions")
 
-    val stackOrder = commitTypeOrder.map(_.toString.toLowerCase)
-    val colors     = commitTypeColors.map((k, v) => k.toString.toLowerCase -> v)
-
     trackedHandles.toVector.sorted.foreach { handle =>
-      val rows = commitTypeRowsForDeveloper(handle)
-      if rows.nonEmpty then
+      val data = commitTypeSeriesForDeveloper(handle)
+      if data.points.nonEmpty then
           val svgPath = outputPath.resolve(s"commit-types-$handle.svg")
           writeSvg(
             svgPath,
             renderStackedTimeSeriesSvg(
               s"Commit Types Over Time — @$handle",
-              toStackedCommitTypeRows(rows),
-              stackOrder,
-              colors,
+              data.points,
+              commitTypeOrder,
+              commitTypeColors,
               "Top type",
-              defaultLines
+              defaultLines(data)
             )
           )
           println(s"Wrote commit-type SVG for @$handle to $svgPath")
@@ -186,22 +150,19 @@ object RQ2Renderer {
     println(s"Tracked developers: ${trackedHandles.mkString(", ")}")
     println(s"Loaded ${heuristicsByAgent.size} agent definitions")
 
-    val stackOrder = commitTypeOrder.map(_.toString.toLowerCase)
-    val colors     = commitTypeColors.map((k, v) => k.toString.toLowerCase -> v)
-
     heuristicsByAgent.keys.toVector.sorted.foreach { agent =>
-      val rows = toStackedCommitTypeRows(commitTypeRowsForAgent(agent))
-      if rows.nonEmpty && activeKeys(rows, stackOrder).nonEmpty then
+      val data = commitTypeSeriesForAgent(agent)
+      if data.points.nonEmpty && activeStackKeys(data.points, commitTypeOrder).nonEmpty then
           val svgPath = outputPath.resolve(s"commit-types-agent-$agent.svg")
           writeSvg(
             svgPath,
             renderStackedTimeSeriesSvg(
               s"Commit Types Over Time — agent:$agent",
-              rows,
-              stackOrder,
-              colors,
+              data.points,
+              commitTypeOrder,
+              commitTypeColors,
               "Top type",
-              defaultLines
+              defaultLines(data)
             )
           )
           println(s"Wrote commit-type-by-agent SVG for $agent to $svgPath")
