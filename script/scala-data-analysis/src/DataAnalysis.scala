@@ -305,7 +305,7 @@ object DataAnalysis {
               dayData.commits.iterator.flatMap { commit =>
                 val agents = commitSignals(commit.sha).map(_.agents).getOrElse(Set.empty)
                 val labels =
-                  if agents.isEmpty then Set("no agent")
+                  if agents.isEmpty then Set("no signal")
                   else if agents.size > 1 then Set("multi agent")
                   else agents
                 labels.iterator.map(agent => ((developer, week, agent), 1))
@@ -388,7 +388,7 @@ object DataAnalysis {
               allCommitDetails.get(commit.sha).toVector.filter { entry =>
                 val agents = entry.classification.agents
                 val bucket =
-                  if agents.isEmpty then "no agent"
+                  if agents.isEmpty then "no signal"
                   else if agents.size > 1 then "multi agent"
                   else agents.head
                 bucket == row.agent

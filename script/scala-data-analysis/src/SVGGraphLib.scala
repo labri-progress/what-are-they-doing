@@ -84,8 +84,8 @@ object SVGGraphLib {
   def activeStackKeys(points: Vector[StackedBarPoint], stackOrder: Vector[String]): Vector[String] = {
     val present: Set[String] = points.iterator.flatMap(_.values.iterator.collect { case (key, value) if value > 0 => key }).toSet
     val known = stackOrder.filter(present.contains)
-    val extra = present.diff(stackOrder.toSet).toVector.sorted.filterNot(_ == "no agent")
-    known.filterNot(_ == "no agent") ++ extra ++ (if present.contains("no agent") then Vector("no agent") else Vector.empty)
+    val extra = present.diff(stackOrder.toSet).toVector.sorted.filterNot(_ == "no signal")
+    known.filterNot(_ == "no signal") ++ extra ++ (if present.contains("no signal") then Vector("no signal") else Vector.empty)
   }
 
   def activeLineSeries(lines: Vector[LineSeries]): Vector[LineSeries] =

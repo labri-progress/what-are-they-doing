@@ -40,7 +40,7 @@ object RQ2Renderer {
     "roo_code",
     "sweep",
     "multi agent",
-    "no agent"
+    "no signal"
   )
 
   private val agentColors: Map[String, String] = Map(
@@ -58,7 +58,7 @@ object RQ2Renderer {
     "roo_code"    -> "#90be6d",
     "sweep"       -> "#6c757d",
     "multi agent" -> "#c77dff",
-    "no agent"    -> "#e9ecef"
+    "no signal"   -> "#e9ecef"
   )
 
   private val developerPalette: Vector[String] = Vector(
@@ -85,7 +85,8 @@ object RQ2Renderer {
       LineSeries("total commits (snapshot)", "#343a40", "6 4", "#343a40", data.totalCommits)
     )
 
-  private def commitsForDeveloper(handle: String): Vector[(commit: CommitEntry, detail: CommitDetail, classification: ClassifiedCommit)] =
+  private def commitsForDeveloper(handle: String)
+      : Vector[(commit: CommitEntry, detail: CommitDetail, classification: ClassifiedCommit)] =
     aggregateData.iterator
       .filter(_.dev == handle)
       .flatMap { case (_, _, _, snapshot) =>
@@ -97,14 +98,18 @@ object RQ2Renderer {
       }
       .toVector
 
-  private def commitAgentBucket(entry: (commit: CommitEntry, detail: CommitDetail, classification: ClassifiedCommit)): String = {
+  private def commitAgentBucket(entry: (commit: CommitEntry, detail: CommitDetail, classification: ClassifiedCommit))
+      : String = {
     val agents = entry.classification.agents
-    if agents.isEmpty then "no agent"
+    if agents.isEmpty then "no signal"
     else if agents.size > 1 then "multi agent"
     else agents.head
   }
 
-  private def toBoxPlotStats(label: String, commits: Vector[(commit: CommitEntry, detail: CommitDetail, classification: ClassifiedCommit)]): BoxPlotStats = {
+  private def toBoxPlotStats(
+      label: String,
+      commits: Vector[(commit: CommitEntry, detail: CommitDetail, classification: ClassifiedCommit)]
+  ): BoxPlotStats = {
     val stats = summarizeLinesChanged(commits)
     BoxPlotStats(
       label = label,
@@ -253,7 +258,10 @@ object RQ2Renderer {
     Files.createDirectories(outputPath)
 
     trackedHandles.toVector.sorted.foreach { handle =>
-      val data = linesChangedByAgentSeriesForDeveloper.getOrElse(handle, TimeSeriesData(Vector.empty, Vector.empty, Vector.empty))
+      val data = linesChangedByAgentSeriesForDeveloper.getOrElse(
+        handle,
+        TimeSeriesData(Vector.empty, Vector.empty, Vector.empty)
+      )
       if data.points.nonEmpty && activeStackKeys(data.points, agentColorOrder).nonEmpty then
           val svgPath = outputPath.resolve(s"lines-changed-weekly-agents-$handle.svg")
           writeSvg(
