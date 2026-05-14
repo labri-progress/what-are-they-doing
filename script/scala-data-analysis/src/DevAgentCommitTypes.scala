@@ -1,7 +1,6 @@
 package whataretheydoing
 
 import com.github.plokhotnyuk.jsoniter_scala.core.*
-import com.github.tototoshi.csv.CSVWriter
 
 import java.nio.file.{Files, Path}
 import java.time.{DayOfWeek, LocalDate, YearMonth}
@@ -25,8 +24,16 @@ object DevAgentCommitTypes {
       developer: String,
       period_iso: String,
       total_commits: Int,
+      sampled_commits: Int,
       agent: String,
       count: Int
+  )
+
+  case class AgentPeriodRow(
+      periodIso: String,
+      totalCommits: Int,
+      sampledCommits: Int,
+      countsByAgent: Map[String, Int]
   )
 
   case class CommitTypePeriodRow(
@@ -36,7 +43,41 @@ object DevAgentCommitTypes {
       countsByType: Map[CommitType, Int]
   )
 
-// ── CSV output ─────────────────────────────────────────────────────────────
+  val agentColorOrder = Vector(
+    "claude_code",
+    "cursor",
+    "copilot",
+    "codex",
+    "aider",
+    "devin",
+    "opencode",
+    "windsurf",
+    "amp",
+    "gemini",
+    "qwen_code",
+    "roo_code",
+    "sweep",
+    "no agent"
+  )
+
+  val agentColors: Map[String, String] = Map(
+    "claude_code" -> "#e76f51",
+    "cursor" -> "#2a9d8f",
+    "copilot" -> "#264653",
+    "codex" -> "#f4a261",
+    "aider" -> "#9b5de5",
+    "devin" -> "#00bbf9",
+    "opencode" -> "#fee440",
+    "windsurf" -> "#00f5d4",
+    "amp" -> "#577590",
+    "gemini" -> "#adb5bd",
+    "qwen_code" -> "#43aa8b",
+    "roo_code" -> "#90be6d",
+    "sweep" -> "#6c757d",
+    "no agent" -> "#e9ecef"
+  )
+
+// ── Shared output helpers ──────────────────────────────────────────────────
 
   inline def time[A](label: String)(inline body: A): A = {
     val start  = System.nanoTime()
@@ -194,6 +235,16 @@ object DevAgentCommitTypes {
           .toVector
           .groupMapReduce(_._1)(_._2)(_ + _)
 
+      val sampledByDeveloperWeek =
+        aggregateData.iterator
+          .flatMap { case (developer, _, _, snapshot) =>
+            snapshot.days.iterator.map { case (day, dayData) =>
+              ((developer, weekStart(LocalDate.parse(day))), dayData.commits.size)
+            }
+          }
+          .toVector
+          .groupMapReduce(_._1)(_._2)(_ + _)
+
       val countsByDeveloperWeekAgent =
         aggregateData.iterator
           .flatMap { case (developer, _, _, snapshot) =>
@@ -216,29 +267,13 @@ object DevAgentCommitTypes {
             developer = developer,
             period_iso = week.toString,
             total_commits = totalsByDeveloperWeek((developer, week)),
+            sampled_commits = sampledByDeveloperWeek.getOrElse((developer, week), 0),
             agent = agent,
             count = count
           )
         }
     }
 
-  private def writePeriodsCsv(rows: Seq[PeriodCsvRow], path: Path): Unit = {
-    val writer = CSVWriter.open(path.toFile)
-    try
-        writer.writeRow(List("developer", "period_iso", "total_commits", "agent", "count"))
-        rows.foreach { row =>
-          writer.writeRow(
-            List(
-              row.developer,
-              row.period_iso,
-              row.total_commits.toString,
-              row.agent,
-              row.count.toString
-            )
-          )
-        }
-    finally writer.close()
-  }
 
   def commitTypeRowsForDeveloper(handle: String): Vector[CommitTypePeriodRow] = {
     val totalsByWeek =
@@ -288,7 +323,31 @@ object DevAgentCommitTypes {
     }
   }
 
-  @main def makeWeeklyPlotCsv(): Unit = {
+  private def agentPeriodRowsForDeveloper(handle: String): Vector[AgentPeriodRow] = {
+    val rows = periodRows.filter(_.developer == handle)
+    val weekKeys = rows.map(_.period_iso).distinct.sorted
+    weekKeys.map { week =>
+      val weekRows = rows.filter(_.period_iso == week)
+      AgentPeriodRow(
+        periodIso = week,
+        totalCommits = weekRows.headOption.map(_.total_commits).getOrElse(0),
+        sampledCommits = weekRows.headOption.map(_.sampled_commits).getOrElse(0),
+        countsByAgent = weekRows.map(row => row.agent -> row.count).toMap
+      )
+    }.toVector.dropWhile(row => row.totalCommits == 0 && row.sampledCommits == 0 && row.countsByAgent.values.sum == 0)
+  }
+
+  private def toStackedRows(rows: Vector[AgentPeriodRow]): Vector[Rq2CommitTypeSvg.StackedTimeRow] =
+    rows.map(row =>
+      Rq2CommitTypeSvg.StackedTimeRow(
+        periodIso = row.periodIso,
+        totalCommits = row.totalCommits,
+        sampledCommits = row.sampledCommits,
+        counts = row.countsByAgent
+      )
+    )
+
+  @main def makeWeeklyPlotSvgs(): Unit = {
 
     println(s"Running with dataDir=${dataPath.toString} granularity=week")
 
@@ -297,10 +356,22 @@ object DevAgentCommitTypes {
     println(s"Tracked developers: ${trackedHandles.mkString(", ")}")
     println(s"Loaded ${heuristicsByAgent.size} agent definitions")
 
-    val rows       = periodRows
-    val outputFile = outputPath.resolve("agent-coevolution-periods.csv")
-    writePeriodsCsv(rows, outputFile)
-    println(s"Wrote ${rows.size} weekly rows to $outputFile")
+    trackedHandles.toVector.sorted.foreach { handle =>
+      val rows = agentPeriodRowsForDeveloper(handle)
+      if rows.nonEmpty then
+          val outputFile = outputPath.resolve(s"rq2-agent-use-$handle.svg")
+          Rq2CommitTypeSvg.writeSvg(
+            outputFile,
+            Rq2CommitTypeSvg.renderStackedTimeSeriesSvg(
+              s"Agent Usage Over Time — @$handle",
+              toStackedRows(rows),
+              agentColorOrder,
+              agentColors,
+              "Top agent"
+            )
+          )
+          println(s"Wrote agent-use SVG for @$handle to $outputFile")
+    }
   }
 
 }
