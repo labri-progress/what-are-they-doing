@@ -8,7 +8,6 @@ import java.nio.file.Path
 import scala.collection.mutable
 import scala.jdk.CollectionConverters.*
 import scala.util.matching.Regex
-import Codecs.given
 
 object HeuristicMatcher {
 
@@ -16,13 +15,6 @@ object HeuristicMatcher {
     """(?im)^\s*co-?authored-?by:\s*(.*?)\s*<([^>]+)>\s*$""".r
 
   def normalize(s: String): String = s.trim.toLowerCase
-
-  def iterCoauthors(message: String): List[(name: String, email: String)] =
-    if message == null || message.isEmpty then Nil
-    else
-        coauthorPattern.findAllMatchIn(message).map { m =>
-          (normalize(m.group(1).nn), normalize(m.group(2).nn))
-        }.toList
 
   def matchPattern(pattern: String, text: String): Boolean =
       val patNorm  = normalize(pattern)
@@ -63,6 +55,10 @@ object HeuristicMatcher {
             val jsonBytes      = Files.readAllBytes(file)
             val heuristicsJson = readFromArray[List[AgentHeuristic]](jsonBytes)
             val agentName      = file.getFileName.toString.stripSuffix(".json")
+            heuristicsJson.foreach{heuristic =>
+              assert(heuristic.period_start == "", s"Heuristic $agentName has a non-empty period_start")
+              assert(heuristic.period_end == None, s"Heuristic $agentName has a non-empty period_end")
+            }
             (agentName, heuristicsJson)
           }.toMap
       finally
@@ -96,12 +92,15 @@ object HeuristicMatcher {
       commitAuthor: String,
       h: AgentHeuristic
   ): Boolean =
+
       // 1) Author identity
       if h.author_names.exists(n => matchPattern(n, commitAuthor)) then return true
       if h.author_mails.exists(m => matchPattern(m, commitAuthor)) then return true
 
+      val coauthors = coauthorPattern.findAllMatchIn(commitMessage).map { m =>
+        (name = normalize(m.group(1).nn), mail = normalize(m.group(2).nn))
+      }
       // 2) Co-authors in message
-      val coauthors = iterCoauthors(commitMessage)
       if coauthors.exists { case (coName, coMail) =>
             h.author_names.exists(n => matchPattern(n, coName)) ||
             h.author_mails.exists(m => matchPattern(m, coMail))

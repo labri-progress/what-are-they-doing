@@ -2,22 +2,20 @@ package whataretheydoing
 
 import com.github.plokhotnyuk.jsoniter_scala.core.*
 import com.github.plokhotnyuk.jsoniter_scala.macros.*
+import whataretheydoing.DevData.*
 
-object Codecs {
-  given codecMapDayData: JsonValueCodec[Map[String, DayData]] = JsonCodecMaker.make
+given codecMapDayData: JsonValueCodec[Map[String, DayData]] = JsonCodecMaker.make
 
-  given codecMonthlySnapshot: JsonValueCodec[MonthlySnapshot] =
-    JsonCodecMaker.make(CodecMakerConfig.withAllowRecursiveTypes(true))
+given codecMonthlySnapshot: JsonValueCodec[MonthlySnapshot] =
+  JsonCodecMaker.make(CodecMakerConfig.withAllowRecursiveTypes(true))
 
-  given codecCommitFiles: JsonValueCodec[List[CommitFile]] = JsonCodecMaker.make
+given codecCommitFiles: JsonValueCodec[List[CommitFile]] = JsonCodecMaker.make
 
-  given codecCommitDetail: JsonValueCodec[CommitDetail] = JsonCodecMaker.make
+given codecCommitDetail: JsonValueCodec[CommitDetail] = JsonCodecMaker.make
 
-  given codecHeuristicJson: JsonValueCodec[List[AgentHeuristic]] = JsonCodecMaker.make
+given codecHeuristicJson: JsonValueCodec[List[AgentHeuristic]] = JsonCodecMaker.make
 
-  given codecDeveloperEntry: JsonValueCodec[List[DeveloperEntry]] = JsonCodecMaker.make
-
-}
+given codecDeveloperEntry: JsonValueCodec[List[DeveloperEntry]] = JsonCodecMaker.make
 
 case class MonthlySnapshot(
     developer: String,
