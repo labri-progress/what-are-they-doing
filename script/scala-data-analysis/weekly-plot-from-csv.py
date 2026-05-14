@@ -2,10 +2,10 @@
 """Plot per-developer stacked bar charts from Scala-generated CSV.
 
 Reads:
-- figures/agent-coevolution-periods.csv  (one row per developer/period/agent)
+- figures/rq2/agent-coevolution-periods.csv  (one row per developer/period/agent)
 
 Outputs:
-- One PNG per developer: figures/agent-coevolution-{handle}.png
+- One SVG per developer: figures/rq2/rq2-agent-use-{handle}.svg
 
 Usage:
     python script/plot-from-csv.py
@@ -26,7 +26,8 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 FIGURES_DIR = REPO_ROOT / "figures"
-DEFAULT_PERIODS_CSV = FIGURES_DIR / "agent-coevolution-periods.csv"
+RQ2_DIR = FIGURES_DIR / "rq2"
+DEFAULT_PERIODS_CSV = RQ2_DIR / "agent-coevolution-periods.csv"
 
 # ── Colour palette (must match Scala script) ────────────────────────────────
 
@@ -203,8 +204,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=FIGURES_DIR,
-        help=f"Directory for PNG output (default: {FIGURES_DIR.relative_to(REPO_ROOT)}).",
+        default=RQ2_DIR,
+        help=f"Directory for SVG output (default: {RQ2_DIR.relative_to(REPO_ROOT)}).",
     )
     parser.add_argument(
         "--developer",
@@ -227,7 +228,7 @@ def main() -> None:
         developers = [args.developer]
 
     for handle in developers:
-        output_path = args.output_dir / f"agent-coevolution-{handle}.svg"
+        output_path = args.output_dir / f"rq2-agent-use-{handle}.svg"
         plot_developer(handle, periods_data[handle], summarize_periods(periods_data[handle]), output_path)
         print(f"  @{handle} → {output_path}")
 

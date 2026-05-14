@@ -29,6 +29,12 @@ object DevAgentCommitTypes {
       count: Int
   )
 
+  case class CommitTypePeriodRow(
+      periodIso: String,
+      totalCommits: Int,
+      countsByType: Map[CommitType, Int]
+  )
+
 // ── CSV output ─────────────────────────────────────────────────────────────
 
   inline def time[A](label: String)(inline body: A): A = {
@@ -45,7 +51,7 @@ object DevAgentCommitTypes {
   val heuristics: Path  = repoRoot.resolve("agent-mining/agents")
   val commitsPath: Path = repoRoot.resolve("data/commits")
   val devFile: Path     = repoRoot.resolve("developers.json")
-  val outputPath: Path  = repoRoot.resolve("figures")
+  val outputPath: Path  = repoRoot.resolve("figures").resolve("rq2")
   val startDate         = ""
   val endDate           = ""
 
@@ -142,7 +148,37 @@ object DevAgentCommitTypes {
     )
   }
 
-  private def weekStart(day: LocalDate): LocalDate =
+  val commitTypeOrder = Vector(
+    CommitType.Feat,
+    CommitType.Fix,
+    CommitType.Refactor,
+    CommitType.Docs,
+    CommitType.Test,
+    CommitType.Perf,
+    CommitType.Build,
+    CommitType.Ci,
+    CommitType.Style,
+    CommitType.Chore,
+    CommitType.Revert,
+    CommitType.Unknown
+  )
+
+  val commitTypeColors: Map[CommitType, String] = Map(
+    CommitType.Feat -> "#e76f51",
+    CommitType.Fix -> "#f4a261",
+    CommitType.Refactor -> "#2a9d8f",
+    CommitType.Docs -> "#577590",
+    CommitType.Test -> "#9b5de5",
+    CommitType.Perf -> "#43aa8b",
+    CommitType.Build -> "#4d908e",
+    CommitType.Ci -> "#277da1",
+    CommitType.Style -> "#90be6d",
+    CommitType.Chore -> "#adb5bd",
+    CommitType.Revert -> "#6c757d",
+    CommitType.Unknown -> "#e9ecef"
+  )
+
+  def weekStart(day: LocalDate): LocalDate =
     day.`with`(DayOfWeek.MONDAY)
 
   private def periodRows: Vector[PeriodCsvRow] =
@@ -203,6 +239,42 @@ object DevAgentCommitTypes {
     finally writer.close()
   }
 
+  def commitTypeRowsForDeveloper(handle: String): Vector[CommitTypePeriodRow] = {
+    val totalsByWeek =
+      aggregateData.iterator
+        .filter(_.dev == handle)
+        .flatMap { case (_, _, _, snapshot) =>
+          snapshot.days.iterator.map { case (day, dayData) =>
+            (weekStart(LocalDate.parse(day)), dayData.total_count)
+          }
+        }
+        .toVector
+        .groupMapReduce(_._1)(_._2)(_ + _)
+
+    val countsByWeekType =
+      aggregateData.iterator
+        .filter(_.dev == handle)
+        .flatMap { case (_, _, _, snapshot) =>
+          snapshot.days.iterator.flatMap { case (day, dayData) =>
+            val week = weekStart(LocalDate.parse(day))
+            dayData.commits.iterator.map { commit =>
+              val commitType = commitSignals.get(commit.sha).map(_.commitType).getOrElse(CommitType.Unknown)
+              ((week, commitType), 1)
+            }
+          }
+        }
+        .toVector
+        .groupMapReduce(_._1)(_._2)(_ + _)
+
+    totalsByWeek.keys.toVector.sorted.map { week =>
+      CommitTypePeriodRow(
+        periodIso = week.toString,
+        totalCommits = totalsByWeek(week),
+        countsByType = commitTypeOrder.map(t => t -> countsByWeekType.getOrElse((week, t), 0)).toMap
+      )
+    }
+  }
+
   @main def makeWeeklyPlotCsv(): Unit = {
 
     println(s"Running with dataDir=${dataPath.toString} granularity=week")
@@ -215,7 +287,6 @@ object DevAgentCommitTypes {
     val rows       = periodRows
     val outputFile = outputPath.resolve("agent-coevolution-periods.csv")
     writePeriodsCsv(rows, outputFile)
-
     println(s"Wrote ${rows.size} weekly rows to $outputFile")
   }
 
