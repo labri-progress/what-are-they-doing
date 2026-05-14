@@ -3,18 +3,26 @@ Fetch all repos where a developer committed in the last 3 months
 using GitHub GraphQL contributionsCollection API, then update developers.json.
 """
 
+from datetime import datetime, timezone, timedelta
 import argparse
 import json
 import os
-import requests
-from datetime import datetime, timezone, timedelta
+
 import keyring
+import requests
+
+def load_github_token() -> str:
+    for username in ("github_token", "github_token_2"):
+        token = keyring.get_password("login2", username)
+        if token:
+            return token
+    raise EnvironmentError(
+        "No GitHub token found in keyring "
+        "(service='login2', username in {'github_token', 'github_token_2'})"
+    )
 
 
-GITHUB_TOKEN = keyring.get_password("login2", "github_token")
-
-if not GITHUB_TOKEN:
-    raise EnvironmentError("Set GITHUB_TOKEN environment variable")
+GITHUB_TOKEN = load_github_token()
 
 HEADERS = {
     "Authorization": f"Bearer {GITHUB_TOKEN}",
