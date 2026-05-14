@@ -2,6 +2,7 @@ package whataretheydoing
 
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
+import java.time.LocalDate
 import java.util.Locale
 
 object Rq2CommitTypeSvg {
@@ -26,6 +27,11 @@ object Rq2CommitTypeSvg {
 
   case class ChartScale(yMax: Int, yStep: Int)
 
+  case class ChartSeries(
+      titleHandle: String,
+      rows: Vector[CommitTypePeriodRow]
+  )
+
   private def svgEscape(text: String): String =
     text
       .replace("&", "&amp;")
@@ -35,17 +41,27 @@ object Rq2CommitTypeSvg {
 
   private def fmt(value: Double): String = String.format(Locale.US, "%.2f", Double.box(value))
 
+  private def niceStep(maxValue: Int, targetTickCount: Int): Int = {
+    if maxValue <= 0 then 1
+    else
+        val rawStep = maxValue.toDouble / math.max(1, targetTickCount)
+        val magnitude = math.pow(10, math.floor(math.log10(rawStep)))
+        val normalized = rawStep / magnitude
+        val niceNormalized =
+          if normalized <= 1 then 1
+          else if normalized <= 2 then 2
+          else if normalized <= 5 then 5
+          else 10
+        math.max(1, math.ceil(niceNormalized * magnitude).toInt)
+  }
+
   private def computeScale(rows: Vector[CommitTypePeriodRow]): ChartScale = {
     val maxStack = rows.map(_.countsByType.values.sum).maxOption.getOrElse(0)
     val maxTotal = rows.map(_.totalCommits).maxOption.getOrElse(0)
     val yMaxRaw = math.max(maxStack, maxTotal)
-    val roughStep =
-      if yMaxRaw <= 50 then 10
-      else if yMaxRaw <= 150 then 25
-      else if yMaxRaw <= 400 then 50
-      else 100
-    val yMax = math.max(roughStep, ((yMaxRaw + roughStep - 1) / roughStep) * roughStep)
-    ChartScale(yMax = yMax, yStep = roughStep)
+    val yStep = niceStep(yMaxRaw, targetTickCount = 6)
+    val yMax = math.max(yStep, ((yMaxRaw + yStep - 1) / yStep) * yStep)
+    ChartScale(yMax = yMax, yStep = yStep)
   }
 
   private def slotWidth(layout: ChartLayout, count: Int): Double =
@@ -92,12 +108,13 @@ object Rq2CommitTypeSvg {
       scale: ChartScale,
       rowCount: Int,
       index: Int,
-      row: CommitTypePeriodRow
+      row: CommitTypePeriodRow,
+      activeTypes: Vector[CommitType]
   ): String = {
     val x = xForBar(layout, rowCount, index)
     val width = barWidth(layout, rowCount)
     val segments =
-      commitTypeOrder.foldLeft((0.0, Vector.empty[String])) { case ((bottomValue, acc), commitType) =>
+      activeTypes.foldLeft((0.0, Vector.empty[String])) { case ((bottomValue, acc), commitType) =>
         val count = row.countsByType.getOrElse(commitType, 0)
         if count <= 0 then (bottomValue, acc)
         else
@@ -136,8 +153,8 @@ object Rq2CommitTypeSvg {
     s"<polyline fill='none' stroke='#343a40' stroke-width='2' stroke-dasharray='6 4' points='$points' />\n$markers"
   }
 
-  private def renderLegend(layout: ChartLayout): String = {
-    val entries = Vector("total commits (snapshot)") ++ commitTypeOrder.map(_.toString.toLowerCase)
+  private def renderLegend(layout: ChartLayout, activeTypes: Vector[CommitType]): String = {
+    val entries = Vector("total commits (snapshot)") ++ activeTypes.map(_.toString.toLowerCase)
     val boxHeight = 18 + entries.size * 20
     val box =
       s"<rect x='${fmt(layout.legendX)}' y='${fmt(layout.legendY)}' width='${fmt(layout.legendWidth)}' height='${fmt(boxHeight)}' rx='4' ry='4' fill='white' fill-opacity='0.92' stroke='#ced4da' stroke-width='1' />"
@@ -149,7 +166,7 @@ object Rq2CommitTypeSvg {
             s"<rect x='${fmt(layout.legendX + 17)}' y='${fmt(y - 7)}' width='6' height='6' fill='#343a40' transform='rotate(45 ${fmt(layout.legendX + 20)} ${fmt(y - 4)})' />" +
             s"<text x='${fmt(layout.legendX + 38)}' y='${fmt(y)}' font-size='12' fill='#212529'>${svgEscape(label)}</text>"
       else
-          val commitType = commitTypeOrder(idx - 1)
+          val commitType = activeTypes(idx - 1)
           s"<rect x='${fmt(layout.legendX + 10)}' y='${fmt(y - 10)}' width='18' height='12' fill='${commitTypeColors(commitType)}' stroke='#ffffff' stroke-width='0.6' />" +
             s"<text x='${fmt(layout.legendX + 38)}' y='${fmt(y)}' font-size='12' fill='#212529'>${svgEscape(label)}</text>"
     }.mkString("\n")
@@ -157,21 +174,29 @@ object Rq2CommitTypeSvg {
     box + "\n" + lines
   }
 
-  private def renderTitles(layout: ChartLayout, handle: String): String =
-    s"<text x='${fmt(layout.width / 2.0)}' y='24' text-anchor='middle' font-size='18' font-weight='700' fill='#111827'>Commit Types Over Time — @${svgEscape(handle)}</text>" +
+  private def renderTitles(layout: ChartLayout, title: String): String =
+    s"<text x='${fmt(layout.width / 2.0)}' y='24' text-anchor='middle' font-size='18' font-weight='700' fill='#111827'>${svgEscape(title)}</text>" +
       s"\n<text x='20' y='${fmt(layout.plotY + layout.plotHeight / 2.0)}' transform='rotate(-90 20 ${fmt(layout.plotY + layout.plotHeight / 2.0)})' text-anchor='middle' font-size='14' fill='#212529'>Commits</text>" +
       s"\n<text x='${fmt(layout.plotX + layout.plotWidth / 2.0)}' y='${fmt(layout.height - 40.0)}' text-anchor='middle' font-size='14' fill='#212529'>Period</text>"
 
-  private def renderFooter(layout: ChartLayout, rows: Vector[CommitTypePeriodRow]): String = {
+  private def renderFooter(layout: ChartLayout, rows: Vector[CommitTypePeriodRow], activeTypes: Vector[CommitType]): String = {
     val totalSnapshot = rows.map(_.totalCommits).sum
     val embeddedRecords = rows.map(_.countsByType.values.sum).sum
-    val byTypeTotals = commitTypeOrder.map(t => t -> rows.map(_.countsByType.getOrElse(t, 0)).sum).filter(_._2 > 0)
+    val byTypeTotals = activeTypes.map(t => t -> rows.map(_.countsByType.getOrElse(t, 0)).sum).filter(_._2 > 0)
     val dominantType = byTypeTotals.sortBy(-_._2).headOption.map { case (t, c) => s"Top type: ${t.toString.toLowerCase} ($c)" }.getOrElse("Top type: -")
     val footer = s"Total snapshot commits: $totalSnapshot  |  Embedded records: $embeddedRecords  |  Periods: ${rows.size}  |  $dominantType"
     s"<text x='${fmt(layout.width / 2.0)}' y='${fmt(layout.height - 12.0)}' text-anchor='middle' font-size='12' fill='#212529'>${svgEscape(footer)}</text>"
   }
 
-  private def renderChart(handle: String, rows: Vector[CommitTypePeriodRow]): String = {
+  private def trimLeadingEmptyWeeks(rows: Vector[CommitTypePeriodRow]): Vector[CommitTypePeriodRow] =
+    rows.dropWhile(row => row.totalCommits == 0 && row.countsByType.values.sum == 0)
+
+  private def activeCommitTypes(rows: Vector[CommitTypePeriodRow]): Vector[CommitType] =
+    commitTypeOrder.filter(commitType => rows.exists(_.countsByType.getOrElse(commitType, 0) > 0))
+
+  private def renderChart(title: String, rows0: Vector[CommitTypePeriodRow]): String = {
+    val rows = trimLeadingEmptyWeeks(rows0)
+    val activeTypes = activeCommitTypes(rows)
     val layout = ChartLayout(
       width = math.max(1200, rows.size * 48 + 240),
       height = 620,
@@ -184,18 +209,18 @@ object Rq2CommitTypeSvg {
     val scale = computeScale(rows)
 
     val bars = rows.zipWithIndex.map { case (row, index) =>
-      renderStackedBar(layout, scale, rows.size, index, row)
+      renderStackedBar(layout, scale, rows.size, index, row, activeTypes)
     }.mkString("\n")
 
     s"""<svg xmlns='http://www.w3.org/2000/svg' width='${layout.width}' height='${layout.height}' viewBox='0 0 ${layout.width} ${layout.height}'>
 ${renderBackground()}
 ${renderGridAndAxes(layout, scale)}
-${renderTitles(layout, handle)}
+${renderTitles(layout, title)}
 $bars
 ${renderTotalLine(layout, scale, rows)}
 ${renderBarLabels(layout, rows)}
-${renderLegend(layout)}
-${renderFooter(layout, rows)}
+${renderLegend(layout, activeTypes)}
+${renderFooter(layout, rows, activeTypes)}
 </svg>
 """
   }
@@ -203,6 +228,36 @@ ${renderFooter(layout, rows)}
   private def writeSvg(path: java.nio.file.Path, svg: String): Unit = {
     Files.writeString(path, svg, StandardCharsets.UTF_8)
     ()
+  }
+
+  private def commitTypeRowsForAgent(agent: String): Vector[CommitTypePeriodRow] = {
+    val agentCommitsByWeek: Vector[(LocalDate, CommitType)] =
+      aggregateData.iterator
+        .flatMap { case (_, _, _, snapshot) =>
+          snapshot.days.iterator.flatMap { case (day, dayData) =>
+            val week = weekStart(LocalDate.parse(day))
+            dayData.commits.iterator.flatMap { commit =>
+              commitSignals.get(commit.sha).toVector.flatMap { classified =>
+                if classified.agents.contains(agent) then Vector((week, classified.commitType)) else Vector.empty
+              }
+            }
+          }
+        }
+        .toVector
+
+    val totalsByWeek: Map[LocalDate, Int] =
+      agentCommitsByWeek.groupMapReduce(_._1)(_ => 1)(_ + _)
+
+    val countsByWeekType: Map[(LocalDate, CommitType), Int] =
+      agentCommitsByWeek.groupMapReduce(identity)(_ => 1)(_ + _)
+
+    totalsByWeek.keys.toVector.sorted.map { week =>
+      CommitTypePeriodRow(
+        periodIso = week.toString,
+        totalCommits = totalsByWeek(week),
+        countsByType = commitTypeOrder.map(t => t -> countsByWeekType.getOrElse((week, t), 0)).toMap
+      )
+    }
   }
 
   @main def makeRq2CommitTypeSvgs(): Unit = {
@@ -215,8 +270,23 @@ ${renderFooter(layout, rows)}
       val svgRows = commitTypeRowsForDeveloper(handle)
       if svgRows.nonEmpty then
           val svgPath = outputPath.resolve(s"commit-types-$handle.svg")
-          writeSvg(svgPath, renderChart(handle, svgRows))
+          writeSvg(svgPath, renderChart(s"Commit Types Over Time — @$handle", svgRows))
           println(s"Wrote commit-type SVG for @$handle to $svgPath")
+    }
+  }
+
+  @main def makeRq2CommitTypePerAgentSvgs(): Unit = {
+    println(s"Running with dataDir=${dataPath.toString} granularity=week")
+    Files.createDirectories(outputPath)
+    println(s"Tracked developers: ${trackedHandles.mkString(", ")}")
+    println(s"Loaded ${heuristicsByAgent.size} agent definitions")
+
+    heuristicsByAgent.keys.toVector.sorted.foreach { agent =>
+      val svgRows = commitTypeRowsForAgent(agent)
+      if trimLeadingEmptyWeeks(svgRows).nonEmpty && activeCommitTypes(svgRows).nonEmpty then
+          val svgPath = outputPath.resolve(s"commit-types-agent-$agent.svg")
+          writeSvg(svgPath, renderChart(s"Commit Types Over Time — agent:$agent", svgRows))
+          println(s"Wrote commit-type-by-agent SVG for $agent to $svgPath")
     }
   }
 }
