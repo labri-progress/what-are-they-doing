@@ -97,34 +97,6 @@ object RQ2Renderer {
       }
       .toVector
 
-  private def commitsForAgent(agent: String): Vector[(commit: CommitEntry, detail: CommitDetail, classification: ClassifiedCommit)] =
-    allCommitDetails.valuesIterator.filter(_.classification.agents.contains(agent)).toVector
-
-  private def boxPlotStatsByCommitType(
-      commits: Iterable[(commit: CommitEntry, detail: CommitDetail, classification: ClassifiedCommit)]
-  ): Vector[BoxPlotStats] =
-    CommitType.values.toVector.sortBy(_.ordinal).flatMap { commitType =>
-      val bucket = commits.iterator.filter(_.`classification`.commitType == commitType).toVector
-      if bucket.nonEmpty then
-          val stats = summarizeLinesChanged(bucket)
-          Some(
-            BoxPlotStats(
-              label = commitType.toString.toLowerCase,
-              count = stats.count,
-              min = stats.min,
-              q1 = stats.q1,
-              median = stats.median,
-              q3 = stats.q3,
-              max = stats.max,
-              whiskerLow = stats.whiskerLow,
-              whiskerHigh = stats.whiskerHigh,
-              mean = stats.mean,
-              outliers = stats.outliers.map(_.toDouble)
-            )
-          )
-      else None
-    }
-
   private def commitAgentBucket(entry: (commit: CommitEntry, detail: CommitDetail, classification: ClassifiedCommit)): String = {
     val agents = entry.classification.agents
     if agents.isEmpty then "no agent"
@@ -149,14 +121,6 @@ object RQ2Renderer {
     )
   }
 
-  private def boxPlotStatsByAgentBucket(
-      commits: Iterable[(commit: CommitEntry, detail: CommitDetail, classification: ClassifiedCommit)]
-  ): Vector[BoxPlotStats] =
-    agentColorOrder.flatMap { agent =>
-      val bucket = commits.iterator.filter(entry => commitAgentBucket(entry) == agent).toVector
-      if bucket.nonEmpty then Some(toBoxPlotStats(agent, bucket)) else None
-    }
-
   private def boxPlotStatsByDeveloper: Vector[BoxPlotStats] =
     trackedHandles.toVector.sorted.flatMap { handle =>
       val commits = commitsForDeveloper(handle)
@@ -168,6 +132,25 @@ object RQ2Renderer {
       val bucket = allCommitDetails.valuesIterator.filter(entry => commitAgentBucket(entry) == agent).toVector
       if bucket.nonEmpty then Some(toBoxPlotStats(agent, bucket)) else None
     }
+
+  private def boxPlotStatsByDeveloperWeek(handle: String): Vector[BoxPlotStats] =
+    aggregateData.iterator
+      .filter(_.dev == handle)
+      .flatMap { case (_, _, _, snapshot) =>
+        snapshot.days.iterator.flatMap { case (day, dayData) =>
+          val week = weekStart(day)
+          dayData.commits.iterator.flatMap { commit =>
+            allCommitDetails.get(commit.sha).map(entry => week -> entry)
+          }
+        }
+      }
+      .toVector
+      .groupBy(_._1)
+      .toVector
+      .sortBy(_._1)
+      .map { case (week, rows) =>
+        toBoxPlotStats(week.toString, rows.map(_._2))
+      }
 
   private def commitTypeSeriesForAgent(agent: String): TimeSeriesData = {
     val agentCommitsByWeek: Vector[(LocalDate, CommitType)] =
@@ -266,12 +249,37 @@ object RQ2Renderer {
     }
   }
 
+  @main def makeRq2LinesChangedWeeklyStackedSvgs(): Unit = {
+    Files.createDirectories(outputPath)
+
+    trackedHandles.toVector.sorted.foreach { handle =>
+      val data = linesChangedByAgentSeriesForDeveloper.getOrElse(handle, TimeSeriesData(Vector.empty, Vector.empty, Vector.empty))
+      if data.points.nonEmpty && activeStackKeys(data.points, agentColorOrder).nonEmpty then
+          val svgPath = outputPath.resolve(s"lines-changed-weekly-agents-$handle.svg")
+          writeSvg(
+            svgPath,
+            renderStackedTimeSeriesSvg(
+              s"Lines Changed by Agent Over Time — @$handle",
+              data.points,
+              agentColorOrder,
+              agentColors,
+              "Top agent",
+              Vector.empty,
+              yAxisLabel = "Lines changed",
+              xAxisLabel = "Week",
+              totalLabel = "Total lines changed"
+            )
+          )
+          println(s"Wrote weekly lines-changed-by-agent SVG for @$handle to $svgPath")
+    }
+  }
+
   private def writeLinesChangedVariants(
       stem: String,
       title: String,
       stats: Vector[BoxPlotStats],
-      fillByLabel: Map[String, String] = Map.empty,
-      strokeByLabel: Map[String, String] = Map.empty
+      fillByLabel: Map[String, String],
+      strokeByLabel: Map[String, String]
   ): Unit = {
     val variants = Vector(
       ("-outlier-suppressed", s"$title (Outliers Suppressed)", BoxPlotScale.Linear, true),
@@ -319,6 +327,19 @@ object RQ2Renderer {
           fillByLabel = agentColors,
           strokeByLabel = agentColors
         )
+
+    trackedHandles.toVector.sorted.foreach { handle =>
+      val byWeek = boxPlotStatsByDeveloperWeek(handle)
+      if byWeek.nonEmpty then
+          val colors = developerColors(byWeek.map(_.label))
+          writeLinesChangedVariants(
+            stem = s"lines-changed-by-week-$handle",
+            title = s"Lines Changed by Week — @$handle",
+            stats = byWeek,
+            fillByLabel = colors,
+            strokeByLabel = colors
+          )
+    }
   }
 
   @main def makeAllRq2Svgs(): Unit = {
@@ -326,5 +347,6 @@ object RQ2Renderer {
     makeRq2CommitTypeSvgs()
     makeRq2CommitTypePerAgentSvgs()
     makeRq2LinesChangedBoxplots()
+    makeRq2LinesChangedWeeklyStackedSvgs()
   }
 }

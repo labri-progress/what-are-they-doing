@@ -8,7 +8,7 @@ import java.nio.file.{Files, Path}
 import java.time.{DayOfWeek, LocalDate, YearMonth}
 import scala.collection.parallel.immutable.ParVector
 import scala.jdk.CollectionConverters.*
-import scala.util.{Random, Using}
+import scala.util.Using
 
 object DataAnalysis {
 
@@ -376,6 +376,34 @@ object DataAnalysis {
       )
     }.toMap
 
+  lazy val linesChangedByAgentSeriesForDeveloper: Map[String, TimeSeriesData] = {
+    val rows = periodRows.groupBy(_.developer)
+    rows.map { (handle, developerRows) =>
+      val weekKeys = developerRows.map(_.period_iso).distinct.sorted
+      handle -> TimeSeriesData(
+        points = weekKeys.map { week =>
+          val weekRows = developerRows.filter(_.period_iso == week)
+          val values = weekRows.flatMap { row =>
+            val totalLines = weeklyData.get((handle, LocalDate.parse(week))).toVector.flatten.flatMap(_.commits).flatMap { commit =>
+              allCommitDetails.get(commit.sha).toVector.filter { entry =>
+                val agents = entry.classification.agents
+                val bucket =
+                  if agents.isEmpty then "no agent"
+                  else if agents.size > 1 then "multi agent"
+                  else agents.head
+                bucket == row.agent
+              }.map(entry => totalLinesChanged(entry.detail))
+            }.sum
+            Option.when(totalLines > 0)(row.agent -> totalLines)
+          }.toMap
+          SVGGraphLib.StackedBarPoint(xLabel = week, values = values)
+        },
+        totalCommits = weekKeys.map(_ => 0).toVector,
+        sampledCommits = weekKeys.map(_ => 0).toVector
+      )
+    }
+  }
+
   lazy val agentSeriesForDeveloper: Map[String, TimeSeriesData] = {
     val rows = periodRows.groupBy(_.developer)
     rows.map { (handle, rows) =>
@@ -407,7 +435,7 @@ object DataAnalysis {
     }
 
   lazy val multiagent: Map[String, (commit: CommitEntry, detail: CommitDetail, classification: ClassifiedCommit)] =
-    allCommitDetails.filter((sha, cc) => cc.classification.agentSignals.sizeIs > 1)
+    allCommitDetails.filter((_, cc) => cc.classification.agentSignals.sizeIs > 1)
 
   def printMultiagentRepos(): Unit = {
     pprint.pprintln(multiagent)
@@ -420,7 +448,7 @@ object DataAnalysis {
   }
 
   def writeUnknowCommitTypes(): Unit = {
-    val unknownType = allCommitDetails.filter((sha, cc) => cc.classification.commitType == Unknown)
+    val unknownType = allCommitDetails.filter((_, cc) => cc.classification.commitType == Unknown)
     Files.writeString(
       Path.of("commitheader.txt"),
       unknownType.values.map(

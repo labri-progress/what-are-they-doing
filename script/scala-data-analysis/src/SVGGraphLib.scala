@@ -59,6 +59,15 @@ object SVGGraphLib {
 
   private def fmt(value: Double): String = String.format(Locale.US, "%.2f", Double.box(value))
 
+  private def formatSi(value: Double): String = {
+    val rounded = math.rint(value).toLong
+    if value != rounded.toDouble then fmt(value)
+    else if rounded != 0 && rounded % 1000000000L == 0 then s"${rounded / 1000000000L}G"
+    else if rounded != 0 && rounded % 1000000L == 0 then s"${rounded / 1000000L}M"
+    else if rounded != 0 && rounded % 1000L == 0 then s"${rounded / 1000L}k"
+    else rounded.toString
+  }
+
   private def niceStep(maxValue: Int, targetTickCount: Int): Int =
     if maxValue <= 0 then 1
     else
@@ -110,7 +119,7 @@ object SVGGraphLib {
       (0 to scale.yMax by scale.yStep).map { tick =>
         val y = yForValue(layout, scale, tick.toDouble)
         s"<line x1='${fmt(layout.plotX)}' y1='${fmt(y)}' x2='${fmt(layout.plotX + layout.plotWidth)}' y2='${fmt(y)}' stroke='#e9ecef' stroke-width='1' />" +
-          s"<text x='${fmt(layout.plotX - 10)}' y='${fmt(y + 4)}' text-anchor='end' font-size='12' fill='#495057'>$tick</text>"
+          s"<text x='${fmt(layout.plotX - 10)}' y='${fmt(y + 4)}' text-anchor='end' font-size='12' fill='#495057'>${formatSi(tick.toDouble)}</text>"
       }.mkString("\n")
 
     val axes =
@@ -194,17 +203,17 @@ object SVGGraphLib {
     box + "\n" + legendItems
   }
 
-  private def renderTitles(layout: ChartLayout, title: String): String =
+  private def renderTitles(layout: ChartLayout, title: String, yAxisLabel: String, xAxisLabel: String): String =
     s"<text x='${fmt(layout.width / 2.0)}' y='24' text-anchor='middle' font-size='18' font-weight='700' fill='#111827'>${svgEscape(title)}</text>" +
-      s"\n<text x='20' y='${fmt(layout.plotY + layout.plotHeight / 2.0)}' transform='rotate(-90 20 ${fmt(layout.plotY + layout.plotHeight / 2.0)})' text-anchor='middle' font-size='14' fill='#212529'>Commits</text>" +
-      s"\n<text x='${fmt(layout.plotX + layout.plotWidth / 2.0)}' y='${fmt(layout.height - 40.0)}' text-anchor='middle' font-size='14' fill='#212529'>Period</text>"
+      s"\n<text x='20' y='${fmt(layout.plotY + layout.plotHeight / 2.0)}' transform='rotate(-90 20 ${fmt(layout.plotY + layout.plotHeight / 2.0)})' text-anchor='middle' font-size='14' fill='#212529'>${svgEscape(yAxisLabel)}</text>" +
+      s"\n<text x='${fmt(layout.plotX + layout.plotWidth / 2.0)}' y='${fmt(layout.height - 40.0)}' text-anchor='middle' font-size='14' fill='#212529'>${svgEscape(xAxisLabel)}</text>"
 
-  private def renderFooter(layout: ChartLayout, points: Vector[StackedBarPoint], activeKeys: Vector[String], topLabel: String, activeLines: Vector[LineSeries]): String = {
-    val embeddedRecords = points.map(_.values.values.sum).sum
+  private def renderFooter(layout: ChartLayout, points: Vector[StackedBarPoint], activeKeys: Vector[String], topLabel: String, activeLines: Vector[LineSeries], totalLabel: String): String = {
+    val totalValue = points.map(_.values.values.sum).sum
     val totalsByKey = activeKeys.map(key => key -> points.map(_.values.getOrElse(key, 0)).sum).filter(_._2 > 0)
     val dominant = totalsByKey.sortBy(-_._2).headOption.map { case (key, c) => s"$topLabel: $key ($c)" }.getOrElse(s"$topLabel: -")
     val lineSummaries = activeLines.map(line => s"${line.label}: ${line.values.sum}")
-    val footer = (lineSummaries :+ s"Embedded records: $embeddedRecords" :+ s"Periods: ${points.size}" :+ dominant).mkString("  |  ")
+    val footer = (lineSummaries :+ s"$totalLabel: $totalValue" :+ s"Periods: ${points.size}" :+ dominant).mkString("  |  ")
     s"<text x='${fmt(layout.width / 2.0)}' y='${fmt(layout.height - 12.0)}' text-anchor='middle' font-size='12' fill='#212529'>${svgEscape(footer)}</text>"
   }
 
@@ -244,11 +253,8 @@ object SVGGraphLib {
       val y = yForContinuousValue(layout, scaledMax, tick, scale)
       val label =
         scale match
-            case BoxPlotScale.Linear => tick.toInt.toString
-            case BoxPlotScale.Log10  =>
-              if tick >= 1000000 then f"${tick / 1000000.0}%.1fM"
-              else if tick >= 1000 then f"${tick / 1000.0}%.0fk"
-              else tick.toInt.toString
+            case BoxPlotScale.Linear => formatSi(tick)
+            case BoxPlotScale.Log10  => formatSi(tick)
       s"<line x1='${fmt(layout.plotX)}' y1='${fmt(y)}' x2='${fmt(layout.plotX + layout.plotWidth)}' y2='${fmt(y)}' stroke='#e9ecef' stroke-width='1' />" +
         s"<text x='${fmt(layout.plotX - 10)}' y='${fmt(y + 4)}' text-anchor='end' font-size='12' fill='#495057'>$label</text>"
     }.mkString("\n")
@@ -310,22 +316,17 @@ object SVGGraphLib {
 $outliers"""
   }
 
-  private def renderBoxPlotLegend(
-      layout: ChartLayout,
-      boxFill: String,
-      stroke: String,
-      meanFill: String,
-      outlierFill: String
-  ): String = {
+  private def renderBoxPlotLegend(layout: ChartLayout): String = {
     val boxHeight = 18 + 4 * 20
     val box =
       s"<rect x='${fmt(layout.legendX)}' y='${fmt(layout.legendY)}' width='${fmt(layout.legendWidth)}' height='${fmt(boxHeight)}' rx='4' ry='4' fill='white' fill-opacity='0.92' stroke='#ced4da' stroke-width='1' />"
 
+    val legendColor = "#111827"
     val entries = Vector(
-      s"<rect x='${fmt(layout.legendX + 10)}' y='${fmt(layout.legendY + 8)}' width='18' height='12' fill='$boxFill' fill-opacity='0.75' stroke='$stroke' stroke-width='1.2' /><text x='${fmt(layout.legendX + 38)}' y='${fmt(layout.legendY + 18)}' font-size='12' fill='#212529'>IQR (Q1–Q3)</text>",
-      s"<line x1='${fmt(layout.legendX + 10)}' y1='${fmt(layout.legendY + 34)}' x2='${fmt(layout.legendX + 30)}' y2='${fmt(layout.legendY + 34)}' stroke='$stroke' stroke-width='2' /><text x='${fmt(layout.legendX + 38)}' y='${fmt(layout.legendY + 38)}' font-size='12' fill='#212529'>Median</text>",
-      s"<rect x='${fmt(layout.legendX + 17)}' y='${fmt(layout.legendY + 47)}' width='6' height='6' fill='$meanFill' transform='rotate(45 ${fmt(layout.legendX + 20)} ${fmt(layout.legendY + 50)})' /><text x='${fmt(layout.legendX + 38)}' y='${fmt(layout.legendY + 54)}' font-size='12' fill='#212529'>Mean</text>",
-      s"<circle cx='${fmt(layout.legendX + 20)}' cy='${fmt(layout.legendY + 70)}' r='3' fill='$outlierFill' fill-opacity='0.85' /><text x='${fmt(layout.legendX + 38)}' y='${fmt(layout.legendY + 74)}' font-size='12' fill='#212529'>Outliers</text>"
+      s"<rect x='${fmt(layout.legendX + 10)}' y='${fmt(layout.legendY + 8)}' width='18' height='12' fill='white' stroke='$legendColor' stroke-width='1.2' /><text x='${fmt(layout.legendX + 38)}' y='${fmt(layout.legendY + 18)}' font-size='12' fill='#212529'>IQR (Q1–Q3)</text>",
+      s"<line x1='${fmt(layout.legendX + 10)}' y1='${fmt(layout.legendY + 34)}' x2='${fmt(layout.legendX + 30)}' y2='${fmt(layout.legendY + 34)}' stroke='$legendColor' stroke-width='2' /><text x='${fmt(layout.legendX + 38)}' y='${fmt(layout.legendY + 38)}' font-size='12' fill='#212529'>Median</text>",
+      s"<rect x='${fmt(layout.legendX + 17)}' y='${fmt(layout.legendY + 47)}' width='6' height='6' fill='$legendColor' transform='rotate(45 ${fmt(layout.legendX + 20)} ${fmt(layout.legendY + 50)})' /><text x='${fmt(layout.legendX + 38)}' y='${fmt(layout.legendY + 54)}' font-size='12' fill='#212529'>Mean</text>",
+      s"<circle cx='${fmt(layout.legendX + 20)}' cy='${fmt(layout.legendY + 70)}' r='3' fill='$legendColor' fill-opacity='0.85' /><text x='${fmt(layout.legendX + 38)}' y='${fmt(layout.legendY + 74)}' font-size='12' fill='#212529'>Outliers</text>"
     ).mkString("\n")
 
     box + "\n" + entries
@@ -337,8 +338,6 @@ $outliers"""
       stats: Vector[BoxPlotStats],
       boxFill: String = "#93c5fd",
       stroke: String = "#1d4ed8",
-      meanFill: String = "#1d4ed8",
-      outlierFill: String = "#1d4ed8",
       fillByLabel: Map[String, String] = Map.empty,
       strokeByLabel: Map[String, String] = Map.empty,
       scale: BoxPlotScale = BoxPlotScale.Linear,
@@ -384,7 +383,7 @@ ${renderContinuousGridAndAxes(layout, yMax, scale)}
 <text x='${fmt(layout.plotX + layout.plotWidth / 2.0)}' y='${fmt(layout.height - 40.0)}' text-anchor='middle' font-size='14' fill='#212529'>Group</text>
 $plots
 ${renderBoxPlotLabels(layout, stats)}
-${renderBoxPlotLegend(layout, boxFill, stroke, meanFill, outlierFill)}
+${renderBoxPlotLegend(layout)}
 $footer
 </svg>
 """
@@ -396,7 +395,10 @@ $footer
       stackOrder: Vector[String],
       colors: Map[String, String],
       topLabel: String,
-      lineSeries: Vector[LineSeries]
+      lineSeries: Vector[LineSeries],
+      yAxisLabel: String = "Commits",
+      xAxisLabel: String = "Period",
+      totalLabel: String = "Embedded records"
   ): String = {
     val activeStacks = activeStackKeys(points, stackOrder)
     val activeLines = activeLineSeries(lineSeries)
@@ -420,12 +422,12 @@ $footer
     s"""<svg xmlns='http://www.w3.org/2000/svg' width='${layout.width}' height='${layout.height}' viewBox='0 0 ${layout.width} ${layout.height}'>
 ${renderBackground()}
 ${renderGridAndAxes(layout, scale)}
-${renderTitles(layout, title)}
+${renderTitles(layout, title, yAxisLabel, xAxisLabel)}
 $bars
 $lines
 ${renderBarLabels(layout, points)}
 ${renderLegend(layout, activeStacks, colors, activeLines)}
-${renderFooter(layout, points, activeStacks, topLabel, activeLines)}
+${renderFooter(layout, points, activeStacks, topLabel, activeLines, totalLabel)}
 </svg>
 """
   }
