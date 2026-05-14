@@ -86,7 +86,7 @@ case class GitHubUser(
 
 case class CommitDetail(
     message: Option[String],
-    files: Option[List[CommitFile]]
+    files: List[CommitFile] = Nil
 )
 
 case class CommitFile(

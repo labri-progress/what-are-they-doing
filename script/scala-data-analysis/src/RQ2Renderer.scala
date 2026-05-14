@@ -74,7 +74,7 @@ object RQ2Renderer {
           snapshot.days.iterator.flatMap { case (day, dayData) =>
             val week = weekStart(day)
             dayData.commits.iterator.flatMap { commit =>
-              commitSignals.get(commit.sha).toVector.flatMap { classified =>
+              commitSignals(commit.sha).toVector.flatMap { classified =>
                 if classified.agents.contains(agent) then Vector((week, classified.commitType)) else Vector.empty
               }
             }

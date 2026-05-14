@@ -1,14 +1,14 @@
 package whataretheydoing
 
 import com.github.plokhotnyuk.jsoniter_scala.core.*
+import whataretheydoing.DataAnalysis.CommitType.Unknown
+import whataretheydoing.HeuristicMatcher.SignalType
 
 import java.nio.file.{Files, Path}
 import java.time.{DayOfWeek, LocalDate, YearMonth}
-
-import whataretheydoing.HeuristicMatcher.SignalType
 import scala.collection.parallel.immutable.ParVector
 import scala.jdk.CollectionConverters.*
-import scala.util.Using
+import scala.util.{Random, Using}
 
 object DataAnalysis {
 
@@ -28,7 +28,7 @@ object DataAnalysis {
       message: String,
       files: List[String]
   ) {
-      def agents: Set[String] = agentSignals.keySet
+    def agents: Set[String] = agentSignals.keySet
   }
 
   case class PeriodCsvRow(
@@ -96,11 +96,7 @@ object DataAnalysis {
       }.toVector
     }
 
-  def allCommits = aggregateData.iterator.flatMap(_.data.days.valuesIterator.flatMap(_.commits))
-
-  lazy val commitSignals: Map[String, ClassifiedCommit] = time("compute commit signals") {
-    allCommits.to(ParVector).map { c => (c.sha, getCommitDetails(c)) }.to(Map)
-  }
+  def allCommits: Iterator[CommitEntry] = aggregateData.iterator.flatMap(_.data.days.valuesIterator.flatMap(_.commits))
 
   lazy val allDays: Seq[LocalDate] = aggregateData.flatMap(_.data.days.keysIterator)
 
@@ -125,7 +121,7 @@ object DataAnalysis {
               case _          => CommitType.Unknown
         case _ => CommitType.Unknown
 
-  private def getCommitDetails(commit: CommitEntry): ClassifiedCommit = {
+  def loadFullCommitData(commit: CommitEntry): CommitDetail = {
     val detailFile = commitsPath.resolve(s"${commit.sha}.json")
     val detail     =
       if Files.exists(detailFile) then
@@ -134,11 +130,16 @@ object DataAnalysis {
           catch
               case _: Exception =>
                 val files = readFromArray[List[CommitFile]](bytes)
-                CommitDetail(message = Some(commit.commit.message), files = Some(files))
-      else CommitDetail(message = Some(commit.commit.message), files = Some(Nil))
+                CommitDetail(message = Some(commit.commit.message), files = files)
+      else CommitDetail(message = None, files = Nil)
 
-    val message      = detail.message.getOrElse(commit.commit.message)
-    val changedFiles = detail.files.getOrElse(Nil).map(_.filename)
+    detail.copy(message = Some(detail.message.getOrElse(commit.commit.message)))
+  }
+
+  private def classifyCommit(commit: CommitEntry, detail: CommitDetail): ClassifiedCommit = {
+
+    val message      = detail.message.get
+    val changedFiles = detail.files.map(_.filename)
     val author       = commit.commit.author
     val commitAuthor = s"${author.name} <${author.email}>"
     val agentSignals = HeuristicMatcher.detectAgents(
@@ -155,6 +156,18 @@ object DataAnalysis {
       files = changedFiles
     )
   }
+
+  lazy val allCommitDetails
+      : Map[String, (commit: CommitEntry, detail: CommitDetail, classification: ClassifiedCommit)] =
+    time("load commit details") {
+      allCommits.to(ParVector).map { commit =>
+        val detail         = loadFullCommitData(commit)
+        val classification = classifyCommit(commit, detail)
+        (commit.sha, (commit = commit, detail = detail, classification = classification))
+      }.to(Map)
+    }
+
+  def commitSignals(sha: String): Option[ClassifiedCommit] = allCommitDetails.get(sha).map(_.classification)
 
   def weekStart(day: LocalDate): LocalDate = day.`with`(DayOfWeek.MONDAY)
 
@@ -186,7 +199,7 @@ object DataAnalysis {
             snapshot.days.iterator.flatMap { case (day, dayData) =>
               val week = weekStart(day)
               dayData.commits.iterator.flatMap { commit =>
-                val agents = commitSignals.get(commit.sha).map(_.agents).getOrElse(Set.empty)
+                val agents = commitSignals(commit.sha).map(_.agents).getOrElse(Set.empty)
                 val labels =
                   if agents.isEmpty then Set("no agent")
                   else if agents.size > 1 then Set("multi agent")
@@ -232,7 +245,7 @@ object DataAnalysis {
       .flatMap { case ((developer, week), dayDataVector) =>
         dayDataVector.iterator.flatMap { dayData =>
           dayData.commits.iterator.map { commit =>
-            val commitType = commitSignals.get(commit.sha).map(_.commitType).getOrElse(CommitType.Unknown)
+            val commitType = commitSignals(commit.sha).map(_.commitType).getOrElse(CommitType.Unknown)
             ((developer, week, commitType), 1)
           }
         }
@@ -276,6 +289,41 @@ object DataAnalysis {
           weekKeys.map(week => rows.find(_.period_iso == week).map(_.sampled_commits).getOrElse(0)).toVector
       )
     }
+  }
+
+  val commitUrl = "^https://github.com/(?<org>[^/]+)/(?<repo>[^/]+)/commit/".r.unanchored
+
+  def repoOfCommit(sha: String): String =
+    allCommitDetails.get(sha) match {
+      case Some(value) => value.commit.html_url match {
+          case Some(commitUrl(org, repo)) => s"$org/$repo"
+          case _                          => ""
+        }
+      case None => ""
+    }
+
+  lazy val multiagent: Map[String, (commit: CommitEntry, detail: CommitDetail, classification: ClassifiedCommit)] =
+    allCommitDetails.filter((sha, cc) => cc.classification.agentSignals.sizeIs > 1)
+
+  def printMultiagentRepos(): Unit = {
+    pprint.pprintln(multiagent)
+    val multiagentRepos = multiagent.map { e =>
+      repoOfCommit(e._1)
+    }.toSet
+
+    pprint.pprintln(multiagentRepos)
+
+  }
+
+  def main(args: Array[String]): Unit = {
+    val unknownType = allCommitDetails.filter((sha, cc) => cc.classification.commitType == Unknown)
+    Files.writeString(
+      Path.of("commitheader.txt"),
+      unknownType.values.map(
+        _.detail.message.get.linesIterator.nextOption().getOrElse("")
+      ).toVector.sorted.mkString("\n")
+    )
+    ()
   }
 
 }
