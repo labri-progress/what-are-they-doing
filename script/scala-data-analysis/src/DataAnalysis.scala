@@ -8,7 +8,7 @@ import scala.collection.parallel.immutable.ParVector
 import scala.jdk.CollectionConverters.*
 import scala.util.Using
 
-object DevAgentCommitTypes {
+object DataAnalysis {
 
   enum CommitType:
       case Build, Chore, Ci, Docs, Feat, Fix, Perf, Refactor, Revert, Style, Test, Unknown
@@ -158,7 +158,7 @@ object DevAgentCommitTypes {
   def weekStart(day: LocalDate): LocalDate =
     day.`with`(DayOfWeek.MONDAY)
 
-  private def periodRows: Vector[PeriodCsvRow] =
+  private lazy val periodRows: Vector[PeriodCsvRow] = {
     time("build weekly period rows") {
       val totalsByDeveloperWeek =
         aggregateData.iterator
@@ -208,7 +208,7 @@ object DevAgentCommitTypes {
           )
         }
     }
-
+  }
 
   def commitTypeSeriesForDeveloper(handle: String): TimeSeriesData = {
     val totalsByWeek =
@@ -253,7 +253,9 @@ object DevAgentCommitTypes {
       points = weeks.map { week =>
         SVGGraphLib.StackedBarPoint(
           xLabel = week.toString,
-          values = countsByWeekType.collect { case ((w, commitType), count) if w == week => commitType.toString.toLowerCase -> count }
+          values = countsByWeekType.collect {
+            case ((w, commitType), count) if w == week => commitType.toString.toLowerCase -> count
+          }
         )
       },
       totalCommits = weeks.map(totalsByWeek),
@@ -262,7 +264,7 @@ object DevAgentCommitTypes {
   }
 
   def agentSeriesForDeveloper(handle: String): TimeSeriesData = {
-    val rows = periodRows.filter(_.developer == handle)
+    val rows     = periodRows.filter(_.developer == handle)
     val weekKeys = rows.map(_.period_iso).distinct.sorted
     TimeSeriesData(
       points = weekKeys.map { week =>
@@ -273,9 +275,9 @@ object DevAgentCommitTypes {
         )
       }.toVector,
       totalCommits = weekKeys.map(week => rows.find(_.period_iso == week).map(_.total_commits).getOrElse(0)).toVector,
-      sampledCommits = weekKeys.map(week => rows.find(_.period_iso == week).map(_.sampled_commits).getOrElse(0)).toVector
+      sampledCommits =
+        weekKeys.map(week => rows.find(_.period_iso == week).map(_.sampled_commits).getOrElse(0)).toVector
     )
   }
-
 
 }

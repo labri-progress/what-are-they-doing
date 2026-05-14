@@ -1,6 +1,6 @@
 package whataretheydoing
 
-import whataretheydoing.DevAgentCommitTypes.*
+import whataretheydoing.DataAnalysis.*
 import whataretheydoing.SVGGraphLib.*
 
 import java.nio.file.Files
@@ -11,18 +11,18 @@ object RQ2Renderer {
     CommitType.values.toVector.sortBy(_.ordinal).map(_.toString.toLowerCase)
 
   private val commitTypeColors: Map[String, String] = Map(
-    CommitType.Build -> "#4d908e",
-    CommitType.Chore -> "#adb5bd",
-    CommitType.Ci -> "#277da1",
-    CommitType.Docs -> "#577590",
-    CommitType.Feat -> "#e76f51",
-    CommitType.Fix -> "#f4a261",
-    CommitType.Perf -> "#43aa8b",
+    CommitType.Build    -> "#4d908e",
+    CommitType.Chore    -> "#adb5bd",
+    CommitType.Ci       -> "#277da1",
+    CommitType.Docs     -> "#577590",
+    CommitType.Feat     -> "#e76f51",
+    CommitType.Fix      -> "#f4a261",
+    CommitType.Perf     -> "#43aa8b",
     CommitType.Refactor -> "#2a9d8f",
-    CommitType.Revert -> "#6c757d",
-    CommitType.Style -> "#90be6d",
-    CommitType.Test -> "#9b5de5",
-    CommitType.Unknown -> "#e9ecef"
+    CommitType.Revert   -> "#6c757d",
+    CommitType.Style    -> "#90be6d",
+    CommitType.Test     -> "#9b5de5",
+    CommitType.Unknown  -> "#e9ecef"
   ).map((k, v) => k.toString.toLowerCase -> v)
 
   private val agentColorOrder = Vector(
@@ -44,19 +44,19 @@ object RQ2Renderer {
 
   private val agentColors: Map[String, String] = Map(
     "claude_code" -> "#e76f51",
-    "cursor" -> "#2a9d8f",
-    "copilot" -> "#264653",
-    "codex" -> "#f4a261",
-    "aider" -> "#9b5de5",
-    "devin" -> "#00bbf9",
-    "opencode" -> "#fee440",
-    "windsurf" -> "#00f5d4",
-    "amp" -> "#577590",
-    "gemini" -> "#adb5bd",
-    "qwen_code" -> "#43aa8b",
-    "roo_code" -> "#90be6d",
-    "sweep" -> "#6c757d",
-    "no agent" -> "#e9ecef"
+    "cursor"      -> "#2a9d8f",
+    "copilot"     -> "#264653",
+    "codex"       -> "#f4a261",
+    "aider"       -> "#9b5de5",
+    "devin"       -> "#00bbf9",
+    "opencode"    -> "#fee440",
+    "windsurf"    -> "#00f5d4",
+    "amp"         -> "#577590",
+    "gemini"      -> "#adb5bd",
+    "qwen_code"   -> "#43aa8b",
+    "roo_code"    -> "#90be6d",
+    "sweep"       -> "#6c757d",
+    "no agent"    -> "#e9ecef"
   )
 
   private def defaultLines(data: TimeSeriesData): Vector[LineSeries] =
@@ -83,11 +83,13 @@ object RQ2Renderer {
     val countsByWeekType: Map[(LocalDate, CommitType), Int] =
       agentCommitsByWeek.groupMapReduce(identity)(_ => 1)(_ + _)
 
-    val weeks = agentCommitsByWeek.map(_._1).distinct.sorted
+    val weeks  = agentCommitsByWeek.map(_._1).distinct.sorted
     val points = weeks.map { week =>
       StackedBarPoint(
         xLabel = week.toString,
-        values = countsByWeekType.collect { case ((w, commitType), count) if w == week => commitType.toString.toLowerCase -> count }
+        values = countsByWeekType.collect {
+          case ((w, commitType), count) if w == week => commitType.toString.toLowerCase -> count
+        }
       )
     }.toVector
     val totals = points.map(_.values.values.sum)
@@ -95,10 +97,7 @@ object RQ2Renderer {
   }
 
   @main def makeWeeklyPlotSvgs(): Unit = {
-    println(s"Running with dataDir=${dataPath.toString} granularity=week")
     Files.createDirectories(outputPath)
-    println(s"Tracked developers: ${trackedHandles.mkString(", ")}")
-    println(s"Loaded ${heuristicsByAgent.size} agent definitions")
 
     trackedHandles.toVector.sorted.foreach { handle =>
       val data = agentSeriesForDeveloper(handle)
@@ -120,10 +119,7 @@ object RQ2Renderer {
   }
 
   @main def makeRq2CommitTypeSvgs(): Unit = {
-    println(s"Running with dataDir=${dataPath.toString} granularity=week")
     Files.createDirectories(outputPath)
-    println(s"Tracked developers: ${trackedHandles.mkString(", ")}")
-    println(s"Loaded ${heuristicsByAgent.size} agent definitions")
 
     trackedHandles.toVector.sorted.foreach { handle =>
       val data = commitTypeSeriesForDeveloper(handle)
@@ -145,10 +141,7 @@ object RQ2Renderer {
   }
 
   @main def makeRq2CommitTypePerAgentSvgs(): Unit = {
-    println(s"Running with dataDir=${dataPath.toString} granularity=week")
     Files.createDirectories(outputPath)
-    println(s"Tracked developers: ${trackedHandles.mkString(", ")}")
-    println(s"Loaded ${heuristicsByAgent.size} agent definitions")
 
     heuristicsByAgent.keys.toVector.sorted.foreach { agent =>
       val data = commitTypeSeriesForAgent(agent)
