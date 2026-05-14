@@ -103,22 +103,45 @@ object DataAnalysis {
   private val conventionalCommitPattern =
     "^([a-z]+)(?:\\([^\\r\\n()]+\\))?(!)?:\\s+(.+)$".r
 
+  private def conventionalCommitType(rawType: String): CommitType =
+    rawType.toLowerCase match
+        case "build"    => CommitType.Build
+        case "chore"    => CommitType.Chore
+        case "ci"       => CommitType.Ci
+        case "docs"     => CommitType.Docs
+        case "feat"     => CommitType.Feat
+        case "fix"      => CommitType.Fix
+        case "perf"     => CommitType.Perf
+        case "refactor" => CommitType.Refactor
+        case "revert"   => CommitType.Revert
+        case "style"    => CommitType.Style
+        case "test"     => CommitType.Test
+        case _           => CommitType.Unknown
+
+  private def startsWithAny(line: String, prefixes: String*): Boolean =
+    prefixes.exists(line.startsWith)
+
+  private def inferCommitTypeFromHeader(header: String): CommitType = {
+    val normalized = header.trim.toLowerCase
+    if normalized.isEmpty then CommitType.Unknown
+    else if startsWithAny(normalized, "feat", "add ", "implement ", "introduce ", "support ", "enable ", "allow ", "create ", "wire ", "integrate ", "expose ", "provide ", "initialize ", "bootstrap ", "accept ", "share ") then CommitType.Feat
+    else if startsWithAny(normalized, "fix", "bugfix", "hotfix", "repair ", "resolve ", "correct ", "prevent ", "stabilize ", "hardening", "harden ", "security:", "security ") then CommitType.Fix
+    else if startsWithAny(normalized, "perf", "optimize ", "optimise ", "speed up ", "reduce ", "benchmark", "cache ", "faster ", "lazy ") then CommitType.Perf
+    else if startsWithAny(normalized, "refactor", "rename ", "move ", "extract ", "reorganize ", "reorganise ", "modularize ", "modularise ", "consolidate ", "simplify ", "streamline ", "cleanup", "clean up", "deduplicate ", "split ", "port ", "migrate ", "rewrite ", "rework ") then CommitType.Refactor
+    else if startsWithAny(normalized, "docs", "doc:", "document ", "documentation", "readme", "guide", "tutorial", "blog", "changelog", "adr-", "spec", "planning", "plan ", "prompt:") then CommitType.Docs
+    else if startsWithAny(normalized, "test", "tests", "e2e", "integration test", "unit test", "property", "conformance", "coverage", "smoke test", "test:") then CommitType.Test
+    else if startsWithAny(normalized, "style", "format", "fmt", "lint", "lint:", "prettier", "rustfmt", "clang-format", "shfmt", "shellcheck", "typo", "whitespace") then CommitType.Style
+    else if startsWithAny(normalized, "build", "bump ", "release", "publish ", "package", "packaging", "installer", "install ", "cargo", "cmake", "docker", "homebrew", "nix", "npm ", "pnpm ", "wasm build", "binary", "artifact") then CommitType.Build
+    else if startsWithAny(normalized, "ci ", "ci:", "github actions", "workflow", "workflows", "pipeline", "buildkite", "lint/test") then CommitType.Ci
+    else if startsWithAny(normalized, "revert") then CommitType.Revert
+    else if startsWithAny(normalized, "merge ", "sync ", "track ", "checkpoint", "wip", "tmp", "oops", "updates", "update ", "adjust ", "tweak ", "tune ", "polish ", "note ", "use ", "switch ", "set ", "bake ", "prepare ", "release ") then CommitType.Chore
+    else CommitType.Unknown
+  }
+
   def classifyCommitMessage(message: String): CommitType =
     message.linesIterator.nextOption() match
-        case Some(conventionalCommitPattern(rawType, _, _)) =>
-          rawType.nn.toLowerCase match
-              case "build"    => CommitType.Build
-              case "chore"    => CommitType.Chore
-              case "ci"       => CommitType.Ci
-              case "docs"     => CommitType.Docs
-              case "feat"     => CommitType.Feat
-              case "fix"      => CommitType.Fix
-              case "perf"     => CommitType.Perf
-              case "refactor" => CommitType.Refactor
-              case "revert"   => CommitType.Revert
-              case "style"    => CommitType.Style
-              case "test"     => CommitType.Test
-              case _          => CommitType.Unknown
+        case Some(conventionalCommitPattern(rawType, _, _)) => conventionalCommitType(rawType.nn)
+        case Some(header) => inferCommitTypeFromHeader(header)
         case _ => CommitType.Unknown
 
   def loadFullCommitData(commit: CommitEntry): CommitDetail = {
@@ -315,7 +338,7 @@ object DataAnalysis {
 
   }
 
-  def main(args: Array[String]): Unit = {
+  def writeUnknowCommitTypes(): Unit = {
     val unknownType = allCommitDetails.filter((sha, cc) => cc.classification.commitType == Unknown)
     Files.writeString(
       Path.of("commitheader.txt"),
