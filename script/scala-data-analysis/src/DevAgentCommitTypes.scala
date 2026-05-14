@@ -9,7 +9,7 @@ import scala.collection.parallel.immutable.ParVector
 import scala.jdk.CollectionConverters.*
 import scala.util.Using
 
-object DevData {
+object DevAgentCommitTypes {
 
   enum CommitType:
       case Build, Chore, Ci, Docs, Feat, Fix, Perf, Refactor, Revert, Style, Test, Unknown
