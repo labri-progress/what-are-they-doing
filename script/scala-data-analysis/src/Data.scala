@@ -13,7 +13,7 @@ object Codecs {
 
   given codecCommitDetail: JsonValueCodec[CommitDetail] = JsonCodecMaker.make
 
-  given codecHeuristicJson: JsonValueCodec[List[HeuristicJson]] = JsonCodecMaker.make
+  given codecHeuristicJson: JsonValueCodec[List[AgentHeuristic]] = JsonCodecMaker.make
 
   given codecDeveloperEntry: JsonValueCodec[List[DeveloperEntry]] = JsonCodecMaker.make
 
@@ -101,7 +101,7 @@ case class CommitFile(
 
 // ── Data models for heuristic JSON ───────────────────────────────────────
 
-case class HeuristicJson(
+case class AgentHeuristic(
     author_names: List[String],
     author_mails: List[String],
     files: List[String],

@@ -1,7 +1,7 @@
 package whataretheydoing
 
 import com.github.plokhotnyuk.jsoniter_scala.core.readFromArray
-import whataretheydoing.HeuristicJson
+import whataretheydoing.AgentHeuristic
 
 import java.nio.file.Files
 import java.nio.file.Path
@@ -54,44 +54,25 @@ object HeuristicMatcher {
       catch
           case _: Exception => text.contains(pattern)
 
-  case class Heuristic(
-      agentName: String,
-      authorNames: List[String],
-      authorMails: List[String],
-      files: List[String],
-      commitMessagePrefix: List[String]
-  )
-
-  def loadHeuristics(agentsDir: Path): Map[String, List[Heuristic]] =
-      val result = mutable.Map[String, List[Heuristic]]()
+  def loadHeuristics(agentsDir: Path): Map[String, List[AgentHeuristic]] =
       val stream = Files.list(agentsDir)
       try
-          stream.iterator().asScala
-            .filter(path => Files.isRegularFile(path) && path.getFileName.toString.endsWith(".json"))
-            .foreach { file =>
-              val jsonBytes      = Files.readAllBytes(file)
-              val heuristicsJson = readFromArray[List[HeuristicJson]](jsonBytes)
-              val agentName      = file.getFileName.toString.stripSuffix(".json")
-              val heuristics     = heuristicsJson.map { hj =>
-                Heuristic(
-                  agentName = agentName,
-                  authorNames = hj.author_names,
-                  authorMails = hj.author_mails,
-                  files = hj.files,
-                  commitMessagePrefix = hj.commit_message_prefix
-                )
-              }
-              result(agentName) = heuristics
-            }
+        stream.iterator().asScala
+          .filter(path => Files.isRegularFile(path) && path.getFileName.toString.endsWith(".json"))
+          .map { file =>
+            val jsonBytes      = Files.readAllBytes(file)
+            val heuristicsJson = readFromArray[List[AgentHeuristic]](jsonBytes)
+            val agentName      = file.getFileName.toString.stripSuffix(".json")
+            (agentName, heuristicsJson)
+          }.toMap
       finally
-          stream.close()
-      result.toMap
+        stream.close()
 
   def detectAgents(
       commitMessage: String,
       commitAuthor: String,
       filenames: List[String],
-      heuristicsByAgent: Map[String, List[Heuristic]]
+      heuristicsByAgent: Map[String, List[AgentHeuristic]]
   ): List[String] =
       val matched = mutable.ListBuffer[String]()
       for (agentName, heuristics) <- heuristicsByAgent do
@@ -113,22 +94,22 @@ object HeuristicMatcher {
   private def matchCommitHeuristic(
       commitMessage: String,
       commitAuthor: String,
-      h: Heuristic
+      h: AgentHeuristic
   ): Boolean =
       // 1) Author identity
-      if h.authorNames.exists(n => matchPattern(n, commitAuthor)) then return true
-      if h.authorMails.exists(m => matchPattern(m, commitAuthor)) then return true
+      if h.author_names.exists(n => matchPattern(n, commitAuthor)) then return true
+      if h.author_mails.exists(m => matchPattern(m, commitAuthor)) then return true
 
       // 2) Co-authors in message
       val coauthors = iterCoauthors(commitMessage)
       if coauthors.exists { case (coName, coMail) =>
-            h.authorNames.exists(n => matchPattern(n, coName)) ||
-            h.authorMails.exists(m => matchPattern(m, coMail))
+            h.author_names.exists(n => matchPattern(n, coName)) ||
+            h.author_mails.exists(m => matchPattern(m, coMail))
           }
       then return true
 
       // 3) Commit message prefixes
-      if h.commitMessagePrefix.exists(p => matchPattern(p, commitMessage)) then return true
+      if h.commit_message_prefix.exists(p => matchPattern(p, commitMessage)) then return true
 
       false
 }
