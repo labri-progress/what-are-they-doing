@@ -53,6 +53,20 @@ object DataAnalysis {
       sampledCommits: Vector[Int]
   )
 
+  case class LinesChangedStats(
+      count: Int,
+      min: Int,
+      q1: Double,
+      median: Double,
+      q3: Double,
+      max: Int,
+      mean: Double,
+      standardDeviation: Double,
+      whiskerLow: Int,
+      whiskerHigh: Int,
+      outliers: Vector[Int]
+  )
+
 // ── Shared output helpers ──────────────────────────────────────────────────
 
   inline def time[A](label: String)(inline body: A): A = {
@@ -143,6 +157,73 @@ object DataAnalysis {
         case Some(conventionalCommitPattern(rawType, _, _)) => conventionalCommitType(rawType.nn)
         case Some(header) => inferCommitTypeFromHeader(header)
         case _ => CommitType.Unknown
+
+  private def quantile(sortedValues: Vector[Int], p: Double): Double = {
+    if sortedValues.isEmpty then 0.0
+    else if sortedValues.size == 1 then sortedValues.head.toDouble
+    else
+        val clamped = math.max(0.0, math.min(1.0, p))
+        val index   = clamped * (sortedValues.size - 1)
+        val lower   = math.floor(index).toInt
+        val upper   = math.ceil(index).toInt
+        if lower == upper then sortedValues(lower).toDouble
+        else
+            val weight = index - lower
+            sortedValues(lower) * (1.0 - weight) + sortedValues(upper) * weight
+  }
+
+  def totalLinesChanged(detail: CommitDetail): Int =
+    detail.files.iterator.map(file => math.max(file.changes, file.additions + file.deletions)).sum
+
+  def summarizeLinesChanged(commits: Iterable[(commit: CommitEntry, detail: CommitDetail, classification: ClassifiedCommit)]): LinesChangedStats = {
+    val values = commits.iterator.map(entry => totalLinesChanged(entry.detail)).toVector.sorted
+    if values.isEmpty then
+        LinesChangedStats(
+          count = 0,
+          min = 0,
+          q1 = 0.0,
+          median = 0.0,
+          q3 = 0.0,
+          max = 0,
+          mean = 0.0,
+          standardDeviation = 0.0,
+          whiskerLow = 0,
+          whiskerHigh = 0,
+          outliers = Vector.empty
+        )
+    else
+        val count  = values.size
+        val min    = values.head
+        val max    = values.last
+        val q1     = quantile(values, 0.25)
+        val median = quantile(values, 0.50)
+        val q3     = quantile(values, 0.75)
+        val mean   = values.sum.toDouble / count
+        val variance = values.iterator.map { value =>
+          val delta = value - mean
+          delta * delta
+        }.sum / count
+        val standardDeviation = math.sqrt(variance)
+        val iqr               = q3 - q1
+        val lowerFence        = q1 - 1.5 * iqr
+        val upperFence        = q3 + 1.5 * iqr
+        val inliers           = values.filter(value => value >= lowerFence && value <= upperFence)
+        val outliers          = values.filterNot(value => value >= lowerFence && value <= upperFence)
+
+        LinesChangedStats(
+          count = count,
+          min = min,
+          q1 = q1,
+          median = median,
+          q3 = q3,
+          max = max,
+          mean = mean,
+          standardDeviation = standardDeviation,
+          whiskerLow = inliers.headOption.getOrElse(min),
+          whiskerHigh = inliers.lastOption.getOrElse(max),
+          outliers = outliers
+        )
+  }
 
   def loadFullCommitData(commit: CommitEntry): CommitDetail = {
     val detailFile = commitsPath.resolve(s"${commit.sha}.json")
