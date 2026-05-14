@@ -44,12 +44,12 @@ object SVGGraphLib {
       bottom: Double,
       legendWidth: Double
   ) {
-    val plotX: Double = left
-    val plotY: Double = top
-    val plotWidth: Double = width - left - right
+    val plotX: Double      = left
+    val plotY: Double      = top
+    val plotWidth: Double  = width - left - right
     val plotHeight: Double = height - top - bottom
-    val legendX: Double = plotX + 10
-    val legendY: Double = plotY + 12
+    val legendX: Double    = plotX + 10
+    val legendY: Double    = plotY + 12
   }
 
   case class ChartScale(yMax: Int, yStep: Int)
@@ -71,9 +71,9 @@ object SVGGraphLib {
   private def niceStep(maxValue: Int, targetTickCount: Int): Int =
     if maxValue <= 0 then 1
     else
-        val rawStep = maxValue.toDouble / math.max(1, targetTickCount)
-        val magnitude = math.pow(10, math.floor(math.log10(rawStep)))
-        val normalized = rawStep / magnitude
+        val rawStep        = maxValue.toDouble / math.max(1, targetTickCount)
+        val magnitude      = math.pow(10, math.floor(math.log10(rawStep)))
+        val normalized     = rawStep / magnitude
         val niceNormalized =
           if normalized <= 1 then 1
           else if normalized <= 2 then 2
@@ -82,10 +82,13 @@ object SVGGraphLib {
         math.max(1, math.ceil(niceNormalized * magnitude).toInt)
 
   def activeStackKeys(points: Vector[StackedBarPoint], stackOrder: Vector[String]): Vector[String] = {
-    val present: Set[String] = points.iterator.flatMap(_.values.iterator.collect { case (key, value) if value > 0 => key }).toSet
+    val present: Set[String] = points.iterator.flatMap(_.values.iterator.collect {
+      case (key, value) if value > 0 => key
+    }).toSet
     val known = stackOrder.filter(present.contains)
     val extra = present.diff(stackOrder.toSet).toVector.sorted.filterNot(_ == "no signal")
-    known.filterNot(_ == "no signal") ++ extra ++ (if present.contains("no signal") then Vector("no signal") else Vector.empty)
+    known.filterNot(_ == "no signal") ++ extra ++ (if present.contains("no signal") then Vector("no signal")
+                                                   else Vector.empty)
   }
 
   def activeLineSeries(lines: Vector[LineSeries]): Vector[LineSeries] =
@@ -93,10 +96,10 @@ object SVGGraphLib {
 
   private def computeScale(points: Vector[StackedBarPoint], lines: Vector[LineSeries]): ChartScale = {
     val maxStack = points.map(_.values.values.sum).maxOption.getOrElse(0)
-    val maxLine = lines.flatMap(_.values).maxOption.getOrElse(0)
-    val yMaxRaw = math.max(maxStack, maxLine)
-    val yStep = niceStep(yMaxRaw, 6)
-    val yMax = math.max(yStep, ((yMaxRaw + yStep - 1) / yStep) * yStep)
+    val maxLine  = lines.flatMap(_.values).maxOption.getOrElse(0)
+    val yMaxRaw  = math.max(maxStack, maxLine)
+    val yStep    = niceStep(yMaxRaw, 6)
+    val yMax     = math.max(yStep, ((yMaxRaw + yStep - 1) / yStep) * yStep)
     ChartScale(yMax, yStep)
   }
 
@@ -107,7 +110,10 @@ object SVGGraphLib {
     slotWidth(layout, count) * 0.78
 
   private def xForBar(layout: ChartLayout, pointCount: Int, index: Int): Double =
-    layout.plotX + slotWidth(layout, pointCount) * index + (slotWidth(layout, pointCount) - barWidth(layout, pointCount)) / 2.0
+    layout.plotX + slotWidth(
+      layout,
+      pointCount
+    ) * index + (slotWidth(layout, pointCount) - barWidth(layout, pointCount)) / 2.0
 
   private def yForValue(layout: ChartLayout, scale: ChartScale, value: Double): Double =
     layout.plotY + layout.plotHeight - (value / scale.yMax) * layout.plotHeight
@@ -119,12 +125,12 @@ object SVGGraphLib {
       (0 to scale.yMax by scale.yStep).map { tick =>
         val y = yForValue(layout, scale, tick.toDouble)
         s"<line x1='${fmt(layout.plotX)}' y1='${fmt(y)}' x2='${fmt(layout.plotX + layout.plotWidth)}' y2='${fmt(y)}' stroke='#e9ecef' stroke-width='1' />" +
-          s"<text x='${fmt(layout.plotX - 10)}' y='${fmt(y + 4)}' text-anchor='end' font-size='12' fill='#495057'>${formatSi(tick.toDouble)}</text>"
+        s"<text x='${fmt(layout.plotX - 10)}' y='${fmt(y + 4)}' text-anchor='end' font-size='12' fill='#495057'>${formatSi(tick.toDouble)}</text>"
       }.mkString("\n")
 
     val axes =
       s"<line x1='${fmt(layout.plotX)}' y1='${fmt(layout.plotY + layout.plotHeight)}' x2='${fmt(layout.plotX + layout.plotWidth)}' y2='${fmt(layout.plotY + layout.plotHeight)}' stroke='#343a40' stroke-width='1.2' />" +
-        s"<line x1='${fmt(layout.plotX)}' y1='${fmt(layout.plotY)}' x2='${fmt(layout.plotX)}' y2='${fmt(layout.plotY + layout.plotHeight)}' stroke='#343a40' stroke-width='1.2' />"
+      s"<line x1='${fmt(layout.plotX)}' y1='${fmt(layout.plotY)}' x2='${fmt(layout.plotX)}' y2='${fmt(layout.plotY + layout.plotHeight)}' stroke='#343a40' stroke-width='1.2' />"
 
     gridLines + "\n" + axes
   }
@@ -141,15 +147,18 @@ object SVGGraphLib {
       activeKeys: Vector[String],
       colors: Map[String, String]
   ): String = {
-    val x = xForBar(layout, pointCount, index)
+    val x     = xForBar(layout, pointCount, index)
     val width = barWidth(layout, pointCount)
     activeKeys.foldLeft((0.0, Vector.empty[String])) { case ((bottomValue, acc), key) =>
       val count = point.values.getOrElse(key, 0)
       if count <= 0 then (bottomValue, acc)
       else
-          val yTop = yForValue(layout, scale, bottomValue + count)
+          val yTop    = yForValue(layout, scale, bottomValue + count)
           val yBottom = yForValue(layout, scale, bottomValue)
-          (bottomValue + count, acc :+ renderBarSegment(x, yTop, width, yBottom - yTop, colors.getOrElse(key, "#adb5bd")))
+          (
+            bottomValue + count,
+            acc :+ renderBarSegment(x, yTop, width, yBottom - yTop, colors.getOrElse(key, "#adb5bd"))
+          )
     }._2.mkString("\n")
   }
 
@@ -160,7 +169,12 @@ object SVGGraphLib {
       s"<text x='${fmt(x)}' y='${fmt(y)}' transform='rotate(45 ${fmt(x)} ${fmt(y)})' text-anchor='start' font-size='11' fill='#495057'>${svgEscape(point.xLabel)}</text>"
     }.mkString("\n")
 
-  private def renderLineSeries(layout: ChartLayout, scale: ChartScale, points: Vector[StackedBarPoint], line: LineSeries): String = {
+  private def renderLineSeries(
+      layout: ChartLayout,
+      scale: ChartScale,
+      points: Vector[StackedBarPoint],
+      line: LineSeries
+  ): String = {
     val lineValues = line.values.padTo(points.size, 0).take(points.size)
     val polyPoints = lineValues.zipWithIndex.map { case (value, index) =>
       val cx = xForBar(layout, points.size, index) + barWidth(layout, points.size) / 2.0
@@ -183,21 +197,21 @@ object SVGGraphLib {
       colors: Map[String, String],
       activeLines: Vector[LineSeries]
   ): String = {
-    val entries = activeKeys.map(Left(_)) ++ activeLines.map(Right(_))
+    val entries   = activeKeys.map(Left(_)) ++ activeLines.map(Right(_))
     val boxHeight = 18 + entries.size * 20
-    val box =
+    val box       =
       s"<rect x='${fmt(layout.legendX)}' y='${fmt(layout.legendY)}' width='${fmt(layout.legendWidth)}' height='${fmt(boxHeight)}' rx='4' ry='4' fill='white' fill-opacity='0.92' stroke='#ced4da' stroke-width='1' />"
 
     val legendItems = entries.reverse.zipWithIndex.map {
       case (Left(key), idx) =>
         val y = layout.legendY + 18 + idx * 20
         s"<rect x='${fmt(layout.legendX + 10)}' y='${fmt(y - 10)}' width='18' height='12' fill='${colors.getOrElse(key, "#adb5bd")}' stroke='#ffffff' stroke-width='0.6' />" +
-          s"<text x='${fmt(layout.legendX + 38)}' y='${fmt(y)}' font-size='12' fill='#212529'>${svgEscape(key)}</text>"
+        s"<text x='${fmt(layout.legendX + 38)}' y='${fmt(y)}' font-size='12' fill='#212529'>${svgEscape(key)}</text>"
       case (Right(line), idx) =>
         val y = layout.legendY + 18 + idx * 20
         s"<line x1='${fmt(layout.legendX + 10)}' y1='${fmt(y - 4)}' x2='${fmt(layout.legendX + 30)}' y2='${fmt(y - 4)}' stroke='${line.stroke}' stroke-width='2' stroke-dasharray='${line.dashArray}' />" +
-          s"<rect x='${fmt(layout.legendX + 17)}' y='${fmt(y - 7)}' width='6' height='6' fill='${line.markerFill}' transform='rotate(45 ${fmt(layout.legendX + 20)} ${fmt(y - 4)})' />" +
-          s"<text x='${fmt(layout.legendX + 38)}' y='${fmt(y)}' font-size='12' fill='#212529'>${svgEscape(line.label)}</text>"
+        s"<rect x='${fmt(layout.legendX + 17)}' y='${fmt(y - 7)}' width='6' height='6' fill='${line.markerFill}' transform='rotate(45 ${fmt(layout.legendX + 20)} ${fmt(y - 4)})' />" +
+        s"<text x='${fmt(layout.legendX + 38)}' y='${fmt(y)}' font-size='12' fill='#212529'>${svgEscape(line.label)}</text>"
     }.mkString("\n")
 
     box + "\n" + legendItems
@@ -205,15 +219,24 @@ object SVGGraphLib {
 
   private def renderTitles(layout: ChartLayout, title: String, yAxisLabel: String, xAxisLabel: String): String =
     s"<text x='${fmt(layout.width / 2.0)}' y='24' text-anchor='middle' font-size='18' font-weight='700' fill='#111827'>${svgEscape(title)}</text>" +
-      s"\n<text x='20' y='${fmt(layout.plotY + layout.plotHeight / 2.0)}' transform='rotate(-90 20 ${fmt(layout.plotY + layout.plotHeight / 2.0)})' text-anchor='middle' font-size='14' fill='#212529'>${svgEscape(yAxisLabel)}</text>" +
-      s"\n<text x='${fmt(layout.plotX + layout.plotWidth / 2.0)}' y='${fmt(layout.height - 40.0)}' text-anchor='middle' font-size='14' fill='#212529'>${svgEscape(xAxisLabel)}</text>"
+    s"\n<text x='20' y='${fmt(layout.plotY + layout.plotHeight / 2.0)}' transform='rotate(-90 20 ${fmt(layout.plotY + layout.plotHeight / 2.0)})' text-anchor='middle' font-size='14' fill='#212529'>${svgEscape(yAxisLabel)}</text>" +
+    s"\n<text x='${fmt(layout.plotX + layout.plotWidth / 2.0)}' y='${fmt(layout.height - 40.0)}' text-anchor='middle' font-size='14' fill='#212529'>${svgEscape(xAxisLabel)}</text>"
 
-  private def renderFooter(layout: ChartLayout, points: Vector[StackedBarPoint], activeKeys: Vector[String], topLabel: String, activeLines: Vector[LineSeries], totalLabel: String): String = {
-    val totalValue = points.map(_.values.values.sum).sum
+  private def renderFooter(
+      layout: ChartLayout,
+      points: Vector[StackedBarPoint],
+      activeKeys: Vector[String],
+      topLabel: String,
+      activeLines: Vector[LineSeries],
+      totalLabel: String
+  ): String = {
+    val totalValue  = points.map(_.values.values.sum).sum
     val totalsByKey = activeKeys.map(key => key -> points.map(_.values.getOrElse(key, 0)).sum).filter(_._2 > 0)
-    val dominant = totalsByKey.sortBy(-_._2).headOption.map { case (key, c) => s"$topLabel: $key ($c)" }.getOrElse(s"$topLabel: -")
+    val dominant    =
+      totalsByKey.sortBy(-_._2).headOption.map { case (key, c) => s"$topLabel: $key ($c)" }.getOrElse(s"$topLabel: -")
     val lineSummaries = activeLines.map(line => s"${line.label}: ${line.values.sum}")
-    val footer = (lineSummaries :+ s"$totalLabel: $totalValue" :+ s"Periods: ${points.size}" :+ dominant).mkString("  |  ")
+    val footer        =
+      (lineSummaries :+ s"$totalLabel: $totalValue" :+ s"Periods: ${points.size}" :+ dominant).mkString("  |  ")
     s"<text x='${fmt(layout.width / 2.0)}' y='${fmt(layout.height - 12.0)}' text-anchor='middle' font-size='12' fill='#212529'>${svgEscape(footer)}</text>"
   }
 
@@ -235,8 +258,8 @@ object SVGGraphLib {
     scaleValue(computeBoxPlotYMax(stats, suppressOutliers), scale)
 
   private def yForContinuousValue(layout: ChartLayout, scaledMax: Double, value: Double, scale: BoxPlotScale): Double =
-    val scaled = scaleValue(value, scale)
-    layout.plotY + layout.plotHeight - (scaled / scaledMax) * layout.plotHeight
+      val scaled = scaleValue(value, scale)
+      layout.plotY + layout.plotHeight - (scaled / scaledMax) * layout.plotHeight
 
   private def renderContinuousGridAndAxes(layout: ChartLayout, yMax: Double, scale: BoxPlotScale): String = {
     val ticks =
@@ -250,18 +273,18 @@ object SVGGraphLib {
 
     val scaledMax = scaleValue(yMax, scale)
     val gridLines = ticks.map { tick =>
-      val y = yForContinuousValue(layout, scaledMax, tick, scale)
+      val y     = yForContinuousValue(layout, scaledMax, tick, scale)
       val label =
         scale match
             case BoxPlotScale.Linear => formatSi(tick)
             case BoxPlotScale.Log10  => formatSi(tick)
       s"<line x1='${fmt(layout.plotX)}' y1='${fmt(y)}' x2='${fmt(layout.plotX + layout.plotWidth)}' y2='${fmt(y)}' stroke='#e9ecef' stroke-width='1' />" +
-        s"<text x='${fmt(layout.plotX - 10)}' y='${fmt(y + 4)}' text-anchor='end' font-size='12' fill='#495057'>$label</text>"
+      s"<text x='${fmt(layout.plotX - 10)}' y='${fmt(y + 4)}' text-anchor='end' font-size='12' fill='#495057'>$label</text>"
     }.mkString("\n")
 
     val axes =
       s"<line x1='${fmt(layout.plotX)}' y1='${fmt(layout.plotY + layout.plotHeight)}' x2='${fmt(layout.plotX + layout.plotWidth)}' y2='${fmt(layout.plotY + layout.plotHeight)}' stroke='#343a40' stroke-width='1.2' />" +
-        s"<line x1='${fmt(layout.plotX)}' y1='${fmt(layout.plotY)}' x2='${fmt(layout.plotX)}' y2='${fmt(layout.plotY + layout.plotHeight)}' stroke='#343a40' stroke-width='1.2' />"
+      s"<line x1='${fmt(layout.plotX)}' y1='${fmt(layout.plotY)}' x2='${fmt(layout.plotX)}' y2='${fmt(layout.plotY + layout.plotHeight)}' stroke='#343a40' stroke-width='1.2' />"
 
     gridLines + "\n" + axes
   }
@@ -286,17 +309,17 @@ object SVGGraphLib {
       scale: BoxPlotScale,
       suppressOutliers: Boolean
   ): String = {
-    val x           = xForBar(layout, pointCount, index)
-    val width       = barWidth(layout, pointCount)
-    val centerX     = x + width / 2.0
+    val x            = xForBar(layout, pointCount, index)
+    val width        = barWidth(layout, pointCount)
+    val centerX      = x + width / 2.0
     val boxTop       = yForContinuousValue(layout, scaledMax, stat.q3, scale)
     val boxBottom    = yForContinuousValue(layout, scaledMax, stat.q1, scale)
     val medianY      = yForContinuousValue(layout, scaledMax, stat.median, scale)
     val lowWhiskerY  = yForContinuousValue(layout, scaledMax, stat.whiskerLow, scale)
     val highWhiskerY = yForContinuousValue(layout, scaledMax, stat.whiskerHigh, scale)
     val meanY        = yForContinuousValue(layout, scaledMax, stat.mean, scale)
-    val capWidth    = width * 0.55
-    val meanSize    = 4.0
+    val capWidth     = width * 0.55
+    val meanSize     = 4.0
 
     val outliers =
       if suppressOutliers then ""
@@ -306,23 +329,37 @@ object SVGGraphLib {
             s"<circle cx='${fmt(centerX)}' cy='${fmt(cy)}' r='3' fill='$outlierColor' fill-opacity='0.85' />"
           }.mkString("\n")
 
-    s"""<line x1='${fmt(centerX)}' y1='${fmt(highWhiskerY)}' x2='${fmt(centerX)}' y2='${fmt(boxTop)}' stroke='$stroke' stroke-width='1.5' />
-<line x1='${fmt(centerX)}' y1='${fmt(boxBottom)}' x2='${fmt(centerX)}' y2='${fmt(lowWhiskerY)}' stroke='$stroke' stroke-width='1.5' />
-<line x1='${fmt(centerX - capWidth / 2.0)}' y1='${fmt(highWhiskerY)}' x2='${fmt(centerX + capWidth / 2.0)}' y2='${fmt(highWhiskerY)}' stroke='$stroke' stroke-width='1.5' />
-<line x1='${fmt(centerX - capWidth / 2.0)}' y1='${fmt(lowWhiskerY)}' x2='${fmt(centerX + capWidth / 2.0)}' y2='${fmt(lowWhiskerY)}' stroke='$stroke' stroke-width='1.5' />
-<rect x='${fmt(x)}' y='${fmt(boxTop)}' width='${fmt(width)}' height='${fmt(boxBottom - boxTop)}' fill='$boxFill' fill-opacity='0.75' stroke='$stroke' stroke-width='1.5' rx='3' ry='3' />
-<line x1='${fmt(x)}' y1='${fmt(medianY)}' x2='${fmt(x + width)}' y2='${fmt(medianY)}' stroke='$stroke' stroke-width='2' />
-<rect x='${fmt(centerX - meanSize)}' y='${fmt(meanY - meanSize)}' width='${fmt(meanSize * 2)}' height='${fmt(meanSize * 2)}' fill='$meanColor' transform='rotate(45 ${fmt(centerX)} ${fmt(meanY)})' />
+    s"""<line x1='${fmt(centerX)}' y1='${fmt(highWhiskerY)}' x2='${fmt(centerX)}' y2='${fmt(
+        boxTop
+      )}' stroke='$stroke' stroke-width='1.5' />
+<line x1='${fmt(centerX)}' y1='${fmt(boxBottom)}' x2='${fmt(centerX)}' y2='${fmt(
+        lowWhiskerY
+      )}' stroke='$stroke' stroke-width='1.5' />
+<line x1='${fmt(centerX - capWidth / 2.0)}' y1='${fmt(highWhiskerY)}' x2='${fmt(centerX + capWidth / 2.0)}' y2='${fmt(
+        highWhiskerY
+      )}' stroke='$stroke' stroke-width='1.5' />
+<line x1='${fmt(centerX - capWidth / 2.0)}' y1='${fmt(lowWhiskerY)}' x2='${fmt(centerX + capWidth / 2.0)}' y2='${fmt(
+        lowWhiskerY
+      )}' stroke='$stroke' stroke-width='1.5' />
+<rect x='${fmt(x)}' y='${fmt(boxTop)}' width='${fmt(width)}' height='${fmt(
+        boxBottom - boxTop
+      )}' fill='$boxFill' fill-opacity='0.75' stroke='$stroke' stroke-width='1.5' rx='3' ry='3' />
+<line x1='${fmt(x)}' y1='${fmt(medianY)}' x2='${fmt(x + width)}' y2='${fmt(
+        medianY
+      )}' stroke='$stroke' stroke-width='2' />
+<rect x='${fmt(centerX - meanSize)}' y='${fmt(meanY - meanSize)}' width='${fmt(meanSize * 2)}' height='${fmt(
+        meanSize * 2
+      )}' fill='$meanColor' transform='rotate(45 ${fmt(centerX)} ${fmt(meanY)})' />
 $outliers"""
   }
 
   private def renderBoxPlotLegend(layout: ChartLayout): String = {
     val boxHeight = 18 + 4 * 20
-    val box =
+    val box       =
       s"<rect x='${fmt(layout.legendX)}' y='${fmt(layout.legendY)}' width='${fmt(layout.legendWidth)}' height='${fmt(boxHeight)}' rx='4' ry='4' fill='white' fill-opacity='0.92' stroke='#ced4da' stroke-width='1' />"
 
     val legendColor = "#111827"
-    val entries = Vector(
+    val entries     = Vector(
       s"<rect x='${fmt(layout.legendX + 10)}' y='${fmt(layout.legendY + 8)}' width='18' height='12' fill='white' stroke='$legendColor' stroke-width='1.2' /><text x='${fmt(layout.legendX + 38)}' y='${fmt(layout.legendY + 18)}' font-size='12' fill='#212529'>IQR (Q1–Q3)</text>",
       s"<line x1='${fmt(layout.legendX + 10)}' y1='${fmt(layout.legendY + 34)}' x2='${fmt(layout.legendX + 30)}' y2='${fmt(layout.legendY + 34)}' stroke='$legendColor' stroke-width='2' /><text x='${fmt(layout.legendX + 38)}' y='${fmt(layout.legendY + 38)}' font-size='12' fill='#212529'>Median</text>",
       s"<rect x='${fmt(layout.legendX + 17)}' y='${fmt(layout.legendY + 47)}' width='6' height='6' fill='$legendColor' transform='rotate(45 ${fmt(layout.legendX + 20)} ${fmt(layout.legendY + 50)})' /><text x='${fmt(layout.legendX + 38)}' y='${fmt(layout.legendY + 54)}' font-size='12' fill='#212529'>Mean</text>",
@@ -354,7 +391,7 @@ $outliers"""
     )
     val yMax      = computeBoxPlotYMax(stats, suppressOutliers)
     val scaledMax = scaledYMax(stats, scale, suppressOutliers)
-    val plots = stats.zipWithIndex.map { case (stat, index) =>
+    val plots     = stats.zipWithIndex.map { case (stat, index) =>
       val labelFill   = fillByLabel.getOrElse(stat.label, boxFill)
       val labelStroke = strokeByLabel.getOrElse(stat.label, stroke)
       renderBoxPlot(
@@ -378,9 +415,15 @@ $outliers"""
     s"""<svg xmlns='http://www.w3.org/2000/svg' width='${layout.width}' height='${layout.height}' viewBox='0 0 ${layout.width} ${layout.height}'>
 ${renderBackground()}
 ${renderContinuousGridAndAxes(layout, yMax, scale)}
-<text x='${fmt(layout.width / 2.0)}' y='24' text-anchor='middle' font-size='18' font-weight='700' fill='#111827'>${svgEscape(title)}</text>
-<text x='20' y='${fmt(layout.plotY + layout.plotHeight / 2.0)}' transform='rotate(-90 20 ${fmt(layout.plotY + layout.plotHeight / 2.0)})' text-anchor='middle' font-size='14' fill='#212529'>${svgEscape(yLabel)}</text>
-<text x='${fmt(layout.plotX + layout.plotWidth / 2.0)}' y='${fmt(layout.height - 40.0)}' text-anchor='middle' font-size='14' fill='#212529'>Group</text>
+<text x='${fmt(
+        layout.width / 2.0
+      )}' y='24' text-anchor='middle' font-size='18' font-weight='700' fill='#111827'>${svgEscape(title)}</text>
+<text x='20' y='${fmt(layout.plotY + layout.plotHeight / 2.0)}' transform='rotate(-90 20 ${fmt(
+        layout.plotY + layout.plotHeight / 2.0
+      )})' text-anchor='middle' font-size='14' fill='#212529'>${svgEscape(yLabel)}</text>
+<text x='${fmt(layout.plotX + layout.plotWidth / 2.0)}' y='${fmt(
+        layout.height - 40.0
+      )}' text-anchor='middle' font-size='14' fill='#212529'>Group</text>
 $plots
 ${renderBoxPlotLabels(layout, stats)}
 ${renderBoxPlotLegend(layout)}
@@ -401,8 +444,8 @@ $footer
       totalLabel: String = "Embedded records"
   ): String = {
     val activeStacks = activeStackKeys(points, stackOrder)
-    val activeLines = activeLineSeries(lineSeries)
-    val layout = ChartLayout(
+    val activeLines  = activeLineSeries(lineSeries)
+    val layout       = ChartLayout(
       width = math.max(1200, points.size * 48 + 240),
       height = 620,
       left = 64,

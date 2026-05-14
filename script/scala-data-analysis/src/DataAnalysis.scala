@@ -130,7 +130,7 @@ object DataAnalysis {
         case "revert"   => CommitType.Revert
         case "style"    => CommitType.Style
         case "test"     => CommitType.Test
-        case _           => CommitType.Unknown
+        case _          => CommitType.Unknown
 
   private def startsWithAny(line: String, prefixes: String*): Boolean =
     prefixes.exists(line.startsWith)
@@ -138,6 +138,7 @@ object DataAnalysis {
   private def inferCommitTypeFromHeader(header: String): CommitType = {
     val normalized = header.trim.toLowerCase
     if normalized.isEmpty then CommitType.Unknown
+    // format: off
     else if startsWithAny(normalized, "feat", "add ", "implement ", "introduce ", "support ", "enable ", "allow ", "create ", "wire ", "integrate ", "expose ", "provide ", "initialize ", "bootstrap ", "accept ", "share ") then CommitType.Feat
     else if startsWithAny(normalized, "fix", "bugfix", "hotfix", "repair ", "resolve ", "correct ", "prevent ", "stabilize ", "hardening", "harden ", "security:", "security ") then CommitType.Fix
     else if startsWithAny(normalized, "perf", "optimize ", "optimise ", "speed up ", "reduce ", "benchmark", "cache ", "faster ", "lazy ") then CommitType.Perf
@@ -149,14 +150,15 @@ object DataAnalysis {
     else if startsWithAny(normalized, "ci ", "ci:", "github actions", "workflow", "workflows", "pipeline", "buildkite", "lint/test") then CommitType.Ci
     else if startsWithAny(normalized, "revert") then CommitType.Revert
     else if startsWithAny(normalized, "merge ", "sync ", "track ", "checkpoint", "wip", "tmp", "oops", "updates", "update ", "adjust ", "tweak ", "tune ", "polish ", "note ", "use ", "switch ", "set ", "bake ", "prepare ", "release ") then CommitType.Chore
+    // format: on
     else CommitType.Unknown
   }
 
   def classifyCommitMessage(message: String): CommitType =
     message.linesIterator.nextOption() match
         case Some(conventionalCommitPattern(rawType, _, _)) => conventionalCommitType(rawType.nn)
-        case Some(header) => inferCommitTypeFromHeader(header)
-        case _ => CommitType.Unknown
+        case Some(header)                                   => inferCommitTypeFromHeader(header)
+        case _                                              => CommitType.Unknown
 
   private def quantile(sortedValues: Vector[Int], p: Double): Double = {
     if sortedValues.isEmpty then 0.0
@@ -175,7 +177,11 @@ object DataAnalysis {
   def totalLinesChanged(detail: CommitDetail): Int =
     detail.files.iterator.map(file => math.max(file.changes, file.additions + file.deletions)).sum
 
-  def summarizeLinesChanged(commits: Iterable[(commit: CommitEntry, detail: CommitDetail, classification: ClassifiedCommit)]): LinesChangedStats = {
+  def summarizeLinesChanged(commits: Iterable[(
+      commit: CommitEntry,
+      detail: CommitDetail,
+      classification: ClassifiedCommit
+  )]): LinesChangedStats = {
     val values = commits.iterator.map(entry => totalLinesChanged(entry.detail)).toVector.sorted
     if values.isEmpty then
         LinesChangedStats(
@@ -192,13 +198,13 @@ object DataAnalysis {
           outliers = Vector.empty
         )
     else
-        val count  = values.size
-        val min    = values.head
-        val max    = values.last
-        val q1     = quantile(values, 0.25)
-        val median = quantile(values, 0.50)
-        val q3     = quantile(values, 0.75)
-        val mean   = values.sum.toDouble / count
+        val count    = values.size
+        val min      = values.head
+        val max      = values.last
+        val q1       = quantile(values, 0.25)
+        val median   = quantile(values, 0.50)
+        val q3       = quantile(values, 0.75)
+        val mean     = values.sum.toDouble / count
         val variance = values.iterator.map { value =>
           val delta = value - mean
           delta * delta
@@ -383,17 +389,18 @@ object DataAnalysis {
       handle -> TimeSeriesData(
         points = weekKeys.map { week =>
           val weekRows = developerRows.filter(_.period_iso == week)
-          val values = weekRows.flatMap { row =>
-            val totalLines = weeklyData.get((handle, LocalDate.parse(week))).toVector.flatten.flatMap(_.commits).flatMap { commit =>
-              allCommitDetails.get(commit.sha).toVector.filter { entry =>
-                val agents = entry.classification.agents
-                val bucket =
-                  if agents.isEmpty then "no signal"
-                  else if agents.size > 1 then "multi agent"
-                  else agents.head
-                bucket == row.agent
-              }.map(entry => totalLinesChanged(entry.detail))
-            }.sum
+          val values   = weekRows.flatMap { row =>
+            val totalLines =
+              weeklyData.get((handle, LocalDate.parse(week))).toVector.flatten.flatMap(_.commits).flatMap { commit =>
+                allCommitDetails.get(commit.sha).toVector.filter { entry =>
+                  val agents = entry.classification.agents
+                  val bucket =
+                    if agents.isEmpty then "no signal"
+                    else if agents.size > 1 then "multi agent"
+                    else agents.head
+                  bucket == row.agent
+                }.map(entry => totalLinesChanged(entry.detail))
+              }.sum
             Option.when(totalLines > 0)(row.agent -> totalLines)
           }.toMap
           SVGGraphLib.StackedBarPoint(xLabel = week, values = values)
