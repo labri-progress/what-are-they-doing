@@ -39,6 +39,7 @@ object RQ2Renderer {
     "qwen_code",
     "roo_code",
     "sweep",
+    "multi agent",
     "no agent"
   )
 
@@ -56,6 +57,7 @@ object RQ2Renderer {
     "qwen_code"   -> "#43aa8b",
     "roo_code"    -> "#90be6d",
     "sweep"       -> "#6c757d",
+    "multi agent" -> "#c77dff",
     "no agent"    -> "#e9ecef"
   )
 

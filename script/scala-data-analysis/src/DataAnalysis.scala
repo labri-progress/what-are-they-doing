@@ -4,6 +4,8 @@ import com.github.plokhotnyuk.jsoniter_scala.core.*
 
 import java.nio.file.{Files, Path}
 import java.time.{DayOfWeek, LocalDate, YearMonth}
+
+import whataretheydoing.HeuristicMatcher.SignalType
 import scala.collection.parallel.immutable.ParVector
 import scala.jdk.CollectionConverters.*
 import scala.util.Using
@@ -21,11 +23,13 @@ object DataAnalysis {
       case Build, Chore, Ci, Docs, Feat, Fix, Perf, Refactor, Revert, Style, Test, Unknown
 
   case class ClassifiedCommit(
-      agents: Set[String],
+      agentSignals: Map[String, Set[SignalType]],
       commitType: CommitType,
       message: String,
       files: List[String]
-  )
+  ) {
+      def agents: Set[String] = agentSignals.keySet
+  }
 
   case class PeriodCsvRow(
       developer: String,
@@ -137,7 +141,7 @@ object DataAnalysis {
     val changedFiles = detail.files.getOrElse(Nil).map(_.filename)
     val author       = commit.commit.author
     val commitAuthor = s"${author.name} <${author.email}>"
-    val agents       = HeuristicMatcher.detectAgents(
+    val agentSignals = HeuristicMatcher.detectAgents(
       message,
       commitAuthor,
       changedFiles,
@@ -145,7 +149,7 @@ object DataAnalysis {
     )
 
     ClassifiedCommit(
-      agents = agents,
+      agentSignals = agentSignals,
       commitType = classifyCommitMessage(message),
       message = message,
       files = changedFiles
@@ -183,7 +187,10 @@ object DataAnalysis {
               val week = weekStart(day)
               dayData.commits.iterator.flatMap { commit =>
                 val agents = commitSignals.get(commit.sha).map(_.agents).getOrElse(Set.empty)
-                val labels = if agents.nonEmpty then agents else Set("no agent")
+                val labels =
+                  if agents.isEmpty then Set("no agent")
+                  else if agents.size > 1 then Set("multi agent")
+                  else agents
                 labels.iterator.map(agent => ((developer, week, agent), 1))
               }
             }

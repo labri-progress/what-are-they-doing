@@ -10,6 +10,9 @@ import scala.util.matching.Regex
 
 object HeuristicMatcher {
 
+  enum SignalType:
+      case PrimaryAuthor, CoAuthor, CommitMessage, Files
+
   private val coauthorPattern: Regex =
     """(?im)^\s*co-?authored-?by:\s*(.*?)\s*<([^>]+)>\s*$""".r
 
@@ -59,37 +62,40 @@ object HeuristicMatcher {
       commitAuthor: String,
       filenames: List[String],
       heuristicsByAgent: Map[String, List[AgentHeuristic]]
-  ): Set[String] =
-      heuristicsByAgent.iterator.collect {
-        case (agentName, heuristics)
-            if heuristics.exists(h =>
-              matchCommitHeuristic(commitMessage, commitAuthor, h) ||
-                (filenames.nonEmpty && h.files.exists(pat => filenames.exists(fn => matchPattern(pat, fn))))
-            ) => agentName
-      }.toSet
+  ): Map[String, Set[SignalType]] =
+      heuristicsByAgent.iterator.flatMap { case (agentName, heuristics) =>
+        val signals = heuristics.iterator.flatMap(h => detectSignals(commitMessage, commitAuthor, filenames, h)).toSet
+        if signals.nonEmpty then Some(agentName -> signals) else None
+      }.toMap
 
-  private def matchCommitHeuristic(
+  private def detectSignals(
       commitMessage: String,
       commitAuthor: String,
+      filenames: List[String],
       h: AgentHeuristic
-  ): Boolean =
-
-      // 1) Author identity
-      if h.author_names.exists(n => matchPattern(n, commitAuthor)) then return true
-      if h.author_mails.exists(m => matchPattern(m, commitAuthor)) then return true
-
+  ): Set[SignalType] =
       val coauthors = coauthorPattern.findAllMatchIn(commitMessage).map { m =>
         (name = normalize(m.group(1).nn), mail = normalize(m.group(2).nn))
-      }
-      // 2) Co-authors in message
-      if coauthors.exists { case (coName, coMail) =>
+      }.toVector
+
+      val authorSignal =
+        if h.author_names.exists(n => matchPattern(n, commitAuthor)) || h.author_mails.exists(m => matchPattern(m, commitAuthor))
+        then Set(SignalType.PrimaryAuthor)
+        else Set.empty
+
+      val coauthorSignal =
+        if coauthors.exists { case (coName, coMail) =>
             h.author_names.exists(n => matchPattern(n, coName)) ||
             h.author_mails.exists(m => matchPattern(m, coMail))
           }
-      then return true
+        then Set(SignalType.CoAuthor)
+        else Set.empty
 
-      // 3) Commit message prefixes
-      if h.commit_message_prefix.exists(p => matchPattern(p, commitMessage)) then return true
+      val messageSignal =
+        if h.commit_message_prefix.exists(p => matchPattern(p, commitMessage)) then Set(SignalType.CommitMessage) else Set.empty
 
-      false
+      val fileSignal =
+        if filenames.nonEmpty && h.files.exists(pat => filenames.exists(fn => matchPattern(pat, fn))) then Set(SignalType.Files) else Set.empty
+
+      authorSignal ++ coauthorSignal ++ messageSignal ++ fileSignal
 }
