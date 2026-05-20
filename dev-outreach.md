@@ -16,7 +16,7 @@ We have essentially three options for that:
   - Easy to ignore
   - Hard to follow up
 
-For this, we already have an initial draft:
+For this, we already have an initial draft, with questions that *should* address issues of all four research questions:
 
 ---
 
@@ -65,6 +65,8 @@ We're researchers from four different universities, with a long history of resea
   - Fabian Meerkötter (Doctoral Researcher, Human-Centered Software Engineering)
   - Website: <https://www.st.informatik.tu-darmstadt.de/>
 
+TODO add missing people and universities, possibly shorten?
+
 ---
 
 ## Semi-Structured Interview
@@ -89,6 +91,8 @@ There are a few candidates which appear likely to agree to an interview:
 
 The actual interview could probably recycle the questions from the "questionnaire" above in some way, but with the added benefit of facilitating more in-depth answers and allowing follow-up questions. Also, the interviews could be personalized a bit better, e.g., to touch on specific topics of interest for that person (like certain patterns we observed or behavior we can't yet explain).
 
+TODO create interview guide (which questions to ask, roughly which order, prompts about specific details we're looking for in each question)
+
 ## Analyze public statements (podcasts, talks, blog posts)
 
 - Pro:
@@ -102,3 +106,5 @@ The actual interview could probably recycle the questions from the "questionnair
   - Requires significant effort and time investment on our side (to find relevant media and work through it)
 
 This should probably only be used as a **fallback** if we're unable to reach a person directly.
+
+TODO collect links to podcasts, talks, blog posts *per developer*, possibly transcribe podcasts and talks to make them searchable (for filtering down to relevant media)
