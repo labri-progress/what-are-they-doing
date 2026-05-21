@@ -1,0 +1,29 @@
+{
+  "message": "fix: bd delete --cascade now recursively deletes dependents (#787)\n\nThe --cascade flag was documented but not working for single-issue\ndeletes. The bug had two causes:\n\n1. CLI direct mode: Single-issue deletes bypassed the batch path where\n   cascade expansion actually happens. Fixed by routing cascade deletes\n   through deleteBatch() regardless of issue count.\n\n2. Daemon/RPC mode: handleDelete() iterated through IDs individually\n   without expanding dependents. Fixed by using DeleteIssues() with\n   cascade flag when SQLite storage is available.\n\nNow `bd delete <id> --cascade --force` correctly deletes the target\nissue plus all issues that depend on it (recursively).\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "c0a505fce11ded98a1644f664f4f5b22414eaeff",
+      "filename": "cmd/bd/delete.go",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/gastownhall/beads/blob/1256352d498c6b7e44c453a2fd7cd53e594bc72c/cmd%2Fbd%2Fdelete.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/1256352d498c6b7e44c453a2fd7cd53e594bc72c/cmd%2Fbd%2Fdelete.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/cmd%2Fbd%2Fdelete.go?ref=1256352d498c6b7e44c453a2fd7cd53e594bc72c",
+      "patch": "@@ -167,7 +167,8 @@ the issues will not resurrect from remote branches.`,\n \t\t}\n \t\t\n \t\t// Handle batch deletion in direct mode\n-\t\tif len(issueIDs) > 1 {\n+\t\t// Also use batch path for cascade (which needs to expand dependents)\n+\t\tif len(issueIDs) > 1 || cascade {\n \t\t\tdeleteBatch(cmd, issueIDs, force, dryRun, cascade, jsonOutput, hardDelete, reason)\n \t\t\treturn\n \t\t}"
+    },
+    {
+      "sha": "08c394845ae862b9b8f8ea411bca997cf67fbde8",
+      "filename": "internal/rpc/server_issues_epics.go",
+      "status": "modified",
+      "additions": 55,
+      "deletions": 1,
+      "changes": 56,
+      "blob_url": "https://github.com/gastownhall/beads/blob/1256352d498c6b7e44c453a2fd7cd53e594bc72c/internal%2Frpc%2Fserver_issues_epics.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/1256352d498c6b7e44c453a2fd7cd53e594bc72c/internal%2Frpc%2Fserver_issues_epics.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Frpc%2Fserver_issues_epics.go?ref=1256352d498c6b7e44c453a2fd7cd53e594bc72c",
+      "patch": "@@ -681,6 +681,61 @@ func (s *Server) handleDelete(req *Request) Response {\n \t\t}\n \t}\n \n+\tctx := s.reqCtx(req)\n+\n+\t// Use batch delete for cascade/multi-issue operations on SQLite storage\n+\t// This handles cascade delete properly by expanding dependents recursively\n+\t// For simple single-issue deletes, use the direct path to preserve custom reason\n+\tif sqlStore, ok := store.(*sqlite.SQLiteStorage); ok {\n+\t\t// Use batch delete if: cascade enabled, force enabled, multiple IDs, or dry-run\n+\t\tuseBatchDelete := deleteArgs.Cascade || deleteArgs.Force || len(deleteArgs.IDs) > 1 || deleteArgs.DryRun\n+\t\tif useBatchDelete {\n+\t\t\tresult, err := sqlStore.DeleteIssues(ctx, deleteArgs.IDs, deleteArgs.Cascade, deleteArgs.Force, deleteArgs.DryRun)\n+\t\t\tif err != nil {\n+\t\t\t\treturn Response{\n+\t\t\t\t\tSuccess: false,\n+\t\t\t\t\tError:   fmt.Sprintf(\"delete failed: %v\", err),\n+\t\t\t\t}\n+\t\t\t}\n+\n+\t\t\t// Emit mutation events for deleted issues\n+\t\t\tif !deleteArgs.DryRun {\n+\t\t\t\tfor _, issueID := range deleteArgs.IDs {\n+\t\t\t\t\ts.emitMutation(MutationDelete, issueID, \"\", \"\")\n+\t\t\t\t}\n+\t\t\t}\n+\n+\t\t\t// Build response\n+\t\t\tresponseData := map[string]interface{}{\n+\t\t\t\t\"deleted_count\": result.DeletedCount,\n+\t\t\t\t\"total_count\":   len(deleteArgs.IDs),\n+\t\t\t}\n+\t\t\tif deleteArgs.DryRun {\n+\t\t\t\tresponseData[\"dry_run\"] = true\n+\t\t\t\tresponseData[\"issue_count\"] = result.DeletedCount\n+\t\t\t}\n+\t\t\tif result.DependenciesCount > 0 {\n+\t\t\t\tresponseData[\"dependencies_removed\"] = result.DependenciesCount\n+\t\t\t}\n+\t\t\tif result.LabelsCount > 0 {\n+\t\t\t\tresponseData[\"labels_removed\"] = result.LabelsCount\n+\t\t\t}\n+\t\t\tif result.EventsCount > 0 {\n+\t\t\t\tresponseData[\"events_removed\"] = result.EventsCount\n+\t\t\t}\n+\t\t\tif len(result.OrphanedIssues) > 0 {\n+\t\t\t\tresponseData[\"orphaned_issues\"] = result.OrphanedIssues\n+\t\t\t}\n+\n+\t\t\tdata, _ := json.Marshal(responseData)\n+\t\t\treturn Response{\n+\t\t\t\tSuccess: true,\n+\t\t\t\tData:    data,\n+\t\t\t}\n+\t\t}\n+\t}\n+\n+\t// Simple single-issue delete path (preserves custom reason)\n \t// DryRun mode: just return what would be deleted\n \tif deleteArgs.DryRun {\n \t\tdata, _ := json.Marshal(map[string]interface{}{\n@@ -694,7 +749,6 @@ func (s *Server) handleDelete(req *Request) Response {\n \t\t}\n \t}\n \n-\tctx := s.reqCtx(req)\n \tdeletedCount := 0\n \terrors := make([]string, 0)\n "
+    }
+  ]
+}

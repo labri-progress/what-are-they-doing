@@ -1,0 +1,29 @@
+{
+  "message": "Merge PR #1495: refactor(molecule): delegate step readiness to bd ready --mol\n\nrefactor(molecule): delegate step readiness to bd ready --mol",
+  "files": [
+    {
+      "sha": "3478d103210e3b16b033202942e5f615c19a8240",
+      "filename": "internal/beads/beads.go",
+      "status": "modified",
+      "additions": 18,
+      "deletions": 0,
+      "changes": 18,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/334f16a372e6757f053eaf31ac1e908ef29e7e44/internal%2Fbeads%2Fbeads.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/334f16a372e6757f053eaf31ac1e908ef29e7e44/internal%2Fbeads%2Fbeads.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fbeads%2Fbeads.go?ref=334f16a372e6757f053eaf31ac1e908ef29e7e44",
+      "patch": "@@ -426,6 +426,24 @@ func (b *Beads) Ready() ([]*Issue, error) {\n \treturn issues, nil\n }\n \n+// ReadyForMol returns ready steps within a specific molecule.\n+// Delegates to bd ready --mol which uses beads' canonical blocking semantics\n+// (blocked_issues_cache), handling all blocking types, transitive propagation,\n+// and conditional-blocks resolution.\n+func (b *Beads) ReadyForMol(moleculeID string) ([]*Issue, error) {\n+\tout, err := b.run(\"ready\", \"--mol\", moleculeID, \"--json\", \"-n\", \"100\")\n+\tif err != nil {\n+\t\treturn nil, err\n+\t}\n+\n+\tvar issues []*Issue\n+\tif err := json.Unmarshal(out, &issues); err != nil {\n+\t\treturn nil, fmt.Errorf(\"parsing bd ready --mol output: %w\", err)\n+\t}\n+\n+\treturn issues, nil\n+}\n+\n // ReadyWithType returns ready issues filtered by label.\n // Uses bd ready --label flag for server-side filtering.\n // The issueType is converted to a gt:<type> label (e.g., \"molecule\" -> \"gt:molecule\")."
+    },
+    {
+      "sha": "67bd545f4ae16045cbb9184e3e14019ba294c709",
+      "filename": "internal/cmd/molecule_step.go",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 51,
+      "changes": 71,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/334f16a372e6757f053eaf31ac1e908ef29e7e44/internal%2Fcmd%2Fmolecule_step.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/334f16a372e6757f053eaf31ac1e908ef29e7e44/internal%2Fcmd%2Fmolecule_step.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fcmd%2Fmolecule_step.go?ref=334f16a372e6757f053eaf31ac1e908ef29e7e44",
+      "patch": "@@ -203,8 +203,15 @@ func extractMoleculeIDFromStep(stepID string) string {\n // Returns (readySteps, allComplete, error).\n // If all steps are complete, returns (nil, true, nil).\n // If no steps are ready but some are blocked/in_progress, returns (nil, false, nil).\n+//\n+// Delegates readiness calculation to beads' canonical bd ready --mol command,\n+// which uses the materialized blocked_issues_cache for correct handling of all\n+// blocking types (blocks, conditional-blocks, waits-for), transitive propagation,\n+// and cross-rig dependencies. See #1420.\n func findAllReadySteps(b *beads.Beads, moleculeID string) ([]*beads.Issue, bool, error) {\n-\t// Get all children of the molecule\n+\t// Check completion: list all children to detect \"all closed\" state.\n+\t// bd ready --mol only returns open+unblocked steps, so it can't distinguish\n+\t// \"all complete\" from \"all blocked\".\n \tchildren, err := b.List(beads.ListOptions{\n \t\tParent:   moleculeID,\n \t\tStatus:   \"all\",\n@@ -218,63 +225,25 @@ func findAllReadySteps(b *beads.Beads, moleculeID string) ([]*beads.Issue, bool,\n \t\treturn nil, true, nil // No steps = complete\n \t}\n \n-\t// Build set of closed step IDs and collect open step IDs\n-\tclosedIDs := make(map[string]bool)\n-\tvar openStepIDs []string\n-\thasNonClosedSteps := false\n-\n+\t// Check if all steps are closed\n+\tallClosed := true\n \tfor _, child := range children {\n-\t\tswitch child.Status {\n-\t\tcase \"closed\":\n-\t\t\tclosedIDs[child.ID] = true\n-\t\tcase \"open\":\n-\t\t\topenStepIDs = append(openStepIDs, child.ID)\n-\t\t\thasNonClosedSteps = true\n-\t\tdefault:\n-\t\t\thasNonClosedSteps = true\n+\t\tif child.Status != \"closed\" {\n+\t\t\tallClosed = false\n+\t\t\tbreak\n \t\t}\n \t}\n-\n-\t// Check if all complete\n-\tif !hasNonClosedSteps {\n+\tif allClosed {\n \t\treturn nil, true, nil\n \t}\n \n-\t// No open steps to check\n-\tif len(openStepIDs) == 0 {\n-\t\treturn nil, false, nil\n-\t}\n-\n-\t// Fetch full details for open steps to get dependency info\n-\topenStepsMap, err := b.ShowMultiple(openStepIDs)\n+\t// Delegate readiness to beads' canonical ready-work semantics.\n+\t// This replaces manual dependency walking with isBlockingDepType,\n+\t// using beads' blocked_issues_cache which handles all blocking types,\n+\t// transitive propagation, and conditional-blocks resolution.\n+\treadySteps, err := b.ReadyForMol(moleculeID)\n \tif err != nil {\n-\t\treturn nil, false, fmt.Errorf(\"fetching step details: %w\", err)\n-\t}\n-\n-\t// Find ALL ready steps (open steps with all dependencies closed)\n-\tvar readySteps []*beads.Issue\n-\tfor _, stepID := range openStepIDs {\n-\t\tstep, ok := openStepsMap[stepID]\n-\t\tif !ok {\n-\t\t\tcontinue\n-\t\t}\n-\n-\t\tallDepsClosed := true\n-\t\thasBlockingDeps := false\n-\t\tfor _, dep := range step.Dependencies {\n-\t\t\tif !isBlockingDepType(dep.DependencyType) {\n-\t\t\t\tcontinue\n-\t\t\t}\n-\t\t\thasBlockingDeps = true\n-\t\t\tif !closedIDs[dep.ID] {\n-\t\t\t\tallDepsClosed = false\n-\t\t\t\tbreak\n-\t\t\t}\n-\t\t}\n-\n-\t\tif !hasBlockingDeps || allDepsClosed {\n-\t\t\treadySteps = append(readySteps, step)\n-\t\t}\n+\t\treturn nil, false, fmt.Errorf(\"finding ready steps: %w\", err)\n \t}\n \n \t// Sort ready steps by sequence number so step 1 comes before step 2, etc."
+    }
+  ]
+}

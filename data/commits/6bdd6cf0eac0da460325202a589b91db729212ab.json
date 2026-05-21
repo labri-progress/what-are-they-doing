@@ -1,0 +1,77 @@
+{
+  "message": "Merge PR #2052: fix(test): isolate all test packages on ephemeral Dolt server\n\nTest infra: adds EnsureDoltForTestMain() helper and TestMain functions to convoy and daemon packages. Routes test databases to isolated ephemeral Dolt servers, preventing orphan accumulation in production data dir. Also installs Dolt in CI and increases integration test timeout. Author: l0g1x (Krystian Gebis)",
+  "files": [
+    {
+      "sha": "7425d767d58458f6dddf46451be279c6f9179401",
+      "filename": ".github/workflows/ci.yml",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 1,
+      "changes": 10,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/6bdd6cf0eac0da460325202a589b91db729212ab/.github%2Fworkflows%2Fci.yml",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/6bdd6cf0eac0da460325202a589b91db729212ab/.github%2Fworkflows%2Fci.yml",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/.github%2Fworkflows%2Fci.yml?ref=6bdd6cf0eac0da460325202a589b91db729212ab",
+      "patch": "@@ -55,6 +55,10 @@ jobs:\n           git config --global user.name \"CI Bot\"\n           git config --global user.email \"ci@gastown.test\"\n \n+      - name: Install Dolt\n+        run: |\n+          curl -L https://github.com/dolthub/dolt/releases/latest/download/install.sh | sudo bash\n+\n       - name: Install gotestsum\n         run: go install gotest.tools/gotestsum@latest\n \n@@ -132,6 +136,10 @@ jobs:\n           git config --global user.name \"CI Bot\"\n           git config --global user.email \"ci@gastown.test\"\n \n+      - name: Install Dolt\n+        run: |\n+          curl -L https://github.com/dolthub/dolt/releases/latest/download/install.sh | sudo bash\n+\n       - name: Cache beads (bd)\n         id: cache-beads-int\n         uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5\n@@ -155,7 +163,7 @@ jobs:\n         run: echo \"$(go env GOPATH)/bin\" >> $GITHUB_PATH\n \n       - name: Integration Tests\n-        run: gotestsum --format testname --junitfile junit-integration.xml -- -tags=integration -timeout=5m -v ./internal/cmd/...\n+        run: gotestsum --format testname --junitfile junit-integration.xml -- -tags=integration -timeout=15m -v ./internal/cmd/...\n \n       - name: Test Report\n         if: always()"
+    },
+    {
+      "sha": "fd7009a041af4c77082a86268c68b4b04736570b",
+      "filename": ".github/workflows/windows-ci.yml",
+      "status": "modified",
+      "additions": 12,
+      "deletions": 0,
+      "changes": 12,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/6bdd6cf0eac0da460325202a589b91db729212ab/.github%2Fworkflows%2Fwindows-ci.yml",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/6bdd6cf0eac0da460325202a589b91db729212ab/.github%2Fworkflows%2Fwindows-ci.yml",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/.github%2Fworkflows%2Fwindows-ci.yml?ref=6bdd6cf0eac0da460325202a589b91db729212ab",
+      "patch": "@@ -43,6 +43,18 @@ jobs:\n           git config --global user.name \"CI Bot\"\n           git config --global user.email \"ci@gastown.test\"\n \n+      - name: Install Dolt\n+        shell: pwsh\n+        run: |\n+          $release = Invoke-RestMethod 'https://api.github.com/repos/dolthub/dolt/releases/latest'\n+          $asset = $release.assets | Where-Object { $_.name -like 'dolt-windows-amd64.zip' }\n+          $zip = \"$env:RUNNER_TEMP\\dolt.zip\"\n+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zip\n+          Expand-Archive -Path $zip -DestinationPath \"$env:RUNNER_TEMP\\dolt\"\n+          $bin = Get-ChildItem -Path \"$env:RUNNER_TEMP\\dolt\" -Recurse -Filter 'dolt.exe' | Select-Object -First 1\n+          Copy-Item $bin.FullName \"$env:GOPATH\\bin\\dolt.exe\"\n+          dolt version\n+\n       - name: Install gotestsum\n         run: go install gotest.tools/gotestsum@latest\n "
+    },
+    {
+      "sha": "bcf88300f3c7e4c904072cc6b01e110a2e7a77e4",
+      "filename": "internal/cmd/integration_testmain_test.go",
+      "status": "modified",
+      "additions": 18,
+      "deletions": 2,
+      "changes": 20,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/6bdd6cf0eac0da460325202a589b91db729212ab/internal%2Fcmd%2Fintegration_testmain_test.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/6bdd6cf0eac0da460325202a589b91db729212ab/internal%2Fcmd%2Fintegration_testmain_test.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fcmd%2Fintegration_testmain_test.go?ref=6bdd6cf0eac0da460325202a589b91db729212ab",
+      "patch": "@@ -4,16 +4,32 @@ package cmd\n \n import (\n \t\"flag\"\n+\t\"fmt\"\n \t\"os\"\n \t\"testing\"\n+\n+\t\"github.com/steveyegge/gastown/internal/testutil\"\n )\n \n func TestMain(m *testing.M) {\n \t// Force sequential test execution to avoid bd file locks on Windows.\n \t_ = flag.Set(\"test.parallel\", \"1\")\n \tflag.Parse()\n+\n+\t// Start an ephemeral Dolt server for this package's integration tests.\n+\t// Tests like TestAgentWorktreesStayClean and TestBeadsRoutingFromTownRoot\n+\t// spawn gt/bd subprocesses that create databases (e.g., \"tr\", \"hq\").\n+\t// By routing to an isolated server (via GT_DOLT_PORT), those databases\n+\t// are destroyed when the server's temp data dir is removed at cleanup \u2014\n+\t// preventing orphan accumulation in the shared production Dolt data dir.\n+\tif err := testutil.EnsureDoltForTestMain(); err != nil {\n+\t\tfmt.Fprintf(os.Stderr, \"integration TestMain: dolt setup: %v\\n\", err)\n+\t\tos.Exit(1)\n+\t}\n+\n \tcode := m.Run()\n-\t// Clean up the shared dolt test server if one was started.\n-\tcleanupDoltServer()\n+\n+\t// Clean up the shared dolt test server.\n+\ttestutil.CleanupDoltServer()\n \tos.Exit(code)\n }"
+    },
+    {
+      "sha": "cdf58e78dc2d9eb6934e8f21acc58fc365229e00",
+      "filename": "internal/convoy/testmain_test.go",
+      "status": "added",
+      "additions": 27,
+      "deletions": 0,
+      "changes": 27,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/6bdd6cf0eac0da460325202a589b91db729212ab/internal%2Fconvoy%2Ftestmain_test.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/6bdd6cf0eac0da460325202a589b91db729212ab/internal%2Fconvoy%2Ftestmain_test.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fconvoy%2Ftestmain_test.go?ref=6bdd6cf0eac0da460325202a589b91db729212ab",
+      "patch": "@@ -0,0 +1,27 @@\n+package convoy\n+\n+import (\n+\t\"fmt\"\n+\t\"os\"\n+\t\"testing\"\n+\n+\t\"github.com/steveyegge/gastown/internal/testutil\"\n+)\n+\n+func TestMain(m *testing.M) {\n+\t// Start an ephemeral Dolt server for this package's tests.\n+\t// setupTestStore sets BEADS_TEST_MODE=1, which causes the beads SDK\n+\t// to create testdb_<hash> databases. By routing those to an isolated\n+\t// server (via BEADS_DOLT_PORT), the databases are destroyed when the\n+\t// server's temp data dir is removed at cleanup \u2014 preventing orphan\n+\t// accumulation in the shared production Dolt data dir.\n+\tif err := testutil.EnsureDoltForTestMain(); err != nil {\n+\t\tfmt.Fprintf(os.Stderr, \"convoy TestMain: dolt setup: %v\\n\", err)\n+\t\tos.Exit(1)\n+\t}\n+\n+\tcode := m.Run()\n+\n+\ttestutil.CleanupDoltServer()\n+\tos.Exit(code)\n+}"
+    },
+    {
+      "sha": "39bb26a53068dd32bb75ccfbfa76218284c926fc",
+      "filename": "internal/daemon/testmain_test.go",
+      "status": "added",
+      "additions": 46,
+      "deletions": 0,
+      "changes": 46,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/6bdd6cf0eac0da460325202a589b91db729212ab/internal%2Fdaemon%2Ftestmain_test.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/6bdd6cf0eac0da460325202a589b91db729212ab/internal%2Fdaemon%2Ftestmain_test.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fdaemon%2Ftestmain_test.go?ref=6bdd6cf0eac0da460325202a589b91db729212ab",
+      "patch": "@@ -0,0 +1,46 @@\n+package daemon\n+\n+import (\n+\t\"fmt\"\n+\t\"os\"\n+\t\"os/exec\"\n+\t\"path/filepath\"\n+\t\"testing\"\n+\n+\t\"github.com/steveyegge/gastown/internal/testutil\"\n+\t\"github.com/steveyegge/gastown/internal/tmux\"\n+)\n+\n+func TestMain(m *testing.M) {\n+\t// Start an ephemeral Dolt server for this package's tests.\n+\t// convoy_manager_test.go calls setupTestStore which sets BEADS_TEST_MODE=1,\n+\t// causing the beads SDK to create testdb_<hash> databases. By routing\n+\t// those to an isolated server (via BEADS_DOLT_PORT), the databases are\n+\t// destroyed when the server's temp data dir is removed at cleanup \u2014\n+\t// preventing orphan accumulation in the shared production Dolt data dir.\n+\tif err := testutil.EnsureDoltForTestMain(); err != nil {\n+\t\tfmt.Fprintf(os.Stderr, \"daemon TestMain: dolt setup: %v\\n\", err)\n+\t\tos.Exit(1)\n+\t}\n+\n+\t// Isolate tmux sessions on a package-specific socket.\n+\t// handler_test.go creates tmux.NewTmux() instances that query has-session;\n+\t// polecat_health_test.go uses fake tmux stubs but still constructs Tmux\n+\t// instances. Routing all of these to an isolated socket prevents\n+\t// interference with the user's tmux and other packages' tests.\n+\tvar tmuxSocket string\n+\tif _, err := exec.LookPath(\"tmux\"); err == nil {\n+\t\ttmuxSocket = fmt.Sprintf(\"gt-test-daemon-%d\", os.Getpid())\n+\t\ttmux.SetDefaultSocket(tmuxSocket)\n+\t}\n+\n+\tcode := m.Run()\n+\n+\tif tmuxSocket != \"\" {\n+\t\t_ = exec.Command(\"tmux\", \"-L\", tmuxSocket, \"kill-server\").Run()\n+\t\tsocketPath := filepath.Join(fmt.Sprintf(\"/tmp/tmux-%d\", os.Getuid()), tmuxSocket)\n+\t\t_ = os.Remove(socketPath)\n+\t}\n+\ttestutil.CleanupDoltServer()\n+\tos.Exit(code)\n+}"
+    },
+    {
+      "sha": "367b7a6f607b3dcaa45a8e18c2ba17f87f27b434",
+      "filename": "internal/testutil/doltserver.go",
+      "status": "modified",
+      "additions": 25,
+      "deletions": 0,
+      "changes": 25,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/6bdd6cf0eac0da460325202a589b91db729212ab/internal%2Ftestutil%2Fdoltserver.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/6bdd6cf0eac0da460325202a589b91db729212ab/internal%2Ftestutil%2Fdoltserver.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Ftestutil%2Fdoltserver.go?ref=6bdd6cf0eac0da460325202a589b91db729212ab",
+      "patch": "@@ -107,6 +107,31 @@ func FindFreePort() (int, error) {\n \treturn port, nil\n }\n \n+// EnsureDoltForTestMain starts an ephemeral Dolt server for use in TestMain\n+// functions that don't have access to a testing.T. It also sets BEADS_DOLT_PORT\n+// so that the beads SDK (which reads this env var in BEADS_TEST_MODE) connects\n+// to the ephemeral server instead of the default port 3307.\n+//\n+// Call CleanupDoltServer() after m.Run() to tear down the server.\n+func EnsureDoltForTestMain() error {\n+\tif _, err := exec.LookPath(\"dolt\"); err != nil {\n+\t\treturn fmt.Errorf(\"dolt not installed: %w\", err)\n+\t}\n+\n+\tdoltServerOnce.Do(func() {\n+\t\tdoltServerErr = startDoltServer()\n+\t})\n+\n+\tif doltServerErr != nil {\n+\t\treturn fmt.Errorf(\"dolt server setup: %w\", doltServerErr)\n+\t}\n+\n+\t// Bridge GT_DOLT_PORT \u2192 BEADS_DOLT_PORT so the beads SDK connects\n+\t// to the ephemeral server when BEADS_TEST_MODE=1 is set.\n+\tos.Setenv(\"BEADS_DOLT_PORT\", doltTestPort) //nolint:tenv // intentional process-wide env\n+\treturn nil\n+}\n+\n // portReady returns true if the dolt test port is accepting TCP connections.\n func portReady(timeout time.Duration) bool {\n \tconn, err := net.DialTimeout(\"tcp\", DoltTestAddr(), timeout)"
+    }
+  ]
+}

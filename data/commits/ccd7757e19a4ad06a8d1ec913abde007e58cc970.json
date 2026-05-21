@@ -1,0 +1,29 @@
+{
+  "message": "fix: selfNukePolecat verifies remote push + RemoveWithOptions checks open MRs\n\nselfNukePolecat now verifies the branch exists on at least one remote\nbefore nuking the worktree. In rigs with no git remote (like sky), this\nprevents data loss by preserving the worktree.\n\nRemoveWithOptions now checks for open merge requests in the agent bead\neven in nuclear mode (unless --force). This prevents accidental removal\nof worktrees whose MRs are still being processed by the Refinery.\n\nAlso adds public ClonePath() accessor on polecat.Manager.\n\nFixes: gt-46tw0\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "fd2ff222d352954a567244c3bf50473be8c613c9",
+      "filename": "internal/cmd/done.go",
+      "status": "modified",
+      "additions": 27,
+      "deletions": 3,
+      "changes": 30,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/ccd7757e19a4ad06a8d1ec913abde007e58cc970/internal%2Fcmd%2Fdone.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/ccd7757e19a4ad06a8d1ec913abde007e58cc970/internal%2Fcmd%2Fdone.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fcmd%2Fdone.go?ref=ccd7757e19a4ad06a8d1ec913abde007e58cc970",
+      "patch": "@@ -805,7 +805,7 @@ func parseCleanupStatus(s string) polecat.CleanupStatus {\n // selfNukePolecat deletes this polecat's worktree (self-cleaning model).\n // Called by polecats when they complete work via `gt done`.\n // This is safe because:\n-// 1. Work has been pushed to origin (MR is in queue)\n+// 1. Work has been pushed to origin (verified below)\n // 2. We're about to exit anyway\n // 3. Unix allows deleting directories while processes run in them\n func selfNukePolecat(roleInfo RoleInfo, _ string) error {\n@@ -819,8 +819,32 @@ func selfNukePolecat(roleInfo RoleInfo, _ string) error {\n \t\treturn fmt.Errorf(\"getting polecat manager: %w\", err)\n \t}\n \n-\t// Use nuclear=true since we know we just pushed our work\n-\t// The branch is pushed, MR is created, we're clean\n+\t// Verify branch actually exists on a remote before nuking local copy.\n+\t// If push didn't land (no remote, auth failure, etc.), preserve worktree\n+\t// so Witness/Refinery can still access the branch.\n+\tclonePath := mgr.ClonePath(roleInfo.Polecat)\n+\tpolecatGit := git.NewGit(clonePath)\n+\tremotes, err := polecatGit.Remotes()\n+\tif err != nil || len(remotes) == 0 {\n+\t\treturn fmt.Errorf(\"no git remotes configured \u2014 preserving worktree to prevent data loss\")\n+\t}\n+\tbranchName, err := polecatGit.CurrentBranch()\n+\tif err != nil {\n+\t\treturn fmt.Errorf(\"cannot determine current branch \u2014 preserving worktree: %w\", err)\n+\t}\n+\tpushed := false\n+\tfor _, remote := range remotes {\n+\t\texists, err := polecatGit.RemoteBranchExists(remote, branchName)\n+\t\tif err == nil && exists {\n+\t\t\tpushed = true\n+\t\t\tbreak\n+\t\t}\n+\t}\n+\tif !pushed {\n+\t\treturn fmt.Errorf(\"branch %s not found on any remote \u2014 preserving worktree\", branchName)\n+\t}\n+\n+\t// Use nuclear=true since we verified the branch is pushed\n \t// selfNuke=true because polecat is deleting its own worktree from inside it\n \tif err := mgr.RemoveWithOptions(roleInfo.Polecat, true, true, true); err != nil {\n \t\treturn fmt.Errorf(\"removing worktree: %w\", err)"
+    },
+    {
+      "sha": "4a0d9d01bc478e7fe41dc934dac2b63fb6f1ca64",
+      "filename": "internal/polecat/manager.go",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 1,
+      "changes": 21,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/ccd7757e19a4ad06a8d1ec913abde007e58cc970/internal%2Fpolecat%2Fmanager.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/ccd7757e19a4ad06a8d1ec913abde007e58cc970/internal%2Fpolecat%2Fmanager.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fpolecat%2Fmanager.go?ref=ccd7757e19a4ad06a8d1ec913abde007e58cc970",
+      "patch": "@@ -214,6 +214,11 @@ func (m *Manager) clonePath(name string) string {\n \treturn newPath\n }\n \n+// ClonePath returns the path to a polecat's git worktree.\n+func (m *Manager) ClonePath(name string) string {\n+\treturn m.clonePath(name)\n+}\n+\n // exists checks if a polecat exists.\n func (m *Manager) exists(name string) bool {\n \t_, err := os.Stat(m.polecatDir(name))\n@@ -540,7 +545,21 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool)\n \t\t}\n \t}\n \n-// Close agent bead FIRST, before any filesystem operations.\n+\t// Even nuclear mode must not delete worktrees with unmerged MRs.\n+\t// The nuclear flag bypasses git-status checks (needed for self-nuke)\n+\t// but MR status is a higher-level concern that should always be checked.\n+\tif !force {\n+\t\tagentID := m.agentBeadID(name)\n+\t\t_, fields, aErr := m.beads.GetAgentBead(agentID)\n+\t\tif aErr == nil && fields != nil && fields.ActiveMR != \"\" {\n+\t\t\tmrBead, mrErr := m.beads.Show(fields.ActiveMR)\n+\t\t\tif mrErr == nil && mrBead != nil && mrBead.Status == \"open\" {\n+\t\t\t\treturn fmt.Errorf(\"cannot remove polecat %s: MR %s is still open in merge queue\\nRefinery will process the MR and clean up after merge\\nUse --force to override (risks data loss)\", name, fields.ActiveMR)\n+\t\t\t}\n+\t\t}\n+\t}\n+\n+\t// Close agent bead FIRST, before any filesystem operations.\n \t// This prevents a race where a concurrent sling allocates the same name,\n \t// sets hook_bead, and then has it cleared by this cleanup. By closing\n \t// the agent bead first, concurrent slings see a CLOSED bead and"
+    }
+  ]
+}

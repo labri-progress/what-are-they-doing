@@ -1,0 +1,29 @@
+{
+  "message": "fix: replace flock with sync.Mutex for EnsureMetadata goroutine sync (gt-o9lsz)\n\nflock (gofrs/flock) provides inter-process file locks, but EnsureMetadata is\ncalled concurrently by goroutines within the same process via EnsureAllMetadata.\nOn some OSes the same process can acquire the same flock twice without blocking,\nproviding zero actual goroutine protection.\n\nChanges:\n- Replace flock with per-path sync.Mutex for goroutine-safe locking\n- Move MkdirAll inside the locked section to fix TOCTOU race\n- No more .lock files left on disk (eliminates accumulation issue)\n- Keep flock for Start() which genuinely needs inter-process locking\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "c8e18ef586ec5fb42db2255b6203d014912893b7",
+      "filename": "internal/doltserver/doltserver.go",
+      "status": "modified",
+      "additions": 23,
+      "deletions": 13,
+      "changes": 36,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/3a424c388a4b3a377947692af3fa2bb00936e293/internal%2Fdoltserver%2Fdoltserver.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/3a424c388a4b3a377947692af3fa2bb00936e293/internal%2Fdoltserver%2Fdoltserver.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fdoltserver%2Fdoltserver.go?ref=3a424c388a4b3a377947692af3fa2bb00936e293",
+      "patch": "@@ -39,6 +39,7 @@ import (\n \t\"runtime\"\n \t\"strconv\"\n \t\"strings\"\n+\t\"sync\"\n \t\"syscall\"\n \t\"time\"\n \n@@ -54,6 +55,17 @@ const (\n \tDefaultMaxConnections = 50     // Conservative default to prevent connection storms\n )\n \n+// metadataMu provides per-path mutexes for EnsureMetadata goroutine synchronization.\n+// flock is inter-process only and cannot reliably synchronize goroutines within the\n+// same process (the same process may acquire the same flock twice without blocking).\n+var metadataMu sync.Map // map[string]*sync.Mutex\n+\n+// getMetadataMu returns a mutex for the given metadata file path, creating one if needed.\n+func getMetadataMu(path string) *sync.Mutex {\n+\tmu, _ := metadataMu.LoadOrStore(path, &sync.Mutex{})\n+\treturn mu.(*sync.Mutex)\n+}\n+\n // Config holds Dolt server configuration.\n type Config struct {\n \t// TownRoot is the Gas Town workspace root.\n@@ -708,22 +720,20 @@ func EnsureMetadata(townRoot, rigName string) error {\n \t\treturn fmt.Errorf(\"could not find .beads directory for rig %q\", rigName)\n \t}\n \n-\t// Ensure directory exists before locking\n-\tif err := os.MkdirAll(beadsDir, 0755); err != nil {\n-\t\treturn fmt.Errorf(\"creating beads directory: %w\", err)\n-\t}\n-\n \tmetadataPath := filepath.Join(beadsDir, \"metadata.json\")\n \n-\t// Acquire file lock to prevent concurrent read-modify-write races.\n-\t// Multiple goroutines (via EnsureAllMetadata) can target the same\n-\t// metadata.json if rig resolution overlaps.\n-\tlockPath := metadataPath + \".lock\"\n-\tfileLock := flock.New(lockPath)\n-\tif err := fileLock.Lock(); err != nil {\n-\t\treturn fmt.Errorf(\"acquiring metadata lock: %w\", err)\n+\t// Acquire per-path mutex for goroutine synchronization.\n+\t// EnsureAllMetadata calls EnsureMetadata concurrently; flock (inter-process)\n+\t// cannot reliably synchronize goroutines within the same process.\n+\tmu := getMetadataMu(metadataPath)\n+\tmu.Lock()\n+\tdefer mu.Unlock()\n+\n+\t// Ensure directory exists inside the lock to prevent TOCTOU races where\n+\t// one goroutine creates the dir and reads stale data before another finishes.\n+\tif err := os.MkdirAll(beadsDir, 0755); err != nil {\n+\t\treturn fmt.Errorf(\"creating beads directory: %w\", err)\n \t}\n-\tdefer func() { _ = fileLock.Unlock() }()\n \n \t// Load existing metadata if present (preserve any extra fields)\n \texisting := make(map[string]interface{})"
+    },
+    {
+      "sha": "b8a32b757ec578cb045a207684cb64c303272c68",
+      "filename": "internal/doltserver/doltserver_test.go",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 3,
+      "changes": 6,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/3a424c388a4b3a377947692af3fa2bb00936e293/internal%2Fdoltserver%2Fdoltserver_test.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/3a424c388a4b3a377947692af3fa2bb00936e293/internal%2Fdoltserver%2Fdoltserver_test.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fdoltserver%2Fdoltserver_test.go?ref=3a424c388a4b3a377947692af3fa2bb00936e293",
+      "patch": "@@ -903,10 +903,10 @@ func TestConcurrentMetadataSameFile(t *testing.T) {\n \t\tt.Errorf(\"version = %v, want 42 (field was clobbered)\", meta[\"version\"])\n \t}\n \n-\t// Lock file should exist (cleanup is caller's responsibility)\n+\t// No lock file should be left behind (sync.Mutex is used instead of flock)\n \tlockPath := metadataPath + \".lock\"\n-\tif _, err := os.Stat(lockPath); os.IsNotExist(err) {\n-\t\tt.Error(\"lock file should exist after locking\")\n+\tif _, err := os.Stat(lockPath); err == nil {\n+\t\tt.Error(\"lock file should not exist \u2014 EnsureMetadata uses sync.Mutex, not flock\")\n \t}\n }\n "
+    }
+  ]
+}

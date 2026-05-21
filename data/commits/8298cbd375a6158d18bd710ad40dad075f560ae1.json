@@ -1,0 +1,52 @@
+{
+  "message": "Fix bd-346: Auto-flush after renumber/rename-prefix now does full export\n\nProblem: Incremental flush merged dirty issues with existing JSONL, leaving\nold IDs when issues were renamed (e.g., test-3 remained after renumbering to test-2).\n\nSolution:\n- Add needsFullExport flag to force complete JSONL rebuild from DB\n- Skip loading existing JSONL when fullExport=true (start with empty map)\n- Use markDirtyAndScheduleFullExport() in renumber and rename-prefix commands\n- PersistentPostRun flushes immediately before process exits (respects fullExport)\n\nTest: Verified renumber with gaps correctly exports only current IDs to JSONL",
+  "files": [
+    {
+      "sha": "ece4450244abcfbd9553acd6a0c4425073cd4c9f",
+      "filename": ".beads/issues.jsonl",
+      "status": "modified",
+      "additions": 109,
+      "deletions": 111,
+      "changes": 220,
+      "blob_url": "https://github.com/gastownhall/beads/blob/8298cbd375a6158d18bd710ad40dad075f560ae1/.beads%2Fissues.jsonl",
+      "raw_url": "https://github.com/gastownhall/beads/raw/8298cbd375a6158d18bd710ad40dad075f560ae1/.beads%2Fissues.jsonl",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/.beads%2Fissues.jsonl?ref=8298cbd375a6158d18bd710ad40dad075f560ae1"
+    },
+    {
+      "sha": "d7f6253d41a5cf93d852d87885cedc151517dd62",
+      "filename": "cmd/bd/main.go",
+      "status": "modified",
+      "additions": 77,
+      "deletions": 31,
+      "changes": 108,
+      "blob_url": "https://github.com/gastownhall/beads/blob/8298cbd375a6158d18bd710ad40dad075f560ae1/cmd%2Fbd%2Fmain.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/8298cbd375a6158d18bd710ad40dad075f560ae1/cmd%2Fbd%2Fmain.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/cmd%2Fbd%2Fmain.go?ref=8298cbd375a6158d18bd710ad40dad075f560ae1",
+      "patch": "@@ -30,8 +30,9 @@ var (\n \tjsonOutput bool\n \n \t// Auto-flush state\n-\tautoFlushEnabled  = true // Can be disabled with --no-auto-flush\n-\tisDirty           = false\n+\tautoFlushEnabled  = true  // Can be disabled with --no-auto-flush\n+\tisDirty           = false // Tracks if DB has changes needing export\n+\tneedsFullExport   = false // Set to true when IDs change (renumber, rename-prefix)\n \tflushMutex        sync.Mutex\n \tflushTimer        *time.Timer\n \tflushDebounce     = 5 * time.Second\n@@ -115,12 +116,12 @@ var rootCmd = &cobra.Command{\n \t\t\t\tflushTimer.Stop()\n \t\t\t\tflushTimer = nil\n \t\t\t}\n-\t\t\t// Don't clear isDirty here - let flushToJSONL do it\n+\t\t\t// Don't clear isDirty or needsFullExport here - let flushToJSONL do it\n \t\t}\n \t\tflushMutex.Unlock()\n \n \t\tif needsFlush {\n-\t\t\t// Call the shared flush function (no code duplication)\n+\t\t\t// Call the shared flush function (handles both incremental and full export)\n \t\t\tflushToJSONL()\n \t\t}\n \n@@ -512,6 +513,30 @@ func markDirtyAndScheduleFlush() {\n \t})\n }\n \n+// markDirtyAndScheduleFullExport marks DB as needing a full export (for ID-changing operations)\n+func markDirtyAndScheduleFullExport() {\n+\tif !autoFlushEnabled {\n+\t\treturn\n+\t}\n+\n+\tflushMutex.Lock()\n+\tdefer flushMutex.Unlock()\n+\n+\tisDirty = true\n+\tneedsFullExport = true // Force full export, not incremental\n+\n+\t// Cancel existing timer if any\n+\tif flushTimer != nil {\n+\t\tflushTimer.Stop()\n+\t\tflushTimer = nil\n+\t}\n+\n+\t// Schedule new flush\n+\tflushTimer = time.AfterFunc(flushDebounce, func() {\n+\t\tflushToJSONL()\n+\t})\n+}\n+\n // clearAutoFlushState cancels pending flush and marks DB as clean (after manual export)\n func clearAutoFlushState() {\n \tflushMutex.Lock()\n@@ -547,6 +572,8 @@ func flushToJSONL() {\n \t\treturn\n \t}\n \tisDirty = false\n+\tfullExport := needsFullExport\n+\tneedsFullExport = false // Reset flag\n \tflushMutex.Unlock()\n \n \tjsonlPath := findJSONLPath()\n@@ -589,39 +616,58 @@ func flushToJSONL() {\n \n \tctx := context.Background()\n \n-\t// Get dirty issue IDs (bd-39: incremental export optimization)\n-\tdirtyIDs, err := store.GetDirtyIssues(ctx)\n-\tif err != nil {\n-\t\trecordFailure(fmt.Errorf(\"failed to get dirty issues: %w\", err))\n-\t\treturn\n-\t}\n+\t// Determine which issues to export\n+\tvar dirtyIDs []string\n+\tvar err error\n+\t\n+\tif fullExport {\n+\t\t// Full export: get ALL issues (needed after ID-changing operations like renumber)\n+\t\tallIssues, err := store.SearchIssues(ctx, \"\", types.IssueFilter{})\n+\t\tif err != nil {\n+\t\t\trecordFailure(fmt.Errorf(\"failed to get all issues: %w\", err))\n+\t\t\treturn\n+\t\t}\n+\t\tdirtyIDs = make([]string, len(allIssues))\n+\t\tfor i, issue := range allIssues {\n+\t\t\tdirtyIDs[i] = issue.ID\n+\t\t}\n+\t} else {\n+\t\t// Incremental export: get only dirty issue IDs (bd-39 optimization)\n+\t\tdirtyIDs, err = store.GetDirtyIssues(ctx)\n+\t\tif err != nil {\n+\t\t\trecordFailure(fmt.Errorf(\"failed to get dirty issues: %w\", err))\n+\t\t\treturn\n+\t\t}\n \n-\t// No dirty issues? Nothing to do!\n-\tif len(dirtyIDs) == 0 {\n-\t\trecordSuccess()\n-\t\treturn\n+\t\t// No dirty issues? Nothing to do!\n+\t\tif len(dirtyIDs) == 0 {\n+\t\t\trecordSuccess()\n+\t\t\treturn\n+\t\t}\n \t}\n \n-\t// Read existing JSONL into a map\n+\t// Read existing JSONL into a map (skip for full export - we'll rebuild from scratch)\n \tissueMap := make(map[string]*types.Issue)\n-\tif existingFile, err := os.Open(jsonlPath); err == nil {\n-\t\tscanner := bufio.NewScanner(existingFile)\n-\t\tlineNum := 0\n-\t\tfor scanner.Scan() {\n-\t\t\tlineNum++\n-\t\t\tline := scanner.Text()\n-\t\t\tif line == \"\" {\n-\t\t\t\tcontinue\n-\t\t\t}\n-\t\t\tvar issue types.Issue\n-\t\t\tif err := json.Unmarshal([]byte(line), &issue); err == nil {\n-\t\t\t\tissueMap[issue.ID] = &issue\n-\t\t\t} else {\n-\t\t\t\t// Warn about malformed JSONL lines\n-\t\t\t\tfmt.Fprintf(os.Stderr, \"Warning: skipping malformed JSONL line %d: %v\\n\", lineNum, err)\n+\tif !fullExport {\n+\t\tif existingFile, err := os.Open(jsonlPath); err == nil {\n+\t\t\tscanner := bufio.NewScanner(existingFile)\n+\t\t\tlineNum := 0\n+\t\t\tfor scanner.Scan() {\n+\t\t\t\tlineNum++\n+\t\t\t\tline := scanner.Text()\n+\t\t\t\tif line == \"\" {\n+\t\t\t\t\tcontinue\n+\t\t\t\t}\n+\t\t\t\tvar issue types.Issue\n+\t\t\t\tif err := json.Unmarshal([]byte(line), &issue); err == nil {\n+\t\t\t\t\tissueMap[issue.ID] = &issue\n+\t\t\t\t} else {\n+\t\t\t\t\t// Warn about malformed JSONL lines\n+\t\t\t\t\tfmt.Fprintf(os.Stderr, \"Warning: skipping malformed JSONL line %d: %v\\n\", lineNum, err)\n+\t\t\t\t}\n \t\t\t}\n+\t\t\texistingFile.Close()\n \t\t}\n-\t\texistingFile.Close()\n \t}\n \n \t// Fetch only dirty issues from DB"
+    },
+    {
+      "sha": "b69fc3999a2a03c8420b6f48e57e9e230f2bed88",
+      "filename": "cmd/bd/rename_prefix.go",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/gastownhall/beads/blob/8298cbd375a6158d18bd710ad40dad075f560ae1/cmd%2Fbd%2Frename_prefix.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/8298cbd375a6158d18bd710ad40dad075f560ae1/cmd%2Fbd%2Frename_prefix.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/cmd%2Fbd%2Frename_prefix.go?ref=8298cbd375a6158d18bd710ad40dad075f560ae1",
+      "patch": "@@ -96,8 +96,8 @@ Example:\n \t\t\tos.Exit(1)\n \t\t}\n \n-\t\t// Schedule auto-flush to export changes\n-\t\tmarkDirtyAndScheduleFlush()\n+\t\t// Schedule full export (IDs changed, incremental won't work)\n+\t\tmarkDirtyAndScheduleFullExport()\n \n \t\tfmt.Printf(\"%s Successfully renamed prefix from %s to %s\\n\", green(\"\u2713\"), cyan(oldPrefix), cyan(newPrefix))\n "
+    },
+    {
+      "sha": "e0c5cfbc388c34a6cd7293fa5e694b542fb2ea54",
+      "filename": "cmd/bd/renumber.go",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/gastownhall/beads/blob/8298cbd375a6158d18bd710ad40dad075f560ae1/cmd%2Fbd%2Frenumber.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/8298cbd375a6158d18bd710ad40dad075f560ae1/cmd%2Fbd%2Frenumber.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/cmd%2Fbd%2Frenumber.go?ref=8298cbd375a6158d18bd710ad40dad075f560ae1",
+      "patch": "@@ -128,8 +128,8 @@ Risks:\n \t\t\tos.Exit(1)\n \t\t}\n \n-\t\t// Schedule auto-flush to export changes\n-\t\tmarkDirtyAndScheduleFlush()\n+\t\t// Schedule full export (IDs changed, incremental won't work)\n+\t\tmarkDirtyAndScheduleFullExport()\n \n \t\tfmt.Printf(\"%s Successfully renumbered %d issues\\n\", green(\"\u2713\"), len(issues))\n "
+    }
+  ]
+}

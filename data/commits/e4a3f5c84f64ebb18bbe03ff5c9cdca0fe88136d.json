@@ -1,0 +1,29 @@
+{
+  "message": "fix: replace N+1 query patterns with batch queries in deep.go and migration_validation.go (bd-7zej)\n\n- deep.go checkMoleculeIntegrity: replace per-molecule QueryRow loop with\n  single SELECT...IN(...) GROUP BY query\n- migration_validation.go compareDoltWithJSONL: replace per-ID GetIssue loop\n  with batched GetIssuesByIDs (chunks of 500) + set difference in Go\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\nExecuted-By: beads/polecats/onyx\nRig: beads\nRole: polecats",
+  "files": [
+    {
+      "sha": "06a178993e1557f3813f706ae327772659ba0741",
+      "filename": "cmd/bd/doctor/deep.go",
+      "status": "modified",
+      "additions": 26,
+      "deletions": 13,
+      "changes": 39,
+      "blob_url": "https://github.com/gastownhall/beads/blob/e4a3f5c84f64ebb18bbe03ff5c9cdca0fe88136d/cmd%2Fbd%2Fdoctor%2Fdeep.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/e4a3f5c84f64ebb18bbe03ff5c9cdca0fe88136d/cmd%2Fbd%2Fdoctor%2Fdeep.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/cmd%2Fbd%2Fdoctor%2Fdeep.go?ref=e4a3f5c84f64ebb18bbe03ff5c9cdca0fe88136d",
+      "patch": "@@ -478,20 +478,33 @@ func checkMoleculeIntegrity(db *sql.DB) DoctorCheck {\n \t\treturn check\n \t}\n \n-\t// For each molecule, check if all children exist\n+\t// Find molecules with missing children in a single batch query\n \tvar brokenMolecules []string\n-\tfor _, mol := range molecules {\n-\t\t// Count children that don't exist\n-\t\tvar orphanCount int\n-\t\terr := db.QueryRow(`\n-\t\t\tSELECT COUNT(*)\n-\t\t\tFROM dependencies d\n-\t\t\tWHERE d.depends_on_id = ?\n-\t\t\t  AND d.type = 'parent-child'\n-\t\t\t  AND NOT EXISTS (SELECT 1 FROM issues WHERE id = d.issue_id)\n-\t\t`, mol.ID).Scan(&orphanCount)\n-\t\tif err == nil && orphanCount > 0 {\n-\t\t\tbrokenMolecules = append(brokenMolecules, fmt.Sprintf(\"%s (%d missing children)\", mol.ID, orphanCount))\n+\tmolIDs := make([]interface{}, len(molecules))\n+\tplaceholders := make([]string, len(molecules))\n+\tfor i, mol := range molecules {\n+\t\tmolIDs[i] = mol.ID\n+\t\tplaceholders[i] = \"?\"\n+\t}\n+\n+\t// nolint:gosec // G201: placeholders contains only ? markers, actual values passed via args\n+\tbrokenQuery := fmt.Sprintf(`\n+\t\tSELECT d.depends_on_id, COUNT(*) AS orphan_count\n+\t\tFROM dependencies d\n+\t\tWHERE d.depends_on_id IN (%s)\n+\t\t  AND d.type = 'parent-child'\n+\t\t  AND NOT EXISTS (SELECT 1 FROM issues WHERE id = d.issue_id)\n+\t\tGROUP BY d.depends_on_id`, strings.Join(placeholders, \",\"))\n+\n+\tbrokenRows, err := db.Query(brokenQuery, molIDs...)\n+\tif err == nil {\n+\t\tdefer brokenRows.Close()\n+\t\tfor brokenRows.Next() {\n+\t\t\tvar molID string\n+\t\t\tvar orphanCount int\n+\t\t\tif err := brokenRows.Scan(&molID, &orphanCount); err == nil {\n+\t\t\t\tbrokenMolecules = append(brokenMolecules, fmt.Sprintf(\"%s (%d missing children)\", molID, orphanCount))\n+\t\t\t}\n \t\t}\n \t}\n "
+    },
+    {
+      "sha": "e9e69c16ed9c4be35ceb30614c34bdd38a6536c8",
+      "filename": "cmd/bd/doctor/migration_validation.go",
+      "status": "modified",
+      "additions": 27,
+      "deletions": 4,
+      "changes": 31,
+      "blob_url": "https://github.com/gastownhall/beads/blob/e4a3f5c84f64ebb18bbe03ff5c9cdca0fe88136d/cmd%2Fbd%2Fdoctor%2Fmigration_validation.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/e4a3f5c84f64ebb18bbe03ff5c9cdca0fe88136d/cmd%2Fbd%2Fdoctor%2Fmigration_validation.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/cmd%2Fbd%2Fdoctor%2Fmigration_validation.go?ref=e4a3f5c84f64ebb18bbe03ff5c9cdca0fe88136d",
+      "patch": "@@ -441,18 +441,41 @@ func validateJSONLForMigration(jsonlPath string) (int, int, map[string]bool, err\n // compareDoltWithJSONL compares Dolt database with JSONL IDs.\n // Returns IDs in JSONL but not in Dolt (sample first 100).\n func compareDoltWithJSONL(ctx context.Context, store *dolt.DoltStore, jsonlIDs map[string]bool) []string {\n-\tvar missing []string\n-\n+\tids := make([]string, 0, len(jsonlIDs))\n \tfor id := range jsonlIDs {\n-\t\t_, err := store.GetIssue(ctx, id)\n+\t\tids = append(ids, id)\n+\t}\n+\tif len(ids) == 0 {\n+\t\treturn nil\n+\t}\n+\n+\t// Batch fetch all issues from Dolt in chunks\n+\tfoundIDs := make(map[string]bool, len(ids))\n+\tconst batchSize = 500\n+\tfor i := 0; i < len(ids); i += batchSize {\n+\t\tend := i + batchSize\n+\t\tif end > len(ids) {\n+\t\t\tend = len(ids)\n+\t\t}\n+\t\tissues, err := store.GetIssuesByIDs(ctx, ids[i:end])\n \t\tif err != nil {\n+\t\t\tcontinue\n+\t\t}\n+\t\tfor _, issue := range issues {\n+\t\t\tfoundIDs[issue.ID] = true\n+\t\t}\n+\t}\n+\n+\t// Set difference: IDs in JSONL but not in Dolt (sample first 100)\n+\tvar missing []string\n+\tfor _, id := range ids {\n+\t\tif !foundIDs[id] {\n \t\t\tmissing = append(missing, id)\n \t\t\tif len(missing) >= 100 {\n \t\t\t\tbreak\n \t\t\t}\n \t\t}\n \t}\n-\n \treturn missing\n }\n "
+    }
+  ]
+}

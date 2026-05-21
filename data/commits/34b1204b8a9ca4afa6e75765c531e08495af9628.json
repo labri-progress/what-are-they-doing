@@ -1,0 +1,53 @@
+{
+  "message": "fix: close orphan step wisps before closing root molecule (gt-3o59)\n\nFormula step wisps were created by pourDogMolecule but never fully closed,\nleaking ~40 open wisps per 5-minute cycle across all patrols.\n\nRoot cause: dogMol.close() only closed the root wisp, leaving child step\nwisps orphaned. Individual callers also had gaps:\n\n- wisp_reaper: never closed \"auto-close\" step (also unmapped in discoverSteps)\n- compactor_dog: used wrong slug \"scan\" (should be \"inspect\"), never closed \"verify\"\n- jsonl_git_backup: never closed \"verify\" step\n\nFix has two layers:\n1. Systemic: close() now calls closeRemainingSteps() which queries all children\n   and closes any still-open ones before closing the root. This backstop\n   prevents leaks regardless of individual caller bugs.\n2. Per-caller: added missing closeStep calls and fixed wrong slugs.\n3. discoverSteps: added keyword mappings for \"auto-close\", \"sync\", \"offsite\".\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "1a1459fb23441923192fbb6815e2570d6560b734",
+      "filename": "internal/daemon/compactor_dog.go",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 1,
+      "changes": 6,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/34b1204b8a9ca4afa6e75765c531e08495af9628/internal%2Fdaemon%2Fcompactor_dog.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/34b1204b8a9ca4afa6e75765c531e08495af9628/internal%2Fdaemon%2Fcompactor_dog.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fdaemon%2Fcompactor_dog.go?ref=34b1204b8a9ca4afa6e75765c531e08495af9628",
+      "patch": "@@ -114,10 +114,12 @@ func (d *Daemon) runCompactorDog() {\n \tdatabases := d.compactorDatabases()\n \tif len(databases) == 0 {\n \t\td.logger.Printf(\"compactor_dog: no databases to compact\")\n-\t\tmol.failStep(\"scan\", \"no databases found\")\n+\t\tmol.failStep(\"inspect\", \"no databases found\")\n \t\treturn\n \t}\n \n+\tmol.closeStep(\"inspect\")\n+\n \tcompacted := 0\n \tskipped := 0\n \terrors := 0\n@@ -167,6 +169,8 @@ func (d *Daemon) runCompactorDog() {\n \t\tmol.closeStep(\"compact\")\n \t}\n \n+\tmol.closeStep(\"verify\")\n+\n \td.logger.Printf(\"compactor_dog: cycle complete \u2014 compacted=%d skipped=%d errors=%d\",\n \t\tcompacted, skipped, errors)\n \tmol.closeStep(\"report\")"
+    },
+    {
+      "sha": "1047969a9ca2eca291a2981efd689fd932854e48",
+      "filename": "internal/daemon/dog_molecule.go",
+      "status": "modified",
+      "additions": 50,
+      "deletions": 1,
+      "changes": 51,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/34b1204b8a9ca4afa6e75765c531e08495af9628/internal%2Fdaemon%2Fdog_molecule.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/34b1204b8a9ca4afa6e75765c531e08495af9628/internal%2Fdaemon%2Fdog_molecule.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fdaemon%2Fdog_molecule.go?ref=34b1204b8a9ca4afa6e75765c531e08495af9628",
+      "patch": "@@ -100,18 +100,61 @@ func (dm *dogMol) failStep(stepSlug, reason string) {\n \t}\n }\n \n-// close closes the root molecule wisp.\n+// close closes all remaining open child step wisps, then closes the root molecule wisp.\n+// This prevents orphan step wisps from accumulating when callers forget to\n+// explicitly close individual steps (the root cause of gt-3o59).\n func (dm *dogMol) close() {\n \tif dm.rootID == \"\" {\n \t\treturn\n \t}\n \n+\t// Close any step wisps that were never explicitly closed/failed.\n+\tdm.closeRemainingSteps()\n+\n \t_, err := dm.runBd(\"close\", dm.rootID)\n \tif err != nil {\n \t\tdm.logger.Printf(\"dog_molecule: close root %s failed (non-fatal): %v\", dm.rootID, err)\n \t}\n }\n \n+// closeRemainingSteps queries all children of the root wisp and closes any that\n+// are still open. This is the backstop that prevents step wisp leaks regardless\n+// of whether individual callers remembered to close each step.\n+func (dm *dogMol) closeRemainingSteps() {\n+\tif dm.rootID == \"\" {\n+\t\treturn\n+\t}\n+\n+\tout, err := dm.runBd(\"show\", dm.rootID, \"--children\", \"--format=jsonl\")\n+\tif err != nil {\n+\t\tdm.logger.Printf(\"dog_molecule: closeRemainingSteps: list children of %s failed: %v\", dm.rootID, err)\n+\t\treturn\n+\t}\n+\n+\tclosed := 0\n+\tfor _, line := range strings.Split(strings.TrimSpace(out), \"\\n\") {\n+\t\tif line == \"\" {\n+\t\t\tcontinue\n+\t\t}\n+\t\tid := extractJSONField(line, \"id\")\n+\t\tstatus := extractJSONField(line, \"status\")\n+\t\tif id == \"\" || status == \"\" {\n+\t\t\tcontinue\n+\t\t}\n+\t\t// Close any child that is still open/hooked/in_progress.\n+\t\tif status == \"open\" || status == \"hooked\" || status == \"in_progress\" {\n+\t\t\tif _, err := dm.runBd(\"close\", id); err != nil {\n+\t\t\t\tdm.logger.Printf(\"dog_molecule: closeRemainingSteps: close %s failed: %v\", id, err)\n+\t\t\t} else {\n+\t\t\t\tclosed++\n+\t\t\t}\n+\t\t}\n+\t}\n+\tif closed > 0 {\n+\t\tdm.logger.Printf(\"dog_molecule: closeRemainingSteps: closed %d orphan step wisp(s) under %s\", closed, dm.rootID)\n+\t}\n+}\n+\n // discoverSteps lists children of the root wisp and maps step slugs to IDs.\n // Step titles in the formula are like \"Scan databases for stale wisps\" \u2014\n // we match on the step ID embedded in the wisp title or metadata.\n@@ -172,6 +215,12 @@ func (dm *dogMol) discoverSteps() {\n \t\t\tdm.stepIDs[\"verify\"] = id\n \t\tcase strings.Contains(titleLower, \"compact\"):\n \t\t\tdm.stepIDs[\"compact\"] = id\n+\t\tcase strings.Contains(titleLower, \"auto-close\") || strings.Contains(titleLower, \"auto close\"):\n+\t\t\tdm.stepIDs[\"auto-close\"] = id\n+\t\tcase strings.Contains(titleLower, \"sync\"):\n+\t\t\tdm.stepIDs[\"sync\"] = id\n+\t\tcase strings.Contains(titleLower, \"offsite\"):\n+\t\t\tdm.stepIDs[\"offsite\"] = id\n \t\t}\n \t}\n }"
+    },
+    {
+      "sha": "cf6fed59379f355f26f5d1e073cb7a97610fc83b",
+      "filename": "internal/daemon/jsonl_git_backup.go",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/34b1204b8a9ca4afa6e75765c531e08495af9628/internal%2Fdaemon%2Fjsonl_git_backup.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/34b1204b8a9ca4afa6e75765c531e08495af9628/internal%2Fdaemon%2Fjsonl_git_backup.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fdaemon%2Fjsonl_git_backup.go?ref=34b1204b8a9ca4afa6e75765c531e08495af9628",
+      "patch": "@@ -165,6 +165,8 @@ func (d *Daemon) syncJsonlGitBackup() {\n \t\td.escalate(\"jsonl_git_backup\", fmt.Sprintf(\"post-scrub verification found %d suspicious records \u2014 review JSONL exports\", remaining))\n \t}\n \n+\tmol.closeStep(\"verify\")\n+\n \t// Phase D: Spike detection \u2014 compare current counts to previous commit.\n \tthreshold := spikeThreshold(config)\n \tspikes := d.verifyExportCounts(gitRepo, databases, counts, threshold)"
+    },
+    {
+      "sha": "f90360aea89a4871a8498f6a02b19f99822b6ab0",
+      "filename": "internal/daemon/wisp_reaper.go",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/34b1204b8a9ca4afa6e75765c531e08495af9628/internal%2Fdaemon%2Fwisp_reaper.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/34b1204b8a9ca4afa6e75765c531e08495af9628/internal%2Fdaemon%2Fwisp_reaper.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fdaemon%2Fwisp_reaper.go?ref=34b1204b8a9ca4afa6e75765c531e08495af9628",
+      "patch": "@@ -180,6 +180,8 @@ func (d *Daemon) reapWisps() {\n \t\tmol.closeStep(\"reap\")\n \t}\n \n+\tmol.closeStep(\"auto-close\")\n+\n \t// --- PURGE STEP: delete closed wisps older than purge age ---\n \n \ttotalPurged := 0"
+    }
+  ]
+}

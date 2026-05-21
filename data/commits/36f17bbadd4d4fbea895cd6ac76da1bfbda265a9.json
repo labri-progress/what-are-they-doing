@@ -1,0 +1,41 @@
+{
+  "message": "fix: Refinery queue uses beads MQ as source of truth (hq-eggh5)\n\nThe refinery was checking git branches instead of the beads merge queue.\nThis caused MRs to pile up when branches were deleted but MR beads remained.\n\n- manager.go: Queue() now queries beads for type=merge-request issues\n- refinery.md.tmpl: Updated queue-scan to use gt mq list\n- mol-refinery-patrol.formula.toml: Updated queue-scan step instructions",
+  "files": [
+    {
+      "sha": "a968c27fec2cccdced8c2047ebc9f8ea7f79664b",
+      "filename": ".beads/formulas/mol-refinery-patrol.formula.toml",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 13,
+      "changes": 27,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/36f17bbadd4d4fbea895cd6ac76da1bfbda265a9/.beads%2Fformulas%2Fmol-refinery-patrol.formula.toml",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/36f17bbadd4d4fbea895cd6ac76da1bfbda265a9/.beads%2Fformulas%2Fmol-refinery-patrol.formula.toml",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/.beads%2Fformulas%2Fmol-refinery-patrol.formula.toml?ref=36f17bbadd4d4fbea895cd6ac76da1bfbda265a9",
+      "patch": "@@ -99,27 +99,28 @@ id = \"queue-scan\"\n title = \"Scan merge queue\"\n needs = [\"inbox-check\"]\n description = \"\"\"\n-Review the queue built from MERGE_READY messages in inbox-check.\n+Check the beads merge queue - this is the SOURCE OF TRUTH for pending merges.\n \n ```bash\n-# Always fetch with prune to clean stale tracking refs:\n git fetch --prune origin\n-\n-# For each queued merge request, verify the branch exists:\n-git branch -r | grep <branch>\n-\n-# IMPORTANT: Before queuing, verify branch has unmerged commits:\n-git log origin/main..origin/<branch> --oneline | head -1\n-# If empty \u2192 branch already merged. Archive MERGE_READY, don't queue.\n+gt mq list <rig>\n ```\n \n+The beads MQ tracks all pending merge requests. Do NOT rely on `git branch -r | grep polecat`\n+as branches may exist without MR beads, or MR beads may exist for already-merged work.\n+\n If queue empty, skip to context-check step.\n \n-If branch doesn't exist for a queued item:\n-- Mail witness: Branch not found, cannot merge\n-- Remove from queue\n+For each MR in the queue, verify the branch still exists:\n+```bash\n+git branch -r | grep <branch>\n+```\n+\n+If branch doesn't exist for a queued MR:\n+- Close the MR bead: `bd close <mr-id> --reason \"Branch no longer exists\"`\n+- Remove from processing queue\n \n-Track verified branch list for this cycle.\"\"\"\n+Track verified MR list for this cycle.\"\"\"\n \n [[steps]]\n id = \"process-branch\""
+    },
+    {
+      "sha": "412a65c1530453f34d6e47f88d8fa045c001bb6a",
+      "filename": "internal/refinery/manager.go",
+      "status": "modified",
+      "additions": 57,
+      "deletions": 7,
+      "changes": 64,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/36f17bbadd4d4fbea895cd6ac76da1bfbda265a9/internal%2Frefinery%2Fmanager.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/36f17bbadd4d4fbea895cd6ac76da1bfbda265a9/internal%2Frefinery%2Fmanager.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Frefinery%2Fmanager.go?ref=36f17bbadd4d4fbea895cd6ac76da1bfbda265a9",
+      "patch": "@@ -13,6 +13,7 @@ import (\n \t\"strings\"\n \t\"time\"\n \n+\t\"github.com/steveyegge/gastown/internal/beads\"\n \t\"github.com/steveyegge/gastown/internal/claude\"\n \t\"github.com/steveyegge/gastown/internal/config\"\n \t\"github.com/steveyegge/gastown/internal/events\"\n@@ -239,14 +240,21 @@ func (m *Manager) Stop() error {\n }\n \n // Queue returns the current merge queue.\n+// Uses beads merge-request issues as the source of truth (not git branches).\n func (m *Manager) Queue() ([]QueueItem, error) {\n-\t// Discover branches that look like polecat work branches\n-\tbranches, err := m.discoverWorkBranches()\n+\t// Query beads for open merge-request type issues\n+\t// BeadsPath() returns the git-synced beads location\n+\tb := beads.New(m.rig.BeadsPath())\n+\tissues, err := b.List(beads.ListOptions{\n+\t\tType:     \"merge-request\",\n+\t\tStatus:   \"open\",\n+\t\tPriority: -1, // No priority filter\n+\t})\n \tif err != nil {\n-\t\treturn nil, err\n+\t\treturn nil, fmt.Errorf(\"querying merge queue from beads: %w\", err)\n \t}\n \n-\t// Load any pending MRs from state\n+\t// Load any current processing state\n \tref, err := m.loadState()\n \tif err != nil {\n \t\treturn nil, err\n@@ -265,10 +273,14 @@ func (m *Manager) Queue() ([]QueueItem, error) {\n \t\t})\n \t}\n \n-\t// Add discovered branches as pending\n-\tfor _, branch := range branches {\n-\t\tmr := m.branchToMR(branch)\n+\t// Convert beads issues to queue items\n+\tfor _, issue := range issues {\n+\t\tmr := m.issueToBead(issue)\n \t\tif mr != nil {\n+\t\t\t// Skip if this is the currently processing MR\n+\t\t\tif ref.CurrentMR != nil && ref.CurrentMR.ID == mr.ID {\n+\t\t\t\tcontinue\n+\t\t\t}\n \t\t\titems = append(items, QueueItem{\n \t\t\t\tPosition: pos,\n \t\t\t\tMR:       mr,\n@@ -281,6 +293,44 @@ func (m *Manager) Queue() ([]QueueItem, error) {\n \treturn items, nil\n }\n \n+// issueToBead converts a beads issue to a MergeRequest.\n+func (m *Manager) issueToBead(issue *beads.Issue) *MergeRequest {\n+\tif issue == nil {\n+\t\treturn nil\n+\t}\n+\n+\tfields := beads.ParseMRFields(issue)\n+\tif fields == nil {\n+\t\t// No MR fields in description, construct from title/ID\n+\t\treturn &MergeRequest{\n+\t\t\tID:           issue.ID,\n+\t\t\tIssueID:      issue.ID,\n+\t\t\tStatus:       MROpen,\n+\t\t\tCreatedAt:    parseTime(issue.CreatedAt),\n+\t\t\tTargetBranch: \"main\",\n+\t\t}\n+\t}\n+\n+\treturn &MergeRequest{\n+\t\tID:           issue.ID,\n+\t\tBranch:       fields.Branch,\n+\t\tWorker:       fields.Worker,\n+\t\tIssueID:      fields.SourceIssue,\n+\t\tTargetBranch: fields.Target,\n+\t\tStatus:       MROpen,\n+\t\tCreatedAt:    parseTime(issue.CreatedAt),\n+\t}\n+}\n+\n+// parseTime parses a time string, returning zero time on error.\n+func parseTime(s string) time.Time {\n+\tt, err := time.Parse(time.RFC3339, s)\n+\tif err != nil {\n+\t\tt, _ = time.Parse(\"2006-01-02T15:04:05Z\", s)\n+\t}\n+\treturn t\n+}\n+\n // discoverWorkBranches finds branches that look like polecat work.\n func (m *Manager) discoverWorkBranches() ([]string, error) {\n \tcmd := exec.Command(\"git\", \"branch\", \"-r\", \"--list\", \"origin/polecat/*\")"
+    },
+    {
+      "sha": "48f951efdd6fcde1ccfe06c410a6843ecf7e60cb",
+      "filename": "internal/templates/roles/refinery.md.tmpl",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 4,
+      "changes": 8,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/36f17bbadd4d4fbea895cd6ac76da1bfbda265a9/internal%2Ftemplates%2Froles%2Frefinery.md.tmpl",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/36f17bbadd4d4fbea895cd6ac76da1bfbda265a9/internal%2Ftemplates%2Froles%2Frefinery.md.tmpl",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Ftemplates%2Froles%2Frefinery.md.tmpl?ref=36f17bbadd4d4fbea895cd6ac76da1bfbda265a9",
+      "patch": "@@ -198,12 +198,12 @@ gt mail inbox\n # Process each message: lifecycle requests, escalations\n ```\n \n-**queue-scan**: Fetch remote and identify branches\n+**queue-scan**: Check beads merge queue (source of truth)\n ```bash\n-git fetch origin\n-git branch -r | grep polecat\n-gt refinery queue {{ .RigName }}\n+git fetch --prune origin\n+gt mq list {{ .RigName }}\n ```\n+The beads MQ is the source of truth for pending merges, not git branches.\n If queue empty, skip to context-check step.\n \n **process-branch**: Pick next branch, rebase on main"
+    }
+  ]
+}

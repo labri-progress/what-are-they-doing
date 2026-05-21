@@ -1,0 +1,41 @@
+{
+  "message": "fix(gitlab): resolve hardcoded work item type ID and O(n) milestone scan\n\n- Query Task work item type ID dynamically via GraphQL instead of\n  hardcoding gid://gitlab/WorkItems::Type/5 (varies by GitLab instance).\n  Result is cached per session with fallback for older GitLab versions.\n- Add FetchMilestoneByIID using the iids[] API parameter to fetch a\n  single milestone directly, replacing the O(n) FetchMilestones scan\n  in findParentEpicMilestone.\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>\n\nExecuted-By: beads/crew/emma",
+  "files": [
+    {
+      "sha": "744faeb612be667fcbac5969cae37bceb49156cb",
+      "filename": "internal/gitlab/client.go",
+      "status": "modified",
+      "additions": 76,
+      "deletions": 2,
+      "changes": 78,
+      "blob_url": "https://github.com/gastownhall/beads/blob/ead8d09a82059b80cd803bc3165b81e9128445dd/internal%2Fgitlab%2Fclient.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/ead8d09a82059b80cd803bc3165b81e9128445dd/internal%2Fgitlab%2Fclient.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fgitlab%2Fclient.go?ref=ead8d09a82059b80cd803bc3165b81e9128445dd",
+      "patch": "@@ -36,6 +36,7 @@ func (c *Client) WithGroupID(groupID string) *Client {\n \t\tProjectID:  c.ProjectID,\n \t\tGroupID:    groupID,\n \t\tHTTPClient: c.HTTPClient,\n+\t\ttaskTypeID: c.taskTypeID,\n \t}\n }\n \n@@ -48,6 +49,7 @@ func (c *Client) WithHTTPClient(httpClient *http.Client) *Client {\n \t\tProjectID:  c.ProjectID,\n \t\tGroupID:    c.GroupID,\n \t\tHTTPClient: httpClient,\n+\t\ttaskTypeID: c.taskTypeID,\n \t}\n }\n \n@@ -60,6 +62,7 @@ func (c *Client) WithEndpoint(endpoint string) *Client {\n \t\tProjectID:  c.ProjectID,\n \t\tGroupID:    c.GroupID,\n \t\tHTTPClient: c.HTTPClient,\n+\t\ttaskTypeID: c.taskTypeID,\n \t}\n }\n \n@@ -430,6 +433,31 @@ func (c *Client) FetchMilestones(ctx context.Context, state string) ([]Milestone\n \treturn milestones, nil\n }\n \n+// FetchMilestoneByIID retrieves a single milestone by its project-scoped IID.\n+// Returns nil if no milestone matches the given IID.\n+func (c *Client) FetchMilestoneByIID(ctx context.Context, iid int) (*Milestone, error) {\n+\tparams := map[string]string{\n+\t\t\"iids[]\": strconv.Itoa(iid),\n+\t}\n+\n+\turlStr := c.buildURL(\"/projects/\"+c.projectPath()+\"/milestones\", params)\n+\trespBody, _, err := c.doRequest(ctx, http.MethodGet, urlStr, nil)\n+\tif err != nil {\n+\t\treturn nil, fmt.Errorf(\"failed to fetch milestone by IID %d: %w\", iid, err)\n+\t}\n+\n+\tvar milestones []Milestone\n+\tif err := json.Unmarshal(respBody, &milestones); err != nil {\n+\t\treturn nil, fmt.Errorf(\"failed to parse milestone response: %w\", err)\n+\t}\n+\n+\tif len(milestones) == 0 {\n+\t\treturn nil, nil\n+\t}\n+\n+\treturn &milestones[0], nil\n+}\n+\n // CreateMilestone creates a new milestone in GitLab.\n func (c *Client) CreateMilestone(ctx context.Context, title, description string) (*Milestone, error) {\n \tbody := map[string]interface{}{\n@@ -506,10 +534,56 @@ type WorkItem struct {\n \tType  string `json:\"type\"` // Work item type name\n }\n \n+// defaultTaskTypeID is the fallback GID for older GitLab instances where the\n+// workItemTypes GraphQL query is unavailable.\n+const defaultTaskTypeID = \"gid://gitlab/WorkItems::Type/5\"\n+\n+// getTaskWorkItemTypeID returns the GraphQL GID for the \"Task\" work item type.\n+// It queries the GitLab instance once per session and caches the result.\n+// Falls back to the hardcoded default if the query fails (e.g., older GitLab versions).\n+func (c *Client) getTaskWorkItemTypeID(ctx context.Context, projectPath string) string {\n+\tif c.taskTypeID != \"\" {\n+\t\treturn c.taskTypeID\n+\t}\n+\n+\tquery := fmt.Sprintf(`{\n+\t\tproject(fullPath: %q) {\n+\t\t\tworkItemTypes(name: \"Task\") {\n+\t\t\t\tnodes { id }\n+\t\t\t}\n+\t\t}\n+\t}`, projectPath)\n+\n+\tdata, err := c.graphqlRequest(ctx, query, nil)\n+\tif err != nil {\n+\t\tc.taskTypeID = defaultTaskTypeID\n+\t\treturn c.taskTypeID\n+\t}\n+\n+\tvar resp struct {\n+\t\tProject struct {\n+\t\t\tWorkItemTypes struct {\n+\t\t\t\tNodes []struct {\n+\t\t\t\t\tID string `json:\"id\"`\n+\t\t\t\t} `json:\"nodes\"`\n+\t\t\t} `json:\"workItemTypes\"`\n+\t\t} `json:\"project\"`\n+\t}\n+\tif err := json.Unmarshal(data, &resp); err != nil || len(resp.Project.WorkItemTypes.Nodes) == 0 {\n+\t\tc.taskTypeID = defaultTaskTypeID\n+\t\treturn c.taskTypeID\n+\t}\n+\n+\tc.taskTypeID = resp.Project.WorkItemTypes.Nodes[0].ID\n+\treturn c.taskTypeID\n+}\n+\n // CreateTaskWorkItem creates a Task-type work item via GraphQL, optionally with a parent.\n // parentGID is the global ID of the parent work item (e.g., \"gid://gitlab/WorkItem/456\").\n // If parentGID is empty, creates a standalone task.\n func (c *Client) CreateTaskWorkItem(ctx context.Context, projectPath, title, description, parentGID string) (*WorkItem, error) {\n+\ttypeID := c.getTaskWorkItemTypeID(ctx, projectPath)\n+\n \thierarchyPart := \"\"\n \tif parentGID != \"\" {\n \t\thierarchyPart = fmt.Sprintf(`, hierarchyWidget: { parentId: %q }`, parentGID)\n@@ -520,12 +594,12 @@ func (c *Client) CreateTaskWorkItem(ctx context.Context, projectPath, title, des\n \t\t\tprojectPath: %q,\n \t\t\ttitle: %q,\n \t\t\tdescription: %q,\n-\t\t\tworkItemTypeId: \"gid://gitlab/WorkItems::Type/5\"%s\n+\t\t\tworkItemTypeId: %q%s\n \t\t}) {\n \t\t\terrors\n \t\t\tworkItem { id iid title workItemType { name } webUrl }\n \t\t}\n-\t}`, projectPath, title, description, hierarchyPart)\n+\t}`, projectPath, title, description, typeID, hierarchyPart)\n \n \tdata, err := c.graphqlRequest(ctx, query, nil)\n \tif err != nil {"
+    },
+    {
+      "sha": "08f4253f6b53ff6905d193329357300ac85b9e7d",
+      "filename": "internal/gitlab/tracker.go",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 9,
+      "changes": 13,
+      "blob_url": "https://github.com/gastownhall/beads/blob/ead8d09a82059b80cd803bc3165b81e9128445dd/internal%2Fgitlab%2Ftracker.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/ead8d09a82059b80cd803bc3165b81e9128445dd/internal%2Fgitlab%2Ftracker.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fgitlab%2Ftracker.go?ref=ead8d09a82059b80cd803bc3165b81e9128445dd",
+      "patch": "@@ -304,17 +304,12 @@ func (t *Tracker) findParentEpicMilestone(ctx context.Context, issueID string) i\n \t\t\t\tif err != nil {\n \t\t\t\t\treturn 0\n \t\t\t\t}\n-\t\t\t\t// Look up API ID by IID\n-\t\t\t\tmilestones, err := t.client.FetchMilestones(ctx, \"\")\n-\t\t\t\tif err != nil {\n+\t\t\t\t// Look up API ID by IID (single API call instead of fetching all milestones)\n+\t\t\t\tms, err := t.client.FetchMilestoneByIID(ctx, milestoneIID)\n+\t\t\t\tif err != nil || ms == nil {\n \t\t\t\t\treturn 0\n \t\t\t\t}\n-\t\t\t\tfor _, ms := range milestones {\n-\t\t\t\t\tif ms.IID == milestoneIID {\n-\t\t\t\t\t\treturn ms.ID\n-\t\t\t\t\t}\n-\t\t\t\t}\n-\t\t\t\treturn 0\n+\t\t\t\treturn ms.ID\n \t\t\t}\n \t\t\t// Not an epic \u2014 keep walking up\n \t\t\tcurrentID = dep.Issue.ID"
+    },
+    {
+      "sha": "20d967550fd291dda48477502d255609f7bfaddf",
+      "filename": "internal/gitlab/types.go",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/gastownhall/beads/blob/ead8d09a82059b80cd803bc3165b81e9128445dd/internal%2Fgitlab%2Ftypes.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/ead8d09a82059b80cd803bc3165b81e9128445dd/internal%2Fgitlab%2Ftypes.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fgitlab%2Ftypes.go?ref=ead8d09a82059b80cd803bc3165b81e9128445dd",
+      "patch": "@@ -51,6 +51,10 @@ type Client struct {\n \tProjectID  string       // Project ID or URL-encoded path (e.g., \"group/project\")\n \tGroupID    string       // Optional group ID or path for group-level issue fetching\n \tHTTPClient *http.Client // Optional custom HTTP client\n+\n+\t// taskTypeID caches the GraphQL GID for the \"Task\" work item type.\n+\t// Populated lazily on first call to getTaskWorkItemTypeID.\n+\ttaskTypeID string\n }\n \n // Issue represents an issue from the GitLab API."
+    }
+  ]
+}

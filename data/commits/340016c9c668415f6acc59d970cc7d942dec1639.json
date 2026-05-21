@@ -1,0 +1,53 @@
+{
+  "message": "fix(bd-53c): Add reverse ZFC check to prevent stale DB from corrupting JSONL\n\nRoot cause: bd sync exports DB to JSONL BEFORE pulling from remote.\nIf the local DB is stale (fewer issues than JSONL), the stale data gets\nexported and committed, potentially corrupting the remote when pushed.\n\nThe existing ZFC (Zero-Fill Check) only detected when DB had MORE issues\nthan JSONL, missing the dangerous reverse case.\n\nFix: Added \"reverse ZFC\" check in sync.go that detects when JSONL has\nsignificantly more issues than DB (>20% divergence or empty DB).\nWhen detected, it imports JSONL first to sync the database before\nany export occurs.\n\nThis prevents stale/fresh clones from exporting their incomplete\ndatabase state over a well-populated JSONL file.\n\nVersion bump: 0.26.0 -> 0.26.1\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "ebcfcfaae6e61189961774cfffe5ffba0e8ccdd7",
+      "filename": "cmd/bd/daemon_sync.go",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/gastownhall/beads/blob/340016c9c668415f6acc59d970cc7d942dec1639/cmd%2Fbd%2Fdaemon_sync.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/340016c9c668415f6acc59d970cc7d942dec1639/cmd%2Fbd%2Fdaemon_sync.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/cmd%2Fbd%2Fdaemon_sync.go?ref=340016c9c668415f6acc59d970cc7d942dec1639",
+      "patch": "@@ -43,6 +43,8 @@ func exportToJSONLWithStore(ctx context.Context, store storage.Storage, jsonlPat\n \t}\n \n \t// Safety check: prevent exporting empty database over non-empty JSONL\n+\t// Note: The main bd-53c protection is in sync.go's reverse ZFC check which runs BEFORE export.\n+\t// Here we only block the most catastrophic case (empty DB) to allow legitimate deletions.\n \tif len(issues) == 0 {\n \t\texistingCount, err := countIssuesInJSONL(jsonlPath)\n \t\tif err != nil {"
+    },
+    {
+      "sha": "5cef88903ff9c61be221c91bbce4dc1c0d150805",
+      "filename": "cmd/bd/integrity.go",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 2,
+      "changes": 5,
+      "blob_url": "https://github.com/gastownhall/beads/blob/340016c9c668415f6acc59d970cc7d942dec1639/cmd%2Fbd%2Fintegrity.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/340016c9c668415f6acc59d970cc7d942dec1639/cmd%2Fbd%2Fintegrity.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/cmd%2Fbd%2Fintegrity.go?ref=340016c9c668415f6acc59d970cc7d942dec1639",
+      "patch": "@@ -180,8 +180,9 @@ func validatePreExport(ctx context.Context, store storage.Storage, jsonlPath str\n \t\treturn fmt.Errorf(\"refusing to export empty DB over %d issues in JSONL (would cause data loss)\", jsonlCount)\n \t}\n \n-\t// Note: ZFC (JSONL First Consistency - bd-l0r) is now enforced in sync.go\n-\t// by always importing before export. This validation is kept for direct bd export calls.\n+\t// Note: The main bd-53c protection is the reverse ZFC check in sync.go\n+\t// which runs BEFORE this validation. Here we only block empty DB.\n+\t// This allows legitimate deletions while sync.go catches stale DBs.\n \n \treturn nil\n }"
+    },
+    {
+      "sha": "4eeb9d8c29400aec17cafad86af455901d4ea84b",
+      "filename": "cmd/bd/sync.go",
+      "status": "modified",
+      "additions": 47,
+      "deletions": 24,
+      "changes": 71,
+      "blob_url": "https://github.com/gastownhall/beads/blob/340016c9c668415f6acc59d970cc7d942dec1639/cmd%2Fbd%2Fsync.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/340016c9c668415f6acc59d970cc7d942dec1639/cmd%2Fbd%2Fsync.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/cmd%2Fbd%2Fsync.go?ref=340016c9c668415f6acc59d970cc7d942dec1639",
+      "patch": "@@ -171,25 +171,55 @@ Use --merge to merge the sync branch back to main branch.`,\n \t\tif dryRun {\n \t\t\tfmt.Println(\"\u2192 [DRY RUN] Would export pending changes to JSONL\")\n \t\t} else {\n-\t\t\t// ZFC safety check (bd-l0r): if DB significantly diverges from JSONL,\n-\t\t\t// force import first to sync with JSONL source of truth\n-\t\t\t// After import, skip export to prevent overwriting JSONL (JSONL is source of truth)\n+\t\t\t// ZFC safety check (bd-l0r, bd-53c): if DB significantly diverges from JSONL,\n+\t\t\t// force import first to sync with JSONL source of truth.\n+\t\t\t// After import, skip export to prevent overwriting JSONL (JSONL is source of truth).\n+\t\t\t//\n+\t\t\t// bd-53c fix: Added REVERSE ZFC check - if JSONL has MORE issues than DB,\n+\t\t\t// this indicates the DB is stale and exporting would cause data loss.\n+\t\t\t// This catches the case where a fresh/stale clone tries to export an\n+\t\t\t// empty or outdated database over a JSONL with many issues.\n \t\t\tif err := ensureStoreActive(); err == nil && store != nil {\n \t\t\t\tdbCount, err := countDBIssuesFast(ctx, store)\n \t\t\t\tif err == nil {\n \t\t\t\t\tjsonlCount, err := countIssuesInJSONL(jsonlPath)\n-\t\t\t\t\tif err == nil && jsonlCount > 0 && dbCount > jsonlCount {\n-\t\t\t\t\t\tdivergence := float64(dbCount-jsonlCount) / float64(jsonlCount)\n-\t\t\t\t\t\tif divergence > 0.5 { // >50% more issues in DB than JSONL\n-\t\t\t\t\t\t\tfmt.Printf(\"\u2192 DB has %d issues but JSONL has %d (stale DB detected)\\n\", dbCount, jsonlCount)\n-\t\t\t\t\t\t\tfmt.Println(\"\u2192 Importing JSONL first (ZFC)...\")\n-\t\t\t\t\t\t\tif err := importFromJSONL(ctx, jsonlPath, renameOnImport, noGitHistory); err != nil {\n-\t\t\t\t\t\t\t\tfmt.Fprintf(os.Stderr, \"Error importing (ZFC): %v\\n\", err)\n-\t\t\t\t\t\t\t\tos.Exit(1)\n+\t\t\t\t\tif err == nil && jsonlCount > 0 {\n+\t\t\t\t\t\t// Case 1: DB has significantly more issues than JSONL\n+\t\t\t\t\t\t// (original ZFC check - DB is ahead of JSONL)\n+\t\t\t\t\t\tif dbCount > jsonlCount {\n+\t\t\t\t\t\t\tdivergence := float64(dbCount-jsonlCount) / float64(jsonlCount)\n+\t\t\t\t\t\t\tif divergence > 0.5 { // >50% more issues in DB than JSONL\n+\t\t\t\t\t\t\t\tfmt.Printf(\"\u2192 DB has %d issues but JSONL has %d (stale JSONL detected)\\n\", dbCount, jsonlCount)\n+\t\t\t\t\t\t\t\tfmt.Println(\"\u2192 Importing JSONL first (ZFC)...\")\n+\t\t\t\t\t\t\t\tif err := importFromJSONL(ctx, jsonlPath, renameOnImport, noGitHistory); err != nil {\n+\t\t\t\t\t\t\t\t\tfmt.Fprintf(os.Stderr, \"Error importing (ZFC): %v\\n\", err)\n+\t\t\t\t\t\t\t\t\tos.Exit(1)\n+\t\t\t\t\t\t\t\t}\n+\t\t\t\t\t\t\t\t// Skip export after ZFC import - JSONL is source of truth\n+\t\t\t\t\t\t\t\tskipExport = true\n+\t\t\t\t\t\t\t\tfmt.Println(\"\u2192 Skipping export (JSONL is source of truth after ZFC import)\")\n+\t\t\t\t\t\t\t}\n+\t\t\t\t\t\t}\n+\n+\t\t\t\t\t\t// Case 2 (bd-53c): JSONL has significantly more issues than DB\n+\t\t\t\t\t\t// This is the DANGEROUS case - exporting would lose issues!\n+\t\t\t\t\t\t// A stale/empty DB exporting over a populated JSONL causes data loss.\n+\t\t\t\t\t\tif jsonlCount > dbCount && !skipExport {\n+\t\t\t\t\t\t\tdivergence := float64(jsonlCount-dbCount) / float64(jsonlCount)\n+\t\t\t\t\t\t\t// Use stricter threshold for this dangerous case:\n+\t\t\t\t\t\t\t// - Any loss > 20% is suspicious\n+\t\t\t\t\t\t\t// - Complete loss (DB empty) is always blocked\n+\t\t\t\t\t\t\tif dbCount == 0 || divergence > 0.2 {\n+\t\t\t\t\t\t\t\tfmt.Printf(\"\u2192 JSONL has %d issues but DB has only %d (stale DB detected - bd-53c)\\n\", jsonlCount, dbCount)\n+\t\t\t\t\t\t\t\tfmt.Println(\"\u2192 Importing JSONL first to prevent data loss...\")\n+\t\t\t\t\t\t\t\tif err := importFromJSONL(ctx, jsonlPath, renameOnImport, noGitHistory); err != nil {\n+\t\t\t\t\t\t\t\t\tfmt.Fprintf(os.Stderr, \"Error importing (reverse ZFC): %v\\n\", err)\n+\t\t\t\t\t\t\t\t\tos.Exit(1)\n+\t\t\t\t\t\t\t\t}\n+\t\t\t\t\t\t\t\t// Skip export after import - JSONL is source of truth\n+\t\t\t\t\t\t\t\tskipExport = true\n+\t\t\t\t\t\t\t\tfmt.Println(\"\u2192 Skipping export (JSONL is source of truth after reverse ZFC import)\")\n \t\t\t\t\t\t\t}\n-\t\t\t\t\t\t\t// Skip export after ZFC import - JSONL is source of truth\n-\t\t\t\t\t\t\tskipExport = true\n-\t\t\t\t\t\t\tfmt.Println(\"\u2192 Skipping export (JSONL is source of truth after ZFC import)\")\n \t\t\t\t\t\t}\n \t\t\t\t\t}\n \t\t\t\t}\n@@ -886,6 +916,9 @@ func exportToJSONL(ctx context.Context, jsonlPath string) error {\n \t}\n \n \t// Safety check: prevent exporting empty database over non-empty JSONL\n+\t// Note: The main bd-53c protection is the reverse ZFC check earlier in sync.go\n+\t// which runs BEFORE export. Here we only block the most catastrophic case (empty DB)\n+\t// to allow legitimate deletions.\n \tif len(issues) == 0 {\n \t\texistingCount, countErr := countIssuesInJSONL(jsonlPath)\n \t\tif countErr != nil {\n@@ -898,16 +931,6 @@ func exportToJSONL(ctx context.Context, jsonlPath string) error {\n \t\t}\n \t}\n \n-\t// Warning: check if export would lose >50% of issues\n-\texistingCount, err := countIssuesInJSONL(jsonlPath)\n-\tif err == nil && existingCount > 0 {\n-\t\tlossPercent := float64(existingCount-len(issues)) / float64(existingCount) * 100\n-\t\tif lossPercent > 50 {\n-\t\t\tfmt.Fprintf(os.Stderr, \"WARNING: Export would lose %.1f%% of issues (existing: %d, database: %d)\\n\",\n-\t\t\t\tlossPercent, existingCount, len(issues))\n-\t\t}\n-\t}\n-\n \t// Sort by ID for consistent output\n \tsort.Slice(issues, func(i, j int) bool {\n \t\treturn issues[i].ID < issues[j].ID"
+    },
+    {
+      "sha": "57267a2219f95ddd8cf0c5688f2c068d0607692d",
+      "filename": "cmd/bd/version.go",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/gastownhall/beads/blob/340016c9c668415f6acc59d970cc7d942dec1639/cmd%2Fbd%2Fversion.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/340016c9c668415f6acc59d970cc7d942dec1639/cmd%2Fbd%2Fversion.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/cmd%2Fbd%2Fversion.go?ref=340016c9c668415f6acc59d970cc7d942dec1639",
+      "patch": "@@ -14,7 +14,7 @@ import (\n \n var (\n \t// Version is the current version of bd (overridden by ldflags at build time)\n-\tVersion = \"0.26.0\"\n+\tVersion = \"0.26.1\"\n \t// Build can be set via ldflags at compile time\n \tBuild = \"dev\"\n \t// Commit and branch the git revision the binary was built from (optional ldflag)"
+    }
+  ]
+}

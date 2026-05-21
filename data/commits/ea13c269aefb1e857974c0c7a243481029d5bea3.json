@@ -1,0 +1,29 @@
+{
+  "message": "Merge pull request #108 from jakehemmerle/fix/daemon-orphan-race-condition\n\nfix(daemon): prevent orphan daemons via file locking",
+  "files": [
+    {
+      "sha": "1c08d929ab244cbf9225c47aec8e8ca766dba453",
+      "filename": "internal/cmd/daemon.go",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 1,
+      "changes": 11,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/ea13c269aefb1e857974c0c7a243481029d5bea3/internal%2Fcmd%2Fdaemon.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/ea13c269aefb1e857974c0c7a243481029d5bea3/internal%2Fcmd%2Fdaemon.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fcmd%2Fdaemon.go?ref=ea13c269aefb1e857974c0c7a243481029d5bea3",
+      "patch": "@@ -117,7 +117,7 @@ func runDaemonStart(cmd *cobra.Command, args []string) error {\n \t\treturn fmt.Errorf(\"starting daemon: %w\", err)\n \t}\n \n-\t// Wait a moment for the daemon to initialize\n+\t// Wait a moment for the daemon to initialize and acquire the lock\n \ttime.Sleep(200 * time.Millisecond)\n \n \t// Verify it started\n@@ -129,6 +129,15 @@ func runDaemonStart(cmd *cobra.Command, args []string) error {\n \t\treturn fmt.Errorf(\"daemon failed to start (check logs with 'gt daemon logs')\")\n \t}\n \n+\t// Check if our spawned process is the one that won the race.\n+\t// If another concurrent start won, our process would have exited after\n+\t// failing to acquire the lock, and the PID file would have a different PID.\n+\tif pid != daemonCmd.Process.Pid {\n+\t\t// Another daemon won the race - that's fine, report it\n+\t\tfmt.Printf(\"%s Daemon already running (PID %d)\\n\", style.Bold.Render(\"\u25cf\"), pid)\n+\t\treturn nil\n+\t}\n+\n \tfmt.Printf(\"%s Daemon started (PID %d)\\n\", style.Bold.Render(\"\u2713\"), pid)\n \treturn nil\n }"
+    },
+    {
+      "sha": "7ac908d602a7a4d3f00865455b28aadb32a37f33",
+      "filename": "internal/daemon/daemon.go",
+      "status": "modified",
+      "additions": 24,
+      "deletions": 3,
+      "changes": 27,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/ea13c269aefb1e857974c0c7a243481029d5bea3/internal%2Fdaemon%2Fdaemon.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/ea13c269aefb1e857974c0c7a243481029d5bea3/internal%2Fdaemon%2Fdaemon.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fdaemon%2Fdaemon.go?ref=ea13c269aefb1e857974c0c7a243481029d5bea3",
+      "patch": "@@ -67,6 +67,22 @@ func New(config *Config) (*Daemon, error) {\n func (d *Daemon) Run() error {\n \td.logger.Printf(\"Daemon starting (PID %d)\", os.Getpid())\n \n+\t// Acquire exclusive lock to prevent multiple daemons from running.\n+\t// This prevents the TOCTOU race condition where multiple concurrent starts\n+\t// can all pass the IsRunning() check before any writes the PID file.\n+\tlockFile := filepath.Join(d.config.TownRoot, \"daemon\", \"daemon.lock\")\n+\tlock, err := os.OpenFile(lockFile, os.O_CREATE|os.O_RDWR, 0644)\n+\tif err != nil {\n+\t\treturn fmt.Errorf(\"opening lock file: %w\", err)\n+\t}\n+\tdefer lock.Close()\n+\n+\t// Try to acquire exclusive lock (non-blocking)\n+\tif err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {\n+\t\treturn fmt.Errorf(\"daemon already running (lock held by another process)\")\n+\t}\n+\tdefer func() { _ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) }()\n+\n \t// Write PID file\n \tif err := os.WriteFile(d.config.PidFile, []byte(strconv.Itoa(os.Getpid())), 0644); err != nil {\n \t\treturn fmt.Errorf(\"writing PID file: %w\", err)\n@@ -684,6 +700,9 @@ func (d *Daemon) Stop() {\n }\n \n // IsRunning checks if a daemon is running for the given town.\n+// It checks the PID file and verifies the process is alive.\n+// Note: The file lock in Run() is the authoritative mechanism for preventing\n+// duplicate daemons. This function is for status checks and cleanup.\n func IsRunning(townRoot string) (bool, int, error) {\n \tpidFile := filepath.Join(townRoot, \"daemon\", \"daemon.pid\")\n \tdata, err := os.ReadFile(pidFile)\n@@ -708,7 +727,7 @@ func IsRunning(townRoot string) (bool, int, error) {\n \t// On Unix, FindProcess always succeeds. Send signal 0 to check if alive.\n \terr = process.Signal(syscall.Signal(0))\n \tif err != nil {\n-\t\t// Process not running, clean up stale PID file (best-effort cleanup)\n+\t\t// Process not running, clean up stale PID file\n \t\t_ = os.Remove(pidFile)\n \t\treturn false, 0, nil\n \t}\n@@ -717,6 +736,8 @@ func IsRunning(townRoot string) (bool, int, error) {\n }\n \n // StopDaemon stops the running daemon for the given town.\n+// Note: The file lock in Run() prevents multiple daemons per town, so we only\n+// need to kill the process from the PID file.\n func StopDaemon(townRoot string) error {\n \trunning, pid, err := IsRunning(townRoot)\n \tif err != nil {\n@@ -741,11 +762,11 @@ func StopDaemon(townRoot string) error {\n \n \t// Check if still running\n \tif err := process.Signal(syscall.Signal(0)); err == nil {\n-\t\t// Still running, force kill (best-effort)\n+\t\t// Still running, force kill\n \t\t_ = process.Signal(syscall.SIGKILL)\n \t}\n \n-\t// Clean up PID file (best-effort cleanup)\n+\t// Clean up PID file\n \tpidFile := filepath.Join(townRoot, \"daemon\", \"daemon.pid\")\n \t_ = os.Remove(pidFile)\n "
+    }
+  ]
+}

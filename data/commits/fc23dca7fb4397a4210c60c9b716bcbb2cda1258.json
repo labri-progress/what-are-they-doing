@@ -1,0 +1,52 @@
+{
+  "message": "feat(cli): add --lock-timeout flag for SQLite busy_timeout control (#536)\n\nImplements single-shot mode improvements for Windows and Docker scenarios:\n\n- Add --lock-timeout global flag (default 30s, 0 = fail immediately)\n- Add config file support: lock-timeout: 100ms\n- Parameterize SQLite busy_timeout via NewWithTimeout() function\n- In --sandbox mode: default lock-timeout to 100ms\n- In --sandbox mode: skip FlushManager creation (no background goroutines)\n\nThis addresses bd.exe hanging on Windows and locking conflicts when\nusing beads across host + Docker containers.\n\nCloses: bd-59er, bd-r4od, bd-dh8a\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "bfc376d415040dee35b4210e9714a267c3ea9ac3",
+      "filename": ".beads/issues.jsonl",
+      "status": "modified",
+      "additions": 785,
+      "deletions": 772,
+      "changes": 1557,
+      "blob_url": "https://github.com/gastownhall/beads/blob/fc23dca7fb4397a4210c60c9b716bcbb2cda1258/.beads%2Fissues.jsonl",
+      "raw_url": "https://github.com/gastownhall/beads/raw/fc23dca7fb4397a4210c60c9b716bcbb2cda1258/.beads%2Fissues.jsonl",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/.beads%2Fissues.jsonl?ref=fc23dca7fb4397a4210c60c9b716bcbb2cda1258"
+    },
+    {
+      "sha": "7beb4f9822616766656a3dac6b31fe7c57c41270",
+      "filename": "cmd/bd/main.go",
+      "status": "modified",
+      "additions": 21,
+      "deletions": 8,
+      "changes": 29,
+      "blob_url": "https://github.com/gastownhall/beads/blob/fc23dca7fb4397a4210c60c9b716bcbb2cda1258/cmd%2Fbd%2Fmain.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/fc23dca7fb4397a4210c60c9b716bcbb2cda1258/cmd%2Fbd%2Fmain.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/cmd%2Fbd%2Fmain.go?ref=fc23dca7fb4397a4210c60c9b716bcbb2cda1258",
+      "patch": "@@ -96,12 +96,13 @@ var (\n )\n \n var (\n-\tnoAutoFlush  bool\n-\tnoAutoImport bool\n-\tsandboxMode  bool\n-\tallowStale   bool // Use --allow-stale: skip staleness check (emergency escape hatch)\n-\tnoDb         bool // Use --no-db mode: load from JSONL, write back after each command\n-\treadonlyMode bool // Read-only mode: block write operations (for worker sandboxes)\n+\tnoAutoFlush    bool\n+\tnoAutoImport   bool\n+\tsandboxMode    bool\n+\tallowStale     bool          // Use --allow-stale: skip staleness check (emergency escape hatch)\n+\tnoDb           bool          // Use --no-db mode: load from JSONL, write back after each command\n+\treadonlyMode   bool          // Read-only mode: block write operations (for worker sandboxes)\n+\tlockTimeout    time.Duration // SQLite busy_timeout (default 30s, 0 = fail immediately)\n \tprofileEnabled bool\n \tprofileFile    *os.File\n \ttraceFile      *os.File\n@@ -126,6 +127,7 @@ func init() {\n \trootCmd.PersistentFlags().BoolVar(&allowStale, \"allow-stale\", false, \"Allow operations on potentially stale data (skip staleness check)\")\n \trootCmd.PersistentFlags().BoolVar(&noDb, \"no-db\", false, \"Use no-db mode: load from JSONL, no SQLite\")\n \trootCmd.PersistentFlags().BoolVar(&readonlyMode, \"readonly\", false, \"Read-only mode: block write operations (for worker sandboxes)\")\n+\trootCmd.PersistentFlags().DurationVar(&lockTimeout, \"lock-timeout\", 30*time.Second, \"SQLite busy timeout (0 = fail immediately if locked)\")\n \trootCmd.PersistentFlags().BoolVar(&profileEnabled, \"profile\", false, \"Generate CPU profile for performance analysis\")\n \trootCmd.PersistentFlags().BoolVarP(&verboseFlag, \"verbose\", \"v\", false, \"Enable verbose/debug output\")\n \trootCmd.PersistentFlags().BoolVarP(&quietFlag, \"quiet\", \"q\", false, \"Suppress non-essential output (errors only)\")\n@@ -178,6 +180,9 @@ var rootCmd = &cobra.Command{\n \t\tif !cmd.Flags().Changed(\"readonly\") {\n \t\t\treadonlyMode = config.GetBool(\"readonly\")\n \t\t}\n+\t\tif !cmd.Flags().Changed(\"lock-timeout\") {\n+\t\t\tlockTimeout = config.GetDuration(\"lock-timeout\")\n+\t\t}\n \t\tif !cmd.Flags().Changed(\"db\") && dbPath == \"\" {\n \t\t\tdbPath = config.GetString(\"db\")\n \t\t}\n@@ -250,6 +255,10 @@ var rootCmd = &cobra.Command{\n \t\t\tnoDaemon = true\n \t\t\tnoAutoFlush = true\n \t\t\tnoAutoImport = true\n+\t\t\t// Use shorter lock timeout in sandbox mode unless explicitly set\n+\t\t\tif !cmd.Flags().Changed(\"lock-timeout\") {\n+\t\t\t\tlockTimeout = 100 * time.Millisecond\n+\t\t\t}\n \t\t}\n \n \t\t// Force direct mode for human-only interactive commands\n@@ -555,7 +564,7 @@ var rootCmd = &cobra.Command{\n \n \t\t// Fall back to direct storage access\n \t\tvar err error\n-\t\tstore, err = sqlite.New(rootCtx, dbPath)\n+\t\tstore, err = sqlite.NewWithTimeout(rootCtx, dbPath, lockTimeout)\n \t\tif err != nil {\n \t\t\t// Check for fresh clone scenario (bd-dmb)\n \t\t\tbeadsDir := filepath.Dir(dbPath)\n@@ -572,10 +581,14 @@ var rootCmd = &cobra.Command{\n \t\tstoreMutex.Unlock()\n \n \t\t// Initialize flush manager (fixes bd-52: race condition in auto-flush)\n+\t\t// Skip FlushManager creation in sandbox mode - no background goroutines needed\n+\t\t// (bd-dh8a: improves Windows exit behavior and container scenarios)\n \t\t// For in-process test scenarios where commands run multiple times,\n \t\t// we create a new manager each time. Shutdown() is idempotent so\n \t\t// PostRun can safely shutdown whichever manager is active.\n-\t\tflushManager = NewFlushManager(autoFlushEnabled, getDebounceDuration())\n+\t\tif !sandboxMode {\n+\t\t\tflushManager = NewFlushManager(autoFlushEnabled, getDebounceDuration())\n+\t\t}\n \n \t\t// Warn if multiple databases detected in directory hierarchy\n \t\twarnMultipleDatabases(dbPath)"
+    },
+    {
+      "sha": "0483ece0b424b4c9d691798eabcc7f6da09002c7",
+      "filename": "internal/config/config.go",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/gastownhall/beads/blob/fc23dca7fb4397a4210c60c9b716bcbb2cda1258/internal%2Fconfig%2Fconfig.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/fc23dca7fb4397a4210c60c9b716bcbb2cda1258/internal%2Fconfig%2Fconfig.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fconfig%2Fconfig.go?ref=fc23dca7fb4397a4210c60c9b716bcbb2cda1258",
+      "patch": "@@ -83,6 +83,7 @@ func Initialize() error {\n \tv.SetDefault(\"db\", \"\")\n \tv.SetDefault(\"actor\", \"\")\n \tv.SetDefault(\"issue-prefix\", \"\")\n+\tv.SetDefault(\"lock-timeout\", \"30s\")\n \t\n \t// Additional environment variables (not prefixed with BD_)\n \t// These are bound explicitly for backward compatibility"
+    },
+    {
+      "sha": "b1607fdff33b884f97c216f98510fd003c2892a9",
+      "filename": "internal/storage/sqlite/store.go",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 4,
+      "changes": 18,
+      "blob_url": "https://github.com/gastownhall/beads/blob/fc23dca7fb4397a4210c60c9b716bcbb2cda1258/internal%2Fstorage%2Fsqlite%2Fstore.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/fc23dca7fb4397a4210c60c9b716bcbb2cda1258/internal%2Fstorage%2Fsqlite%2Fstore.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fstorage%2Fsqlite%2Fstore.go?ref=fc23dca7fb4397a4210c60c9b716bcbb2cda1258",
+      "patch": "@@ -10,6 +10,7 @@ import (\n \t\"runtime\"\n \t\"strings\"\n \t\"sync/atomic\"\n+\t\"time\"\n \n \t// Import SQLite driver\n \tsqlite3 \"github.com/ncruces/go-sqlite3\"\n@@ -72,21 +73,30 @@ func init() {\n \t_ = setupWASMCache()\n }\n \n-// New creates a new SQLite storage backend\n+// New creates a new SQLite storage backend with default 30s busy timeout\n func New(ctx context.Context, path string) (*SQLiteStorage, error) {\n+\treturn NewWithTimeout(ctx, path, 30*time.Second)\n+}\n+\n+// NewWithTimeout creates a new SQLite storage backend with configurable busy timeout.\n+// A timeout of 0 means fail immediately if the database is locked.\n+func NewWithTimeout(ctx context.Context, path string, busyTimeout time.Duration) (*SQLiteStorage, error) {\n+\t// Convert timeout to milliseconds for SQLite pragma\n+\ttimeoutMs := int64(busyTimeout / time.Millisecond)\n+\n \t// Build connection string with proper URI syntax\n \t// For :memory: databases, use shared cache so multiple connections see the same data\n \tvar connStr string\n \tif path == \":memory:\" {\n \t\t// Use shared in-memory database with a named identifier\n \t\t// Note: WAL mode doesn't work with shared in-memory databases, so use DELETE mode\n \t\t// The name \"memdb\" is required for cache=shared to work properly across connections\n-\t\tconnStr = \"file:memdb?mode=memory&cache=shared&_pragma=journal_mode(DELETE)&_pragma=foreign_keys(ON)&_pragma=busy_timeout(30000)&_time_format=sqlite\"\n+\t\tconnStr = fmt.Sprintf(\"file:memdb?mode=memory&cache=shared&_pragma=journal_mode(DELETE)&_pragma=foreign_keys(ON)&_pragma=busy_timeout(%d)&_time_format=sqlite\", timeoutMs)\n \t} else if strings.HasPrefix(path, \"file:\") {\n \t\t// Already a URI - append our pragmas if not present\n \t\tconnStr = path\n \t\tif !strings.Contains(path, \"_pragma=foreign_keys\") {\n-\t\t\tconnStr += \"&_pragma=foreign_keys(ON)&_pragma=busy_timeout(30000)&_time_format=sqlite\"\n+\t\t\tconnStr += fmt.Sprintf(\"&_pragma=foreign_keys(ON)&_pragma=busy_timeout(%d)&_time_format=sqlite\", timeoutMs)\n \t\t}\n \t} else {\n \t\t// Ensure directory exists for file-based databases\n@@ -95,7 +105,7 @@ func New(ctx context.Context, path string) (*SQLiteStorage, error) {\n \t\t\treturn nil, fmt.Errorf(\"failed to create directory: %w\", err)\n \t\t}\n \t\t// Use file URI with pragmas\n-\t\tconnStr = \"file:\" + path + \"?_pragma=foreign_keys(ON)&_pragma=busy_timeout(30000)&_time_format=sqlite\"\n+\t\tconnStr = fmt.Sprintf(\"file:%s?_pragma=foreign_keys(ON)&_pragma=busy_timeout(%d)&_time_format=sqlite\", path, timeoutMs)\n \t}\n \n \tdb, err := sql.Open(\"sqlite3\", connStr)"
+    }
+  ]
+}

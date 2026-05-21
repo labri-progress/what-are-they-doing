@@ -1,0 +1,53 @@
+{
+  "message": "Fix race condition in dirty issue tracking (bd-52, bd-53)\n\nFix critical TOCTOU bug where concurrent operations could lose dirty\nissue tracking, causing data loss in incremental exports. Also fixes\nbug where export with filters would incorrectly clear all dirty issues.\n\nThe Problem:\n1. GetDirtyIssues() returns [bd-1, bd-2]\n2. Concurrent CRUD marks bd-3 dirty\n3. Export writes bd-1, bd-2\n4. ClearDirtyIssues() deletes ALL (including bd-3)\n5. Result: bd-3 never gets exported!\n\nThe Fix:\n- Add ClearDirtyIssuesByID() that only clears specific issue IDs\n- Track which issues were actually exported\n- Clear only those specific IDs, not all dirty issues\n- Fixes both race condition and filter export bug\n\nChanges:\n- internal/storage/sqlite/dirty.go:\n  * Add ClearDirtyIssuesByID() method\n  * Add warning to ClearDirtyIssues() about race condition\n- internal/storage/storage.go:\n  * Add ClearDirtyIssuesByID to interface\n- cmd/bd/main.go:\n  * Update auto-flush to use ClearDirtyIssuesByID()\n- cmd/bd/export.go:\n  * Track exported issue IDs\n  * Use ClearDirtyIssuesByID() instead of ClearDirtyIssues()\n\nTesting:\n- Created test-1, test-2, test-3 (all dirty)\n- Updated test-2 to in_progress\n- Exported with --status open filter (exports only test-1, test-3)\n- Verified only test-2 remains dirty \u2713\n- All existing tests pass \u2713\n\nImpact:\n- Race condition eliminated - concurrent operations are safe\n- Export with filters now works correctly\n- No data loss from competing writes\n\nCloses bd-52, bd-53\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "439b7cf0db49ef3b87f6fc0840f5f3fe6015c294",
+      "filename": "cmd/bd/export.go",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 2,
+      "changes": 6,
+      "blob_url": "https://github.com/gastownhall/beads/blob/92759710de1a13b52748faadd4faed6a0ef6660f/cmd%2Fbd%2Fexport.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/92759710de1a13b52748faadd4faed6a0ef6660f/cmd%2Fbd%2Fexport.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/cmd%2Fbd%2Fexport.go?ref=92759710de1a13b52748faadd4faed6a0ef6660f",
+      "patch": "@@ -76,18 +76,20 @@ Output to stdout by default, or use -o flag for file output.`,\n \n \t\t// Write JSONL\n \t\tencoder := json.NewEncoder(out)\n+\t\texportedIDs := make([]string, 0, len(issues))\n \t\tfor _, issue := range issues {\n \t\t\tif err := encoder.Encode(issue); err != nil {\n \t\t\t\tfmt.Fprintf(os.Stderr, \"Error encoding issue %s: %v\\n\", issue.ID, err)\n \t\t\t\tos.Exit(1)\n \t\t\t}\n+\t\t\texportedIDs = append(exportedIDs, issue.ID)\n \t\t}\n \n \t\t// Only clear dirty issues and auto-flush state if exporting to the default JSONL path\n \t\t// This prevents clearing dirty flags when exporting to custom paths (e.g., bd export -o backup.jsonl)\n \t\tif output == \"\" || output == findJSONLPath() {\n-\t\t\t// Clear dirty issues since we just exported to the canonical JSONL file\n-\t\t\tif err := store.ClearDirtyIssues(ctx); err != nil {\n+\t\t\t// Clear only the issues that were actually exported (fixes bd-52 race condition)\n+\t\t\tif err := store.ClearDirtyIssuesByID(ctx, exportedIDs); err != nil {\n \t\t\t\tfmt.Fprintf(os.Stderr, \"Warning: failed to clear dirty issues: %v\\n\", err)\n \t\t\t}\n "
+    },
+    {
+      "sha": "4b1c4308f7a69d35087201d2afffd3df4ee4864e",
+      "filename": "cmd/bd/main.go",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/gastownhall/beads/blob/92759710de1a13b52748faadd4faed6a0ef6660f/cmd%2Fbd%2Fmain.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/92759710de1a13b52748faadd4faed6a0ef6660f/cmd%2Fbd%2Fmain.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/cmd%2Fbd%2Fmain.go?ref=92759710de1a13b52748faadd4faed6a0ef6660f",
+      "patch": "@@ -516,8 +516,8 @@ func flushToJSONL() {\n \t\treturn\n \t}\n \n-\t// Clear dirty issues after successful export\n-\tif err := store.ClearDirtyIssues(ctx); err != nil {\n+\t// Clear only the dirty issues that were actually exported (fixes bd-52 race condition)\n+\tif err := store.ClearDirtyIssuesByID(ctx, dirtyIDs); err != nil {\n \t\t// Don't fail the whole flush for this, but warn\n \t\tfmt.Fprintf(os.Stderr, \"Warning: failed to clear dirty issues: %v\\n\", err)\n \t}"
+    },
+    {
+      "sha": "a612a89eddc5367e7d806eba5614c47f43b0ed0d",
+      "filename": "internal/storage/sqlite/dirty.go",
+      "status": "modified",
+      "additions": 31,
+      "deletions": 0,
+      "changes": 31,
+      "blob_url": "https://github.com/gastownhall/beads/blob/92759710de1a13b52748faadd4faed6a0ef6660f/internal%2Fstorage%2Fsqlite%2Fdirty.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/92759710de1a13b52748faadd4faed6a0ef6660f/internal%2Fstorage%2Fsqlite%2Fdirty.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fstorage%2Fsqlite%2Fdirty.go?ref=92759710de1a13b52748faadd4faed6a0ef6660f",
+      "patch": "@@ -77,6 +77,9 @@ func (s *SQLiteStorage) GetDirtyIssues(ctx context.Context) ([]string, error) {\n \n // ClearDirtyIssues removes all entries from the dirty_issues table\n // This should be called after a successful JSONL export\n+//\n+// WARNING: This has a race condition (bd-52). Use ClearDirtyIssuesByID instead\n+// to only clear specific issues that were actually exported.\n func (s *SQLiteStorage) ClearDirtyIssues(ctx context.Context) error {\n \t_, err := s.db.ExecContext(ctx, `DELETE FROM dirty_issues`)\n \tif err != nil {\n@@ -85,6 +88,34 @@ func (s *SQLiteStorage) ClearDirtyIssues(ctx context.Context) error {\n \treturn nil\n }\n \n+// ClearDirtyIssuesByID removes specific issue IDs from the dirty_issues table\n+// This avoids race conditions by only clearing issues that were actually exported\n+func (s *SQLiteStorage) ClearDirtyIssuesByID(ctx context.Context, issueIDs []string) error {\n+\tif len(issueIDs) == 0 {\n+\t\treturn nil\n+\t}\n+\n+\ttx, err := s.db.BeginTx(ctx, nil)\n+\tif err != nil {\n+\t\treturn fmt.Errorf(\"failed to begin transaction: %w\", err)\n+\t}\n+\tdefer tx.Rollback()\n+\n+\tstmt, err := tx.PrepareContext(ctx, `DELETE FROM dirty_issues WHERE issue_id = ?`)\n+\tif err != nil {\n+\t\treturn fmt.Errorf(\"failed to prepare statement: %w\", err)\n+\t}\n+\tdefer stmt.Close()\n+\n+\tfor _, issueID := range issueIDs {\n+\t\tif _, err := stmt.ExecContext(ctx, issueID); err != nil {\n+\t\t\treturn fmt.Errorf(\"failed to clear dirty issue %s: %w\", issueID, err)\n+\t\t}\n+\t}\n+\n+\treturn tx.Commit()\n+}\n+\n // GetDirtyIssueCount returns the count of dirty issues (for monitoring/debugging)\n func (s *SQLiteStorage) GetDirtyIssueCount(ctx context.Context) (int, error) {\n \tvar count int"
+    },
+    {
+      "sha": "1b3b4c965bec69bd387d51767c8f9943c87af897",
+      "filename": "internal/storage/storage.go",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/gastownhall/beads/blob/92759710de1a13b52748faadd4faed6a0ef6660f/internal%2Fstorage%2Fstorage.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/92759710de1a13b52748faadd4faed6a0ef6660f/internal%2Fstorage%2Fstorage.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fstorage%2Fstorage.go?ref=92759710de1a13b52748faadd4faed6a0ef6660f",
+      "patch": "@@ -45,7 +45,8 @@ type Storage interface {\n \n \t// Dirty tracking (for incremental JSONL export)\n \tGetDirtyIssues(ctx context.Context) ([]string, error)\n-\tClearDirtyIssues(ctx context.Context) error\n+\tClearDirtyIssues(ctx context.Context) error // WARNING: Race condition (bd-52), use ClearDirtyIssuesByID\n+\tClearDirtyIssuesByID(ctx context.Context, issueIDs []string) error\n \n \t// Config\n \tSetConfig(ctx context.Context, key, value string) error"
+    }
+  ]
+}

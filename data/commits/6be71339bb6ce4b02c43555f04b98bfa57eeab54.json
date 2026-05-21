@@ -1,0 +1,41 @@
+{
+  "message": "fix: use SQLITE_BUSY retry logic for all BEGIN IMMEDIATE calls (bd-ola6)\n\nThree call sites were using raw BEGIN IMMEDIATE without retry, relying\nsolely on busy_timeout. Replace with beginImmediateWithRetry (exponential\nbackoff: 10ms..160ms, 5 retries) which handles SQLITE_BUSY_SNAPSHOT and\nother cases where busy_timeout alone is insufficient.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "0cb31ff9504a49c682db968739ae5be6677e39f6",
+      "filename": "internal/storage/sqlite/batch_ops.go",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 3,
+      "changes": 7,
+      "blob_url": "https://github.com/gastownhall/beads/blob/6be71339bb6ce4b02c43555f04b98bfa57eeab54/internal%2Fstorage%2Fsqlite%2Fbatch_ops.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/6be71339bb6ce4b02c43555f04b98bfa57eeab54/internal%2Fstorage%2Fsqlite%2Fbatch_ops.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fstorage%2Fsqlite%2Fbatch_ops.go?ref=6be71339bb6ce4b02c43555f04b98bfa57eeab54",
+      "patch": "@@ -272,9 +272,10 @@ func (s *SQLiteStorage) CreateIssuesWithFullOptions(ctx context.Context, issues\n \t}\n \tdefer func() { _ = conn.Close() }()\n \n-\t// Start IMMEDIATE transaction to acquire write lock early.\n-\t// The connection's busy_timeout pragma (30s) handles retries if locked.\n-\tif _, err := conn.ExecContext(ctx, \"BEGIN IMMEDIATE\"); err != nil {\n+\t// Start IMMEDIATE transaction with retry logic for SQLITE_BUSY.\n+\t// Retries with exponential backoff handle cases where busy_timeout alone\n+\t// is insufficient (e.g., SQLITE_BUSY_SNAPSHOT).\n+\tif err := beginImmediateWithRetry(ctx, conn, 5, 10*time.Millisecond); err != nil {\n \t\treturn fmt.Errorf(\"failed to begin immediate transaction: %w\", err)\n \t}\n "
+    },
+    {
+      "sha": "f521c01eeff755b9153ed8262afc4dd4ba492abe",
+      "filename": "internal/storage/sqlite/queries.go",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 3,
+      "changes": 6,
+      "blob_url": "https://github.com/gastownhall/beads/blob/6be71339bb6ce4b02c43555f04b98bfa57eeab54/internal%2Fstorage%2Fsqlite%2Fqueries.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/6be71339bb6ce4b02c43555f04b98bfa57eeab54/internal%2Fstorage%2Fsqlite%2Fqueries.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fstorage%2Fsqlite%2Fqueries.go?ref=6be71339bb6ce4b02c43555f04b98bfa57eeab54",
+      "patch": "@@ -153,15 +153,15 @@ func (s *SQLiteStorage) CreateIssue(ctx context.Context, issue *types.Issue, act\n \t}\n \tdefer func() { _ = conn.Close() }()\n \n-\t// Start IMMEDIATE transaction to acquire write lock early and prevent race conditions.\n+\t// Start IMMEDIATE transaction with retry logic for SQLITE_BUSY.\n \t// IMMEDIATE acquires a RESERVED lock immediately, preventing other IMMEDIATE or EXCLUSIVE\n \t// transactions from starting. This serializes ID generation across concurrent writers.\n \t//\n \t// We use raw Exec instead of BeginTx because database/sql doesn't support transaction\n \t// modes in BeginTx, and modernc.org/sqlite's BeginTx always uses DEFERRED mode.\n \t//\n-\t// The connection's busy_timeout pragma (30s) handles retries if locked.\n-\tif _, err := conn.ExecContext(ctx, \"BEGIN IMMEDIATE\"); err != nil {\n+\t// Retries with exponential backoff handle cases where busy_timeout alone is insufficient.\n+\tif err := beginImmediateWithRetry(ctx, conn, 5, 10*time.Millisecond); err != nil {\n \t\treturn fmt.Errorf(\"failed to begin immediate transaction: %w\", err)\n \t}\n "
+    },
+    {
+      "sha": "c9f57632c4b8fa51cc26aa5083292e937e54a5bc",
+      "filename": "internal/storage/sqlite/util.go",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 4,
+      "changes": 10,
+      "blob_url": "https://github.com/gastownhall/beads/blob/6be71339bb6ce4b02c43555f04b98bfa57eeab54/internal%2Fstorage%2Fsqlite%2Futil.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/6be71339bb6ce4b02c43555f04b98bfa57eeab54/internal%2Fstorage%2Fsqlite%2Futil.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fstorage%2Fsqlite%2Futil.go?ref=6be71339bb6ce4b02c43555f04b98bfa57eeab54",
+      "patch": "@@ -4,6 +4,7 @@ import (\n \t\"context\"\n \t\"database/sql\"\n \t\"strings\"\n+\t\"time\"\n )\n \n // QueryContext exposes the underlying database QueryContext method for advanced queries\n@@ -35,11 +36,12 @@ func (s *SQLiteStorage) withTx(ctx context.Context, fn func(*sql.Conn) error) er\n \t}\n \tdefer func() { _ = conn.Close() }()\n \n-\t// Start IMMEDIATE transaction to acquire write lock early.\n+\t// Start IMMEDIATE transaction with retry logic for SQLITE_BUSY.\n \t// BEGIN IMMEDIATE prevents deadlocks by acquiring the write lock upfront\n-\t// rather than upgrading from a read lock later. The connection's\n-\t// busy_timeout pragma (30s) handles retries if another writer holds the lock.\n-\tif _, err := conn.ExecContext(ctx, \"BEGIN IMMEDIATE\"); err != nil {\n+\t// rather than upgrading from a read lock later. Retries with exponential\n+\t// backoff handle cases where busy_timeout alone is insufficient\n+\t// (e.g., SQLITE_BUSY_SNAPSHOT).\n+\tif err := beginImmediateWithRetry(ctx, conn, 5, 10*time.Millisecond); err != nil {\n \t\treturn wrapDBError(\"begin transaction\", err)\n \t}\n "
+    }
+  ]
+}

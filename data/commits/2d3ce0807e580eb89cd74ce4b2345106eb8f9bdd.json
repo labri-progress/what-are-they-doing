@@ -1,0 +1,41 @@
+{
+  "message": "fix: sync CLI remotes into SQL server on store open (GH#2315)\n\nAfter a Dolt server restart, dolt_remotes (in-memory) is empty while CLI\nremotes persist in .dolt/config. This caused bd dolt push to fail with\n\"remote origin not found\" because DOLT_PUSH queries the SQL table.\n\nsyncCLIRemotesToSQL runs on every store Open() \u2014 it compares CLI and SQL\nremotes and re-registers any CLI-only remotes into the SQL server. The\ncheck is cheap (two local queries) and only fires DOLT_REMOTE('add') on\ndiscrepancy, which only happens after a server restart.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "025616689ff34c40a091d49ec2108d3ea5a25ab8",
+      "filename": "internal/storage/dolt/federation.go",
+      "status": "modified",
+      "additions": 26,
+      "deletions": 0,
+      "changes": 26,
+      "blob_url": "https://github.com/gastownhall/beads/blob/2d3ce0807e580eb89cd74ce4b2345106eb8f9bdd/internal%2Fstorage%2Fdolt%2Ffederation.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/2d3ce0807e580eb89cd74ce4b2345106eb8f9bdd/internal%2Fstorage%2Fdolt%2Ffederation.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fstorage%2Fdolt%2Ffederation.go?ref=2d3ce0807e580eb89cd74ce4b2345106eb8f9bdd",
+      "patch": "@@ -117,6 +117,32 @@ func (s *DoltStore) ListRemotes(ctx context.Context) ([]storage.RemoteInfo, erro\n \treturn remotes, rows.Err()\n }\n \n+// syncCLIRemotesToSQL re-registers CLI-level remotes into the SQL server.\n+// After a server restart, dolt_remotes (in-memory) is empty while CLI remotes\n+// (persisted in .dolt/config) survive. This is best-effort: errors are silently\n+// ignored because a missing remote will surface a clear error at push/pull time.\n+// See GH#2315.\n+func (s *DoltStore) syncCLIRemotesToSQL(ctx context.Context) {\n+\tdir := s.cliDir()\n+\tif dir == \"\" {\n+\t\treturn\n+\t}\n+\tcliRemotes, err := doltutil.ListCLIRemotes(dir)\n+\tif err != nil || len(cliRemotes) == 0 {\n+\t\treturn\n+\t}\n+\tsqlRemotes, err := s.ListRemotes(ctx)\n+\tif err != nil {\n+\t\treturn\n+\t}\n+\tsqlMap := doltutil.ToRemoteNameMap(sqlRemotes)\n+\tfor _, r := range cliRemotes {\n+\t\tif _, exists := sqlMap[r.Name]; !exists {\n+\t\t\t_ = s.AddRemote(ctx, r.Name, r.URL)\n+\t\t}\n+\t}\n+}\n+\n // RemoveRemote removes a configured remote.\n func (s *DoltStore) RemoveRemote(ctx context.Context, name string) error {\n \t_, err := s.execContext(ctx, \"CALL DOLT_REMOTE('remove', ?)\", name)"
+    },
+    {
+      "sha": "c8348329a1647832adefeb91f039202cdabe1992",
+      "filename": "internal/storage/dolt/federation_test.go",
+      "status": "modified",
+      "additions": 100,
+      "deletions": 0,
+      "changes": 100,
+      "blob_url": "https://github.com/gastownhall/beads/blob/2d3ce0807e580eb89cd74ce4b2345106eb8f9bdd/internal%2Fstorage%2Fdolt%2Ffederation_test.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/2d3ce0807e580eb89cd74ce4b2345106eb8f9bdd/internal%2Fstorage%2Fdolt%2Ffederation_test.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fstorage%2Fdolt%2Ffederation_test.go?ref=2d3ce0807e580eb89cd74ce4b2345106eb8f9bdd",
+      "patch": "@@ -5,10 +5,12 @@ package dolt\n import (\n \t\"context\"\n \t\"os\"\n+\t\"os/exec\"\n \t\"path/filepath\"\n \t\"testing\"\n \t\"time\"\n \n+\t\"github.com/steveyegge/beads/internal/storage/doltutil\"\n \t\"github.com/steveyegge/beads/internal/types\"\n )\n \n@@ -418,6 +420,104 @@ func TestFederationPushPullMethods(t *testing.T) {\n \t}\n }\n \n+// TestSyncCLIRemotesToSQL verifies GH#2315: after a server restart, CLI-only\n+// remotes are re-registered into the SQL server by syncCLIRemotesToSQL.\n+func TestSyncCLIRemotesToSQL(t *testing.T) {\n+\tskipIfNoDolt(t)\n+\n+\tctx, cancel := context.WithTimeout(context.Background(), time.Minute)\n+\tdefer cancel()\n+\n+\tstore, cleanup := setupTestStore(t)\n+\tdefer cleanup()\n+\n+\tremoteName := \"test-sync-remote\"\n+\tremoteURL := \"file:///tmp/test-sync-remote\"\n+\n+\t// Ensure cliDir exists with a dolt init so CLI remote commands work.\n+\t// In test mode, dbPath/database may not exist on the filesystem.\n+\tdir := store.cliDir()\n+\tif dir == \"\" {\n+\t\tt.Skip(\"no CLI dir available\")\n+\t}\n+\tif err := os.MkdirAll(dir, 0755); err != nil {\n+\t\tt.Fatalf(\"failed to create CLI dir: %v\", err)\n+\t}\n+\tinitCmd := exec.Command(\"dolt\", \"init\", \"--name\", \"test\", \"--email\", \"test@test.com\")\n+\tinitCmd.Dir = dir\n+\tif out, err := initCmd.CombinedOutput(); err != nil {\n+\t\tt.Fatalf(\"dolt init failed: %s: %v\", out, err)\n+\t}\n+\n+\t// Add remote via SQL so it exists in dolt_remotes\n+\tif err := store.AddRemote(ctx, remoteName, remoteURL); err != nil {\n+\t\tt.Fatalf(\"failed to add SQL remote: %v\", err)\n+\t}\n+\n+\t// Also add it to CLI so it persists across restarts\n+\tif err := doltutil.AddCLIRemote(dir, remoteName, remoteURL); err != nil {\n+\t\tt.Fatalf(\"failed to add CLI remote: %v\", err)\n+\t}\n+\n+\t// Verify remote exists in SQL\n+\thas, err := store.HasRemote(ctx, remoteName)\n+\tif err != nil {\n+\t\tt.Fatalf(\"HasRemote failed: %v\", err)\n+\t}\n+\tif !has {\n+\t\tt.Fatal(\"expected remote to exist in SQL after add\")\n+\t}\n+\n+\t// Simulate server restart: remove the remote from SQL only\n+\tif err := store.RemoveRemote(ctx, remoteName); err != nil {\n+\t\tt.Fatalf(\"failed to remove SQL remote: %v\", err)\n+\t}\n+\n+\t// Verify it's gone from SQL\n+\thas, err = store.HasRemote(ctx, remoteName)\n+\tif err != nil {\n+\t\tt.Fatalf(\"HasRemote after remove failed: %v\", err)\n+\t}\n+\tif has {\n+\t\tt.Fatal(\"expected remote to be absent from SQL after remove\")\n+\t}\n+\n+\t// Run sync \u2014 should re-register the CLI remote into SQL\n+\tstore.syncCLIRemotesToSQL(ctx)\n+\n+\t// Verify it's back in SQL\n+\thas, err = store.HasRemote(ctx, remoteName)\n+\tif err != nil {\n+\t\tt.Fatalf(\"HasRemote after sync failed: %v\", err)\n+\t}\n+\tif !has {\n+\t\tt.Fatal(\"expected syncCLIRemotesToSQL to re-register the CLI remote into SQL\")\n+\t}\n+\n+\t// Verify the URL matches\n+\tremotes, err := store.ListRemotes(ctx)\n+\tif err != nil {\n+\t\tt.Fatalf(\"ListRemotes failed: %v\", err)\n+\t}\n+\tfound := false\n+\tfor _, r := range remotes {\n+\t\tif r.Name == remoteName {\n+\t\t\tif r.URL != remoteURL {\n+\t\t\t\tt.Errorf(\"expected URL %s, got %s\", remoteURL, r.URL)\n+\t\t\t}\n+\t\t\tfound = true\n+\t\t\tbreak\n+\t\t}\n+\t}\n+\tif !found {\n+\t\tt.Errorf(\"remote %s not found in ListRemotes after sync\", remoteName)\n+\t}\n+\n+\t// Clean up CLI remote\n+\t_ = doltutil.RemoveCLIRemote(dir, remoteName)\n+\t_ = store.RemoveRemote(ctx, remoteName)\n+}\n+\n // setupFederationStore creates a Dolt store for federation testing\n func setupFederationStore(t *testing.T, ctx context.Context, path, prefix string) (*DoltStore, func()) {\n \tt.Helper()"
+    },
+    {
+      "sha": "45bac08527c176fefbe413fd0333d49dbb3d7f04",
+      "filename": "internal/storage/dolt/store.go",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 0,
+      "changes": 7,
+      "blob_url": "https://github.com/gastownhall/beads/blob/2d3ce0807e580eb89cd74ce4b2345106eb8f9bdd/internal%2Fstorage%2Fdolt%2Fstore.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/2d3ce0807e580eb89cd74ce4b2345106eb8f9bdd/internal%2Fstorage%2Fdolt%2Fstore.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fstorage%2Fdolt%2Fstore.go?ref=2d3ce0807e580eb89cd74ce4b2345106eb8f9bdd",
+      "patch": "@@ -707,6 +707,13 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {\n \t// replaces the former branch-per-polecat approach (BD_BRANCH).\n \tstore.branch = \"main\"\n \n+\t// GH#2315: Sync CLI remotes into SQL server on store open.\n+\t// After a server restart, dolt_remotes is empty (not persisted across sessions).\n+\t// CLI remotes survive in .dolt/config. Re-register them so DOLT_PUSH/DOLT_PULL work.\n+\tif !cfg.ReadOnly {\n+\t\tstore.syncCLIRemotesToSQL(ctx)\n+\t}\n+\n \treturn store, nil\n }\n "
+    }
+  ]
+}

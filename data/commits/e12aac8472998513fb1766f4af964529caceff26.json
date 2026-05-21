@@ -1,0 +1,53 @@
+{
+  "message": "fix: add TOCTOU re-verification before destructive cleanup actions (gt-23rl1)\n\nThe daemon heartbeat loop performs orphan cleanup and zombie scanning, but\nbetween the time a session/process is identified and the time it is killed,\nthe state may have changed. This adds re-verification immediately before\neach destructive action:\n\n- checkRigOrphanedWork: re-verify session dead + hook_bead before notifying\n- checkPolecatHealth: re-verify session still dead before restarting\n- ZombieSessionCheck.Fix: re-verify Claude still dead before killing session\n- CleanupOrphanedClaudeProcesses: re-verify process still orphaned before SIGTERM\n- CleanupZombieClaudeProcesses: re-verify process still zombie before SIGTERM\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "c1798d2b23d36bb03352d06b000fbf135f3cdd09",
+      "filename": "internal/daemon/daemon.go",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 0,
+      "changes": 8,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/e12aac8472998513fb1766f4af964529caceff26/internal%2Fdaemon%2Fdaemon.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/e12aac8472998513fb1766f4af964529caceff26/internal%2Fdaemon%2Fdaemon.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fdaemon%2Fdaemon.go?ref=e12aac8472998513fb1766f4af964529caceff26",
+      "patch": "@@ -1467,6 +1467,14 @@ func (d *Daemon) checkPolecatHealth(rigName, polecatName string) {\n \t\treturn\n \t}\n \n+\t// TOCTOU guard: re-verify session is still dead before restarting.\n+\t// Between the initial check and now, the session may have been restarted\n+\t// by another heartbeat cycle, witness, or the polecat itself.\n+\tsessionStillDead, err := d.tmux.HasSession(sessionName)\n+\tif err == nil && sessionStillDead {\n+\t\treturn // Session came back - no restart needed\n+\t}\n+\n \t// Polecat has work but session is dead - this is a crash!\n \td.logger.Printf(\"CRASH DETECTED: polecat %s/%s has hook_bead=%s but session %s is dead\",\n \t\trigName, polecatName, info.HookBead, sessionName)"
+    },
+    {
+      "sha": "2d5f20d27d9f506427e4b99bc3730bdbeaaa6507",
+      "filename": "internal/daemon/lifecycle.go",
+      "status": "modified",
+      "additions": 35,
+      "deletions": 2,
+      "changes": 37,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/e12aac8472998513fb1766f4af964529caceff26/internal%2Fdaemon%2Flifecycle.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/e12aac8472998513fb1766f4af964529caceff26/internal%2Fdaemon%2Flifecycle.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fdaemon%2Flifecycle.go?ref=e12aac8472998513fb1766f4af964529caceff26",
+      "patch": "@@ -795,6 +795,28 @@ func (d *Daemon) getAgentBeadInfo(agentBeadID string) (*AgentBeadInfo, error) {\n \treturn info, nil\n }\n \n+// getAgentHookBead re-reads the hook_bead for an agent bead from the database.\n+// Used for TOCTOU re-verification before taking destructive action on agents.\n+// Returns empty string on error or if no hook_bead is set.\n+func (d *Daemon) getAgentHookBead(agentBeadID string) string {\n+\tcmd := exec.Command(d.bdPath, \"show\", agentBeadID, \"--json\")\n+\tcmd.Dir = d.config.TownRoot\n+\tcmd.Env = os.Environ()\n+\n+\toutput, err := cmd.Output()\n+\tif err != nil {\n+\t\treturn \"\"\n+\t}\n+\n+\tvar issues []struct {\n+\t\tHookBead string `json:\"hook_bead\"`\n+\t}\n+\tif err := json.Unmarshal(output, &issues); err != nil || len(issues) == 0 {\n+\t\treturn \"\"\n+\t}\n+\treturn issues[0].HookBead\n+}\n+\n // identityToAgentBeadID maps a daemon identity to an agent bead ID.\n // Uses parseIdentity to extract components, then uses beads package helpers.\n func (d *Daemon) identityToAgentBeadID(identity string) string {\n@@ -1022,11 +1044,22 @@ func (d *Daemon) checkRigOrphanedWork(rigName string) {\n \t\t\tcontinue\n \t\t}\n \n+\t\t// TOCTOU guard: re-verify agent state before taking action.\n+\t\t// Between the bd list above and now, the agent may have been\n+\t\t// restarted or its hook_bead cleared. Re-check both conditions.\n+\t\tif d.tmux.IsAgentAlive(sessionName) {\n+\t\t\tcontinue\n+\t\t}\n+\t\tcurrentHookBead := d.getAgentHookBead(agent.ID)\n+\t\tif currentHookBead == \"\" {\n+\t\t\tcontinue\n+\t\t}\n+\n \t\t// Session dead but has hooked work = orphaned!\n \t\td.logger.Printf(\"Orphaned work detected: agent %s session is dead but has hook_bead=%s\",\n-\t\t\tagent.ID, agent.HookBead)\n+\t\t\tagent.ID, currentHookBead)\n \n-\t\td.notifyWitnessOfOrphanedWork(rigName, agent.ID, agent.HookBead)\n+\t\td.notifyWitnessOfOrphanedWork(rigName, agent.ID, currentHookBead)\n \t}\n }\n "
+    },
+    {
+      "sha": "ca5b7cea541e4acc06ff8cfd44e49625db327815",
+      "filename": "internal/doctor/zombie_check.go",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 0,
+      "changes": 7,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/e12aac8472998513fb1766f4af964529caceff26/internal%2Fdoctor%2Fzombie_check.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/e12aac8472998513fb1766f4af964529caceff26/internal%2Fdoctor%2Fzombie_check.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fdoctor%2Fzombie_check.go?ref=e12aac8472998513fb1766f4af964529caceff26",
+      "patch": "@@ -124,6 +124,13 @@ func (c *ZombieSessionCheck) Fix(ctx *CheckContext) error {\n \t\t\tcontinue\n \t\t}\n \n+\t\t// TOCTOU guard: re-verify Claude is still dead in this session.\n+\t\t// Between Run() identifying zombies and Fix() killing them,\n+\t\t// a Claude process may have started (e.g., session was restarted).\n+\t\tif t.IsAgentAlive(sess) {\n+\t\t\tcontinue\n+\t\t}\n+\n \t\t// Log pre-death event for audit trail\n \t\t_ = events.LogFeed(events.TypeSessionDeath, sess,\n \t\t\tevents.SessionDeathPayload(sess, \"unknown\", \"zombie cleanup\", \"gt doctor\"))"
+    },
+    {
+      "sha": "09f94c47211297d85ae1cd01a90eaeb7e999f0be",
+      "filename": "internal/util/orphan.go",
+      "status": "modified",
+      "additions": 40,
+      "deletions": 0,
+      "changes": 40,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/e12aac8472998513fb1766f4af964529caceff26/internal%2Futil%2Forphan.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/e12aac8472998513fb1766f4af964529caceff26/internal%2Futil%2Forphan.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Futil%2Forphan.go?ref=e12aac8472998513fb1766f4af964529caceff26",
+      "patch": "@@ -578,6 +578,13 @@ func CleanupZombieClaudeProcesses() ([]ZombieCleanupResult, error) {\n \t\t\tcontinue\n \t\t}\n \n+\t\t// TOCTOU guard: re-verify this process is still a zombie before signaling.\n+\t\t// Between FindZombieClaudeProcesses() and now, the process may have\n+\t\t// joined a tmux session or been adopted by an active session.\n+\t\tif !isProcessStillOrphaned(zombie.PID) {\n+\t\t\tcontinue\n+\t\t}\n+\n \t\tif err := syscall.Kill(zombie.PID, syscall.SIGTERM); err != nil {\n \t\t\tif err != syscall.ESRCH {\n \t\t\t\tlastErr = fmt.Errorf(\"SIGTERM PID %d: %w\", zombie.PID, err)\n@@ -679,6 +686,13 @@ func CleanupOrphanedClaudeProcesses() ([]CleanupResult, error) {\n \t\t\tcontinue // Already in state, waiting for grace period\n \t\t}\n \n+\t\t// TOCTOU guard: re-verify this process is still orphaned before signaling.\n+\t\t// Between FindOrphanedClaudeProcesses() and now, the process may have\n+\t\t// joined a tmux session or acquired a TTY.\n+\t\tif !isProcessStillOrphaned(orphan.PID) {\n+\t\t\tcontinue\n+\t\t}\n+\n \t\t// New orphan - send SIGTERM\n \t\tif err := syscall.Kill(orphan.PID, syscall.SIGTERM); err != nil {\n \t\t\tif err != syscall.ESRCH {\n@@ -702,3 +716,29 @@ func CleanupOrphanedClaudeProcesses() ([]CleanupResult, error) {\n \n \treturn results, lastErr\n }\n+\n+// isProcessStillOrphaned re-checks whether a process is still orphaned/zombie.\n+// Used for TOCTOU re-verification immediately before sending signals.\n+// Returns true if the process still has no controlling terminal and is not\n+// in any active tmux session (i.e., still safe to signal).\n+func isProcessStillOrphaned(pid int) bool {\n+\t// Re-check the process TTY via ps\n+\tout, err := exec.Command(\"ps\", \"-o\", \"tty=\", \"-p\", strconv.Itoa(pid)).Output()\n+\tif err != nil {\n+\t\treturn false // Process may have exited - not orphaned anymore\n+\t}\n+\n+\ttty := strings.TrimSpace(string(out))\n+\tif tty == \"\" {\n+\t\treturn false // Process gone\n+\t}\n+\n+\t// If it now has a real TTY, it's been adopted\n+\tif tty != \"?\" && tty != \"??\" {\n+\t\treturn false\n+\t}\n+\n+\t// Re-check against current tmux session PIDs\n+\tprotectedPIDs := getTmuxSessionPIDs()\n+\treturn !protectedPIDs[pid]\n+}"
+    }
+  ]
+}

@@ -1,0 +1,113 @@
+{
+  "message": "fix: honor --base-branch in formula rendering and MR targeting\n\nTwo bugs caused polecats to ignore --base-branch:\n1. Formula template variables were never substituted when displayed via\n   gt prime. Polecats saw raw placeholders and used the formula default.\n   Fix: store FormulaVars in bead attachment fields and render them.\n2. gt done always targeted the rig default branch for MR creation,\n   ignoring --base-branch stored at sling time. Fix: read base_branch\n   from stored formula vars and use it as the MR target.\n\nCherry-picked from DreadPirateRobertz/gastown@04a3c43 (PR #2474)\nCloses #2357\n\nCo-authored-by: Chris Deal <DreadPirateRobertz@users.noreply.github.com>\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "2ab2c4b66becf870c87748379d27b53727649f59",
+      "filename": "internal/beads/fields.go",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 0,
+      "changes": 10,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/64fc8ccffb3b83e3310f0e6992fed554d9c2144d/internal%2Fbeads%2Ffields.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/64fc8ccffb3b83e3310f0e6992fed554d9c2144d/internal%2Fbeads%2Ffields.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fbeads%2Ffields.go?ref=64fc8ccffb3b83e3310f0e6992fed554d9c2144d",
+      "patch": "@@ -24,6 +24,7 @@ type AttachmentFields struct {\n \tConvoyID         string // Convoy bead ID tracking this issue (e.g., \"hq-cv-abc\")\n \tMergeStrategy    string // Convoy merge strategy: \"direct\", \"mr\", \"local\", or \"\" (default = mr)\n \tConvoyOwned      bool   // If true, convoy has gt:owned label (caller-managed lifecycle)\n+\tFormulaVars      string // Newline-separated key=value pairs for formula template substitution\n }\n \n // ParseAttachmentFields extracts attachment fields from an issue's description.\n@@ -89,6 +90,9 @@ func ParseAttachmentFields(issue *Issue) *AttachmentFields {\n \t\tcase \"convoy_owned\", \"convoy-owned\", \"convoyowned\":\n \t\t\tfields.ConvoyOwned = strings.ToLower(value) == \"true\"\n \t\t\thasFields = true\n+\t\tcase \"formula_vars\", \"formula-vars\", \"formulavars\":\n+\t\t\tfields.FormulaVars = value\n+\t\t\thasFields = true\n \t\t}\n \t}\n \n@@ -140,6 +144,9 @@ func FormatAttachmentFields(fields *AttachmentFields) string {\n \tif fields.ConvoyOwned {\n \t\tlines = append(lines, \"convoy_owned: true\")\n \t}\n+\tif fields.FormulaVars != \"\" {\n+\t\tlines = append(lines, \"formula_vars: \"+fields.FormulaVars)\n+\t}\n \n \treturn strings.Join(lines, \"\\n\")\n }\n@@ -182,6 +189,9 @@ func SetAttachmentFields(issue *Issue, fields *AttachmentFields) string {\n \t\t\"convoy_owned\":      true,\n \t\t\"convoy-owned\":      true,\n \t\t\"convoyowned\":       true,\n+\t\t\"formula_vars\":      true,\n+\t\t\"formula-vars\":      true,\n+\t\t\"formulavars\":       true,\n \t}\n \n \t// Collect non-attachment lines from existing description"
+    },
+    {
+      "sha": "f2897269a0b6cdabdbaa4cc6c71829f8b183d178",
+      "filename": "internal/cmd/done.go",
+      "status": "modified",
+      "additions": 28,
+      "deletions": 10,
+      "changes": 38,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/64fc8ccffb3b83e3310f0e6992fed554d9c2144d/internal%2Fcmd%2Fdone.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/64fc8ccffb3b83e3310f0e6992fed554d9c2144d/internal%2Fcmd%2Fdone.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fcmd%2Fdone.go?ref=64fc8ccffb3b83e3310f0e6992fed554d9c2144d",
+      "patch": "@@ -752,18 +752,36 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {\n \t\t\t}\n \t\t}\n \n-\t\t// Determine target branch (auto-detect integration branch if applicable)\n-\t\t// Only if refinery integration branch auto-targeting is enabled\n+\t\t// Determine target branch for the MR.\n+\t\t// Priority: explicit --base-branch > integration branch auto-detect > rig default.\n \t\ttarget := defaultBranch\n-\t\trefineryEnabled := true\n-\t\tsettingsPath := filepath.Join(townRoot, rigName, \"settings\", \"config.json\")\n-\t\tif settings, err := config.LoadRigSettings(settingsPath); err == nil && settings.MergeQueue != nil {\n-\t\t\trefineryEnabled = settings.MergeQueue.IsRefineryIntegrationEnabled()\n+\n+\t\t// Check for explicit --base-branch override (stored in formula vars at sling time).\n+\t\t// When gt sling is called with --base-branch, the value is persisted in the bead's\n+\t\t// formula_vars field. If it differs from the rig's default branch, use it as the\n+\t\t// MR target so the refinery merges into the correct branch (GH#2357).\n+\t\tif sourceIssueForNoMerge != nil {\n+\t\t\tif af := beads.ParseAttachmentFields(sourceIssueForNoMerge); af != nil {\n+\t\t\t\tif bb := extractFormulaVar(af.FormulaVars, \"base_branch\"); bb != \"\" && bb != defaultBranch {\n+\t\t\t\t\ttarget = bb\n+\t\t\t\t\tfmt.Printf(\"  Target branch override: %s (from --base-branch)\\n\", target)\n+\t\t\t\t}\n+\t\t\t}\n \t\t}\n-\t\tif refineryEnabled {\n-\t\t\tautoTarget, err := beads.DetectIntegrationBranch(bd, g, issueID)\n-\t\t\tif err == nil && autoTarget != \"\" {\n-\t\t\t\ttarget = autoTarget\n+\n+\t\t// Auto-detect integration branch from epic hierarchy (if enabled).\n+\t\t// Only overrides if no explicit --base-branch was set (target == defaultBranch).\n+\t\tif target == defaultBranch {\n+\t\t\trefineryEnabled := true\n+\t\t\tsettingsPath := filepath.Join(townRoot, rigName, \"settings\", \"config.json\")\n+\t\t\tif settings, err := config.LoadRigSettings(settingsPath); err == nil && settings.MergeQueue != nil {\n+\t\t\t\trefineryEnabled = settings.MergeQueue.IsRefineryIntegrationEnabled()\n+\t\t\t}\n+\t\t\tif refineryEnabled {\n+\t\t\t\tautoTarget, err := beads.DetectIntegrationBranch(bd, g, issueID)\n+\t\t\t\tif err == nil && autoTarget != \"\" {\n+\t\t\t\t\ttarget = autoTarget\n+\t\t\t\t}\n \t\t\t}\n \t\t}\n "
+    },
+    {
+      "sha": "85c18744716c165ba3f220aac9dcedd15e57165b",
+      "filename": "internal/cmd/prime.go",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/64fc8ccffb3b83e3310f0e6992fed554d9c2144d/internal%2Fcmd%2Fprime.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/64fc8ccffb3b83e3310f0e6992fed554d9c2144d/internal%2Fcmd%2Fprime.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fcmd%2Fprime.go?ref=64fc8ccffb3b83e3310f0e6992fed554d9c2144d",
+      "patch": "@@ -715,7 +715,7 @@ func outputMoleculeWorkflow(ctx RoleContext, attachment *beads.AttachmentFields)\n \n \t// Show inline formula steps from the embedded binary (root-only: no child wisps to query).\n \tif attachment.AttachedFormula != \"\" {\n-\t\tshowFormulaStepsFull(attachment.AttachedFormula)\n+\t\tshowFormulaStepsFull(attachment.AttachedFormula, strings.Split(attachment.FormulaVars, \"\\n\"))\n \t\tfmt.Println()\n \t\tfmt.Printf(\"%s\\n\", style.Bold.Render(\"Work through the checklist above. When all steps complete, run `\"+cli.Name()+\" done`.\"))\n \t\tfmt.Println(\"The base bead is your assignment. The formula steps define your workflow.\")"
+    },
+    {
+      "sha": "0e5631366a558f33929e0cfd18024b008165f428",
+      "filename": "internal/cmd/prime_molecule.go",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 1,
+      "changes": 14,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/64fc8ccffb3b83e3310f0e6992fed554d9c2144d/internal%2Fcmd%2Fprime_molecule.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/64fc8ccffb3b83e3310f0e6992fed554d9c2144d/internal%2Fcmd%2Fprime_molecule.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fcmd%2Fprime_molecule.go?ref=64fc8ccffb3b83e3310f0e6992fed554d9c2144d",
+      "patch": "@@ -172,7 +172,8 @@ func showFormulaStepsFull(formulaName string, extraVars ...[]string) {\n \tfmt.Println()\n \tfmt.Printf(\"**Formula Checklist** (%d steps from %s):\\n\\n\", len(f.Steps), formulaName)\n \tfor i, step := range f.Steps {\n-\t\tfmt.Printf(\"### Step %d: %s\\n\\n\", i+1, step.Title)\n+\t\ttitle := applyFormulaVars(step.Title, varMap)\n+\t\tfmt.Printf(\"### Step %d: %s\\n\\n\", i+1, title)\n \t\tif step.Description != \"\" {\n \t\t\tfmt.Println(applyFormulaVars(step.Description, varMap))\n \t\t\tfmt.Println()\n@@ -205,6 +206,17 @@ func applyFormulaVars(text string, varMap map[string]string) string {\n \treturn text\n }\n \n+// extractFormulaVar extracts a specific key's value from a newline-separated\n+// key=value string (as stored in AttachmentFields.FormulaVars).\n+// Returns \"\" if the key is not found.\n+func extractFormulaVar(formulaVars, key string) string {\n+\tfor _, line := range strings.Split(formulaVars, \"\\n\") {\n+\t\tif k, v, ok := strings.Cut(strings.TrimSpace(line), \"=\"); ok && k == key {\n+\t\t\treturn v\n+\t\t}\n+\t}\n+\treturn \"\"\n+}\n // truncateDescription truncates a multi-line description to a single line summary.\n func truncateDescription(desc string, maxLen int) string {\n \t// Take just the first line"
+    },
+    {
+      "sha": "e982780ed527e182ef3c590f0fb94af3eeb420b4",
+      "filename": "internal/cmd/prime_output.go",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/64fc8ccffb3b83e3310f0e6992fed554d9c2144d/internal%2Fcmd%2Fprime_output.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/64fc8ccffb3b83e3310f0e6992fed554d9c2144d/internal%2Fcmd%2Fprime_output.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fcmd%2Fprime_output.go?ref=64fc8ccffb3b83e3310f0e6992fed554d9c2144d",
+      "patch": "@@ -6,6 +6,7 @@ import (\n \t\"fmt\"\n \t\"os\"\n \t\"path/filepath\"\n+\t\"strings\"\n \t\"time\"\n \n \t\"github.com/steveyegge/gastown/internal/beads\"\n@@ -560,7 +561,7 @@ func outputAttachmentStatus(ctx RoleContext) {\n \n \t// Show inline formula steps if formula name is known, else fall back to bd mol current\n \tif attachment.AttachedFormula != \"\" {\n-\t\tshowFormulaStepsFull(attachment.AttachedFormula)\n+\t\tshowFormulaStepsFull(attachment.AttachedFormula, strings.Split(attachment.FormulaVars, \"\\n\"))\n \t} else {\n \t\tshowMoleculeExecutionPrompt(ctx.WorkDir, attachment.AttachedMolecule)\n \t}"
+    },
+    {
+      "sha": "e4d344c75dcfc98743c83957f39a20fc2114752d",
+      "filename": "internal/cmd/sling.go",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/64fc8ccffb3b83e3310f0e6992fed554d9c2144d/internal%2Fcmd%2Fsling.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/64fc8ccffb3b83e3310f0e6992fed554d9c2144d/internal%2Fcmd%2Fsling.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fcmd%2Fsling.go?ref=64fc8ccffb3b83e3310f0e6992fed554d9c2144d",
+      "patch": "@@ -923,6 +923,7 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {\n \t\tAttachedMolecule: attachedMoleculeID,\n \t\tAttachedFormula:  formulaName,\n \t\tNoMerge:          slingNoMerge,\n+\t\tFormulaVars:      strings.Join(slingVars, \"\\n\"),\n \t}\n \tif err := storeFieldsInBead(beadID, fieldUpdates); err != nil {\n \t\t// Warn but don't fail - polecat will still complete work"
+    },
+    {
+      "sha": "f2b3c00dac7c2d4fd7a5c460fe3170b086cd6a18",
+      "filename": "internal/cmd/sling_dispatch.go",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 1,
+      "changes": 4,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/64fc8ccffb3b83e3310f0e6992fed554d9c2144d/internal%2Fcmd%2Fsling_dispatch.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/64fc8ccffb3b83e3310f0e6992fed554d9c2144d/internal%2Fcmd%2Fsling_dispatch.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fcmd%2Fsling_dispatch.go?ref=64fc8ccffb3b83e3310f0e6992fed554d9c2144d",
+      "patch": "@@ -280,11 +280,12 @@ func executeSling(params SlingParams) (*SlingResult, error) {\n \t// 6. Instantiate formula on bead (wisp + bond)\n \tbeadToHook := params.BeadID\n \tattachedMoleculeID := \"\"\n+\tvar allVars []string\n \tif params.FormulaName != \"\" && formulaCooked {\n \t\t// Auto-inject rig command vars as defaults (user --var flags override)\n \t\trigCmdVars := loadRigCommandVars(townRoot, params.RigName)\n \t\t// Build per-bead vars: rig defaults first, then user vars (higher priority)\n-\t\tallVars := append(rigCmdVars, params.Vars...)\n+\t\tallVars = append(rigCmdVars, params.Vars...)\n \t\tif spawnInfo.BaseBranch != \"\" && spawnInfo.BaseBranch != \"main\" {\n \t\t\tallVars = append(allVars, fmt.Sprintf(\"base_branch=%s\", spawnInfo.BaseBranch))\n \t\t}\n@@ -334,6 +335,7 @@ func executeSling(params SlingParams) (*SlingResult, error) {\n \t\tAttachedFormula:  params.FormulaName,\n \t\tNoMerge:          params.NoMerge,\n \t\tMode:             params.Mode,\n+\t\tFormulaVars:      strings.Join(allVars, \"\\n\"),\n \t}\n \t// Use beadToHook for the update target (may differ from beadID when formula-on-bead)\n \tif err := storeFieldsInBead(beadToHook, fieldUpdates); err != nil {"
+    },
+    {
+      "sha": "0ead3a979e3b7fa7bc34d728caa4c6bbe1f5760f",
+      "filename": "internal/cmd/sling_formula.go",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/64fc8ccffb3b83e3310f0e6992fed554d9c2144d/internal%2Fcmd%2Fsling_formula.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/64fc8ccffb3b83e3310f0e6992fed554d9c2144d/internal%2Fcmd%2Fsling_formula.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fcmd%2Fsling_formula.go?ref=64fc8ccffb3b83e3310f0e6992fed554d9c2144d",
+      "patch": "@@ -204,6 +204,7 @@ func runSlingFormula(ctx context.Context, args []string) error {\n \t\tArgs:            slingArgs,\n \t\tVars:            append([]string(nil), slingVars...),\n \t\tAttachedFormula: formulaName,\n+\t\tFormulaVars:     strings.Join(slingVars, \"\\n\"),\n \t}\n \tif err := storeFieldsInBead(wispRootID, fieldUpdates); err != nil {\n \t\tfmt.Printf(\"%s Could not store fields in bead: %v\\n\", style.Dim.Render(\"Warning:\"), err)"
+    },
+    {
+      "sha": "a1521a175f39fdd42cb199f58ea7515c36f082c1",
+      "filename": "internal/cmd/sling_helpers.go",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/64fc8ccffb3b83e3310f0e6992fed554d9c2144d/internal%2Fcmd%2Fsling_helpers.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/64fc8ccffb3b83e3310f0e6992fed554d9c2144d/internal%2Fcmd%2Fsling_helpers.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fcmd%2Fsling_helpers.go?ref=64fc8ccffb3b83e3310f0e6992fed554d9c2144d",
+      "patch": "@@ -264,6 +264,7 @@ type beadFieldUpdates struct {\n \tConvoyID         string // Convoy bead ID (e.g., \"hq-cv-abc\")\n \tMergeStrategy    string // Convoy merge strategy: \"direct\", \"mr\", \"local\"\n \tConvoyOwned      bool   // Convoy has gt:owned label (caller-managed lifecycle)\n+\tFormulaVars      string // Newline-separated key=value pairs for formula template substitution\n }\n \n // storeFieldsInBead performs a single read-modify-write to update all attachment fields\n@@ -338,6 +339,9 @@ func storeFieldsInBead(beadID string, updates beadFieldUpdates) error {\n \tif updates.ConvoyOwned {\n \t\tfields.ConvoyOwned = true\n \t}\n+\tif updates.FormulaVars != \"\" {\n+\t\tfields.FormulaVars = updates.FormulaVars\n+\t}\n \n \t// Write back once\n \tnewDesc := beads.SetAttachmentFields(issue, fields)"
+    }
+  ]
+}

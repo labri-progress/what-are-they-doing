@@ -1,0 +1,64 @@
+{
+  "message": "fix(ready): prevent wisps from appearing in bd ready\n\nAdd multiple layers of defense against misclassified wisps:\n- Importer auto-detects -wisp- pattern and sets ephemeral flag\n- GetReadyWork excludes -wisp- IDs via SQL LIKE clause\n- Doctor check 26d detects misclassified wisps in JSONL\n\nThis addresses recurring issue where wisps with missing ephemeral\nflag would pollute bd ready output after JSONL import.\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "923ff47e0695997bedb71266573bcf415afd2003",
+      "filename": ".beads/issues.jsonl",
+      "status": "modified",
+      "additions": 114,
+      "deletions": 81,
+      "changes": 195,
+      "blob_url": "https://github.com/gastownhall/beads/blob/f703237c3d23a28348f3f0cd67219c24e642e707/.beads%2Fissues.jsonl",
+      "raw_url": "https://github.com/gastownhall/beads/raw/f703237c3d23a28348f3f0cd67219c24e642e707/.beads%2Fissues.jsonl",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/.beads%2Fissues.jsonl?ref=f703237c3d23a28348f3f0cd67219c24e642e707"
+    },
+    {
+      "sha": "14e48be5e86b3d6bc6431435c5fc34bee5245ba3",
+      "filename": "cmd/bd/doctor.go",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/gastownhall/beads/blob/f703237c3d23a28348f3f0cd67219c24e642e707/cmd%2Fbd%2Fdoctor.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/f703237c3d23a28348f3f0cd67219c24e642e707/cmd%2Fbd%2Fdoctor.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/cmd%2Fbd%2Fdoctor.go?ref=f703237c3d23a28348f3f0cd67219c24e642e707",
+      "patch": "@@ -577,6 +577,11 @@ func runDiagnostics(path string) doctorResult {\n \tresult.Checks = append(result.Checks, staleMQFilesCheck)\n \t// Don't fail overall check for legacy MQ files, just warn\n \n+\t// Check 26d: Misclassified wisps (wisp-patterned IDs without ephemeral flag)\n+\tmisclassifiedWispsCheck := convertDoctorCheck(doctor.CheckMisclassifiedWisps(path))\n+\tresult.Checks = append(result.Checks, misclassifiedWispsCheck)\n+\t// Don't fail overall check for misclassified wisps, just warn\n+\n \t// Check 27: Expired tombstones (maintenance)\n \ttombstonesExpiredCheck := convertDoctorCheck(doctor.CheckExpiredTombstones(path))\n \tresult.Checks = append(result.Checks, tombstonesExpiredCheck)"
+    },
+    {
+      "sha": "24513abd6bccd903649012a9192b0ccfb76032c2",
+      "filename": "cmd/bd/doctor/maintenance.go",
+      "status": "modified",
+      "additions": 75,
+      "deletions": 0,
+      "changes": 75,
+      "blob_url": "https://github.com/gastownhall/beads/blob/f703237c3d23a28348f3f0cd67219c24e642e707/cmd%2Fbd%2Fdoctor%2Fmaintenance.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/f703237c3d23a28348f3f0cd67219c24e642e707/cmd%2Fbd%2Fdoctor%2Fmaintenance.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/cmd%2Fbd%2Fdoctor%2Fmaintenance.go?ref=f703237c3d23a28348f3f0cd67219c24e642e707",
+      "patch": "@@ -445,3 +445,78 @@ func FixStaleMQFiles(path string) error {\n \n \treturn nil\n }\n+\n+// CheckMisclassifiedWisps detects wisp-patterned issues that lack the ephemeral flag.\n+// Issues with IDs containing \"-wisp-\" should always have Ephemeral=true.\n+// If they're in JSONL without the ephemeral flag, they'll pollute bd ready.\n+func CheckMisclassifiedWisps(path string) DoctorCheck {\n+\tbeadsDir := resolveBeadsDir(filepath.Join(path, \".beads\"))\n+\tjsonlPath := filepath.Join(beadsDir, \"issues.jsonl\")\n+\n+\tif _, err := os.Stat(jsonlPath); os.IsNotExist(err) {\n+\t\treturn DoctorCheck{\n+\t\t\tName:     \"Misclassified Wisps\",\n+\t\t\tStatus:   StatusOK,\n+\t\t\tMessage:  \"N/A (no JSONL file)\",\n+\t\t\tCategory: CategoryMaintenance,\n+\t\t}\n+\t}\n+\n+\t// Read JSONL and find wisp-patterned issues without ephemeral flag\n+\tfile, err := os.Open(jsonlPath) // #nosec G304 - path constructed safely\n+\tif err != nil {\n+\t\treturn DoctorCheck{\n+\t\t\tName:     \"Misclassified Wisps\",\n+\t\t\tStatus:   StatusOK,\n+\t\t\tMessage:  \"N/A (unable to read JSONL)\",\n+\t\t\tCategory: CategoryMaintenance,\n+\t\t}\n+\t}\n+\tdefer file.Close()\n+\n+\tvar wispCount int\n+\tvar wispIDs []string\n+\tdecoder := json.NewDecoder(file)\n+\n+\tfor {\n+\t\tvar issue types.Issue\n+\t\tif err := decoder.Decode(&issue); err != nil {\n+\t\t\tbreak\n+\t\t}\n+\t\t// Skip deleted issues (tombstones)\n+\t\tif issue.DeletedAt != nil {\n+\t\t\tcontinue\n+\t\t}\n+\t\t// Look for wisp pattern without ephemeral flag\n+\t\t// These shouldn't be in JSONL at all (wisps are ephemeral)\n+\t\tif strings.Contains(issue.ID, \"-wisp-\") && !issue.Ephemeral {\n+\t\t\twispCount++\n+\t\t\tif len(wispIDs) < 3 {\n+\t\t\t\twispIDs = append(wispIDs, issue.ID)\n+\t\t\t}\n+\t\t}\n+\t}\n+\n+\tif wispCount == 0 {\n+\t\treturn DoctorCheck{\n+\t\t\tName:     \"Misclassified Wisps\",\n+\t\t\tStatus:   StatusOK,\n+\t\t\tMessage:  \"No misclassified wisps found\",\n+\t\t\tCategory: CategoryMaintenance,\n+\t\t}\n+\t}\n+\n+\tdetail := fmt.Sprintf(\"Example: %v\", wispIDs)\n+\tif wispCount > 3 {\n+\t\tdetail += fmt.Sprintf(\" (+%d more)\", wispCount-3)\n+\t}\n+\n+\treturn DoctorCheck{\n+\t\tName:     \"Misclassified Wisps\",\n+\t\tStatus:   StatusWarning,\n+\t\tMessage:  fmt.Sprintf(\"%d wisp issue(s) in JSONL missing ephemeral flag\", wispCount),\n+\t\tDetail:   detail,\n+\t\tFix:      \"Remove from JSONL: grep -v '\\\"id\\\":\\\"<id>\\\"' issues.jsonl > tmp && mv tmp issues.jsonl\",\n+\t\tCategory: CategoryMaintenance,\n+\t}\n+}"
+    },
+    {
+      "sha": "4fe84ec4b08de982b3df29c989609d9fce0cbecd",
+      "filename": "internal/importer/importer.go",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 0,
+      "changes": 9,
+      "blob_url": "https://github.com/gastownhall/beads/blob/f703237c3d23a28348f3f0cd67219c24e642e707/internal%2Fimporter%2Fimporter.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/f703237c3d23a28348f3f0cd67219c24e642e707/internal%2Fimporter%2Fimporter.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fimporter%2Fimporter.go?ref=f703237c3d23a28348f3f0cd67219c24e642e707",
+      "patch": "@@ -99,6 +99,15 @@ func ImportIssues(ctx context.Context, dbPath string, store storage.Storage, iss\n \t\tissue.ContentHash = issue.ComputeContentHash()\n \t}\n \n+\t// Auto-detect wisps by ID pattern and set ephemeral flag\n+\t// This prevents orphaned wisp entries in JSONL from polluting bd ready\n+\t// Pattern: *-wisp-* indicates ephemeral patrol/workflow instances\n+\tfor _, issue := range issues {\n+\t\tif strings.Contains(issue.ID, \"-wisp-\") && !issue.Ephemeral {\n+\t\t\tissue.Ephemeral = true\n+\t\t}\n+\t}\n+\n \t// Get or create SQLite store\n \tsqliteStore, needCloseStore, err := getOrCreateStore(ctx, dbPath, store)\n \tif err != nil {"
+    },
+    {
+      "sha": "73cf38cdbe1c7b2686e762c1926ab8e65656e203",
+      "filename": "internal/storage/sqlite/ready.go",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/gastownhall/beads/blob/f703237c3d23a28348f3f0cd67219c24e642e707/internal%2Fstorage%2Fsqlite%2Fready.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/f703237c3d23a28348f3f0cd67219c24e642e707/internal%2Fstorage%2Fsqlite%2Fready.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fstorage%2Fsqlite%2Fready.go?ref=f703237c3d23a28348f3f0cd67219c24e642e707",
+      "patch": "@@ -19,6 +19,7 @@ func (s *SQLiteStorage) GetReadyWork(ctx context.Context, filter types.WorkFilte\n \twhereClauses := []string{\n \t\t\"i.pinned = 0\",                             // Exclude pinned issues\n \t\t\"(i.ephemeral = 0 OR i.ephemeral IS NULL)\", // Exclude wisps\n+\t\t\"i.id NOT LIKE '%-wisp-%'\",                 // Defense in depth: exclude wisp IDs even if ephemeral flag missing\n \t}\n \targs := []interface{}{}\n "
+    }
+  ]
+}

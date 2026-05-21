@@ -1,0 +1,29 @@
+{
+  "message": "refactor: replace manual save/defer globals with saveAndRestoreGlobals helper (dolt-test-0uf)\n\nAdd saveAndRestoreGlobals() helper using t.Cleanup() for atomic\nsave/restore of package-level globals (dbPath, store, storeActive,\nautoFlushEnabled, flushManager). Refactor 4 functions in daemon_test.go\nto use it, replacing fragile manual save/defer patterns that could\nleak state on crashes or miss variables.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "32f1f38d866bbf1ea823b99db9ed4421f4c4cd06",
+      "filename": "cmd/bd/daemon_test.go",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 26,
+      "changes": 34,
+      "blob_url": "https://github.com/gastownhall/beads/blob/829ac5955b86440a82f7da63814d2ae4c5104790/cmd%2Fbd%2Fdaemon_test.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/829ac5955b86440a82f7da63814d2ae4c5104790/cmd%2Fbd%2Fdaemon_test.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/cmd%2Fbd%2Fdaemon_test.go?ref=829ac5955b86440a82f7da63814d2ae4c5104790",
+      "patch": "@@ -66,8 +66,7 @@ func makeSocketTempDir(t testing.TB) string {\n \n func TestGetPIDFilePath(t *testing.T) {\n \ttmpDir := t.TempDir()\n-\toldDBPath := dbPath\n-\tdefer func() { dbPath = oldDBPath }()\n+\tsaveAndRestoreGlobals(t)\n \n \tdbPath = filepath.Join(tmpDir, \".beads\", \"test.db\")\n \tpidFile, err := getPIDFilePath()\n@@ -114,8 +113,7 @@ func TestGetLogFilePath(t *testing.T) {\n \t\tt.Run(tt.name, func(t *testing.T) {\n \t\t\tuserPath, dbFile, expected := tt.set(t)\n \n-\t\t\toldDBPath := dbPath\n-\t\t\tdefer func() { dbPath = oldDBPath }()\n+\t\t\tsaveAndRestoreGlobals(t)\n \t\t\tdbPath = dbFile\n \n \t\t\tresult, err := getLogFilePath(userPath)\n@@ -193,13 +191,7 @@ func TestDaemonIntegration(t *testing.T) {\n \ttestDBPath := filepath.Join(dbDir, \"test.db\")\n \ttestStore := newTestStore(t, testDBPath)\n \n-\toldStore := store\n-\toldDBPath := dbPath\n-\tdefer func() {\n-\t\ttestStore.Close()\n-\t\tstore = oldStore\n-\t\tdbPath = oldDBPath\n-\t}()\n+\tsaveAndRestoreGlobals(t)\n \tstore = testStore\n \tdbPath = testDBPath\n \n@@ -719,25 +711,15 @@ func TestMutationToExportLatency(t *testing.T) {\n \tinitTestGitRepo(t, tmpDir)\n \t\n \ttestStore := newTestStore(t, testDBPath)\n-\tdefer testStore.Close()\n \n-\t// Configure test environment - set global store\n-\toldDBPath := dbPath\n-\toldStore := store\n-\toldStoreActive := storeActive\n-\toldAutoFlush := autoFlushEnabled\n+\t// Configure test environment - save/restore all globals atomically\n+\tsaveAndRestoreGlobals(t)\n \torigDebounce := config.GetDuration(\"flush-debounce\")\n-\tdefer func() { \n-\t\tdbPath = oldDBPath \n-\t\tstore = oldStore\n-\t\tstoreMutex.Lock()\n-\t\tstoreActive = oldStoreActive\n-\t\tstoreMutex.Unlock()\n-\t\tautoFlushEnabled = oldAutoFlush\n+\tt.Cleanup(func() {\n \t\tconfig.Set(\"flush-debounce\", origDebounce)\n \t\tclearAutoFlushState()\n-\t}()\n-\t\n+\t})\n+\n \tdbPath = testDBPath\n \tstore = testStore\n \tstoreMutex.Lock()"
+    },
+    {
+      "sha": "2ebf5aaeb1a9cb47421254b578df7a11cb2b2ee9",
+      "filename": "cmd/bd/test_helpers_test.go",
+      "status": "modified",
+      "additions": 47,
+      "deletions": 0,
+      "changes": 47,
+      "blob_url": "https://github.com/gastownhall/beads/blob/829ac5955b86440a82f7da63814d2ae4c5104790/cmd%2Fbd%2Ftest_helpers_test.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/829ac5955b86440a82f7da63814d2ae4c5104790/cmd%2Fbd%2Ftest_helpers_test.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/cmd%2Fbd%2Ftest_helpers_test.go?ref=829ac5955b86440a82f7da63814d2ae4c5104790",
+      "patch": "@@ -13,6 +13,7 @@ import (\n \n \t\"github.com/steveyegge/beads/internal/config\"\n \t\"github.com/steveyegge/beads/internal/git\"\n+\t\"github.com/steveyegge/beads/internal/storage\"\n \t\"github.com/steveyegge/beads/internal/storage/sqlite\"\n )\n \n@@ -63,6 +64,52 @@ func ensureCleanGlobalState(t *testing.T) {\n \tresetCommandContext()\n }\n \n+// savedGlobals holds a snapshot of package-level globals for safe restoration.\n+// Used by saveAndRestoreGlobals to ensure test isolation.\n+type savedGlobals struct {\n+\tdbPath           string\n+\tstore            storage.Storage\n+\tstoreActive      bool\n+\tautoFlushEnabled bool\n+\tflushManager     *FlushManager\n+}\n+\n+// saveAndRestoreGlobals snapshots all commonly-mutated package-level globals\n+// and registers a t.Cleanup() to restore them when the test completes.\n+// This replaces the fragile manual save/defer pattern:\n+//\n+//\toldDBPath := dbPath\n+//\tdefer func() { dbPath = oldDBPath }()\n+//\n+// With the safer:\n+//\n+//\tsaveAndRestoreGlobals(t)\n+//\n+// Benefits:\n+//   - All globals saved atomically (can't forget one)\n+//   - t.Cleanup runs even on panic (no risk of missed defer registration)\n+//   - Single call replaces multiple save/defer pairs\n+func saveAndRestoreGlobals(t *testing.T) *savedGlobals {\n+\tt.Helper()\n+\tsaved := &savedGlobals{\n+\t\tdbPath:           dbPath,\n+\t\tstore:            store,\n+\t\tstoreActive:      storeActive,\n+\t\tautoFlushEnabled: autoFlushEnabled,\n+\t\tflushManager:     flushManager,\n+\t}\n+\tt.Cleanup(func() {\n+\t\tdbPath = saved.dbPath\n+\t\tstore = saved.store\n+\t\tstoreMutex.Lock()\n+\t\tstoreActive = saved.storeActive\n+\t\tstoreMutex.Unlock()\n+\t\tautoFlushEnabled = saved.autoFlushEnabled\n+\t\tflushManager = saved.flushManager\n+\t})\n+\treturn saved\n+}\n+\n // failIfProductionDatabase checks if the database path is in a production directory\n // and fails the test to prevent test pollution (bd-2c5a)\n func failIfProductionDatabase(t *testing.T, dbPath string) {"
+    }
+  ]
+}

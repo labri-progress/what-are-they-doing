@@ -1,0 +1,28 @@
+{
+  "message": "fix: add retry with rebase for concurrent push conflicts\n\nWhen multiple polecats run bd sync simultaneously, they race to push to\nthe shared beads-sync branch. Previously this caused non-fast-forward\nerrors that blocked all polecats.\n\nNow pushFromWorktree:\n- Detects non-fast-forward errors from git push output\n- On conflict: fetches remote, rebases local commits on top, retries\n- Uses exponential backoff for transient failures (up to 5 retries)\n- Aborts rebase cleanly if it fails to leave worktree in good state\n\nFixes gt-zqor.\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "b83bc76a1b3b214c388d2e310f1483e458f4742b",
+      "filename": ".beads/issues.jsonl",
+      "status": "modified",
+      "additions": 786,
+      "deletions": 779,
+      "changes": 1565,
+      "blob_url": "https://github.com/gastownhall/beads/blob/e7991b9334de992047303c700a618f66cfbe1ce1/.beads%2Fissues.jsonl",
+      "raw_url": "https://github.com/gastownhall/beads/raw/e7991b9334de992047303c700a618f66cfbe1ce1/.beads%2Fissues.jsonl",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/.beads%2Fissues.jsonl?ref=e7991b9334de992047303c700a618f66cfbe1ce1"
+    },
+    {
+      "sha": "de27257588a8445c7e82040e373eaa5f85e7e2e7",
+      "filename": "internal/syncbranch/worktree.go",
+      "status": "modified",
+      "additions": 61,
+      "deletions": 7,
+      "changes": 68,
+      "blob_url": "https://github.com/gastownhall/beads/blob/e7991b9334de992047303c700a618f66cfbe1ce1/internal%2Fsyncbranch%2Fworktree.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/e7991b9334de992047303c700a618f66cfbe1ce1/internal%2Fsyncbranch%2Fworktree.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fsyncbranch%2Fworktree.go?ref=e7991b9334de992047303c700a618f66cfbe1ce1",
+      "patch": "@@ -690,18 +690,72 @@ func commitInWorktree(ctx context.Context, worktreePath, jsonlRelPath, message s\n \treturn nil\n }\n \n-// pushFromWorktree pushes the sync branch from the worktree\n+// isNonFastForwardError checks if git push output indicates a non-fast-forward rejection\n+func isNonFastForwardError(output string) bool {\n+\t// Git outputs these messages for non-fast-forward rejections\n+\treturn strings.Contains(output, \"non-fast-forward\") ||\n+\t\tstrings.Contains(output, \"fetch first\") ||\n+\t\tstrings.Contains(output, \"rejected\") && strings.Contains(output, \"behind\")\n+}\n+\n+// fetchAndRebaseInWorktree fetches remote and rebases local commits on top\n+func fetchAndRebaseInWorktree(ctx context.Context, worktreePath, branch, remote string) error {\n+\t// Fetch latest from remote\n+\tfetchCmd := exec.CommandContext(ctx, \"git\", \"-C\", worktreePath, \"fetch\", remote, branch)\n+\tif output, err := fetchCmd.CombinedOutput(); err != nil {\n+\t\treturn fmt.Errorf(\"fetch failed: %w\\n%s\", err, output)\n+\t}\n+\n+\t// Rebase local commits on top of remote\n+\trebaseCmd := exec.CommandContext(ctx, \"git\", \"-C\", worktreePath, \"rebase\", fmt.Sprintf(\"%s/%s\", remote, branch))\n+\tif output, err := rebaseCmd.CombinedOutput(); err != nil {\n+\t\t// Abort the failed rebase to leave worktree in clean state\n+\t\tabortCmd := exec.CommandContext(ctx, \"git\", \"-C\", worktreePath, \"rebase\", \"--abort\")\n+\t\t_ = abortCmd.Run() // Best effort\n+\t\treturn fmt.Errorf(\"rebase failed: %w\\n%s\", err, output)\n+\t}\n+\n+\treturn nil\n+}\n+\n+// pushFromWorktree pushes the sync branch from the worktree with retry logic\n+// for handling concurrent push conflicts (non-fast-forward errors).\n func pushFromWorktree(ctx context.Context, worktreePath, branch string) error {\n \tremote := getRemoteForBranch(ctx, worktreePath, branch)\n+\tmaxRetries := 5\n \n-\t// Push with explicit remote and branch, set upstream if not set\n-\tcmd := exec.CommandContext(ctx, \"git\", \"-C\", worktreePath, \"push\", \"--set-upstream\", remote, branch)\n-\toutput, err := cmd.CombinedOutput()\n-\tif err != nil {\n-\t\treturn fmt.Errorf(\"git push failed from worktree: %w\\n%s\", err, output)\n+\tvar lastErr error\n+\tfor attempt := 0; attempt < maxRetries; attempt++ {\n+\t\t// Push with explicit remote and branch, set upstream if not set\n+\t\tcmd := exec.CommandContext(ctx, \"git\", \"-C\", worktreePath, \"push\", \"--set-upstream\", remote, branch)\n+\t\toutput, err := cmd.CombinedOutput()\n+\n+\t\tif err == nil {\n+\t\t\treturn nil // Success\n+\t\t}\n+\n+\t\toutputStr := string(output)\n+\t\tlastErr = fmt.Errorf(\"git push failed from worktree: %w\\n%s\", err, outputStr)\n+\n+\t\t// Check if this is a non-fast-forward error (concurrent push conflict)\n+\t\tif isNonFastForwardError(outputStr) {\n+\t\t\t// Attempt fetch + rebase to get ahead of remote\n+\t\t\tif rebaseErr := fetchAndRebaseInWorktree(ctx, worktreePath, branch, remote); rebaseErr != nil {\n+\t\t\t\t// Rebase failed - return original push error with context\n+\t\t\t\treturn fmt.Errorf(\"push failed and recovery rebase also failed: push: %w; rebase: %v\", lastErr, rebaseErr)\n+\t\t\t}\n+\t\t\t// Rebase succeeded - retry push immediately (no backoff needed)\n+\t\t\tcontinue\n+\t\t}\n+\n+\t\t// For other errors, use exponential backoff before retry\n+\t\tif attempt < maxRetries-1 {\n+\t\t\twaitTime := time.Duration(100<<uint(attempt)) * time.Millisecond // 100ms, 200ms, 400ms, 800ms\n+\t\t\ttime.Sleep(waitTime)\n+\t\t}\n \t}\n \n-\treturn nil\n+\treturn fmt.Errorf(\"push failed after %d attempts: %w\", maxRetries, lastErr)\n }\n \n // PushSyncBranch pushes the sync branch to remote. (bd-4u8)"
+    }
+  ]
+}

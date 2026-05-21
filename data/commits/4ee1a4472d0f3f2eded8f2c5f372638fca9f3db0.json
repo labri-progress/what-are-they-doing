@@ -1,0 +1,29 @@
+{
+  "message": "fix(done,mayor): push branch before MR creation, restart runtime on attach\n\ndone.go: Push branch to origin BEFORE creating MR bead (hq-6dk53, hq-a4ksk)\n- The MR bead triggers Refinery to process the branch\n- If branch isnt pushed, Refinery finds nothing to merge\n- The worktree gets nuked at end of gt done, losing commits forever\n- This is why polecats kept submitting MRs with empty branches\n\nmayor.go: Restart runtime with context when attaching (hq-95xfq)\n- When runtime has exited, gt may at now respawns with startup beacon\n- Previously, attaching to dead session left agent with no context\n- Now matches gt handoff behavior: hook check, inbox check, full prime\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "2933f1ed83bfad7c7a188d6bb253d913f2b564d1",
+      "filename": "internal/cmd/done.go",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 0,
+      "changes": 10,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/4ee1a4472d0f3f2eded8f2c5f372638fca9f3db0/internal%2Fcmd%2Fdone.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/4ee1a4472d0f3f2eded8f2c5f372638fca9f3db0/internal%2Fcmd%2Fdone.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fcmd%2Fdone.go?ref=4ee1a4472d0f3f2eded8f2c5f372638fca9f3db0",
+      "patch": "@@ -264,6 +264,16 @@ func runDone(cmd *cobra.Command, args []string) error {\n \t\t\treturn fmt.Errorf(\"branch '%s' has 0 commits ahead of %s; nothing to merge\\nMake and commit changes first, or use --status DEFERRED to exit without completing\", branch, originDefault)\n \t\t}\n \n+\t\t// CRITICAL: Push branch BEFORE creating MR bead (hq-6dk53, hq-a4ksk)\n+\t\t// The MR bead triggers Refinery to process this branch. If the branch\n+\t\t// isn't pushed yet, Refinery finds nothing to merge. The worktree gets\n+\t\t// nuked at the end of gt done, so the commits are lost forever.\n+\t\tfmt.Printf(\"Pushing branch to remote...\\n\")\n+\t\tif err := g.Push(\"origin\", branch, false); err != nil {\n+\t\t\treturn fmt.Errorf(\"pushing branch '%s' to origin: %w\\nCommits exist locally but failed to push. Fix the issue and retry.\", branch, err)\n+\t\t}\n+\t\tfmt.Printf(\"%s Branch pushed to origin\\n\", style.Bold.Render(\"\u2713\"))\n+\n \t\tif issueID == \"\" {\n \t\t\treturn fmt.Errorf(\"cannot determine source issue from branch '%s'; use --issue to specify\", branch)\n \t\t}"
+    },
+    {
+      "sha": "fcb50fe796f01f47b28abf2c42f777d6be16e185",
+      "filename": "internal/cmd/mayor.go",
+      "status": "modified",
+      "additions": 47,
+      "deletions": 1,
+      "changes": 48,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/4ee1a4472d0f3f2eded8f2c5f372638fca9f3db0/internal%2Fcmd%2Fmayor.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/4ee1a4472d0f3f2eded8f2c5f372638fca9f3db0/internal%2Fcmd%2Fmayor.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fcmd%2Fmayor.go?ref=4ee1a4472d0f3f2eded8f2c5f372638fca9f3db0",
+      "patch": "@@ -4,8 +4,11 @@ import (\n \t\"fmt\"\n \n \t\"github.com/spf13/cobra\"\n+\t\"github.com/steveyegge/gastown/internal/config\"\n \t\"github.com/steveyegge/gastown/internal/mayor\"\n+\t\"github.com/steveyegge/gastown/internal/session\"\n \t\"github.com/steveyegge/gastown/internal/style\"\n+\t\"github.com/steveyegge/gastown/internal/tmux\"\n \t\"github.com/steveyegge/gastown/internal/workspace\"\n )\n \n@@ -142,6 +145,14 @@ func runMayorAttach(cmd *cobra.Command, args []string) error {\n \t\treturn err\n \t}\n \n+\ttownRoot, err := workspace.FindFromCwdOrError()\n+\tif err != nil {\n+\t\treturn fmt.Errorf(\"finding workspace: %w\", err)\n+\t}\n+\n+\tt := tmux.NewTmux()\n+\tsessionID := mgr.SessionName()\n+\n \trunning, err := mgr.IsRunning()\n \tif err != nil {\n \t\treturn fmt.Errorf(\"checking session: %w\", err)\n@@ -152,10 +163,45 @@ func runMayorAttach(cmd *cobra.Command, args []string) error {\n \t\tif err := mgr.Start(mayorAgentOverride); err != nil {\n \t\t\treturn err\n \t\t}\n+\t} else {\n+\t\t// Session exists - check if runtime is still running (hq-95xfq)\n+\t\t// If runtime exited or sitting at shell, restart with proper context\n+\t\tagentCfg, _, err := config.ResolveAgentConfigWithOverride(townRoot, townRoot, mayorAgentOverride)\n+\t\tif err != nil {\n+\t\t\treturn fmt.Errorf(\"resolving agent: %w\", err)\n+\t\t}\n+\t\tif !t.IsAgentRunning(sessionID, config.ExpectedPaneCommands(agentCfg)...) {\n+\t\t\t// Runtime has exited, restart it with proper context\n+\t\t\tfmt.Println(\"Runtime exited, restarting with context...\")\n+\n+\t\t\tpaneID, err := t.GetPaneID(sessionID)\n+\t\t\tif err != nil {\n+\t\t\t\treturn fmt.Errorf(\"getting pane ID: %w\", err)\n+\t\t\t}\n+\n+\t\t\t// Build startup beacon for context (like gt handoff does)\n+\t\t\tbeacon := session.FormatStartupNudge(session.StartupNudgeConfig{\n+\t\t\t\tRecipient: \"mayor\",\n+\t\t\t\tSender:    \"human\",\n+\t\t\t\tTopic:     \"attach\",\n+\t\t\t})\n+\n+\t\t\t// Build startup command with beacon\n+\t\t\tstartupCmd, err := config.BuildAgentStartupCommandWithAgentOverride(\"mayor\", \"mayor\", \"\", beacon, mayorAgentOverride)\n+\t\t\tif err != nil {\n+\t\t\t\treturn fmt.Errorf(\"building startup command: %w\", err)\n+\t\t\t}\n+\n+\t\t\tif err := t.RespawnPane(paneID, startupCmd); err != nil {\n+\t\t\t\treturn fmt.Errorf(\"restarting runtime: %w\", err)\n+\t\t\t}\n+\n+\t\t\tfmt.Printf(\"%s Mayor restarted with context\\n\", style.Bold.Render(\"\u2713\"))\n+\t\t}\n \t}\n \n \t// Use shared attach helper (smart: links if inside tmux, attaches if outside)\n-\treturn attachToTmuxSession(mgr.SessionName())\n+\treturn attachToTmuxSession(sessionID)\n }\n \n func runMayorStatus(cmd *cobra.Command, args []string) error {"
+    }
+  ]
+}

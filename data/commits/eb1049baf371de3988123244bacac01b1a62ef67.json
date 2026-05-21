@@ -1,0 +1,29 @@
+{
+  "message": "fix(sqlite): make Close() idempotent to prevent WAL retry deadlock (bd-4ri)\n\nSQLiteStorage.Close() was not idempotent -- double-close triggered the WAL\ncheckpoint retry loop (~3.1s backoff per call). With 81 double-closes from\nt.Cleanup overlapping manual Close() in tests, this added ~250s to the test\nsuite. Use CompareAndSwap on the closed flag so only the first call proceeds.\n\nAlso fix cleanup ordering in TestFallbackToDirectModeEnablesFlush to shut\ndown FlushManager before closing the store, preventing the deadlock where\nthe FlushManager background goroutine holds a DB connection while Close()\nblocks on the sql.DB mutex.\n\nResults: test suite 231s -> 103s, WAL checkpoint warnings 81 -> 0.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "3c1d0a44b7a18390ed83e1bf645e24b9973d13f6",
+      "filename": "cmd/bd/direct_mode_test.go",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 5,
+      "changes": 14,
+      "blob_url": "https://github.com/gastownhall/beads/blob/eb1049baf371de3988123244bacac01b1a62ef67/cmd%2Fbd%2Fdirect_mode_test.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/eb1049baf371de3988123244bacac01b1a62ef67/cmd%2Fbd%2Fdirect_mode_test.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/cmd%2Fbd%2Fdirect_mode_test.go?ref=eb1049baf371de3988123244bacac01b1a62ef67",
+      "patch": "@@ -40,6 +40,15 @@ func TestFallbackToDirectModeEnablesFlush(t *testing.T) {\n \t}\n \n \tdefer func() {\n+\t\t// Shutdown FlushManager BEFORE closing store to prevent deadlock (bd-4ri).\n+\t\t// The FlushManager's background goroutine may hold a DB connection via\n+\t\t// flushToJSONLWithState \u2192 validateJSONLIntegrity \u2192 GetJSONLFileHash.\n+\t\t// Closing the store while that goroutine holds the connection causes\n+\t\t// database/sql.(*DB).Close to block on its internal mutex.\n+\t\tif flushManager != nil && flushManager != origFlushManager {\n+\t\t\t_ = flushManager.Shutdown()\n+\t\t}\n+\n \t\tif store != nil && store != origStore {\n \t\t\t_ = store.Close()\n \t\t}\n@@ -55,11 +64,6 @@ func TestFallbackToDirectModeEnablesFlush(t *testing.T) {\n \t\tautoFlushEnabled = origAutoFlush\n \t\tflushFailureCount = origFlushFailures\n \t\tlastFlushError = origLastFlushErr\n-\n-\t\t// Restore FlushManager\n-\t\tif flushManager != nil {\n-\t\t\t_ = flushManager.Shutdown()\n-\t\t}\n \t\tflushManager = origFlushManager\n \t}()\n "
+    },
+    {
+      "sha": "b7cce04aaa6f4dbf91c96d3abbc3fc5cd1d241b0",
+      "filename": "internal/storage/sqlite/store.go",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 1,
+      "changes": 8,
+      "blob_url": "https://github.com/gastownhall/beads/blob/eb1049baf371de3988123244bacac01b1a62ef67/internal%2Fstorage%2Fsqlite%2Fstore.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/eb1049baf371de3988123244bacac01b1a62ef67/internal%2Fstorage%2Fsqlite%2Fstore.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fstorage%2Fsqlite%2Fstore.go?ref=eb1049baf371de3988123244bacac01b1a62ef67",
+      "patch": "@@ -324,8 +324,14 @@ func NewReadOnlyWithTimeout(ctx context.Context, path string, busyTimeout time.D\n // are flushed to the main database file. If another process holds a read lock,\n // checkpoint will retry with exponential backoff (up to ~3 seconds total).\n // For read-only connections (GH#804), it skips checkpointing to avoid file modifications.\n+// Idempotent: subsequent calls after the first return nil immediately (bd-4ri).\n func (s *SQLiteStorage) Close() error {\n-\ts.closed.Store(true)\n+\t// Use CompareAndSwap to ensure only the first call proceeds.\n+\t// Without this, double-close triggers the WAL retry backoff (~3.1s each),\n+\t// which caused test suite timeouts when t.Cleanup and manual Close() overlap.\n+\tif !s.closed.CompareAndSwap(false, true) {\n+\t\treturn nil\n+\t}\n \t// Acquire write lock to prevent racing with reconnect() (GH#607)\n \ts.reconnectMu.Lock()\n \tdefer s.reconnectMu.Unlock()"
+    }
+  ]
+}

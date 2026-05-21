@@ -1,0 +1,77 @@
+{
+  "message": "fix(identity): sanitize agent env vars at process/session boundaries (#3429)\n\nCo-Authored-By: A3Ackerman <A3Ackerman@users.noreply.github.com>",
+  "files": [
+    {
+      "sha": "50761c1308419e68f01fc570f8178a376340ead2",
+      "filename": "internal/cmd/daemon.go",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 0,
+      "changes": 11,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/daa039d9f481b37973e2a03da9e34e929298d339/internal%2Fcmd%2Fdaemon.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/daa039d9f481b37973e2a03da9e34e929298d339/internal%2Fcmd%2Fdaemon.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fcmd%2Fdaemon.go?ref=daa039d9f481b37973e2a03da9e34e929298d339",
+      "patch": "@@ -10,6 +10,7 @@ import (\n \t\"time\"\n \n \t\"github.com/spf13/cobra\"\n+\tagentconfig \"github.com/steveyegge/gastown/internal/config\"\n \t\"github.com/steveyegge/gastown/internal/daemon\"\n \t\"github.com/steveyegge/gastown/internal/style\"\n \t\"github.com/steveyegge/gastown/internal/templates\"\n@@ -365,6 +366,16 @@ func runDaemonRun(cmd *cobra.Command, args []string) error {\n \t\treturn fmt.Errorf(\"not in a Gas Town workspace: %w\", err)\n \t}\n \n+\t// Clear agent identity env vars inherited from the launch environment.\n+\t// When the daemon is started from an agent session (e.g. crew runs\n+\t// 'gt daemon start'), it inherits GT_ROLE/GT_CREW/etc. Any subprocess\n+\t// that derives sender identity from ambient env vars (e.g. gt mail send)\n+\t// would then be misattributed to the launching agent. GH#3006.\n+\tfor _, k := range agentconfig.IdentityEnvVars {\n+\t\tos.Unsetenv(k)\n+\t}\n+\tos.Setenv(\"BD_ACTOR\", \"daemon\")\n+\n \tconfig := daemon.DefaultConfig(townRoot)\n \td, err := daemon.New(config)\n \tif err != nil {"
+    },
+    {
+      "sha": "acdd35af2bd9d43ac1117293d8d38e5ce73a9923",
+      "filename": "internal/cmd/prime.go",
+      "status": "modified",
+      "additions": 76,
+      "deletions": 0,
+      "changes": 76,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/daa039d9f481b37973e2a03da9e34e929298d339/internal%2Fcmd%2Fprime.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/daa039d9f481b37973e2a03da9e34e929298d339/internal%2Fcmd%2Fprime.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fcmd%2Fprime.go?ref=daa039d9f481b37973e2a03da9e34e929298d339",
+      "patch": "@@ -16,6 +16,7 @@ import (\n \t\"github.com/spf13/cobra\"\n \t\"github.com/steveyegge/gastown/internal/beads\"\n \t\"github.com/steveyegge/gastown/internal/cli\"\n+\t\"github.com/steveyegge/gastown/internal/config\"\n \t\"github.com/steveyegge/gastown/internal/lock\"\n \t\"github.com/steveyegge/gastown/internal/state\"\n \t\"github.com/steveyegge/gastown/internal/style\"\n@@ -388,10 +389,85 @@ func setupPrimeSession(ctx RoleContext, roleInfo RoleInfo) error {\n \tif !roleInfo.Mismatch {\n \t\tensureBeadsRedirect(ctx)\n \t}\n+\trepairSessionEnv(ctx, roleInfo)\n \temitSessionEvent(ctx)\n \treturn nil\n }\n \n+// repairSessionEnv checks if the tmux session is missing identity env vars\n+// and re-injects them from the current role context. This self-heals sessions\n+// that were created through non-standard paths or older gt versions. GH#3006.\n+func repairSessionEnv(ctx RoleContext, roleInfo RoleInfo) {\n+\tif os.Getenv(\"TMUX\") == \"\" {\n+\t\treturn\n+\t}\n+\n+\tt := tmux.NewTmux()\n+\tsession, err := t.ResolveCurrentSession()\n+\tif err != nil || session == \"\" {\n+\t\treturn\n+\t}\n+\n+\t// Quick check: if GT_ROLE is already set in the session env, assume healthy.\n+\tif _, err := t.GetEnvironment(session, \"GT_ROLE\"); err == nil {\n+\t\treturn\n+\t}\n+\n+\t// Map prime Role type to config.AgentEnv role constant.\n+\tvar agentName string\n+\tswitch ctx.Role {\n+\tcase RoleCrew:\n+\t\tagentName = roleInfo.Polecat // RoleInfo.Polecat holds crew member name too\n+\tcase RolePolecat:\n+\t\tagentName = roleInfo.Polecat\n+\tcase RoleDog:\n+\t\tagentName = roleInfo.Polecat\n+\t}\n+\n+\tenvVars := config.AgentEnv(config.AgentEnvConfig{\n+\t\tRole:        string(ctx.Role),\n+\t\tRig:         ctx.Rig,\n+\t\tAgentName:   agentName,\n+\t\tTownRoot:    ctx.TownRoot,\n+\t\tSessionName: session,\n+\t})\n+\n+\t// Only inject identity-related vars that are missing, not the full AgentEnv\n+\t// output (which includes Dolt ports, OTEL config, etc. that may have been\n+\t// intentionally overridden per-session).\n+\tidentitySet := make(map[string]bool, len(config.IdentityEnvVars))\n+\tfor _, k := range config.IdentityEnvVars {\n+\t\tidentitySet[k] = true\n+\t}\n+\t// Also include GT_ROOT and GT_SESSION \u2014 core session identity.\n+\tidentitySet[\"GT_ROOT\"] = true\n+\tidentitySet[\"GT_SESSION\"] = true\n+\n+\tvar repaired int\n+\tfor k, v := range envVars {\n+\t\tif !identitySet[k] {\n+\t\t\tcontinue\n+\t\t}\n+\t\tif _, err := t.GetEnvironment(session, k); err == nil {\n+\t\t\tcontinue // already set at session level\n+\t\t}\n+\t\tif err := t.SetEnvironment(session, k, v); err == nil {\n+\t\t\trepaired++\n+\t\t}\n+\t}\n+\n+\tif repaired > 0 {\n+\t\tfmt.Printf(\"\\n%s Injected %d missing identity vars into session %s\\n\",\n+\t\t\tstyle.Bold.Render(\"\u26a0\ufe0f  SESSION ENV REPAIR:\"), repaired, session)\n+\t\t// Also set in the current process so this prime run uses the correct identity.\n+\t\tfor k, v := range envVars {\n+\t\t\tif identitySet[k] {\n+\t\t\t\tos.Setenv(k, v)\n+\t\t\t}\n+\t\t}\n+\t}\n+}\n+\n // outputRoleContext emits session metadata and all role/context output sections.\n // Returns the rendered formula content for OTEL telemetry (empty if using fallback path).\n func outputRoleContext(ctx RoleContext) (string, error) {"
+    },
+    {
+      "sha": "b881696f9b56c5f4b02943878ffd1791a4876c9f",
+      "filename": "internal/config/env.go",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 0,
+      "changes": 9,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/daa039d9f481b37973e2a03da9e34e929298d339/internal%2Fconfig%2Fenv.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/daa039d9f481b37973e2a03da9e34e929298d339/internal%2Fconfig%2Fenv.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fconfig%2Fenv.go?ref=daa039d9f481b37973e2a03da9e34e929298d339",
+      "patch": "@@ -13,6 +13,15 @@ import (\n \t\"github.com/steveyegge/gastown/internal/constants\"\n )\n \n+// IdentityEnvVars are agent identity env vars that must not leak across\n+// process or session boundaries. Used by daemon sanitization (clearing\n+// inherited vars), tmux global cleanup, and prime session env repair.\n+// See GH#3006.\n+var IdentityEnvVars = []string{\n+\t\"GT_ROLE\", \"GT_RIG\", \"GT_CREW\", \"GT_POLECAT\", \"GT_DOG_NAME\",\n+\t\"GT_SESSION\", \"GT_AGENT\", \"BD_ACTOR\", \"GIT_AUTHOR_NAME\", \"BEADS_AGENT_NAME\",\n+}\n+\n // AgentEnvConfig specifies the configuration for generating agent environment variables.\n // This is the single source of truth for all agent environment configuration.\n type AgentEnvConfig struct {"
+    },
+    {
+      "sha": "1c8b4f396e1cd4d7ec593d8285823acbcf8be35d",
+      "filename": "internal/config/env_test.go",
+      "status": "modified",
+      "additions": 28,
+      "deletions": 0,
+      "changes": 28,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/daa039d9f481b37973e2a03da9e34e929298d339/internal%2Fconfig%2Fenv_test.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/daa039d9f481b37973e2a03da9e34e929298d339/internal%2Fconfig%2Fenv_test.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fconfig%2Fenv_test.go?ref=daa039d9f481b37973e2a03da9e34e929298d339",
+      "patch": "@@ -134,6 +134,34 @@ func TestAgentEnv_Dog(t *testing.T) {\n \tassertNotSet(t, env, \"GT_RIG\")\n }\n \n+// TestIdentityEnvVars_CoversAgentEnvOutput verifies that IdentityEnvVars contains\n+// all identity-bearing keys that AgentEnv can produce. If AgentEnv gains a new\n+// identity key, this test fails to remind you to add it to IdentityEnvVars.\n+func TestIdentityEnvVars_CoversAgentEnvOutput(t *testing.T) {\n+\tt.Parallel()\n+\n+\t// Collect all identity keys produced by AgentEnv across all role types.\n+\t// Identity keys are role/rig/agent-specific \u2014 NOT infrastructure keys like\n+\t// GT_ROOT, NODE_OPTIONS, CLAUDECODE, etc.\n+\tidentityKeys := map[string]bool{\n+\t\t\"GT_ROLE\": true, \"GT_RIG\": true, \"GT_CREW\": true,\n+\t\t\"GT_POLECAT\": true, \"GT_DOG_NAME\": true, \"GT_SESSION\": true,\n+\t\t\"GT_AGENT\": true, \"BD_ACTOR\": true, \"GIT_AUTHOR_NAME\": true,\n+\t\t\"BEADS_AGENT_NAME\": true,\n+\t}\n+\n+\thave := make(map[string]bool, len(IdentityEnvVars))\n+\tfor _, k := range IdentityEnvVars {\n+\t\thave[k] = true\n+\t}\n+\n+\tfor k := range identityKeys {\n+\t\tif !have[k] {\n+\t\t\tt.Errorf(\"IdentityEnvVars is missing %q \u2014 add it to prevent identity leakage (GH#3006)\", k)\n+\t\t}\n+\t}\n+}\n+\n func TestAgentEnv_WithRuntimeConfigDir(t *testing.T) {\n \tt.Parallel()\n \tenv := AgentEnv(AgentEnvConfig{"
+    },
+    {
+      "sha": "803ddc9385c5d87a35463a0c911bf6f6bcb99e71",
+      "filename": "internal/daemon/daemon.go",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 2,
+      "changes": 13,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/daa039d9f481b37973e2a03da9e34e929298d339/internal%2Fdaemon%2Fdaemon.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/daa039d9f481b37973e2a03da9e34e929298d339/internal%2Fdaemon%2Fdaemon.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fdaemon%2Fdaemon.go?ref=daa039d9f481b37973e2a03da9e34e929298d339",
+      "patch": "@@ -24,7 +24,7 @@ import (\n \tbeadsdk \"github.com/steveyegge/beads\"\n \t\"github.com/steveyegge/gastown/internal/beads\"\n \t\"github.com/steveyegge/gastown/internal/boot\"\n-\t\"github.com/steveyegge/gastown/internal/config\"\n+\tagentconfig \"github.com/steveyegge/gastown/internal/config\"\n \t\"github.com/steveyegge/gastown/internal/constants\"\n \t\"github.com/steveyegge/gastown/internal/deacon\"\n \t\"github.com/steveyegge/gastown/internal/deps\"\n@@ -174,6 +174,15 @@ func New(config *Config) (*Daemon, error) {\n \t\tlogger.Printf(\"Warning: failed to set GT_TOWN_ROOT in tmux global env: %v\", err)\n \t}\n \n+\t// Clear any agent identity vars that leaked into tmux global env.\n+\t// Only GT_TOWN_ROOT should be global. Leaked identity vars cause sessions\n+\t// without their own session-level overrides to inherit a stale identity,\n+\t// misattributing beads and mail. GH#3006.\n+\tidentityVars := agentconfig.IdentityEnvVars\n+\tfor _, k := range identityVars {\n+\t\t_ = t.UnsetGlobalEnvironment(k)\n+\t}\n+\n \t// Load patrol config from mayor/daemon.json, ensuring lifecycle defaults\n \t// are populated for any missing data maintenance tickers. Without this,\n \t// opt-in patrols (compactor, reaper, doctor, JSONL backup, dolt backup)\n@@ -1852,7 +1861,7 @@ func (d *Daemon) isRigOperational(rigName string) (bool, string) {\n \t\tprefix = rigCfg.Beads.Prefix\n \t} else {\n \t\t// Fall back to registry (mayor/rigs.json) when config.json is missing\n-\t\tprefix = config.GetRigPrefix(d.config.TownRoot, rigName)\n+\t\tprefix = agentconfig.GetRigPrefix(d.config.TownRoot, rigName)\n \t}\n \n \trigBeadID := fmt.Sprintf(\"%s-rig-%s\", prefix, rigName)"
+    },
+    {
+      "sha": "cce31310cb6c5e84aa88ed36e1ed0aa90b041b09",
+      "filename": "internal/tmux/tmux.go",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/daa039d9f481b37973e2a03da9e34e929298d339/internal%2Ftmux%2Ftmux.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/daa039d9f481b37973e2a03da9e34e929298d339/internal%2Ftmux%2Ftmux.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Ftmux%2Ftmux.go?ref=daa039d9f481b37973e2a03da9e34e929298d339",
+      "patch": "@@ -2324,6 +2324,12 @@ func (t *Tmux) SetGlobalEnvironment(key, value string) error {\n \treturn err\n }\n \n+// UnsetGlobalEnvironment removes an environment variable from the tmux global environment.\n+func (t *Tmux) UnsetGlobalEnvironment(key string) error {\n+\t_, err := t.run(\"set-environment\", \"-g\", \"-u\", key)\n+\treturn err\n+}\n+\n // GetGlobalEnvironment gets an environment variable from the tmux global environment.\n func (t *Tmux) GetGlobalEnvironment(key string) (string, error) {\n \tout, err := t.run(\"show-environment\", \"-g\", key)"
+    }
+  ]
+}

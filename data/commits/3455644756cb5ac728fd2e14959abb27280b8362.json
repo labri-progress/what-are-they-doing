@@ -1,0 +1,41 @@
+{
+  "message": "Merge PR #2197: fix(zfc): replace PID string matching with flock + port checks\n\nReplace PID string matching with port connectivity checks for Dolt server\nidentity verification. Add isGasTownDaemon for orphan daemon discovery.\nMore reliable than ps output parsing (ZFC fix: gt-utuk).\n\nPR: https://github.com/steveyegge/gastown/pull/2197\nAuthor: DreadPirateRobertz\nCo-authored-by: deckard <cdeal@mines.edu>",
+  "files": [
+    {
+      "sha": "ddb7949c062c278f185826a82e286c2c42b9a4c9",
+      "filename": "internal/daemon/daemon.go",
+      "status": "modified",
+      "additions": 60,
+      "deletions": 3,
+      "changes": 63,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/3455644756cb5ac728fd2e14959abb27280b8362/internal%2Fdaemon%2Fdaemon.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/3455644756cb5ac728fd2e14959abb27280b8362/internal%2Fdaemon%2Fdaemon.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fdaemon%2Fdaemon.go?ref=3455644756cb5ac728fd2e14959abb27280b8362",
+      "patch": "@@ -1520,10 +1520,51 @@ func IsShutdownInProgress(townRoot string) bool {\n }\n \n // IsRunning checks if a daemon is running for the given town.\n-// It checks the PID file and verifies the process is alive.\n-// Note: The file lock in Run() is the authoritative mechanism for preventing\n-// duplicate daemons. This function is for status checks and cleanup.\n+// Uses the daemon.lock flock as the authoritative signal \u2014 if the lock is held,\n+// the daemon is running. Falls back to PID file for the process ID.\n+// This avoids fragile ps string matching for process identity (ZFC fix: gt-utuk).\n func IsRunning(townRoot string) (bool, int, error) {\n+\t// Primary check: is the daemon lock held?\n+\tlockPath := filepath.Join(townRoot, \"daemon\", \"daemon.lock\")\n+\tif _, err := os.Stat(lockPath); os.IsNotExist(err) {\n+\t\treturn false, 0, nil\n+\t}\n+\n+\tlock := flock.New(lockPath)\n+\tlocked, err := lock.TryLock()\n+\tif err != nil {\n+\t\t// Can't check lock \u2014 fall back to PID file + signal check\n+\t\treturn isRunningFromPID(townRoot)\n+\t}\n+\n+\tif locked {\n+\t\t// We acquired the lock, so no daemon holds it\n+\t\t_ = lock.Unlock()\n+\t\t// Clean up stale PID file if present\n+\t\tpidFile := filepath.Join(townRoot, \"daemon\", \"daemon.pid\")\n+\t\t_ = os.Remove(pidFile)\n+\t\treturn false, 0, nil\n+\t}\n+\n+\t// Lock is held \u2014 daemon is running. Read PID from file.\n+\tpidFile := filepath.Join(townRoot, \"daemon\", \"daemon.pid\")\n+\tdata, err := os.ReadFile(pidFile)\n+\tif err != nil {\n+\t\t// Lock held but no PID file \u2014 daemon is running but we can't report PID\n+\t\treturn true, 0, nil\n+\t}\n+\n+\tpidStr := strings.TrimSpace(string(data))\n+\tpid, err := strconv.Atoi(pidStr)\n+\tif err != nil {\n+\t\treturn true, 0, nil\n+\t}\n+\n+\treturn true, pid, nil\n+}\n+\n+// isRunningFromPID is the fallback when flock check fails. Uses PID file + signal.\n+func isRunningFromPID(townRoot string) (bool, int, error) {\n \tpidFile := filepath.Join(townRoot, \"daemon\", \"daemon.pid\")\n \n \tpid, alive, err := verifyPIDOwnership(pidFile)\n@@ -1547,6 +1588,22 @@ func IsRunning(townRoot string) (bool, int, error) {\n \treturn true, pid, nil\n }\n \n+// isGasTownDaemon checks if a PID is actually a gt daemon run process.\n+// This prevents false positives from PID reuse.\n+// Uses ps command for cross-platform compatibility (Linux, macOS).\n+// Note: This remains for FindOrphanedDaemons which discovers unknown processes\n+// where no lock file identity is available. IsRunning uses flock instead.\n+func isGasTownDaemon(pid int) bool {\n+\tcmd := exec.Command(\"ps\", \"-p\", strconv.Itoa(pid), \"-o\", \"command=\")\n+\toutput, err := cmd.Output()\n+\tif err != nil {\n+\t\treturn false\n+\t}\n+\n+\tcmdline := strings.TrimSpace(string(output))\n+\treturn strings.Contains(cmdline, \"gt\") && strings.Contains(cmdline, \"daemon\") && strings.Contains(cmdline, \"run\")\n+}\n+\n // StopDaemon stops the running daemon for the given town.\n // Note: The file lock in Run() prevents multiple daemons per town, so we only\n // need to kill the process from the PID file."
+    },
+    {
+      "sha": "03effb539001dcda8dc2679db383195a37785202",
+      "filename": "internal/daemon/dolt.go",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 1,
+      "changes": 21,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/3455644756cb5ac728fd2e14959abb27280b8362/internal%2Fdaemon%2Fdolt.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/3455644756cb5ac728fd2e14959abb27280b8362/internal%2Fdaemon%2Fdolt.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fdaemon%2Fdolt.go?ref=3455644756cb5ac728fd2e14959abb27280b8362",
+      "patch": "@@ -5,6 +5,7 @@ import (\n \t\"context\"\n \t\"encoding/json\"\n \t\"fmt\"\n+\t\"net\"\n \t\"os\"\n \t\"os/exec\"\n \t\"path/filepath\"\n@@ -315,15 +316,33 @@ func (m *DoltServerManager) isRunning() (int, bool) {\n \t\treturn 0, false\n \t}\n \n+\t// Verify it's actually our dolt server by checking port connectivity.\n+\t// More reliable than ps string matching (ZFC fix: gt-utuk).\n+\tif !m.isDoltServerOnPort() {\n+\t\t_ = os.Remove(m.pidFile())\n+\t\treturn 0, false\n+\t}\n+\n \tprocess, err := os.FindProcess(pid)\n \tif err != nil {\n \t\treturn 0, false\n \t}\n-\n \tm.process = process\n \treturn pid, true\n }\n \n+// isDoltServerOnPort checks if the configured dolt port is accepting connections.\n+// More reliable than ps string matching for process identity verification.\n+func (m *DoltServerManager) isDoltServerOnPort() bool {\n+\taddr := net.JoinHostPort(m.config.Host, strconv.Itoa(m.config.Port))\n+\tconn, err := net.DialTimeout(\"tcp\", addr, 2*time.Second)\n+\tif err != nil {\n+\t\treturn false\n+\t}\n+\tconn.Close()\n+\treturn true\n+}\n+\n // EnsureRunning ensures the Dolt server is running.\n // If not running, starts it. If running but unhealthy, restarts it.\n // Uses exponential backoff and a max-restart cap to avoid crash-looping."
+    },
+    {
+      "sha": "cf80728f876f6aae08981796751219282381dfb2",
+      "filename": "internal/daemon/handler.go",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 2,
+      "changes": 6,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/3455644756cb5ac728fd2e14959abb27280b8362/internal%2Fdaemon%2Fhandler.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/3455644756cb5ac728fd2e14959abb27280b8362/internal%2Fdaemon%2Fhandler.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fdaemon%2Fhandler.go?ref=3455644756cb5ac728fd2e14959abb27280b8362",
+      "patch": "@@ -12,8 +12,10 @@ import (\n \t\"github.com/steveyegge/gastown/internal/tmux\"\n )\n \n-// Constants for idle dog reaping.\n-const (\n+// Dog lifecycle defaults \u2014 centralized for visibility and future config override.\n+// These are policy decisions that may eventually move to DaemonPatrolConfig\n+// or role health config. See: gt-yzt0\n+var (\n \t// dogIdleSessionTimeout is how long a dog can be idle with a live tmux\n \t// session before the session is killed.\n \tdogIdleSessionTimeout = 1 * time.Hour"
+    }
+  ]
+}

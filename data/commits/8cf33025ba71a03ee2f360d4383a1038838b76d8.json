@@ -1,0 +1,41 @@
+{
+  "message": "fix(rpc): replace polling drain with WaitGroup in Stop() to prevent storage-close race (bd-11)\n\nStop() used busy-polling on an atomic counter with a hard 5-second timeout\nto drain in-flight connections. After timeout, storage would close even if\nconnections were still active, causing use-after-close on storage.\n\nReplace with sync.WaitGroup that properly blocks until all connection\ngoroutines exit. Keep the atomic counter for metrics/diagnostics. The\n5-second timeout remains as a safety net but the WaitGroup ensures\ncorrect synchronization when connections drain within the deadline.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\nExecuted-By: beads/polecats/quartz\nRig: beads\nRole: polecats",
+  "files": [
+    {
+      "sha": "139c1e5caef381013f395552610319fc9d3ea8e9",
+      "filename": "internal/rpc/limits_test.go",
+      "status": "modified",
+      "additions": 84,
+      "deletions": 0,
+      "changes": 84,
+      "blob_url": "https://github.com/gastownhall/beads/blob/8cf33025ba71a03ee2f360d4383a1038838b76d8/internal%2Frpc%2Flimits_test.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/8cf33025ba71a03ee2f360d4383a1038838b76d8/internal%2Frpc%2Flimits_test.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Frpc%2Flimits_test.go?ref=8cf33025ba71a03ee2f360d4383a1038838b76d8",
+      "patch": "@@ -198,6 +198,90 @@ func TestRequestTimeout(t *testing.T) {\n \t}\n }\n \n+// TestShutdownDrainsBeforeClosingStorage verifies that Stop() waits for\n+// in-flight connections to finish before closing storage (bd-11).\n+func TestShutdownDrainsBeforeClosingStorage(t *testing.T) {\n+\ttmpDir := t.TempDir()\n+\tdbPath := filepath.Join(tmpDir, \".beads\", \"test.db\")\n+\tif err := os.MkdirAll(filepath.Dir(dbPath), 0750); err != nil {\n+\t\tt.Fatal(err)\n+\t}\n+\n+\tstore, err := sqlite.New(context.Background(), dbPath)\n+\tif err != nil {\n+\t\tt.Fatal(err)\n+\t}\n+\tdefer store.Close()\n+\n+\tsocketPath := newTestSocketPath(t)\n+\n+\tsrv := NewServer(socketPath, store, tmpDir, dbPath)\n+\n+\tctx, cancel := context.WithCancel(context.Background())\n+\tdefer cancel()\n+\n+\tgo func() {\n+\t\tif err := srv.Start(ctx); err != nil && ctx.Err() == nil {\n+\t\t\tt.Logf(\"server error: %v\", err)\n+\t\t}\n+\t}()\n+\n+\ttime.Sleep(100 * time.Millisecond)\n+\n+\t// Open several connections and keep them alive with pings\n+\tconst numConns = 3\n+\tconnections := make([]net.Conn, numConns)\n+\tfor i := 0; i < numConns; i++ {\n+\t\tconn := dialTestConn(t, socketPath)\n+\t\tconnections[i] = conn\n+\n+\t\t// Send a ping to make the connection active in handleConnection\n+\t\treq := Request{Operation: OpPing}\n+\t\tdata, _ := json.Marshal(req)\n+\t\tconn.Write(append(data, '\\n'))\n+\n+\t\treader := bufio.NewReader(conn)\n+\t\t_, _ = reader.ReadBytes('\\n') // consume response\n+\t}\n+\n+\t// Verify connections are tracked\n+\ttime.Sleep(50 * time.Millisecond)\n+\tactive := atomic.LoadInt32(&srv.activeConns)\n+\tif active != numConns {\n+\t\tt.Fatalf(\"expected %d active connections, got %d\", numConns, active)\n+\t}\n+\n+\t// Start Stop() in background - it should block waiting for drain\n+\tstopDone := make(chan error, 1)\n+\tgo func() {\n+\t\tstopDone <- srv.Stop()\n+\t}()\n+\n+\t// Give Stop() a moment to close the listener and start waiting\n+\ttime.Sleep(100 * time.Millisecond)\n+\n+\t// Close client connections - this lets handleConnection goroutines exit\n+\tfor _, conn := range connections {\n+\t\tconn.Close()\n+\t}\n+\n+\t// Stop should complete quickly now that connections are drained\n+\tselect {\n+\tcase err := <-stopDone:\n+\t\tif err != nil {\n+\t\t\tt.Logf(\"Stop returned error (may be expected): %v\", err)\n+\t\t}\n+\tcase <-time.After(3 * time.Second):\n+\t\tt.Fatal(\"Stop() did not return after connections were drained\")\n+\t}\n+\n+\t// Verify all connections drained\n+\tfinal := atomic.LoadInt32(&srv.activeConns)\n+\tif final != 0 {\n+\t\tt.Errorf(\"expected 0 active connections after Stop, got %d\", final)\n+\t}\n+}\n+\n func TestHealthResponseIncludesLimits(t *testing.T) {\n \ttmpDir := t.TempDir()\n \tdbPath := filepath.Join(tmpDir, \"test.db\")"
+    },
+    {
+      "sha": "fac2c1fa140712ad209425833c80f1b0b4ebb5ac",
+      "filename": "internal/rpc/server_core.go",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/gastownhall/beads/blob/8cf33025ba71a03ee2f360d4383a1038838b76d8/internal%2Frpc%2Fserver_core.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/8cf33025ba71a03ee2f360d4383a1038838b76d8/internal%2Frpc%2Fserver_core.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Frpc%2Fserver_core.go?ref=8cf33025ba71a03ee2f360d4383a1038838b76d8",
+      "patch": "@@ -41,7 +41,8 @@ type Server struct {\n \tmetrics          *Metrics\n \t// Connection limiting\n \tmaxConns      int\n-\tactiveConns   int32 // atomic counter\n+\tactiveConns   int32          // atomic counter (for metrics/diagnostics)\n+\tconnWg        sync.WaitGroup // tracks in-flight connection goroutines for clean drain\n \tconnSemaphore chan struct{}\n \t// Request timeout\n \trequestTimeout time.Duration"
+    },
+    {
+      "sha": "ef996e8fef0ffa292f4f7a5b5908eef1d0d83e74",
+      "filename": "internal/rpc/server_lifecycle_conn.go",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 7,
+      "changes": 20,
+      "blob_url": "https://github.com/gastownhall/beads/blob/8cf33025ba71a03ee2f360d4383a1038838b76d8/internal%2Frpc%2Fserver_lifecycle_conn.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/8cf33025ba71a03ee2f360d4383a1038838b76d8/internal%2Frpc%2Fserver_lifecycle_conn.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Frpc%2Fserver_lifecycle_conn.go?ref=8cf33025ba71a03ee2f360d4383a1038838b76d8",
+      "patch": "@@ -98,7 +98,9 @@ func (s *Server) Start(_ context.Context) error {\n \t\tcase s.connSemaphore <- struct{}{}:\n \t\t\t// Acquired slot, handle connection\n \t\t\ts.metrics.RecordConnection()\n+\t\t\ts.connWg.Add(1)\n \t\t\tgo func(c net.Conn) {\n+\t\t\t\tdefer s.connWg.Done()\n \t\t\t\tdefer func() { <-s.connSemaphore }() // Release slot\n \t\t\t\tatomic.AddInt32(&s.activeConns, 1)\n \t\t\t\tdefer atomic.AddInt32(&s.activeConns, -1)\n@@ -140,13 +142,17 @@ func (s *Server) Stop() error {\n \t\t\t}\n \t\t}\n \n-\t\t// Wait for in-flight requests to drain (with timeout)\n-\t\tdrainDeadline := time.Now().Add(5 * time.Second)\n-\t\tfor time.Now().Before(drainDeadline) {\n-\t\t\tif atomic.LoadInt32(&s.activeConns) == 0 {\n-\t\t\t\tbreak\n-\t\t\t}\n-\t\t\ttime.Sleep(50 * time.Millisecond)\n+\t\t// Wait for in-flight connection goroutines to drain (with timeout)\n+\t\tdrainDone := make(chan struct{})\n+\t\tgo func() {\n+\t\t\ts.connWg.Wait()\n+\t\t\tclose(drainDone)\n+\t\t}()\n+\t\tselect {\n+\t\tcase <-drainDone:\n+\t\t\t// All connections drained cleanly\n+\t\tcase <-time.After(5 * time.Second):\n+\t\t\t// Timeout waiting for connections to drain - proceed with shutdown\n \t\t}\n \n \t\t// Close storage after in-flight requests complete"
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "message": "fix: eliminate 5+ second delays from stale daemon.lock files (bd-htwx)\n\nRoot cause: When a bd daemon crashes, its daemon.lock file remains with\nthe old PID. If that PID gets reused by an unrelated process, the code\nwould wait 5 seconds for a socket that will never appear.\n\nFix: Use flock-based check as authoritative source for daemon liveness.\nThe OS releases flocks when a process dies, so this is immune to PID reuse.\n\nChanges:\n- handleExistingSocket: Check daemon flock before waiting for socket\n- acquireStartLock: Verify daemon lock is held before waiting\n- handleStaleLock: Use flock check to detect stale startlocks\n- lockfile/process_*.go: Add pid <= 0 check to prevent false positives\n  (PID 0 signals process group on Unix, not a specific process)\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "97419154ff4841fd5fe03535d21fe9aca4456943",
+      "filename": "cmd/bd/daemon_autostart.go",
+      "status": "modified",
+      "additions": 40,
+      "deletions": 11,
+      "changes": 51,
+      "blob_url": "https://github.com/gastownhall/beads/blob/21de43538df62e9dfd8ea2191851270189ea0817/cmd%2Fbd%2Fdaemon_autostart.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/21de43538df62e9dfd8ea2191851270189ea0817/cmd%2Fbd%2Fdaemon_autostart.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/cmd%2Fbd%2Fdaemon_autostart.go?ref=21de43538df62e9dfd8ea2191851270189ea0817",
+      "patch": "@@ -11,6 +11,7 @@ import (\n \n \t\"github.com/steveyegge/beads/internal/config\"\n \t\"github.com/steveyegge/beads/internal/debug\"\n+\t\"github.com/steveyegge/beads/internal/lockfile\"\n \t\"github.com/steveyegge/beads/internal/rpc\"\n \t\"github.com/steveyegge/beads/internal/ui\"\n )\n@@ -217,7 +218,7 @@ func acquireStartLock(lockPath, socketPath string) bool {\n \t// nolint:gosec // G304: lockPath is derived from secure beads directory\n \tlockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)\n \tif err != nil {\n-\t\t// Lock file exists - check if it's from a dead process (stale) or alive daemon\n+\t\t// Lock file exists - check if daemon is actually starting\n \t\tlockPID, pidErr := readPIDFromFile(lockPath)\n \t\tif pidErr != nil || !isPIDAlive(lockPID) {\n \t\t\t// Stale lock from crashed process - clean up immediately (avoids 5s wait)\n@@ -227,7 +228,17 @@ func acquireStartLock(lockPath, socketPath string) bool {\n \t\t\treturn acquireStartLock(lockPath, socketPath)\n \t\t}\n \n-\t\t// PID is alive - daemon is legitimately starting, wait for socket to be ready\n+\t\t// PID is alive - but is daemon actually running/starting?\n+\t\t// Use flock-based check as authoritative source (immune to PID reuse)\n+\t\tbeadsDir := filepath.Dir(socketPath)\n+\t\tif running, _ := lockfile.TryDaemonLock(beadsDir); !running {\n+\t\t\t// Daemon lock not held - the start attempt failed or process was reused\n+\t\t\tdebugLog(\"startlock PID %d alive but daemon lock not held, cleaning up\", lockPID)\n+\t\t\t_ = os.Remove(lockPath)\n+\t\t\treturn acquireStartLock(lockPath, socketPath)\n+\t\t}\n+\n+\t\t// Daemon lock is held - daemon is legitimately starting, wait for socket\n \t\tdebugLog(\"another process (PID %d) is starting daemon, waiting for readiness\", lockPID)\n \t\tif waitForSocketReadiness(socketPath, 5*time.Second) {\n \t\t\treturn true\n@@ -242,11 +253,24 @@ func acquireStartLock(lockPath, socketPath string) bool {\n \n func handleStaleLock(lockPath, socketPath string) bool {\n \tlockPID, err := readPIDFromFile(lockPath)\n-\tif err == nil && !isPIDAlive(lockPID) {\n-\t\tdebugLog(\"lock is stale (PID %d dead), removing and retrying\", lockPID)\n+\n+\t// Check if PID is dead\n+\tif err != nil || !isPIDAlive(lockPID) {\n+\t\tdebugLog(\"lock is stale (PID %d dead or unreadable), removing and retrying\", lockPID)\n+\t\t_ = os.Remove(lockPath)\n+\t\treturn tryAutoStartDaemon(socketPath)\n+\t}\n+\n+\t// PID is alive - but check daemon lock as authoritative source (immune to PID reuse)\n+\tbeadsDir := filepath.Dir(socketPath)\n+\tif running, _ := lockfile.TryDaemonLock(beadsDir); !running {\n+\t\tdebugLog(\"lock PID %d alive but daemon lock not held, removing and retrying\", lockPID)\n \t\t_ = os.Remove(lockPath)\n \t\treturn tryAutoStartDaemon(socketPath)\n \t}\n+\n+\t// Daemon lock is held - daemon is genuinely running but socket isn't ready\n+\t// This shouldn't happen normally, but don't clean up a legitimate lock\n \treturn false\n }\n \n@@ -260,19 +284,24 @@ func handleExistingSocket(socketPath string) bool {\n \t\treturn true\n \t}\n \n-\tpidFile := getPIDFileForSocket(socketPath)\n-\tif pidFile != \"\" {\n-\t\tif pid, err := readPIDFromFile(pidFile); err == nil && isPIDAlive(pid) {\n-\t\t\tdebugLog(\"daemon PID %d alive, waiting for socket\", pid)\n-\t\t\treturn waitForSocketReadiness(socketPath, 5*time.Second)\n-\t\t}\n+\t// Use flock-based check as authoritative source (immune to PID reuse)\n+\t// If daemon lock is not held, daemon is definitely dead regardless of PID file\n+\tbeadsDir := filepath.Dir(socketPath)\n+\tif running, pid := lockfile.TryDaemonLock(beadsDir); running {\n+\t\tdebugLog(\"daemon lock held (PID %d), waiting for socket\", pid)\n+\t\treturn waitForSocketReadiness(socketPath, 5*time.Second)\n \t}\n \n-\tdebugLog(\"socket is stale, cleaning up\")\n+\t// Lock not held - daemon is dead, clean up stale artifacts\n+\tdebugLog(\"socket is stale (daemon lock not held), cleaning up\")\n \t_ = os.Remove(socketPath) // Best-effort cleanup, file may not exist\n+\tpidFile := getPIDFileForSocket(socketPath)\n \tif pidFile != \"\" {\n \t\t_ = os.Remove(pidFile) // Best-effort cleanup, file may not exist\n \t}\n+\t// Also clean up daemon.lock file (contains stale metadata)\n+\tlockFile := filepath.Join(beadsDir, \"daemon.lock\")\n+\t_ = os.Remove(lockFile) // Best-effort cleanup\n \treturn false\n }\n "
+    },
+    {
+      "sha": "f69c70fe423d3f84b484cc70821aff70bbe1de8b",
+      "filename": "internal/lockfile/process_unix.go",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/gastownhall/beads/blob/21de43538df62e9dfd8ea2191851270189ea0817/internal%2Flockfile%2Fprocess_unix.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/21de43538df62e9dfd8ea2191851270189ea0817/internal%2Flockfile%2Fprocess_unix.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Flockfile%2Fprocess_unix.go?ref=21de43538df62e9dfd8ea2191851270189ea0817",
+      "patch": "@@ -8,5 +8,8 @@ import (\n \n // isProcessRunning checks if a process with the given PID is running\n func isProcessRunning(pid int) bool {\n+\tif pid <= 0 {\n+\t\treturn false // Invalid PID (0 would signal our process group, not a specific process)\n+\t}\n \treturn syscall.Kill(pid, 0) == nil\n }"
+    },
+    {
+      "sha": "4421f7b67ea8cf498857801d6d2212dc68888e6b",
+      "filename": "internal/lockfile/process_windows.go",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/gastownhall/beads/blob/21de43538df62e9dfd8ea2191851270189ea0817/internal%2Flockfile%2Fprocess_windows.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/21de43538df62e9dfd8ea2191851270189ea0817/internal%2Flockfile%2Fprocess_windows.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Flockfile%2Fprocess_windows.go?ref=21de43538df62e9dfd8ea2191851270189ea0817",
+      "patch": "@@ -10,6 +10,9 @@ const stillActive = 259\n \n // isProcessRunning checks if a process with the given PID is running\n func isProcessRunning(pid int) bool {\n+\tif pid <= 0 {\n+\t\treturn false // Invalid PID\n+\t}\n \thandle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))\n \tif err != nil {\n \t\treturn false"
+    }
+  ]
+}

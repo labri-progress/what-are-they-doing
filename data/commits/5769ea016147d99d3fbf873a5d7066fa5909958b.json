@@ -1,0 +1,65 @@
+{
+  "message": "fix: forceCloseDescendants returns error to prevent orphaned wisp children (gt-7lx3)\n\nforceCloseDescendants was fire-and-forget (void return), so patrol_report\nclosed the parent even when child closes failed (e.g. Dolt hiccup).\nThis left orphaned wisp children -- 50 found across 5 patrol epics.\n\nChanges:\n- closeDescendantsImpl now returns (int, error) and collects errors via\n  errors.Join instead of silently swallowing them\n- forceCloseDescendants returns (int, error); patrol_report aborts if\n  descendants cannot be closed, so patrol retries next cycle\n- closeDescendants (non-force) preserves existing behavior: logs warnings,\n  returns count only -- used in burn/squash where proceeding is correct\n- Updated 4 other callers (handoff, sling_helpers, polecat nuke) to\n  handle the new return type with best-effort logging\n\nFiled bd-8qc5 for the latent beads-repo bug: getChildrenOfIssues\nhardcodes dependencies table, missing wisp_dependencies.",
+  "files": [
+    {
+      "sha": "91169430d3a538536aaae13b2de250ce36a10735",
+      "filename": "internal/cmd/handoff.go",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 1,
+      "changes": 5,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/5769ea016147d99d3fbf873a5d7066fa5909958b/internal%2Fcmd%2Fhandoff.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/5769ea016147d99d3fbf873a5d7066fa5909958b/internal%2Fcmd%2Fhandoff.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fcmd%2Fhandoff.go?ref=5769ea016147d99d3fbf873a5d7066fa5909958b",
+      "patch": "@@ -1556,7 +1556,10 @@ func cleanupMoleculeOnHandoff() {\n \n \t// Close all descendant wisps first, then the molecule root.\n \t// Without this, handoff leaks orphan wisps into the DB.\n-\tforceCloseDescendants(b, molID)\n+\t// Best-effort in handoff path \u2014 log but proceed.\n+\tif _, err := forceCloseDescendants(b, molID); err != nil {\n+\t\tstyle.PrintWarning(\"handoff: could not close descendants of %s: %v\", molID, err)\n+\t}\n \n \t// Force-close the molecule root wisp\n \tif err := b.ForceCloseWithReason(\"handoff\", molID); err != nil {"
+    },
+    {
+      "sha": "1dab1bb882592abe15fd557a6945ea9079396168",
+      "filename": "internal/cmd/molecule_lifecycle.go",
+      "status": "modified",
+      "additions": 25,
+      "deletions": 12,
+      "changes": 37,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/5769ea016147d99d3fbf873a5d7066fa5909958b/internal%2Fcmd%2Fmolecule_lifecycle.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/5769ea016147d99d3fbf873a5d7066fa5909958b/internal%2Fcmd%2Fmolecule_lifecycle.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fcmd%2Fmolecule_lifecycle.go?ref=5769ea016147d99d3fbf873a5d7066fa5909958b",
+      "patch": "@@ -2,6 +2,7 @@ package cmd\n \n import (\n \t\"encoding/json\"\n+\t\"errors\"\n \t\"fmt\"\n \t\"math/rand\"\n \t\"os\"\n@@ -343,34 +344,43 @@ squashed_at: %s\n // closeDescendants recursively closes all descendant issues of a parent.\n // Returns the count of issues closed. Logs warnings on errors but doesn't fail.\n func closeDescendants(b *beads.Beads, parentID string) int {\n-\treturn closeDescendantsImpl(b, parentID, false)\n+\tcount, err := closeDescendantsImpl(b, parentID, false)\n+\tif err != nil {\n+\t\tstyle.PrintWarning(\"closing descendants of %s: %v\", parentID, err)\n+\t}\n+\treturn count\n }\n \n // forceCloseDescendants is like closeDescendants but uses force-close,\n-// which succeeds even for beads in invalid states. Use in destructive\n-// paths (nuke, burn) where we must clean up regardless.\n-func forceCloseDescendants(b *beads.Beads, parentID string) {\n-\tcloseDescendantsImpl(b, parentID, true)\n+// which succeeds even for beads in invalid states. Returns the count of\n+// issues closed and any error encountered. Callers should check the error\n+// to avoid closing a parent while children survive (gt-7lx3).\n+func forceCloseDescendants(b *beads.Beads, parentID string) (int, error) {\n+\treturn closeDescendantsImpl(b, parentID, true)\n }\n \n-func closeDescendantsImpl(b *beads.Beads, parentID string, force bool) int {\n+func closeDescendantsImpl(b *beads.Beads, parentID string, force bool) (int, error) {\n \tchildren, err := b.List(beads.ListOptions{\n \t\tParent: parentID,\n \t\tStatus: \"all\",\n \t})\n \tif err != nil {\n-\t\tstyle.PrintWarning(\"could not list children of %s: %v\", parentID, err)\n-\t\treturn 0\n+\t\treturn 0, fmt.Errorf(\"listing children of %s: %w\", parentID, err)\n \t}\n \n \tif len(children) == 0 {\n-\t\treturn 0\n+\t\treturn 0, nil\n \t}\n \n \t// First, recursively close grandchildren\n \ttotalClosed := 0\n+\tvar errs []error\n \tfor _, child := range children {\n-\t\ttotalClosed += closeDescendantsImpl(b, child.ID, force)\n+\t\tclosed, childErr := closeDescendantsImpl(b, child.ID, force)\n+\t\ttotalClosed += closed\n+\t\tif childErr != nil {\n+\t\t\terrs = append(errs, childErr)\n+\t\t}\n \t}\n \n \t// Then close direct children\n@@ -389,11 +399,14 @@ func closeDescendantsImpl(b *beads.Beads, parentID string, force bool) int {\n \t\t\tcloseErr = b.Close(idsToClose...)\n \t\t}\n \t\tif closeErr != nil {\n-\t\t\tstyle.PrintWarning(\"could not close children of %s: %v\", parentID, closeErr)\n+\t\t\terrs = append(errs, fmt.Errorf(\"closing children of %s: %w\", parentID, closeErr))\n \t\t} else {\n \t\t\ttotalClosed += len(idsToClose)\n \t\t}\n \t}\n \n-\treturn totalClosed\n+\tif len(errs) > 0 {\n+\t\treturn totalClosed, errors.Join(errs...)\n+\t}\n+\treturn totalClosed, nil\n }"
+    },
+    {
+      "sha": "29348812dcee7d412a48696dbc8a68ac687660ea",
+      "filename": "internal/cmd/patrol_report.go",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 1,
+      "changes": 6,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/5769ea016147d99d3fbf873a5d7066fa5909958b/internal%2Fcmd%2Fpatrol_report.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/5769ea016147d99d3fbf873a5d7066fa5909958b/internal%2Fcmd%2Fpatrol_report.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fcmd%2Fpatrol_report.go?ref=5769ea016147d99d3fbf873a5d7066fa5909958b",
+      "patch": "@@ -95,7 +95,11 @@ func runPatrolReport(cmd *cobra.Command, args []string) error {\n \n \t// Close all descendant wisps first (recursive), then the patrol root.\n \t// Without this, every patrol cycle leaks ~10 orphan wisps into the DB.\n-\tforceCloseDescendants(b, patrolID)\n+\t// If descendants can't be closed, abort so patrol retries next cycle (gt-7lx3).\n+\tclosed, closeDescErr := forceCloseDescendants(b, patrolID)\n+\tif closeDescErr != nil {\n+\t\treturn fmt.Errorf(\"closing descendants of patrol %s (closed %d): %w\", patrolID, closed, closeDescErr)\n+\t}\n \n \t// Close the patrol root\n \tif err := b.ForceCloseWithReason(\"patrol cycle complete: \"+patrolReportSummary, patrolID); err != nil {"
+    },
+    {
+      "sha": "cff0fde3a87c55745b485b83805476118e1d7712",
+      "filename": "internal/cmd/polecat.go",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 2,
+      "changes": 6,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/5769ea016147d99d3fbf873a5d7066fa5909958b/internal%2Fcmd%2Fpolecat.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/5769ea016147d99d3fbf873a5d7066fa5909958b/internal%2Fcmd%2Fpolecat.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fcmd%2Fpolecat.go?ref=5769ea016147d99d3fbf873a5d7066fa5909958b",
+      "patch": "@@ -1379,8 +1379,10 @@ func nukeCleanupMolecules(workBeadID string, r *rig.Rig) {\n \n \t// Force-close descendant steps before detaching (prevents orphaned step beads).\n \t// Uses force variant since nuke is destructive \u2014 must succeed even for beads in\n-\t// invalid states.\n-\tforceCloseDescendants(bd, moleculeID)\n+\t// invalid states. Best-effort \u2014 log but proceed in nuke path.\n+\tif _, err := forceCloseDescendants(bd, moleculeID); err != nil {\n+\t\tstyle.PrintWarning(\"nuke: could not close descendants of %s: %v\", moleculeID, err)\n+\t}\n \n \t// Detach the molecule with audit trail\n \tif _, detachErr := bd.DetachMoleculeWithAudit(workBeadID, beads.DetachOptions{"
+    },
+    {
+      "sha": "42d96e18a0bad3890aecb7cfded9104ecb614cec",
+      "filename": "internal/cmd/sling_helpers.go",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 2,
+      "changes": 10,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/5769ea016147d99d3fbf873a5d7066fa5909958b/internal%2Fcmd%2Fsling_helpers.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/5769ea016147d99d3fbf873a5d7066fa5909958b/internal%2Fcmd%2Fsling_helpers.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fcmd%2Fsling_helpers.go?ref=5769ea016147d99d3fbf873a5d7066fa5909958b",
+      "patch": "@@ -154,8 +154,11 @@ func burnExistingMolecules(molecules []string, beadID, townRoot string) error {\n \n \t// Step 1: Force-close descendant steps before detaching. Uses force variant\n \t// since burn is a destructive recovery path where prior state may be inconsistent.\n+\t// Best-effort \u2014 log but proceed in destructive path.\n \tfor _, molID := range molecules {\n-\t\tforceCloseDescendants(bd, molID)\n+\t\tif _, err := forceCloseDescendants(bd, molID); err != nil {\n+\t\t\tstyle.PrintWarning(\"burn: could not close descendants of %s: %v\", molID, err)\n+\t\t}\n \t}\n \n \t// Step 2: Detach molecule from the base bead using the Go API (with audit logging\n@@ -186,8 +189,11 @@ func burnExistingMolecules(molecules []string, beadID, townRoot string) error {\n \t}\n \n \t// Step 4: Close descendants, then force-close the orphaned wisp roots.\n+\t// Best-effort \u2014 log but proceed in destructive path.\n \tfor _, molID := range molecules {\n-\t\tforceCloseDescendants(bd, molID)\n+\t\tif _, err := forceCloseDescendants(bd, molID); err != nil {\n+\t\t\tstyle.PrintWarning(\"burn: could not close descendants of %s: %v\", molID, err)\n+\t\t}\n \t}\n \tif err := bd.ForceCloseWithReason(\"burned: force re-sling\", molecules...); err != nil {\n \t\tfmt.Printf(\"  %s Could not close molecule wisp(s): %v\\n\","
+    }
+  ]
+}

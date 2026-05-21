@@ -1,0 +1,29 @@
+{
+  "message": "fix(import): preserve comment created_at timestamps during import (#735)\n\nComment timestamps were being overwritten with CURRENT_TIMESTAMP during\nimport, causing infinite sync loops between hosts as each import would\nupdate timestamps.\n\nAdded ImportIssueComment() method that accepts and preserves the original\ntimestamp from JSONL, and updated importComments() to use it.\n\nCloses #735",
+  "files": [
+    {
+      "sha": "69213a5a2d66f443d0b42a3abf5a1fa6f3d7e1fa",
+      "filename": "internal/importer/importer.go",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 1,
+      "changes": 6,
+      "blob_url": "https://github.com/gastownhall/beads/blob/9743b45c6dcca133d4fd24ed57c27ad8da490867/internal%2Fimporter%2Fimporter.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/9743b45c6dcca133d4fd24ed57c27ad8da490867/internal%2Fimporter%2Fimporter.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fimporter%2Fimporter.go?ref=9743b45c6dcca133d4fd24ed57c27ad8da490867",
+      "patch": "@@ -6,6 +6,7 @@ import (\n \t\"os\"\n \t\"sort\"\n \t\"strings\"\n+\t\"time\"\n \n \t\"github.com/steveyegge/beads/internal/config\"\n \t\"github.com/steveyegge/beads/internal/linear\"\n@@ -892,7 +893,10 @@ func importComments(ctx context.Context, sqliteStore *sqlite.SQLiteStorage, issu\n \t\tfor _, comment := range issue.Comments {\n \t\t\tkey := fmt.Sprintf(\"%s:%s\", comment.Author, strings.TrimSpace(comment.Text))\n \t\t\tif !existingComments[key] {\n-\t\t\t\tif _, err := sqliteStore.AddIssueComment(ctx, issue.ID, comment.Author, comment.Text); err != nil {\n+\t\t\t\t// Use ImportIssueComment to preserve original timestamp (GH#735)\n+\t\t\t\t// Format timestamp as RFC3339 for SQLite compatibility\n+\t\t\t\tcreatedAt := comment.CreatedAt.UTC().Format(time.RFC3339)\n+\t\t\t\tif _, err := sqliteStore.ImportIssueComment(ctx, issue.ID, comment.Author, comment.Text, createdAt); err != nil {\n \t\t\t\t\tif opts.Strict {\n \t\t\t\t\t\treturn fmt.Errorf(\"error adding comment to %s: %w\", issue.ID, err)\n \t\t\t\t\t}"
+    },
+    {
+      "sha": "1cdc48d326d33fde9ae2fcd9d3ae773a1dd58f5f",
+      "filename": "internal/storage/sqlite/comments.go",
+      "status": "modified",
+      "additions": 48,
+      "deletions": 0,
+      "changes": 48,
+      "blob_url": "https://github.com/gastownhall/beads/blob/9743b45c6dcca133d4fd24ed57c27ad8da490867/internal%2Fstorage%2Fsqlite%2Fcomments.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/9743b45c6dcca133d4fd24ed57c27ad8da490867/internal%2Fstorage%2Fsqlite%2Fcomments.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fstorage%2Fsqlite%2Fcomments.go?ref=9743b45c6dcca133d4fd24ed57c27ad8da490867",
+      "patch": "@@ -52,6 +52,54 @@ func (s *SQLiteStorage) AddIssueComment(ctx context.Context, issueID, author, te\n \treturn comment, nil\n }\n \n+// ImportIssueComment adds a comment during import, preserving the original timestamp.\n+// Unlike AddIssueComment which uses CURRENT_TIMESTAMP, this method uses the provided\n+// createdAt time from the JSONL file. This prevents timestamp drift during sync cycles.\n+// GH#735: Comment created_at timestamps were being overwritten with current time during import.\n+func (s *SQLiteStorage) ImportIssueComment(ctx context.Context, issueID, author, text string, createdAt string) (*types.Comment, error) {\n+\t// Verify issue exists\n+\tvar exists bool\n+\terr := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM issues WHERE id = ?)`, issueID).Scan(&exists)\n+\tif err != nil {\n+\t\treturn nil, fmt.Errorf(\"failed to check issue existence: %w\", err)\n+\t}\n+\tif !exists {\n+\t\treturn nil, fmt.Errorf(\"issue %s not found\", issueID)\n+\t}\n+\n+\t// Insert comment with provided timestamp\n+\tresult, err := s.db.ExecContext(ctx, `\n+\t\tINSERT INTO comments (issue_id, author, text, created_at)\n+\t\tVALUES (?, ?, ?, ?)\n+\t`, issueID, author, text, createdAt)\n+\tif err != nil {\n+\t\treturn nil, fmt.Errorf(\"failed to insert comment: %w\", err)\n+\t}\n+\n+\t// Get the inserted comment ID\n+\tcommentID, err := result.LastInsertId()\n+\tif err != nil {\n+\t\treturn nil, fmt.Errorf(\"failed to get comment ID: %w\", err)\n+\t}\n+\n+\t// Fetch the complete comment\n+\tcomment := &types.Comment{}\n+\terr = s.db.QueryRowContext(ctx, `\n+\t\tSELECT id, issue_id, author, text, created_at\n+\t\tFROM comments WHERE id = ?\n+\t`, commentID).Scan(&comment.ID, &comment.IssueID, &comment.Author, &comment.Text, &comment.CreatedAt)\n+\tif err != nil {\n+\t\treturn nil, fmt.Errorf(\"failed to fetch comment: %w\", err)\n+\t}\n+\n+\t// Mark issue as dirty for JSONL export\n+\tif err := s.MarkIssueDirty(ctx, issueID); err != nil {\n+\t\treturn nil, fmt.Errorf(\"failed to mark issue dirty: %w\", err)\n+\t}\n+\n+\treturn comment, nil\n+}\n+\n // GetIssueComments retrieves all comments for an issue\n func (s *SQLiteStorage) GetIssueComments(ctx context.Context, issueID string) ([]*types.Comment, error) {\n \trows, err := s.db.QueryContext(ctx, `"
+    }
+  ]
+}

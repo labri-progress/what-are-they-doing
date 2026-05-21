@@ -1,0 +1,65 @@
+{
+  "message": "Merge pull request #3253 from outdoorsea/feat/quota-dog\n\nfeat(daemon): add quota_dog for automatic rate-limit detection and credential rotation",
+  "files": [
+    {
+      "sha": "d6b7d404515525d3937c76d5e5c1b9512fea0a4c",
+      "filename": "internal/daemon/daemon.go",
+      "status": "modified",
+      "additions": 19,
+      "deletions": 0,
+      "changes": 19,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/b661704cbe3022a9decc58e3be2d304edfaf51e9/internal%2Fdaemon%2Fdaemon.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/b661704cbe3022a9decc58e3be2d304edfaf51e9/internal%2Fdaemon%2Fdaemon.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fdaemon%2Fdaemon.go?ref=b661704cbe3022a9decc58e3be2d304edfaf51e9",
+      "patch": "@@ -535,6 +535,18 @@ func (d *Daemon) Run() error {\n \t\td.logger.Printf(\"Main branch test ticker started (interval %v)\", interval)\n \t}\n \n+\t// Start quota dog ticker if configured.\n+\t// Scans for rate-limited sessions and automatically rotates credentials.\n+\tvar quotaDogTicker *time.Ticker\n+\tvar quotaDogChan <-chan time.Time\n+\tif d.isPatrolActive(\"quota_dog\") {\n+\t\tinterval := quotaDogInterval(d.patrolConfig)\n+\t\tquotaDogTicker = time.NewTicker(interval)\n+\t\tquotaDogChan = quotaDogTicker.C\n+\t\tdefer quotaDogTicker.Stop()\n+\t\td.logger.Printf(\"Quota dog ticker started (interval %v)\", interval)\n+\t}\n+\n \t// Note: PATCH-010 uses per-session hooks in deacon/manager.go (SetAutoRespawnHook).\n \t// Global pane-died hooks don't fire reliably in tmux 3.2a, so we rely on the\n \t// per-session approach which has been tested to work for continuous recovery.\n@@ -636,6 +648,13 @@ func (d *Daemon) Run() error {\n \t\t\t\td.runMainBranchTests()\n \t\t\t}\n \n+\t\tcase <-quotaDogChan:\n+\t\t\t// Quota dog \u2014 scans for rate-limited sessions and automatically\n+\t\t\t// rotates credentials to available accounts via keychain swap.\n+\t\t\tif !d.isShutdownInProgress() {\n+\t\t\t\td.runQuotaDog()\n+\t\t\t}\n+\n \t\tcase <-timer.C:\n \t\t\td.heartbeat(state)\n "
+    },
+    {
+      "sha": "727401684a5339227e713a5b1b6ff592a27d63e9",
+      "filename": "internal/daemon/dog_molecule.go",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/b661704cbe3022a9decc58e3be2d304edfaf51e9/internal%2Fdaemon%2Fdog_molecule.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/b661704cbe3022a9decc58e3be2d304edfaf51e9/internal%2Fdaemon%2Fdog_molecule.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fdaemon%2Fdog_molecule.go?ref=b661704cbe3022a9decc58e3be2d304edfaf51e9",
+      "patch": "@@ -222,6 +222,8 @@ func (dm *dogMol) discoverSteps() {\n \t\t\tdm.stepIDs[\"sync\"] = child.ID\n \t\tcase strings.Contains(titleLower, \"offsite\"):\n \t\t\tdm.stepIDs[\"offsite\"] = child.ID\n+\t\tcase strings.Contains(titleLower, \"rotat\"):\n+\t\t\tdm.stepIDs[\"rotate\"] = child.ID\n \t\t}\n \t}\n }"
+    },
+    {
+      "sha": "dc7cd031eb4121bd148920c794a22e81f2925829",
+      "filename": "internal/daemon/quota_dog.go",
+      "status": "added",
+      "additions": 78,
+      "deletions": 0,
+      "changes": 78,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/b661704cbe3022a9decc58e3be2d304edfaf51e9/internal%2Fdaemon%2Fquota_dog.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/b661704cbe3022a9decc58e3be2d304edfaf51e9/internal%2Fdaemon%2Fquota_dog.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fdaemon%2Fquota_dog.go?ref=b661704cbe3022a9decc58e3be2d304edfaf51e9",
+      "patch": "@@ -0,0 +1,78 @@\n+package daemon\n+\n+import (\n+\t\"bytes\"\n+\t\"context\"\n+\t\"os/exec\"\n+\t\"time\"\n+)\n+\n+const (\n+\tdefaultQuotaDogInterval = 5 * time.Minute\n+\t// quotaDogTimeout is the maximum time allowed for a single rotation cycle.\n+\tquotaDogTimeout = 2 * time.Minute\n+)\n+\n+// QuotaDogConfig holds configuration for the quota_dog patrol.\n+type QuotaDogConfig struct {\n+\t// Enabled controls whether the quota dog runs.\n+\tEnabled bool `json:\"enabled\"`\n+\n+\t// IntervalStr is how often to run, as a string (e.g., \"5m\").\n+\tIntervalStr string `json:\"interval,omitempty\"`\n+}\n+\n+// quotaDogInterval returns the configured interval, or the default (5m).\n+func quotaDogInterval(config *DaemonPatrolConfig) time.Duration {\n+\tif config != nil && config.Patrols != nil && config.Patrols.QuotaDog != nil {\n+\t\tif config.Patrols.QuotaDog.IntervalStr != \"\" {\n+\t\t\tif d, err := time.ParseDuration(config.Patrols.QuotaDog.IntervalStr); err == nil && d > 0 {\n+\t\t\t\treturn d\n+\t\t\t}\n+\t\t}\n+\t}\n+\treturn defaultQuotaDogInterval\n+}\n+\n+// runQuotaDog executes a quota rotation cycle by shelling out to `gt quota rotate`.\n+// The daemon is a thin ticker \u2014 `gt quota rotate` handles scanning for rate-limited\n+// sessions, planning account assignments, and executing keychain swaps + session restarts.\n+//\n+// This follows the daemon's \"dumb scheduler\" principle: the daemon schedules,\n+// existing commands do the work. No LLM or molecule needed \u2014 pure mechanical rotation.\n+func (d *Daemon) runQuotaDog() {\n+\tif !d.isPatrolActive(\"quota_dog\") {\n+\t\treturn\n+\t}\n+\n+\td.logger.Printf(\"quota_dog: starting rotation cycle\")\n+\n+\tctx, cancel := context.WithTimeout(d.ctx, quotaDogTimeout)\n+\tdefer cancel()\n+\n+\tcmd := exec.CommandContext(ctx, d.gtPath, \"quota\", \"rotate\", \"--json\") //nolint:gosec // G204: gtPath resolved at daemon init\n+\tcmd.Dir = d.config.TownRoot\n+\n+\tvar stdout, stderr bytes.Buffer\n+\tcmd.Stdout = &stdout\n+\tcmd.Stderr = &stderr\n+\n+\tif err := cmd.Run(); err != nil {\n+\t\t// Non-fatal: rotation failure shouldn't crash the daemon.\n+\t\t// Common expected failures: <2 accounts, no rate-limited sessions.\n+\t\tstderrStr := stderr.String()\n+\t\tif stderrStr != \"\" {\n+\t\t\td.logger.Printf(\"quota_dog: rotation failed (non-fatal): %v: %s\", err, stderrStr)\n+\t\t} else {\n+\t\t\td.logger.Printf(\"quota_dog: rotation failed (non-fatal): %v\", err)\n+\t\t}\n+\t\treturn\n+\t}\n+\n+\toutStr := stdout.String()\n+\tif outStr != \"\" && outStr != \"[]\\n\" && outStr != \"[]\" {\n+\t\td.logger.Printf(\"quota_dog: rotation result: %s\", outStr)\n+\t} else {\n+\t\td.logger.Printf(\"quota_dog: no rate-limited sessions detected\")\n+\t}\n+}"
+    },
+    {
+      "sha": "dfeccf90a4e58a6e6e7f3d8c77eb8a18d7ed2328",
+      "filename": "internal/daemon/quota_dog_test.go",
+      "status": "added",
+      "additions": 85,
+      "deletions": 0,
+      "changes": 85,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/b661704cbe3022a9decc58e3be2d304edfaf51e9/internal%2Fdaemon%2Fquota_dog_test.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/b661704cbe3022a9decc58e3be2d304edfaf51e9/internal%2Fdaemon%2Fquota_dog_test.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fdaemon%2Fquota_dog_test.go?ref=b661704cbe3022a9decc58e3be2d304edfaf51e9",
+      "patch": "@@ -0,0 +1,85 @@\n+package daemon\n+\n+import (\n+\t\"encoding/json\"\n+\t\"testing\"\n+\t\"time\"\n+)\n+\n+func TestQuotaDogInterval(t *testing.T) {\n+\t// Default interval\n+\tif got := quotaDogInterval(nil); got != defaultQuotaDogInterval {\n+\t\tt.Errorf(\"expected default interval %v, got %v\", defaultQuotaDogInterval, got)\n+\t}\n+\n+\t// Custom interval\n+\tconfig := &DaemonPatrolConfig{\n+\t\tPatrols: &PatrolsConfig{\n+\t\t\tQuotaDog: &QuotaDogConfig{\n+\t\t\t\tEnabled:     true,\n+\t\t\t\tIntervalStr: \"2m\",\n+\t\t\t},\n+\t\t},\n+\t}\n+\tif got := quotaDogInterval(config); got != 2*time.Minute {\n+\t\tt.Errorf(\"expected 2m interval, got %v\", got)\n+\t}\n+\n+\t// Invalid interval falls back to default\n+\tconfig.Patrols.QuotaDog.IntervalStr = \"invalid\"\n+\tif got := quotaDogInterval(config); got != defaultQuotaDogInterval {\n+\t\tt.Errorf(\"expected default interval for invalid config, got %v\", got)\n+\t}\n+}\n+\n+func TestIsPatrolEnabled_QuotaDog(t *testing.T) {\n+\t// Nil config: disabled (opt-in patrol)\n+\tif IsPatrolEnabled(nil, \"quota_dog\") {\n+\t\tt.Error(\"expected quota_dog to be disabled with nil config\")\n+\t}\n+\n+\t// Empty patrols: disabled\n+\tconfig := &DaemonPatrolConfig{\n+\t\tPatrols: &PatrolsConfig{},\n+\t}\n+\tif IsPatrolEnabled(config, \"quota_dog\") {\n+\t\tt.Error(\"expected quota_dog to be disabled by default\")\n+\t}\n+\n+\t// Explicitly enabled\n+\tconfig.Patrols.QuotaDog = &QuotaDogConfig{Enabled: true}\n+\tif !IsPatrolEnabled(config, \"quota_dog\") {\n+\t\tt.Error(\"expected quota_dog to be enabled when configured\")\n+\t}\n+\n+\t// Explicitly disabled\n+\tconfig.Patrols.QuotaDog = &QuotaDogConfig{Enabled: false}\n+\tif IsPatrolEnabled(config, \"quota_dog\") {\n+\t\tt.Error(\"expected quota_dog to be disabled when explicitly disabled\")\n+\t}\n+}\n+\n+func TestQuotaDogConfigJSON(t *testing.T) {\n+\tjsonData := `{\"enabled\": true, \"interval\": \"3m\"}`\n+\n+\tvar config QuotaDogConfig\n+\tif err := json.Unmarshal([]byte(jsonData), &config); err != nil {\n+\t\tt.Fatalf(\"failed to unmarshal: %v\", err)\n+\t}\n+\n+\tif !config.Enabled {\n+\t\tt.Error(\"expected enabled=true\")\n+\t}\n+\tif config.IntervalStr != \"3m\" {\n+\t\tt.Errorf(\"expected interval=3m, got %s\", config.IntervalStr)\n+\t}\n+}\n+\n+func TestQuotaDogDefaultConstants(t *testing.T) {\n+\tif defaultQuotaDogInterval != 5*time.Minute {\n+\t\tt.Errorf(\"expected default interval 5m, got %v\", defaultQuotaDogInterval)\n+\t}\n+\tif quotaDogTimeout != 2*time.Minute {\n+\t\tt.Errorf(\"expected timeout 2m, got %v\", quotaDogTimeout)\n+\t}\n+}"
+    },
+    {
+      "sha": "5309dfef5811e80d1502ef7ff9e602bdcbed5078",
+      "filename": "internal/daemon/types.go",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 0,
+      "changes": 7,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/b661704cbe3022a9decc58e3be2d304edfaf51e9/internal%2Fdaemon%2Ftypes.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/b661704cbe3022a9decc58e3be2d304edfaf51e9/internal%2Fdaemon%2Ftypes.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fdaemon%2Ftypes.go?ref=b661704cbe3022a9decc58e3be2d304edfaf51e9",
+      "patch": "@@ -129,6 +129,7 @@ type PatrolsConfig struct {\n \tCheckpointDog          *CheckpointDogConfig           `json:\"checkpoint_dog,omitempty\"`\n \tScheduledMaintenance   *ScheduledMaintenanceConfig    `json:\"scheduled_maintenance,omitempty\"`\n \tMainBranchTest         *MainBranchTestConfig          `json:\"main_branch_test,omitempty\"`\n+\tQuotaDog               *QuotaDogConfig                `json:\"quota_dog,omitempty\"`\n \tRestartTracker         *RestartTrackerConfig          `json:\"restart_tracker,omitempty\"`\n }\n \n@@ -301,6 +302,12 @@ func IsPatrolEnabled(config *DaemonPatrolConfig, patrol string) bool {\n \t\t}\n \t\treturn config.Patrols.MainBranchTest.Enabled\n \t}\n+\tif patrol == \"quota_dog\" {\n+\t\tif config == nil || config.Patrols == nil || config.Patrols.QuotaDog == nil {\n+\t\t\treturn false\n+\t\t}\n+\t\treturn config.Patrols.QuotaDog.Enabled\n+\t}\n \n \tif config == nil || config.Patrols == nil {\n \t\treturn true // Default: enabled"
+    }
+  ]
+}

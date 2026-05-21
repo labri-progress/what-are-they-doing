@@ -1,0 +1,41 @@
+{
+  "message": "fix: extend cycle detection to span wisp_dependencies table (bd-xe27)\n\nAddDependency cycle detection CTE only traversed the permanent\ndependencies table. Cross-table cycles involving wisp_dependencies\n(e.g., permanent A -> wisp B -> permanent A) were not detected.\n\nChanges:\n- AddDependency: CTE now UNIONs dependencies and wisp_dependencies\n- addWispDependency: Add cycle detection (was completely missing)\n- DetectCycles: Include wisp_dependencies records in graph traversal\n- Add getAllWispDependencyRecords helper for DetectCycles\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\nExecuted-By: beads/polecats/ruby\nRig: beads\nRole: polecats",
+  "files": [
+    {
+      "sha": "74e8e54ef259ad0385926b5be544979fad2f9474",
+      "filename": "internal/storage/dolt/dependencies.go",
+      "status": "modified",
+      "additions": 26,
+      "deletions": 6,
+      "changes": 32,
+      "blob_url": "https://github.com/gastownhall/beads/blob/ef7cf9f9b75600c68e39f065756b1ffb0c4ffd9b/internal%2Fstorage%2Fdolt%2Fdependencies.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/ef7cf9f9b75600c68e39f065756b1ffb0c4ffd9b/internal%2Fstorage%2Fdolt%2Fdependencies.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fstorage%2Fdolt%2Fdependencies.go?ref=ef7cf9f9b75600c68e39f065756b1ffb0c4ffd9b",
+      "patch": "@@ -65,6 +65,8 @@ func (s *DoltStore) AddDependency(ctx context.Context, dep *types.Dependency, ac\n \n \t// Cycle detection for blocking dependency types: check if adding this edge\n \t// would create a cycle by seeing if depends_on_id can already reach issue_id.\n+\t// UNIONs both dependencies and wisp_dependencies to detect cross-table cycles\n+\t// (e.g., permanent A -> wisp B -> permanent A). (bd-xe27)\n \tif dep.Type == types.DepBlocks {\n \t\tvar reachable int\n \t\tif err := tx.QueryRowContext(ctx, `\n@@ -73,9 +75,12 @@ func (s *DoltStore) AddDependency(ctx context.Context, dep *types.Dependency, ac\n \t\t\t\tUNION ALL\n \t\t\t\tSELECT d.depends_on_id, r.depth + 1\n \t\t\t\tFROM reachable r\n-\t\t\t\tJOIN dependencies d ON d.issue_id = r.node\n-\t\t\t\tWHERE d.type = 'blocks'\n-\t\t\t\t  AND r.depth < 100\n+\t\t\t\tJOIN (\n+\t\t\t\t\tSELECT issue_id, depends_on_id FROM dependencies WHERE type = 'blocks'\n+\t\t\t\t\tUNION ALL\n+\t\t\t\t\tSELECT issue_id, depends_on_id FROM wisp_dependencies WHERE type = 'blocks'\n+\t\t\t\t) d ON d.issue_id = r.node\n+\t\t\t\tWHERE r.depth < 100\n \t\t\t)\n \t\t\tSELECT COUNT(*) FROM reachable WHERE node = ?\n \t\t`, dep.DependsOnID, dep.IssueID).Scan(&reachable); err != nil {\n@@ -714,15 +719,23 @@ func (s *DoltStore) buildDependencyTree(ctx context.Context, issueID string, dep\n \treturn nodes, nil\n }\n \n-// DetectCycles finds circular dependencies\n+// DetectCycles finds circular dependencies.\n+// Queries both dependencies and wisp_dependencies tables to detect cross-table\n+// cycles (e.g., permanent A -> wisp B -> permanent A). (bd-xe27)\n func (s *DoltStore) DetectCycles(ctx context.Context) ([][]*types.Issue, error) {\n-\t// Get all dependencies\n+\t// Get all permanent dependencies\n \tdeps, err := s.GetAllDependencyRecords(ctx)\n \tif err != nil {\n \t\treturn nil, err\n \t}\n \n-\t// Build adjacency list\n+\t// Get all wisp dependencies\n+\twispDeps, err := s.getAllWispDependencyRecords(ctx)\n+\tif err != nil {\n+\t\treturn nil, err\n+\t}\n+\n+\t// Build adjacency list from both tables\n \tgraph := make(map[string][]string)\n \tfor issueID, records := range deps {\n \t\tfor _, dep := range records {\n@@ -731,6 +744,13 @@ func (s *DoltStore) DetectCycles(ctx context.Context) ([][]*types.Issue, error)\n \t\t\t}\n \t\t}\n \t}\n+\tfor issueID, records := range wispDeps {\n+\t\tfor _, dep := range records {\n+\t\t\tif dep.Type == types.DepBlocks {\n+\t\t\t\tgraph[issueID] = append(graph[issueID], dep.DependsOnID)\n+\t\t\t}\n+\t\t}\n+\t}\n \n \t// Find cycles using DFS\n \tvar cycles [][]*types.Issue"
+    },
+    {
+      "sha": "c53989b27332c3a7d3169673809ff9c3f9b8ebd0",
+      "filename": "internal/storage/dolt/ephemeral_routing.go",
+      "status": "modified",
+      "additions": 24,
+      "deletions": 0,
+      "changes": 24,
+      "blob_url": "https://github.com/gastownhall/beads/blob/ef7cf9f9b75600c68e39f065756b1ffb0c4ffd9b/internal%2Fstorage%2Fdolt%2Fephemeral_routing.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/ef7cf9f9b75600c68e39f065756b1ffb0c4ffd9b/internal%2Fstorage%2Fdolt%2Fephemeral_routing.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fstorage%2Fdolt%2Fephemeral_routing.go?ref=ef7cf9f9b75600c68e39f065756b1ffb0c4ffd9b",
+      "patch": "@@ -270,6 +270,30 @@ func (s *DoltStore) PromoteFromEphemeral(ctx context.Context, id string, actor s\n \treturn s.deleteWisp(ctx, id)\n }\n \n+// getAllWispDependencyRecords returns all wisp dependency records, keyed by issue_id.\n+// Used by DetectCycles to include wisp dependencies in cross-table cycle detection. (bd-xe27)\n+func (s *DoltStore) getAllWispDependencyRecords(ctx context.Context) (map[string][]*types.Dependency, error) {\n+\trows, err := s.queryContext(ctx, `\n+\t\tSELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id\n+\t\tFROM wisp_dependencies\n+\t\tORDER BY issue_id\n+\t`)\n+\tif err != nil {\n+\t\treturn nil, fmt.Errorf(\"failed to get all wisp dependency records: %w\", err)\n+\t}\n+\tdefer rows.Close()\n+\n+\tresult := make(map[string][]*types.Dependency)\n+\tfor rows.Next() {\n+\t\tdep, err := scanDependencyRow(rows)\n+\t\tif err != nil {\n+\t\t\treturn nil, fmt.Errorf(\"get all wisp dependency records: %w\", err)\n+\t\t}\n+\t\tresult[dep.IssueID] = append(result[dep.IssueID], dep)\n+\t}\n+\treturn result, rows.Err()\n+}\n+\n // getWispDependencyRecords returns raw dependency records for a wisp from wisp_dependencies.\n func (s *DoltStore) getWispDependencyRecords(ctx context.Context, issueID string) ([]*types.Dependency, error) {\n \trows, err := s.queryContext(ctx, `"
+    },
+    {
+      "sha": "d2896c2a2baa9686efde4150cef3ef02066f51cc",
+      "filename": "internal/storage/dolt/wisps.go",
+      "status": "modified",
+      "additions": 27,
+      "deletions": 0,
+      "changes": 27,
+      "blob_url": "https://github.com/gastownhall/beads/blob/ef7cf9f9b75600c68e39f065756b1ffb0c4ffd9b/internal%2Fstorage%2Fdolt%2Fwisps.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/ef7cf9f9b75600c68e39f065756b1ffb0c4ffd9b/internal%2Fstorage%2Fdolt%2Fwisps.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fstorage%2Fdolt%2Fwisps.go?ref=ef7cf9f9b75600c68e39f065756b1ffb0c4ffd9b",
+      "patch": "@@ -896,6 +896,33 @@ func (s *DoltStore) addWispDependency(ctx context.Context, dep *types.Dependency\n \t}\n \tdefer func() { _ = tx.Rollback() }()\n \n+\t// Cycle detection for blocking dependency types: check if adding this edge\n+\t// would create a cycle. UNIONs both tables to detect cross-table cycles\n+\t// (e.g., wisp A -> permanent B -> wisp A). (bd-xe27)\n+\tif dep.Type == types.DepBlocks {\n+\t\tvar reachable int\n+\t\tif err := tx.QueryRowContext(ctx, `\n+\t\t\tWITH RECURSIVE reachable AS (\n+\t\t\t\tSELECT ? AS node, 0 AS depth\n+\t\t\t\tUNION ALL\n+\t\t\t\tSELECT d.depends_on_id, r.depth + 1\n+\t\t\t\tFROM reachable r\n+\t\t\t\tJOIN (\n+\t\t\t\t\tSELECT issue_id, depends_on_id FROM dependencies WHERE type = 'blocks'\n+\t\t\t\t\tUNION ALL\n+\t\t\t\t\tSELECT issue_id, depends_on_id FROM wisp_dependencies WHERE type = 'blocks'\n+\t\t\t\t) d ON d.issue_id = r.node\n+\t\t\t\tWHERE r.depth < 100\n+\t\t\t)\n+\t\t\tSELECT COUNT(*) FROM reachable WHERE node = ?\n+\t\t`, dep.DependsOnID, dep.IssueID).Scan(&reachable); err != nil {\n+\t\t\treturn fmt.Errorf(\"failed to check for dependency cycle: %w\", err)\n+\t\t}\n+\t\tif reachable > 0 {\n+\t\t\treturn fmt.Errorf(\"adding dependency would create a cycle\")\n+\t\t}\n+\t}\n+\n \t// Check for existing dependency to prevent silent type overwrites.\n \tvar existingType string\n \terr = tx.QueryRowContext(ctx, `"
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "message": "perf(tests): optimize doctor test suite \u2014 89s to 28s (bd-ktng)\n\n- Reduce stale-closed-issues threshold from 10k to 100 in test (51s \u2192 1.5s)\n- Reduce duplicate-issues test counts with proportional thresholds (9s+3s \u2192 0.6s+0.4s)\n- Use raw SQL bulk insert instead of store.CreateIssue loops\n- Make largeClosedIssuesThreshold a var for test overriding\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "e116da316f4e11cb4936a4ba5e16ddf5c5d29e76",
+      "filename": "cmd/bd/doctor/maintenance.go",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 2,
+      "changes": 5,
+      "blob_url": "https://github.com/gastownhall/beads/blob/e43b491d248620bc3e10e7570a01ca66fff233d0/cmd%2Fbd%2Fdoctor%2Fmaintenance.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/e43b491d248620bc3e10e7570a01ca66fff233d0/cmd%2Fbd%2Fdoctor%2Fmaintenance.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/cmd%2Fbd%2Fdoctor%2Fmaintenance.go?ref=e43b491d248620bc3e10e7570a01ca66fff233d0",
+      "patch": "@@ -27,8 +27,9 @@ import (\n // want time-based pruning must explicitly enable it in metadata.json.\n // Future: Consider adding max_database_size_mb for size-based thresholds.\n \n-// largeClosedIssuesThreshold triggers a warning to enable stale cleanup\n-const largeClosedIssuesThreshold = 10000\n+// largeClosedIssuesThreshold triggers a warning to enable stale cleanup.\n+// Var (not const) so tests can override to avoid inserting 10k rows.\n+var largeClosedIssuesThreshold = 10000\n \n func CheckStaleClosedIssues(path string) DoctorCheck {\n \t_, beadsDir := getBackendAndBeadsDir(path)"
+    },
+    {
+      "sha": "cd14d5e50d3270af85fb5e05e9f7a2d35cf4216a",
+      "filename": "cmd/bd/doctor/maintenance_cgo_test.go",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 1,
+      "changes": 7,
+      "blob_url": "https://github.com/gastownhall/beads/blob/e43b491d248620bc3e10e7570a01ca66fff233d0/cmd%2Fbd%2Fdoctor%2Fmaintenance_cgo_test.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/e43b491d248620bc3e10e7570a01ca66fff233d0/cmd%2Fbd%2Fdoctor%2Fmaintenance_cgo_test.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/cmd%2Fbd%2Fdoctor%2Fmaintenance_cgo_test.go?ref=e43b491d248620bc3e10e7570a01ca66fff233d0",
+      "patch": "@@ -133,8 +133,13 @@ func TestCheckStaleClosedIssues_DisabledSmallCount(t *testing.T) {\n \t}\n }\n \n-// Test #3: Disabled (threshold=0), large closed count (\u226510k) \u2192 warning\n+// Test #3: Disabled (threshold=0), large closed count (\u2265threshold) \u2192 warning\n func TestCheckStaleClosedIssues_DisabledLargeCount(t *testing.T) {\n+\t// Override threshold to avoid inserting 10k rows (saves ~50s).\n+\torig := largeClosedIssuesThreshold\n+\tlargeClosedIssuesThreshold = 100\n+\tt.Cleanup(func() { largeClosedIssuesThreshold = orig })\n+\n \ttmpDir := setupStaleClosedTestDB(t, largeClosedIssuesThreshold, time.Now().AddDate(0, 0, -60), nil, 0)\n \n \tcheck := CheckStaleClosedIssues(tmpDir)"
+    },
+    {
+      "sha": "072e91f632ccac1be14d521400b221e0b3d7ade9",
+      "filename": "cmd/bd/doctor/validation_test.go",
+      "status": "modified",
+      "additions": 29,
+      "deletions": 32,
+      "changes": 61,
+      "blob_url": "https://github.com/gastownhall/beads/blob/e43b491d248620bc3e10e7570a01ca66fff233d0/cmd%2Fbd%2Fdoctor%2Fvalidation_test.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/e43b491d248620bc3e10e7570a01ca66fff233d0/cmd%2Fbd%2Fdoctor%2Fvalidation_test.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/cmd%2Fbd%2Fdoctor%2Fvalidation_test.go?ref=e43b491d248620bc3e10e7570a01ca66fff233d0",
+      "patch": "@@ -4,6 +4,7 @@ package doctor\n \n import (\n \t\"context\"\n+\t\"fmt\"\n \t\"os\"\n \t\"path/filepath\"\n \t\"testing\"\n@@ -369,35 +370,33 @@ func TestCheckDuplicateIssues_GastownOverThreshold(t *testing.T) {\n \t}\n \tdefer store.Close()\n \n-\t// Initialize database with prefix\n \tif err := store.SetConfig(ctx, \"issue_prefix\", \"test\"); err != nil {\n \t\tt.Fatalf(\"Failed to set issue_prefix: %v\", err)\n \t}\n \n-\t// Create 1500 duplicate issues (over threshold, indicates a problem)\n-\tfor i := 0; i < 1501; i++ {\n-\t\tissue := &types.Issue{\n-\t\t\tTitle:       \"Runaway wisps\",\n-\t\t\tDescription: \"Too many wisps\",\n-\t\t\tStatus:      types.StatusOpen,\n-\t\t\tPriority:    2,\n-\t\t\tIssueType:   types.TypeTask,\n-\t\t}\n-\t\tif err := store.CreateIssue(ctx, issue, \"test\"); err != nil {\n-\t\t\tt.Fatalf(\"Failed to create issue: %v\", err)\n+\t// Insert 51 duplicate issues (over threshold of 25) via raw SQL for speed.\n+\t// The original test used 1501 issues/threshold=1000, but that took ~9s of Dolt inserts.\n+\t// The threshold logic is the same regardless of scale.\n+\tdb := store.UnderlyingDB()\n+\tfor i := 0; i < 51; i++ {\n+\t\t_, err := db.ExecContext(ctx,\n+\t\t\t`INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, created_at, updated_at)\n+\t\t\t VALUES (?, 'Runaway wisps', 'Too many wisps', '', '', '', 'open', 2, 'task', NOW(), NOW())`,\n+\t\t\tfmt.Sprintf(\"test-%06d\", i))\n+\t\tif err != nil {\n+\t\t\tt.Fatalf(\"Failed to insert issue %d: %v\", i, err)\n \t\t}\n \t}\n \n \tstore.Close()\n \n-\tcheck := CheckDuplicateIssues(tmpDir, true, 1000)\n+\tcheck := CheckDuplicateIssues(tmpDir, true, 25)\n \n-\t// With gastown mode and threshold=1000, 1500 duplicates should warn\n \tif check.Status != StatusWarning {\n \t\tt.Errorf(\"Status = %q, want %q (over gastown threshold)\", check.Status, StatusWarning)\n \t}\n-\tif check.Message != \"1500 duplicate issue(s) in 1 group(s)\" {\n-\t\tt.Errorf(\"Message = %q, want '1500 duplicate issue(s) in 1 group(s)'\", check.Message)\n+\tif check.Message != \"50 duplicate issue(s) in 1 group(s)\" {\n+\t\tt.Errorf(\"Message = %q, want '50 duplicate issue(s) in 1 group(s)'\", check.Message)\n \t}\n }\n \n@@ -423,30 +422,28 @@ func TestCheckDuplicateIssues_GastownCustomThreshold(t *testing.T) {\n \t\tt.Fatalf(\"Failed to set issue_prefix: %v\", err)\n \t}\n \n-\t// Create 500 duplicate issues\n-\tfor i := 0; i < 501; i++ {\n-\t\tissue := &types.Issue{\n-\t\t\tTitle:       \"Custom threshold test\",\n-\t\t\tDescription: \"Test custom threshold\",\n-\t\t\tStatus:      types.StatusOpen,\n-\t\t\tPriority:    2,\n-\t\t\tIssueType:   types.TypeTask,\n-\t\t}\n-\t\tif err := store.CreateIssue(ctx, issue, \"test\"); err != nil {\n-\t\t\tt.Fatalf(\"Failed to create issue: %v\", err)\n+\t// Insert 21 duplicate issues (over custom threshold of 10) via raw SQL for speed.\n+\tdb := store.UnderlyingDB()\n+\tfor i := 0; i < 21; i++ {\n+\t\t_, err := db.ExecContext(ctx,\n+\t\t\t`INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, created_at, updated_at)\n+\t\t\t VALUES (?, 'Custom threshold test', 'Test custom threshold', '', '', '', 'open', 2, 'task', NOW(), NOW())`,\n+\t\t\tfmt.Sprintf(\"test-%06d\", i))\n+\t\tif err != nil {\n+\t\t\tt.Fatalf(\"Failed to insert issue %d: %v\", i, err)\n \t\t}\n \t}\n \n \tstore.Close()\n \n-\t// With custom threshold of 250, 500 duplicates should warn\n-\tcheck := CheckDuplicateIssues(tmpDir, true, 250)\n+\t// With custom threshold of 10, 20 duplicates should warn\n+\tcheck := CheckDuplicateIssues(tmpDir, true, 10)\n \n \tif check.Status != StatusWarning {\n-\t\tt.Errorf(\"Status = %q, want %q (over custom threshold of 250)\", check.Status, StatusWarning)\n+\t\tt.Errorf(\"Status = %q, want %q (over custom threshold of 10)\", check.Status, StatusWarning)\n \t}\n-\tif check.Message != \"500 duplicate issue(s) in 1 group(s)\" {\n-\t\tt.Errorf(\"Message = %q, want '500 duplicate issue(s) in 1 group(s)'\", check.Message)\n+\tif check.Message != \"20 duplicate issue(s) in 1 group(s)\" {\n+\t\tt.Errorf(\"Message = %q, want '20 duplicate issue(s) in 1 group(s)'\", check.Message)\n \t}\n }\n "
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "message": "fix: retry hook lookup and search town beads for rig agents (GH#1438)\n\nCherry-picks useful fixes from community PR #2007 (ryanmaclean):\n\n1. Retry logic in findAgentWork: polecats/crew retry up to 3 times with\n   2s delays to handle the timing race where hook state hasn't propagated\n   by the time gt prime runs on session startup.\n\n2. Town-level bead search in molecule_status: the \"list by assignee\"\n   fallback path now also checks townRoot/.beads for hq-* beads slung\n   to rig-level agents by the Mayor.\n\nThe PR's prime.go town-level search is not needed because the current\ncode already uses beads.ResolveHookDir() for prefix-based routing.\nOther PR changes (README Tundra Dome docs, mayor pane recovery, mail\ncheck cache, mail inbox nil-check, patrol_helpers sprintf fix) were\neither scope creep or already fixed on main.\n\nCo-authored-by: Ryan MacLean <ryanmaclean@users.noreply.github.com>\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "c3568631c9e75d3aef5e68e6f86548b5b66e4281",
+      "filename": "internal/cmd/molecule_status.go",
+      "status": "modified",
+      "additions": 21,
+      "deletions": 0,
+      "changes": 21,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/43cdbf178f4aeda252c89cf080734fbb68fbcced/internal%2Fcmd%2Fmolecule_status.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/43cdbf178f4aeda252c89cf080734fbb68fbcced/internal%2Fcmd%2Fmolecule_status.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fcmd%2Fmolecule_status.go?ref=43cdbf178f4aeda252c89cf080734fbb68fbcced",
+      "patch": "@@ -463,6 +463,27 @@ func runMoleculeStatus(cmd *cobra.Command, args []string) error {\n \t\t\thookedBeads = scanAllRigsForHookedBeads(townRoot, target)\n \t\t}\n \n+\t\t// For rig-level agents (polecats, crew), also search town-level beads.\n+\t\t// When the Mayor slings an hq-* bead to a polecat, the bead lives in\n+\t\t// townRoot/.beads, not the rig's .beads database.\n+\t\t// See: https://github.com/steveyegge/gastown/issues/1438\n+\t\tif len(hookedBeads) == 0 && !isTownLevelRole(target) && townRoot != \"\" {\n+\t\t\ttownB := beads.New(filepath.Join(townRoot, \".beads\"))\n+\t\t\tif townHooked, err := townB.List(beads.ListOptions{\n+\t\t\t\tStatus:   beads.StatusHooked,\n+\t\t\t\tAssignee: target,\n+\t\t\t\tPriority: -1,\n+\t\t\t}); err == nil && len(townHooked) > 0 {\n+\t\t\t\thookedBeads = townHooked\n+\t\t\t} else if townInProgress, err := townB.List(beads.ListOptions{\n+\t\t\t\tStatus:   \"in_progress\",\n+\t\t\t\tAssignee: target,\n+\t\t\t\tPriority: -1,\n+\t\t\t}); err == nil && len(townInProgress) > 0 {\n+\t\t\t\thookedBeads = townInProgress\n+\t\t\t}\n+\t\t}\n+\n \t\tstatus.HasWork = len(hookedBeads) > 0\n \n \t\tif len(hookedBeads) > 0 {"
+    },
+    {
+      "sha": "9ab06711bd12c042e0c0001a55823d4f452726e4",
+      "filename": "internal/cmd/prime.go",
+      "status": "modified",
+      "additions": 27,
+      "deletions": 0,
+      "changes": 27,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/43cdbf178f4aeda252c89cf080734fbb68fbcced/internal%2Fcmd%2Fprime.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/43cdbf178f4aeda252c89cf080734fbb68fbcced/internal%2Fcmd%2Fprime.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fcmd%2Fprime.go?ref=43cdbf178f4aeda252c89cf080734fbb68fbcced",
+      "patch": "@@ -10,6 +10,7 @@ import (\n \t\"os/exec\"\n \t\"path/filepath\"\n \t\"strings\"\n+\t\"time\"\n \n \t\"github.com/spf13/cobra\"\n \t\"github.com/steveyegge/gastown/internal/beads\"\n@@ -439,13 +440,39 @@ func checkSlungWork(ctx RoleContext) bool {\n // findAgentWork looks up hooked or in-progress beads assigned to this agent.\n // Primary: reads hook_bead from the agent bead (same strategy as detectSessionState/gt hook).\n // Fallback: queries by assignee for agents without an agent bead.\n+// For polecats and crew, retries up to 3 times with 2-second delays to handle\n+// the timing race where hook state hasn't propagated by the time gt prime runs.\n+// See: https://github.com/steveyegge/gastown/issues/1438\n // Returns nil if no work is found.\n func findAgentWork(ctx RoleContext) *beads.Issue {\n \tagentID := getAgentIdentity(ctx)\n \tif agentID == \"\" {\n \t\treturn nil\n \t}\n \n+\t// Polecats and crew use a retry loop to handle the timing race where\n+\t// the hook slot write (SetHookBead) hasn't propagated to the database\n+\t// by the time gt prime runs on session startup.\n+\tmaxAttempts := 1\n+\tif ctx.Role == RolePolecat || ctx.Role == RoleCrew {\n+\t\tmaxAttempts = 3\n+\t}\n+\n+\tfor attempt := 1; attempt <= maxAttempts; attempt++ {\n+\t\tif attempt > 1 {\n+\t\t\ttime.Sleep(2 * time.Second)\n+\t\t}\n+\n+\t\tif result := findAgentWorkOnce(ctx, agentID); result != nil {\n+\t\t\treturn result\n+\t\t}\n+\t}\n+\n+\treturn nil\n+}\n+\n+// findAgentWorkOnce performs a single attempt to find hooked work for an agent.\n+func findAgentWorkOnce(ctx RoleContext, agentID string) *beads.Issue {\n \tb := beads.New(ctx.WorkDir)\n \t// Primary: agent bead's hook_bead field (authoritative, set by bd slot set during sling)\n \tagentBeadID := buildAgentBeadID(agentID, ctx.Role, ctx.TownRoot)"
+    }
+  ]
+}

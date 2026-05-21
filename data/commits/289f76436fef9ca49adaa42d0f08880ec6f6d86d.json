@@ -1,0 +1,65 @@
+{
+  "message": "fix: promote DeleteIssuesBySourceRepo and ClearRepoMtime to Storage interface\n\nrepo.go type-asserted to *sqlite.SQLiteStorage to call these methods,\nsilently skipping cleanup on Dolt backend. Now both methods are part of\nthe Storage interface with implementations for SQLite, Dolt, and Memory.\n\nFixes dolt-test-maq8\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "be4afe50cff02e83587738cb7c4e23a0a50d45ee",
+      "filename": "cmd/bd/repo.go",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 13,
+      "changes": 21,
+      "blob_url": "https://github.com/gastownhall/beads/blob/289f76436fef9ca49adaa42d0f08880ec6f6d86d/cmd%2Fbd%2Frepo.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/289f76436fef9ca49adaa42d0f08880ec6f6d86d/cmd%2Fbd%2Frepo.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/cmd%2Fbd%2Frepo.go?ref=289f76436fef9ca49adaa42d0f08880ec6f6d86d",
+      "patch": "@@ -8,7 +8,6 @@ import (\n \n \t\"github.com/spf13/cobra\"\n \t\"github.com/steveyegge/beads/internal/config\"\n-\t\"github.com/steveyegge/beads/internal/storage/sqlite\"\n )\n \n var repoCmd = &cobra.Command{\n@@ -113,19 +112,15 @@ that came from the removed repository.`,\n \n \t\t// Delete issues from the removed repo before removing from config\n \t\t// The source_repo field uses the original path (e.g., \"~/foo\")\n-\t\tdeletedCount := 0\n-\t\tif sqliteStore, ok := store.(*sqlite.SQLiteStorage); ok {\n-\t\t\tcount, err := sqliteStore.DeleteIssuesBySourceRepo(ctx, repoPath)\n-\t\t\tif err != nil {\n-\t\t\t\treturn fmt.Errorf(\"failed to delete issues from repo: %w\", err)\n-\t\t\t}\n-\t\t\tdeletedCount = count\n+\t\tdeletedCount, err := store.DeleteIssuesBySourceRepo(ctx, repoPath)\n+\t\tif err != nil {\n+\t\t\treturn fmt.Errorf(\"failed to delete issues from repo: %w\", err)\n+\t\t}\n \n-\t\t\t// Also clear the mtime cache entry\n-\t\t\tif err := sqliteStore.ClearRepoMtime(ctx, repoPath); err != nil {\n-\t\t\t\t// Non-fatal: just log a warning\n-\t\t\t\tfmt.Fprintf(os.Stderr, \"Warning: failed to clear mtime cache: %v\\n\", err)\n-\t\t\t}\n+\t\t// Also clear the mtime cache entry\n+\t\tif err := store.ClearRepoMtime(ctx, repoPath); err != nil {\n+\t\t\t// Non-fatal: just log a warning\n+\t\t\tfmt.Fprintf(os.Stderr, \"Warning: failed to clear mtime cache: %v\\n\", err)\n \t\t}\n \n \t\t// Find config.yaml"
+    },
+    {
+      "sha": "d592fae5f8f864a02b7c32bd3017d963c137f7fc",
+      "filename": "internal/storage/dolt/issues.go",
+      "status": "modified",
+      "additions": 106,
+      "deletions": 0,
+      "changes": 106,
+      "blob_url": "https://github.com/gastownhall/beads/blob/289f76436fef9ca49adaa42d0f08880ec6f6d86d/internal%2Fstorage%2Fdolt%2Fissues.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/289f76436fef9ca49adaa42d0f08880ec6f6d86d/internal%2Fstorage%2Fdolt%2Fissues.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fstorage%2Fdolt%2Fissues.go?ref=289f76436fef9ca49adaa42d0f08880ec6f6d86d",
+      "patch": "@@ -6,6 +6,8 @@ import (\n \t\"database/sql\"\n \t\"encoding/json\"\n \t\"fmt\"\n+\t\"os\"\n+\t\"path/filepath\"\n \t\"strings\"\n \t\"time\"\n \n@@ -1248,6 +1250,110 @@ func parseJSONStringArray(s string) []string {\n \treturn result\n }\n \n+// DeleteIssuesBySourceRepo permanently removes all issues from a specific source repository.\n+// This is used when a repo is removed from the multi-repo configuration.\n+// It also cleans up related data: dependencies, labels, comments, events, and dirty markers.\n+// Returns the number of issues deleted.\n+func (s *DoltStore) DeleteIssuesBySourceRepo(ctx context.Context, sourceRepo string) (int, error) {\n+\ttx, err := s.db.BeginTx(ctx, nil)\n+\tif err != nil {\n+\t\treturn 0, fmt.Errorf(\"failed to begin transaction: %w\", err)\n+\t}\n+\tdefer func() { _ = tx.Rollback() }()\n+\n+\t// Get the list of issue IDs to delete\n+\trows, err := tx.QueryContext(ctx, `SELECT id FROM issues WHERE source_repo = ?`, sourceRepo)\n+\tif err != nil {\n+\t\treturn 0, fmt.Errorf(\"failed to query issues: %w\", err)\n+\t}\n+\tvar issueIDs []string\n+\tfor rows.Next() {\n+\t\tvar id string\n+\t\tif err := rows.Scan(&id); err != nil {\n+\t\t\t_ = rows.Close()\n+\t\t\treturn 0, fmt.Errorf(\"failed to scan issue ID: %w\", err)\n+\t\t}\n+\t\tissueIDs = append(issueIDs, id)\n+\t}\n+\t_ = rows.Close()\n+\tif err := rows.Err(); err != nil {\n+\t\treturn 0, fmt.Errorf(\"failed to iterate issues: %w\", err)\n+\t}\n+\n+\tif len(issueIDs) == 0 {\n+\t\tif err := tx.Commit(); err != nil {\n+\t\t\treturn 0, fmt.Errorf(\"failed to commit empty transaction: %w\", err)\n+\t\t}\n+\t\treturn 0, nil\n+\t}\n+\n+\t// Delete related data for all affected issues\n+\ttables := []string{\"dependencies\", \"events\", \"comments\", \"labels\", \"dirty_issues\"}\n+\tfor _, table := range tables {\n+\t\tif err := validateTableName(table); err != nil {\n+\t\t\treturn 0, fmt.Errorf(\"invalid table name %q: %w\", table, err)\n+\t\t}\n+\t\tfor _, id := range issueIDs {\n+\t\t\tif table == \"dependencies\" {\n+\t\t\t\t_, err = tx.ExecContext(ctx, fmt.Sprintf(\"DELETE FROM %s WHERE issue_id = ? OR depends_on_id = ?\", table), id, id) //nolint:gosec // G201: table validated by validateTableName above\n+\t\t\t} else {\n+\t\t\t\t_, err = tx.ExecContext(ctx, fmt.Sprintf(\"DELETE FROM %s WHERE issue_id = ?\", table), id) //nolint:gosec // G201: table validated by validateTableName above\n+\t\t\t}\n+\t\t\tif err != nil {\n+\t\t\t\treturn 0, fmt.Errorf(\"failed to delete from %s for %s: %w\", table, id, err)\n+\t\t\t}\n+\t\t}\n+\t}\n+\n+\t// Delete the issues themselves\n+\tresult, err := tx.ExecContext(ctx, `DELETE FROM issues WHERE source_repo = ?`, sourceRepo)\n+\tif err != nil {\n+\t\treturn 0, fmt.Errorf(\"failed to delete issues: %w\", err)\n+\t}\n+\n+\trowsAffected, err := result.RowsAffected()\n+\tif err != nil {\n+\t\treturn 0, fmt.Errorf(\"failed to check rows affected: %w\", err)\n+\t}\n+\n+\tif err := tx.Commit(); err != nil {\n+\t\treturn 0, fmt.Errorf(\"failed to commit transaction: %w\", err)\n+\t}\n+\n+\treturn int(rowsAffected), nil\n+}\n+\n+// ClearRepoMtime removes the mtime cache entry for a repository.\n+// This is used when a repo is removed from the multi-repo configuration.\n+func (s *DoltStore) ClearRepoMtime(ctx context.Context, repoPath string) error {\n+\t// Expand tilde in path to match how it's stored\n+\texpandedPath := repoPath\n+\tif strings.HasPrefix(repoPath, \"~\") {\n+\t\thomeDir, err := os.UserHomeDir()\n+\t\tif err != nil {\n+\t\t\treturn fmt.Errorf(\"failed to get home directory: %w\", err)\n+\t\t}\n+\t\tif repoPath == \"~\" {\n+\t\t\texpandedPath = homeDir\n+\t\t} else {\n+\t\t\texpandedPath = filepath.Join(homeDir, repoPath[1:])\n+\t\t}\n+\t}\n+\n+\t// Get absolute path to match how it's stored in repo_mtimes\n+\tabsRepoPath, err := filepath.Abs(expandedPath)\n+\tif err != nil {\n+\t\treturn fmt.Errorf(\"failed to get absolute path: %w\", err)\n+\t}\n+\n+\t_, err = s.db.ExecContext(ctx, `DELETE FROM repo_mtimes WHERE repo_path = ?`, absRepoPath)\n+\tif err != nil {\n+\t\treturn fmt.Errorf(\"failed to delete mtime cache: %w\", err)\n+\t}\n+\n+\treturn nil\n+}\n+\n func formatJSONStringArray(arr []string) string {\n \tif len(arr) == 0 {\n \t\treturn \"\""
+    },
+    {
+      "sha": "aca8b08723c5483b0d4a97c6ae5cbf977e400e8e",
+      "filename": "internal/storage/memory/memory.go",
+      "status": "modified",
+      "additions": 30,
+      "deletions": 0,
+      "changes": 30,
+      "blob_url": "https://github.com/gastownhall/beads/blob/289f76436fef9ca49adaa42d0f08880ec6f6d86d/internal%2Fstorage%2Fmemory%2Fmemory.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/289f76436fef9ca49adaa42d0f08880ec6f6d86d/internal%2Fstorage%2Fmemory%2Fmemory.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fstorage%2Fmemory%2Fmemory.go?ref=289f76436fef9ca49adaa42d0f08880ec6f6d86d",
+      "patch": "@@ -1967,6 +1967,36 @@ func (m *MemoryStorage) RunInTransaction(ctx context.Context, fn func(tx storage\n \n // REMOVED (bd-c7af): SyncAllCounters - no longer needed with hash IDs\n \n+// DeleteIssuesBySourceRepo removes all issues from a specific source repository.\n+func (m *MemoryStorage) DeleteIssuesBySourceRepo(ctx context.Context, sourceRepo string) (int, error) {\n+\tm.mu.Lock()\n+\tdefer m.mu.Unlock()\n+\n+\tvar toDelete []string\n+\tfor id, issue := range m.issues {\n+\t\tif issue.SourceRepo == sourceRepo {\n+\t\t\ttoDelete = append(toDelete, id)\n+\t\t}\n+\t}\n+\n+\tfor _, id := range toDelete {\n+\t\tdelete(m.issues, id)\n+\t\tdelete(m.dependencies, id)\n+\t\tdelete(m.labels, id)\n+\t\tdelete(m.events, id)\n+\t\tdelete(m.comments, id)\n+\t\tdelete(m.dirty, id)\n+\t\tdelete(m.externalRefToID, id)\n+\t}\n+\n+\treturn len(toDelete), nil\n+}\n+\n+// ClearRepoMtime is a no-op for MemoryStorage (no mtime cache).\n+func (m *MemoryStorage) ClearRepoMtime(ctx context.Context, repoPath string) error {\n+\treturn nil\n+}\n+\n // MarkIssueDirty marks an issue as dirty for export\n func (m *MemoryStorage) MarkIssueDirty(ctx context.Context, issueID string) error {\n \tm.mu.Lock()"
+    },
+    {
+      "sha": "aa3b0ebc66beabd8c5b94a1686b9096e36e41b3a",
+      "filename": "internal/storage/storage.go",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/gastownhall/beads/blob/289f76436fef9ca49adaa42d0f08880ec6f6d86d/internal%2Fstorage%2Fstorage.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/289f76436fef9ca49adaa42d0f08880ec6f6d86d/internal%2Fstorage%2Fstorage.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fstorage%2Fstorage.go?ref=289f76436fef9ca49adaa42d0f08880ec6f6d86d",
+      "patch": "@@ -182,6 +182,10 @@ type Storage interface {\n \tSetMetadata(ctx context.Context, key, value string) error\n \tGetMetadata(ctx context.Context, key string) (string, error)\n \n+\t// Multi-repo cleanup\n+\tDeleteIssuesBySourceRepo(ctx context.Context, sourceRepo string) (int, error)\n+\tClearRepoMtime(ctx context.Context, repoPath string) error\n+\n \t// Prefix rename operations\n \tUpdateIssueID(ctx context.Context, oldID, newID string, issue *types.Issue, actor string) error\n \tRenameDependencyPrefix(ctx context.Context, oldPrefix, newPrefix string) error"
+    },
+    {
+      "sha": "49687688ee297808c4a1196482ed72319c56bc38",
+      "filename": "internal/storage/storage_test.go",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 0,
+      "changes": 10,
+      "blob_url": "https://github.com/gastownhall/beads/blob/289f76436fef9ca49adaa42d0f08880ec6f6d86d/internal%2Fstorage%2Fstorage_test.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/289f76436fef9ca49adaa42d0f08880ec6f6d86d/internal%2Fstorage%2Fstorage_test.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fstorage%2Fstorage_test.go?ref=289f76436fef9ca49adaa42d0f08880ec6f6d86d",
+      "patch": "@@ -201,6 +201,12 @@ func (m *mockStorage) SetMetadata(ctx context.Context, key, value string) error\n func (m *mockStorage) GetMetadata(ctx context.Context, key string) (string, error) {\n \treturn \"\", nil\n }\n+func (m *mockStorage) DeleteIssuesBySourceRepo(ctx context.Context, sourceRepo string) (int, error) {\n+\treturn 0, nil\n+}\n+func (m *mockStorage) ClearRepoMtime(ctx context.Context, repoPath string) error {\n+\treturn nil\n+}\n func (m *mockStorage) UpdateIssueID(ctx context.Context, oldID, newID string, issue *types.Issue, actor string) error {\n \treturn nil\n }\n@@ -404,6 +410,10 @@ func TestInterfaceDocumentation(t *testing.T) {\n \t\t_ = s.SetMetadata\n \t\t_ = s.GetMetadata\n \n+\t\t// Verify multi-repo cleanup operations\n+\t\t_ = s.DeleteIssuesBySourceRepo\n+\t\t_ = s.ClearRepoMtime\n+\n \t\t// Verify prefix rename operations\n \t\t_ = s.UpdateIssueID\n \t\t_ = s.RenameDependencyPrefix"
+    }
+  ]
+}

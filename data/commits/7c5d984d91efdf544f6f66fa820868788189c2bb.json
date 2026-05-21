@@ -1,0 +1,29 @@
+{
+  "message": "fix(dolt): commit SQL tx before DOLT_COMMIT to persist wisp data (hq-3paz0m)\n\nDOLT_COMMIT inside a Go sql.Tx, when returning \"nothing to commit\" for\ndolt-ignored tables, left the transaction in a broken state where\nCommit() silently failed. Fix: commit SQL tx first (persists working set),\nthen DOLT_COMMIT outside the tx. Also fix findHookedMolecules to recognize\ndirectly-hooked patrol wisps, and fix mol current suggestion text.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "5746c0a3af22118bd1e9915fb640fa5785db2345",
+      "filename": "cmd/bd/mol_current.go",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 2,
+      "changes": 16,
+      "blob_url": "https://github.com/gastownhall/beads/blob/7c5d984d91efdf544f6f66fa820868788189c2bb/cmd%2Fbd%2Fmol_current.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/7c5d984d91efdf544f6f66fa820868788189c2bb/cmd%2Fbd%2Fmol_current.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/cmd%2Fbd%2Fmol_current.go?ref=7c5d984d91efdf544f6f66fa820868788189c2bb",
+      "patch": "@@ -140,7 +140,7 @@ Use --limit or --range to view specific steps:\n \t\t\t\t}\n \t\t\t\tfmt.Println(\".\")\n \t\t\t\tfmt.Println(\"\\nTo start work on a molecule:\")\n-\t\t\t\tfmt.Println(\"  bd mol pour <proto-id>      # Instantiate a molecule from template\")\n+\t\t\t\tfmt.Println(\"  bd mol wisp create <proto-id>  # Instantiate as ephemeral wisp\")\n \t\t\t\tfmt.Println(\"  bd update <step-id> --status in_progress  # Claim a step\")\n \t\t\t\treturn\n \t\t\t}\n@@ -304,9 +304,21 @@ func findHookedMolecules(ctx context.Context, s *dolt.DoltStore, agent string) [\n \t\treturn nil\n \t}\n \n-\t// For each hooked issue, check for blocks dependencies on molecules\n+\t// For each hooked issue, check if it IS a molecule or has blocks deps on one\n \tmoleculeMap := make(map[string]*MoleculeProgress)\n \tfor _, issue := range hookedIssues {\n+\t\t// Check if the hooked issue itself is a molecule (e.g., patrol wisps\n+\t\t// are directly hooked without a separate handoff bead). hq-3paz0m\n+\t\tif issue.IssueType == types.TypeEpic {\n+\t\t\tif _, exists := moleculeMap[issue.ID]; !exists {\n+\t\t\t\tprogress, err := getMoleculeProgress(ctx, s, issue.ID)\n+\t\t\t\tif err == nil {\n+\t\t\t\t\tmoleculeMap[issue.ID] = progress\n+\t\t\t\t\tcontinue\n+\t\t\t\t}\n+\t\t\t}\n+\t\t}\n+\n \t\tdeps, err := s.GetDependencyRecords(ctx, issue.ID)\n \t\tif err != nil {\n \t\t\tcontinue"
+    },
+    {
+      "sha": "f7e53d8cc06548060517ad9a14fad58e2856a2aa",
+      "filename": "internal/storage/dolt/transaction.go",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 15,
+      "changes": 31,
+      "blob_url": "https://github.com/gastownhall/beads/blob/7c5d984d91efdf544f6f66fa820868788189c2bb/internal%2Fstorage%2Fdolt%2Ftransaction.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/7c5d984d91efdf544f6f66fa820868788189c2bb/internal%2Fstorage%2Fdolt%2Ftransaction.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fstorage%2Fdolt%2Ftransaction.go?ref=7c5d984d91efdf544f6f66fa820868788189c2bb",
+      "patch": "@@ -63,28 +63,29 @@ func (s *DoltStore) runDoltTransaction(ctx context.Context, commitMsg string, fn\n \t\treturn err\n \t}\n \n-\t// DOLT_COMMIT ends the SQL transaction implicitly \u2014 no tx.Commit() needed after.\n-\t// Calling tx.Commit() after DOLT_COMMIT can cause connection state issues under\n-\t// concurrent load (the transaction is already closed by Dolt).\n+\t// Commit the SQL transaction first to persist all working set changes,\n+\t// including writes to dolt-ignored tables (e.g., wisps). (hq-3paz0m)\n+\t//\n+\t// Previously, DOLT_COMMIT was called inside the transaction. When it\n+\t// returned \"nothing to commit\" (all writes to dolt-ignored tables), the\n+\t// Go sql.Tx was left in a broken state and Commit() failed silently,\n+\t// losing wisp data.\n+\tif err := sqlTx.Commit(); err != nil {\n+\t\treturn fmt.Errorf(\"sql commit: %w\", err)\n+\t}\n+\n+\t// Create a Dolt version commit from the working set.\n+\t// Runs outside the transaction on a pool connection.\n+\t// \"Nothing to commit\" is benign (all writes to dolt-ignored tables).\n \tif commitMsg != \"\" {\n-\t\t_, err := sqlTx.ExecContext(ctx, \"CALL DOLT_COMMIT('-Am', ?, '--author', ?)\",\n+\t\t_, err := s.db.ExecContext(ctx, \"CALL DOLT_COMMIT('-Am', ?, '--author', ?)\",\n \t\t\tcommitMsg, s.commitAuthorString())\n \t\tif err != nil && !isDoltNothingToCommit(err) {\n-\t\t\t_ = sqlTx.Rollback()\n \t\t\treturn fmt.Errorf(\"dolt commit: %w\", err)\n \t\t}\n-\t\tif err != nil {\n-\t\t\t// \"nothing to commit\" \u2014 DOLT_COMMIT did NOT end the transaction.\n-\t\t\t// Commit the SQL transaction to persist writes to dolt_ignore'd\n-\t\t\t// tables (wisps, wisp_labels, wisp_dependencies).\n-\t\t\treturn sqlTx.Commit()\n-\t\t}\n-\t\t// DOLT_COMMIT succeeded and already ended the transaction.\n-\t\treturn nil\n \t}\n \n-\t// No dolt commit requested \u2014 commit the SQL transaction normally.\n-\treturn sqlTx.Commit()\n+\treturn nil\n }\n \n // isDoltNothingToCommit returns true if the error indicates there were no"
+    }
+  ]
+}

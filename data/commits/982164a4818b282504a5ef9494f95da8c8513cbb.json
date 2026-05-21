@@ -1,0 +1,29 @@
+{
+  "message": "feat(testutil): reuse existing Dolt server via BEADS_DOLT_PORT (L1)\n\nStartTestDoltServer now checks BEADS_DOLT_PORT before spawning a new\nserver. If the env var is set and the server is reachable, it returns a\nlightweight handle with no-op cleanup. Falls through with a warning if\nthe port is stale.\n\nscripts/test.sh gains BEADS_TEST_SHARED_SERVER=1 mode that pre-starts\na single server and exports the port for all test packages.\n\nCloses: bd--sxnz\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\nExecuted-By: beads/crew/emma\nRig: beads\nRole: crew",
+  "files": [
+    {
+      "sha": "c38419b1542c93dcf814038cac1ef03412190d44",
+      "filename": "internal/testutil/testdoltserver.go",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 0,
+      "changes": 15,
+      "blob_url": "https://github.com/gastownhall/beads/blob/982164a4818b282504a5ef9494f95da8c8513cbb/internal%2Ftestutil%2Ftestdoltserver.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/982164a4818b282504a5ef9494f95da8c8513cbb/internal%2Ftestutil%2Ftestdoltserver.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Ftestutil%2Ftestdoltserver.go?ref=982164a4818b282504a5ef9494f95da8c8513cbb",
+      "patch": "@@ -34,9 +34,24 @@ const maxPortRetries = 3\n // on a dynamic port. Cleans up stale test servers first. Installs a signal\n // handler so cleanup runs even when tests are interrupted with Ctrl+C.\n //\n+// If BEADS_DOLT_PORT is already set in the environment (e.g. by an outer test\n+// runner or scripts/test.sh with BEADS_TEST_SHARED_SERVER=1), the existing\n+// server is reused and cleanup is a no-op.\n+//\n // tmpDirPrefix is the os.MkdirTemp prefix (e.g. \"beads-test-dolt-*\").\n // Returns the server (nil if dolt not installed) and a cleanup function.\n func StartTestDoltServer(tmpDirPrefix string) (*TestDoltServer, func()) {\n+\t// Reuse existing server if BEADS_DOLT_PORT is already set by an outer runner.\n+\t// This avoids spawning redundant dolt processes when running go test ./...\n+\t// with a pre-started shared server.\n+\tif port := os.Getenv(\"BEADS_DOLT_PORT\"); port != \"\" {\n+\t\tp, err := strconv.Atoi(port)\n+\t\tif err == nil && WaitForServer(p, 2*time.Second) {\n+\t\t\treturn &TestDoltServer{Port: p}, func() {}\n+\t\t}\n+\t\tfmt.Fprintf(os.Stderr, \"WARN: BEADS_DOLT_PORT=%s set but server not reachable, starting new server\\n\", port)\n+\t}\n+\n \tCleanStaleTestServers()\n \n \tif _, err := exec.LookPath(\"dolt\"); err != nil {"
+    },
+    {
+      "sha": "be43325ffb22febfae75667a56ef314ab0f45c91",
+      "filename": "scripts/test.sh",
+      "status": "modified",
+      "additions": 50,
+      "deletions": 0,
+      "changes": 50,
+      "blob_url": "https://github.com/gastownhall/beads/blob/982164a4818b282504a5ef9494f95da8c8513cbb/scripts%2Ftest.sh",
+      "raw_url": "https://github.com/gastownhall/beads/raw/982164a4818b282504a5ef9494f95da8c8513cbb/scripts%2Ftest.sh",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/scripts%2Ftest.sh?ref=982164a4818b282504a5ef9494f95da8c8513cbb",
+      "patch": "@@ -76,6 +76,56 @@ if [[ ${#PACKAGES[@]} -eq 0 ]]; then\n     PACKAGES=(\"./...\")\n fi\n \n+# Optional: start a single shared Dolt test server for all packages.\n+# When BEADS_TEST_SHARED_SERVER=1, we start one dolt sql-server and export\n+# BEADS_DOLT_PORT so every test package reuses it instead of spawning its own.\n+# This reduces 8-16+ concurrent dolt processes down to 1.\n+if [[ \"${BEADS_TEST_SHARED_SERVER:-}\" == \"1\" && -z \"${BEADS_DOLT_PORT:-}\" ]]; then\n+    if command -v dolt &>/dev/null; then\n+        SHARED_DOLT_DIR=$(mktemp -d /tmp/beads-shared-test-dolt-XXXXXX)\n+        DOLT_ROOT_PATH=\"$SHARED_DOLT_DIR\"\n+        export DOLT_ROOT_PATH\n+\n+        dolt config --global --add user.name \"beads-test\" 2>/dev/null\n+        dolt config --global --add user.email \"test@beads.local\" 2>/dev/null\n+\n+        SHARED_DB_DIR=\"$SHARED_DOLT_DIR/data\"\n+        mkdir -p \"$SHARED_DB_DIR\"\n+        (cd \"$SHARED_DB_DIR\" && dolt init) >/dev/null 2>&1\n+\n+        # Find a free port\n+        SHARED_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind((\"127.0.0.1\",0)); print(s.getsockname()[1]); s.close()')\n+\n+        dolt sql-server -H 127.0.0.1 -P \"$SHARED_PORT\" --no-auto-commit \\\n+            --data-dir \"$SHARED_DB_DIR\" &>/dev/null &\n+        SHARED_DOLT_PID=$!\n+\n+        # Wait for server to accept connections (up to 30s)\n+        for i in $(seq 1 60); do\n+            if nc -z 127.0.0.1 \"$SHARED_PORT\" 2>/dev/null; then\n+                break\n+            fi\n+            sleep 0.5\n+        done\n+\n+        if nc -z 127.0.0.1 \"$SHARED_PORT\" 2>/dev/null; then\n+            export BEADS_DOLT_PORT=\"$SHARED_PORT\"\n+            export BEADS_TEST_MODE=1\n+            echo \"Shared test Dolt server started on port $SHARED_PORT (PID $SHARED_DOLT_PID)\" >&2\n+            cleanup_shared_server() {\n+                kill \"$SHARED_DOLT_PID\" 2>/dev/null || true\n+                wait \"$SHARED_DOLT_PID\" 2>/dev/null || true\n+                rm -rf \"$SHARED_DOLT_DIR\"\n+            }\n+            trap cleanup_shared_server EXIT\n+        else\n+            echo \"WARN: shared Dolt server failed to start, falling back to per-package servers\" >&2\n+            kill \"$SHARED_DOLT_PID\" 2>/dev/null || true\n+            rm -rf \"$SHARED_DOLT_DIR\"\n+        fi\n+    fi\n+fi\n+\n # Build go test command\n CMD=(go test -timeout \"$TIMEOUT\")\n "
+    }
+  ]
+}

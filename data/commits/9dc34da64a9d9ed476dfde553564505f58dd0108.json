@@ -1,0 +1,29 @@
+{
+  "message": "fix(storage): add batch ID conflict detection and fix schema indexes\n\n- Add checkForExistingIDs function to detect duplicate IDs within batch\n  and conflicts with existing database entries before insert\n- Remove thread_id index creation from schema.go since thread_id column\n  is added by migration 020_edge_consolidation.go\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "1d8df816791603cdc8fe43ac42d8c0563e10e508",
+      "filename": "internal/storage/sqlite/batch_ops.go",
+      "status": "modified",
+      "additions": 57,
+      "deletions": 0,
+      "changes": 57,
+      "blob_url": "https://github.com/gastownhall/beads/blob/9dc34da64a9d9ed476dfde553564505f58dd0108/internal%2Fstorage%2Fsqlite%2Fbatch_ops.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/9dc34da64a9d9ed476dfde553564505f58dd0108/internal%2Fstorage%2Fsqlite%2Fbatch_ops.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fstorage%2Fsqlite%2Fbatch_ops.go?ref=9dc34da64a9d9ed476dfde553564505f58dd0108",
+      "patch": "@@ -4,6 +4,7 @@ import (\n \t\"context\"\n \t\"database/sql\"\n \t\"fmt\"\n+\t\"strings\"\n \t\"time\"\n \n \t\"github.com/steveyegge/beads/internal/types\"\n@@ -101,6 +102,57 @@ func bulkMarkDirty(ctx context.Context, conn *sql.Conn, issues []*types.Issue) e\n \treturn markDirtyBatch(ctx, conn, issues)\n }\n \n+// checkForExistingIDs verifies that:\n+// 1. There are no duplicate IDs within the batch itself\n+// 2. None of the issue IDs already exist in the database\n+// Returns an error if any conflicts are found, ensuring CreateIssues fails atomically\n+// rather than silently skipping duplicates via INSERT OR IGNORE.\n+func checkForExistingIDs(ctx context.Context, conn *sql.Conn, issues []*types.Issue) error {\n+\tif len(issues) == 0 {\n+\t\treturn nil\n+\t}\n+\n+\t// Build list of IDs to check and detect duplicates within batch\n+\tseenIDs := make(map[string]bool)\n+\tids := make([]string, 0, len(issues))\n+\tfor _, issue := range issues {\n+\t\tif issue.ID != \"\" {\n+\t\t\t// Check for duplicates within the batch\n+\t\t\tif seenIDs[issue.ID] {\n+\t\t\t\treturn fmt.Errorf(\"duplicate issue ID within batch: %s\", issue.ID)\n+\t\t\t}\n+\t\t\tseenIDs[issue.ID] = true\n+\t\t\tids = append(ids, issue.ID)\n+\t\t}\n+\t}\n+\n+\tif len(ids) == 0 {\n+\t\treturn nil\n+\t}\n+\n+\t// Check for existing IDs in database using a single query with IN clause\n+\tplaceholders := make([]string, len(ids))\n+\targs := make([]interface{}, len(ids))\n+\tfor i, id := range ids {\n+\t\tplaceholders[i] = \"?\"\n+\t\targs[i] = id\n+\t}\n+\n+\tquery := fmt.Sprintf(\"SELECT id FROM issues WHERE id IN (%s) LIMIT 1\", strings.Join(placeholders, \",\"))\n+\tvar existingID string\n+\terr := conn.QueryRowContext(ctx, query, args...).Scan(&existingID)\n+\tif err == nil {\n+\t\t// Found an existing ID\n+\t\treturn fmt.Errorf(\"issue ID %s already exists\", existingID)\n+\t}\n+\tif err != sql.ErrNoRows {\n+\t\t// Unexpected error\n+\t\treturn fmt.Errorf(\"failed to check for existing IDs: %w\", err)\n+\t}\n+\n+\treturn nil\n+}\n+\n // CreateIssues creates multiple issues atomically in a single transaction.\n // This provides significant performance improvements over calling CreateIssue in a loop:\n // - Single connection acquisition\n@@ -209,6 +261,11 @@ func (s *SQLiteStorage) CreateIssuesWithFullOptions(ctx context.Context, issues\n \t\treturn wrapDBError(\"generate batch IDs\", err)\n \t}\n \n+\t// Phase 3.5: Check for conflicts with existing IDs in database\n+\tif err := checkForExistingIDs(ctx, conn, issues); err != nil {\n+\t\treturn err\n+\t}\n+\n \t// Phase 4: Bulk insert issues\n \tif err := bulkInsertIssues(ctx, conn, issues); err != nil {\n \t\treturn wrapDBError(\"bulk insert issues\", err)"
+    },
+    {
+      "sha": "750e3c33db65965eb6779a3c3e1e43c7fc6e4735",
+      "filename": "internal/storage/sqlite/schema.go",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 2,
+      "changes": 5,
+      "blob_url": "https://github.com/gastownhall/beads/blob/9dc34da64a9d9ed476dfde553564505f58dd0108/internal%2Fstorage%2Fsqlite%2Fschema.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/9dc34da64a9d9ed476dfde553564505f58dd0108/internal%2Fstorage%2Fsqlite%2Fschema.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fstorage%2Fsqlite%2Fschema.go?ref=9dc34da64a9d9ed476dfde553564505f58dd0108",
+      "patch": "@@ -59,8 +59,9 @@ CREATE INDEX IF NOT EXISTS idx_dependencies_issue ON dependencies(issue_id);\n CREATE INDEX IF NOT EXISTS idx_dependencies_depends_on ON dependencies(depends_on_id);\n CREATE INDEX IF NOT EXISTS idx_dependencies_depends_on_type ON dependencies(depends_on_id, type);\n CREATE INDEX IF NOT EXISTS idx_dependencies_depends_on_type_issue ON dependencies(depends_on_id, type, issue_id);\n-CREATE INDEX IF NOT EXISTS idx_dependencies_thread ON dependencies(thread_id) WHERE thread_id != '';\n-CREATE INDEX IF NOT EXISTS idx_dependencies_thread_type ON dependencies(thread_id, type) WHERE thread_id != '';\n+-- NOTE: idx_dependencies_thread and idx_dependencies_thread_type are created by\n+-- migration 020_edge_consolidation.go after adding the thread_id column.\n+-- They cannot be in the schema because existing databases may not have thread_id yet.\n \n -- Labels table\n CREATE TABLE IF NOT EXISTS labels ("
+    }
+  ]
+}

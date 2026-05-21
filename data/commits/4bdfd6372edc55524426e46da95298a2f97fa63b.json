@@ -1,0 +1,41 @@
+{
+  "message": "fix: add ResolveCurrentSession and improve signalAgentReady (cherry-pick from #3154)\n\nCherry-pick the valuable parts from PR #3154 (htristan):\n\n- Add Tmux.ResolveCurrentSession() -- walks PID ancestry to find the tmux\n  session name, working even when Claude Code strips $TMUX from hook\n  subprocesses. Fixes silent failures in signalAgentReady.\n\n- Improve signalAgentReady() to use ResolveCurrentSession and the Tmux\n  abstraction instead of raw exec.Command(\"tmux\", ...) which used the\n  default socket and missed the gastown server.\n\n- Add AgentState and HasHookedWork structural fields to StalledResult\n  for richer witness diagnostics.\n\nThe ready marker file system from #3154 was not included -- the existing\nGT_AGENT_READY tmux env var provides the same signal with less machinery.\n\nCo-Authored-By: htristan <htristan@users.noreply.github.com>\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "1a9f4ba77be009cd74bcd87982020e0dfe5f51ab",
+      "filename": "internal/cmd/prime.go",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 11,
+      "changes": 18,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/4bdfd6372edc55524426e46da95298a2f97fa63b/internal%2Fcmd%2Fprime.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/4bdfd6372edc55524426e46da95298a2f97fa63b/internal%2Fcmd%2Fprime.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fcmd%2Fprime.go?ref=4bdfd6372edc55524426e46da95298a2f97fa63b",
+      "patch": "@@ -333,20 +333,16 @@ func hookSessionBeaconLines(sessionID, source string) []string {\n // signalAgentReady sets GT_AGENT_READY=1 in the current tmux session environment.\n // Called from the agent's SessionStart hook to signal that the agent has started.\n // WaitForCommand polls for this variable as a ZFC-compliant alternative to\n-// probing the process tree via IsAgentAlive. No-op when not in a tmux session.\n+// probing the process tree via IsAgentAlive.\n+// Uses ResolveCurrentSession to find our session on the town socket \u2014 raw\n+// exec.Command(\"tmux\", ...) would use the default socket and miss the gastown server.\n func signalAgentReady() {\n-\tif os.Getenv(\"TMUX\") == \"\" {\n-\t\treturn\n-\t}\n-\tout, err := exec.Command(\"tmux\", \"display-message\", \"-p\", \"#{session_name}\").Output()\n-\tif err != nil {\n-\t\treturn\n-\t}\n-\tsession := strings.TrimSpace(string(out))\n-\tif session == \"\" {\n+\tt := tmux.NewTmux()\n+\tname, err := t.ResolveCurrentSession()\n+\tif err != nil || name == \"\" {\n \t\treturn\n \t}\n-\t_ = exec.Command(\"tmux\", \"set-environment\", \"-t\", session, tmux.EnvAgentReady, \"1\").Run()\n+\t_ = t.SetEnvironment(name, tmux.EnvAgentReady, \"1\")\n }\n \n // isCompactResume returns true if the current prime is running after compaction or resume."
+    },
+    {
+      "sha": "eb08a89973e50dc98677ec8b3e07c46619e359ce",
+      "filename": "internal/tmux/tmux.go",
+      "status": "modified",
+      "additions": 50,
+      "deletions": 0,
+      "changes": 50,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/4bdfd6372edc55524426e46da95298a2f97fa63b/internal%2Ftmux%2Ftmux.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/4bdfd6372edc55524426e46da95298a2f97fa63b/internal%2Ftmux%2Ftmux.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Ftmux%2Ftmux.go?ref=4bdfd6372edc55524426e46da95298a2f97fa63b",
+      "patch": "@@ -2247,6 +2247,56 @@ func (t *Tmux) SelectWindow(session string, index int) error {\n \treturn err\n }\n \n+// ResolveCurrentSession returns the session name for the tmux pane that is an\n+// ancestor of the calling process. Works even when $TMUX and $TMUX_PANE are\n+// not in the process environment (e.g., Claude Code hook subprocesses).\n+//\n+// Walks up the process parent chain and matches against tmux pane PIDs on\n+// the configured socket.\n+func (t *Tmux) ResolveCurrentSession() (string, error) {\n+\tout, err := t.run(\"list-panes\", \"-a\", \"-F\", \"#{pane_pid} #{session_name}\")\n+\tif err != nil {\n+\t\treturn \"\", fmt.Errorf(\"listing panes: %w\", err)\n+\t}\n+\n+\tpaneSessions := make(map[int]string)\n+\tfor _, line := range strings.Split(strings.TrimSpace(out), \"\\n\") {\n+\t\tparts := strings.SplitN(line, \" \", 2)\n+\t\tif len(parts) != 2 {\n+\t\t\tcontinue\n+\t\t}\n+\t\tpid, err := strconv.Atoi(parts[0])\n+\t\tif err != nil {\n+\t\t\tcontinue\n+\t\t}\n+\t\tpaneSessions[pid] = parts[1]\n+\t}\n+\n+\t// Walk up from our PID to PID 1, checking each against pane PIDs\n+\tpid := os.Getpid()\n+\tfor pid > 1 {\n+\t\tif name, ok := paneSessions[pid]; ok {\n+\t\t\treturn name, nil\n+\t\t}\n+\t\tppid, err := parentPID(pid)\n+\t\tif err != nil || ppid == pid {\n+\t\t\tbreak\n+\t\t}\n+\t\tpid = ppid\n+\t}\n+\n+\treturn \"\", fmt.Errorf(\"no tmux pane ancestor found for pid %d\", os.Getpid())\n+}\n+\n+// parentPID returns the parent PID of the given process.\n+func parentPID(pid int) (int, error) {\n+\tdata, err := exec.Command(\"ps\", \"-o\", \"ppid=\", \"-p\", strconv.Itoa(pid)).Output()\n+\tif err != nil {\n+\t\treturn 0, err\n+\t}\n+\treturn strconv.Atoi(strings.TrimSpace(string(data)))\n+}\n+\n // SetEnvironment sets an environment variable in the session.\n func (t *Tmux) SetEnvironment(session, key, value string) error {\n \t_, err := t.run(\"set-environment\", \"-t\", session, key, value)"
+    },
+    {
+      "sha": "5c7b4d73925ee73ebe948bf3d359e8d8b6712a0e",
+      "filename": "internal/witness/handlers.go",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 4,
+      "changes": 10,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/4bdfd6372edc55524426e46da95298a2f97fa63b/internal%2Fwitness%2Fhandlers.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/4bdfd6372edc55524426e46da95298a2f97fa63b/internal%2Fwitness%2Fhandlers.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fwitness%2Fhandlers.go?ref=4bdfd6372edc55524426e46da95298a2f97fa63b",
+      "patch": "@@ -1479,10 +1479,12 @@ const SpawnGracePeriod = 5 * time.Minute\n \n // StalledResult represents a single stalled polecat detection.\n type StalledResult struct {\n-\tPolecatName string // e.g., \"alpha\"\n-\tStallType   string // \"startup-stall\", \"unknown-prompt\"\n-\tAction      string // \"auto-dismissed\", \"escalated\"\n-\tError       error\n+\tPolecatName   string // e.g., \"alpha\"\n+\tStallType     string // \"startup-stall\", \"unknown-prompt\"\n+\tAction        string // \"auto-dismissed\", \"escalated\"\n+\tAgentState    string // Agent state from beads (e.g., \"idle\", \"working\")\n+\tHasHookedWork bool   // Whether this polecat has hooked work assigned\n+\tError         error\n }\n \n // DetectStalledPolecatsResult holds aggregate results."
+    }
+  ]
+}

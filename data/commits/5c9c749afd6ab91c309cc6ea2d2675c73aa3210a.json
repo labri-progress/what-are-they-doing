@@ -1,0 +1,41 @@
+{
+  "message": "Fix: polecat spawn storm circuit breaker (clown show #22)\n\nTwo-layer fix for the witness-deacon-spawn feedback loop that created\n162+ polecats when a task repeatedly killed its polecat:\n\nLayer 1 (primary): Witness checks respawn ledger before sending\nRECOVERED_BEAD. After 3 respawns, blocks re-dispatch and escalates\ndirectly to mayor with SPAWN_BLOCKED message.\n\nLayer 2 (safety net): SpawnPolecatForSling refuses to spawn when\nactive polecat count >= 25 (town-wide cap).\n\nCloses bd-lbcd.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "63543b9cdbca704f253d4092ac8f8ce7f3f718f1",
+      "filename": "internal/cmd/polecat_spawn.go",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 0,
+      "changes": 13,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/5c9c749afd6ab91c309cc6ea2d2675c73aa3210a/internal%2Fcmd%2Fpolecat_spawn.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/5c9c749afd6ab91c309cc6ea2d2675c73aa3210a/internal%2Fcmd%2Fpolecat_spawn.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fcmd%2Fpolecat_spawn.go?ref=5c9c749afd6ab91c309cc6ea2d2675c73aa3210a",
+      "patch": "@@ -96,6 +96,19 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec\n \t\treturn nil, fmt.Errorf(\"admission control: %w\", err)\n \t}\n \n+\t// Polecat count cap (clown show #22): refuse to spawn if there are already\n+\t// too many active polecats. This is a safety net \u2014 the primary guard is the\n+\t// per-bead respawn limit in the witness. Default cap: 25 per town.\n+\t// TODO: make configurable via rig config (max_polecats already exists for scheduler)\n+\tconst defaultMaxActivePolecats = 25\n+\tactiveCount := countActivePolecats()\n+\tif activeCount >= defaultMaxActivePolecats {\n+\t\treturn nil, fmt.Errorf(\"polecat cap reached: %d active polecats (max %d). \"+\n+\t\t\t\"This is a safety limit to prevent spawn storms. \"+\n+\t\t\t\"Investigate why polecats are accumulating before spawning more\",\n+\t\t\tactiveCount, defaultMaxActivePolecats)\n+\t}\n+\n \t// Persistent polecat model (gt-4ac): try to reuse an idle polecat first.\n \t// Idle polecats have completed their work but kept their sandbox (worktree).\n \t// Reusing avoids the overhead of creating a new worktree."
+    },
+    {
+      "sha": "96e5856a1cb2b392fe8957d020c7cc82fa96644e",
+      "filename": "internal/witness/handlers.go",
+      "status": "modified",
+      "additions": 29,
+      "deletions": 3,
+      "changes": 32,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/5c9c749afd6ab91c309cc6ea2d2675c73aa3210a/internal%2Fwitness%2Fhandlers.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/5c9c749afd6ab91c309cc6ea2d2675c73aa3210a/internal%2Fwitness%2Fhandlers.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fwitness%2Fhandlers.go?ref=5c9c749afd6ab91c309cc6ea2d2675c73aa3210a",
+      "patch": "@@ -1609,6 +1609,32 @@ func resetAbandonedBead(workDir, rigName, hookBead, polecatName string, router *\n \t\treturn false\n \t}\n \n+\t// Circuit breaker (clown show #22): if this bead has already been\n+\t// respawned too many times, escalate to mayor instead of re-dispatching.\n+\t// This prevents the witness\u2192deacon\u2192spawn feedback loop from creating\n+\t// unbounded polecats when a task repeatedly kills its polecat.\n+\tif shouldBlockRespawn(workDir, hookBead) {\n+\t\tif router != nil {\n+\t\t\tmsg := &mail.Message{\n+\t\t\t\tFrom:     fmt.Sprintf(\"%s/witness\", rigName),\n+\t\t\t\tTo:       \"mayor/\",\n+\t\t\t\tSubject:  fmt.Sprintf(\"SPAWN_BLOCKED %s (respawn limit reached)\", hookBead),\n+\t\t\t\tPriority: mail.PriorityUrgent,\n+\t\t\t\tBody: fmt.Sprintf(`Bead %s has been respawned %d+ times and keeps failing.\n+Re-dispatch blocked to prevent spawn storm.\n+\n+Polecat: %s/%s\n+Previous Status: %s\n+\n+Action required: investigate why this task keeps killing its polecat,\n+then either close the bead or reset the respawn counter.`,\n+\t\t\t\t\thookBead, defaultMaxBeadRespawns, rigName, polecatName, status),\n+\t\t\t}\n+\t\t\t_ = router.Send(msg)\n+\t\t}\n+\t\treturn false\n+\t}\n+\n \t// Track respawn count for audit and storm detection.\n \trespawnCount := recordBeadRespawn(workDir, hookBead)\n \n@@ -1622,12 +1648,12 @@ func resetAbandonedBead(workDir, rigName, hookBead, polecatName string, router *\n \t\tsubject := fmt.Sprintf(\"RECOVERED_BEAD %s\", hookBead)\n \t\tpriority := mail.PriorityHigh\n \t\tstormNote := \"\"\n-\t\tif respawnCount > defaultMaxBeadRespawns {\n+\t\tif respawnCount >= defaultMaxBeadRespawns {\n \t\t\tsubject = fmt.Sprintf(\"SPAWN_STORM RECOVERED_BEAD %s (respawned %dx)\", hookBead, respawnCount)\n \t\t\tpriority = mail.PriorityUrgent\n \t\t\tstormNote = fmt.Sprintf(\"\\n\\n\u26a0\ufe0f SPAWN STORM: bead has been reset %d times. \"+\n-\t\t\t\t\"A polecat may be exiting without closing its hook bead. \"+\n-\t\t\t\t\"Check polecat completion protocol or close the bead manually if not applicable.\",\n+\t\t\t\t\"Next respawn will be BLOCKED. \"+\n+\t\t\t\t\"Check polecat completion protocol or close the bead manually.\",\n \t\t\t\trespawnCount)\n \t\t}\n \t\tmsg := &mail.Message{"
+    },
+    {
+      "sha": "1beb4389d016dbd52c29438c6a14d18ef90c7383",
+      "filename": "internal/witness/spawn_count.go",
+      "status": "modified",
+      "additions": 24,
+      "deletions": 4,
+      "changes": 28,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/5c9c749afd6ab91c309cc6ea2d2675c73aa3210a/internal%2Fwitness%2Fspawn_count.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/5c9c749afd6ab91c309cc6ea2d2675c73aa3210a/internal%2Fwitness%2Fspawn_count.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fwitness%2Fspawn_count.go?ref=5c9c749afd6ab91c309cc6ea2d2675c73aa3210a",
+      "patch": "@@ -15,10 +15,10 @@ import (\n // load-modify-save cycles from losing respawn count increments.\n var respawnMu sync.Mutex\n \n-// defaultMaxBeadRespawns is the threshold above which a SPAWN_STORM warning is\n-// included in the RECOVERED_BEAD mail sent to deacon. It does not block respawns\n-// \u2014 the intent is audit visibility so deacon/mayor can investigate.\n-const defaultMaxBeadRespawns = 2\n+// defaultMaxBeadRespawns is the threshold at which respawns are BLOCKED and\n+// the bead is escalated to mayor instead of re-dispatched. This is the\n+// circuit breaker that prevents spawn storms (clown show #22).\n+const defaultMaxBeadRespawns = 3\n \n // beadRespawnRecord tracks how many times a single bead has been reset for re-dispatch.\n type beadRespawnRecord struct {\n@@ -65,6 +65,26 @@ func saveBeadRespawnState(townRoot string, state *beadRespawnState) error {\n \treturn os.WriteFile(stateFile, data, 0600)\n }\n \n+// shouldBlockRespawn returns true if the bead has already been respawned\n+// defaultMaxBeadRespawns times. When true, the caller should escalate to\n+// mayor instead of sending RECOVERED_BEAD to deacon for re-dispatch.\n+// This is the primary circuit breaker for spawn storms (clown show #22).\n+func shouldBlockRespawn(workDir, beadID string) bool {\n+\trespawnMu.Lock()\n+\tdefer respawnMu.Unlock()\n+\n+\ttownRoot, err := workspace.Find(workDir)\n+\tif err != nil || townRoot == \"\" {\n+\t\ttownRoot = workDir\n+\t}\n+\tstate := loadBeadRespawnState(townRoot)\n+\trec, ok := state.Beads[beadID]\n+\tif !ok {\n+\t\treturn false\n+\t}\n+\treturn rec.Count >= defaultMaxBeadRespawns\n+}\n+\n // recordBeadRespawn increments the respawn count for beadID and returns the new count.\n // workDir is the rig path; townRoot is resolved internally via workspace.Find.\n // On state file errors the count is still incremented in memory and returned, so the"
+    }
+  ]
+}

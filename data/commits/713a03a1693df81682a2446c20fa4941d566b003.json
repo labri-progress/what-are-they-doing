@@ -1,0 +1,65 @@
+{
+  "message": "fix: ephemeral store read routing \u2014 beads created with --ephemeral now queryable\n\nThree gaps in the ephemeral store routing caused --ephemeral beads (including\nmail messages) to be invisible to reads:\n\n1. GetIssue: Only checked ephemeral store for IDs containing \"-wisp-\". Non-wisp\n   ephemeral IDs (like mail hq-xxxx) fell through to Dolt and returned nil.\n   Fix: fall back to ephemeral store when Dolt returns nil.\n\n2. SearchIssues: Only routed to ephemeral store when filter.Ephemeral=true.\n   Generic queries (like gt mail inbox) never searched ephemeral store.\n   Fix: merge ephemeral results when filter.Ephemeral is nil (search all).\n\n3. Ephemeral store prefix: Was initialized with empty string, causing ID\n   generation to produce unprefixed IDs.\n   Fix: pass configured issue_prefix from Dolt config to ephemeral store.\n\nAlso includes non-transaction path ID generation for ephemeral CreateIssue\n(complements the transaction-path fix in b0c8abfc).\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "6661894ac996a82b84ad58bcdfcb78d6edf79997",
+      "filename": "cmd/bd/main.go",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/gastownhall/beads/blob/713a03a1693df81682a2446c20fa4941d566b003/cmd%2Fbd%2Fmain.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/713a03a1693df81682a2446c20fa4941d566b003/cmd%2Fbd%2Fmain.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/cmd%2Fbd%2Fmain.go?ref=713a03a1693df81682a2446c20fa4941d566b003",
+      "patch": "@@ -574,7 +574,8 @@ var rootCmd = &cobra.Command{\n \n \t\t// Initialize ephemeral store (SQLite) for wisp/molecule storage\n \t\tephPath := filepath.Join(beadsDir, \"ephemeral.sqlite3\")\n-\t\tif es, esErr := ephemeral.New(ephPath, \"\"); esErr != nil {\n+\t\tephPrefix, _ := store.GetConfig(rootCtx, \"issue_prefix\")\n+\t\tif es, esErr := ephemeral.New(ephPath, ephPrefix); esErr != nil {\n \t\t\tdebug.Logf(\"warning: failed to open ephemeral store: %v\", esErr)\n \t\t} else {\n \t\t\tstore.SetEphemeralStore(es)"
+    },
+    {
+      "sha": "914cb0c8e088adc05c38733c794b1b1852e916ae",
+      "filename": "internal/storage/dolt/issues.go",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 10,
+      "changes": 26,
+      "blob_url": "https://github.com/gastownhall/beads/blob/713a03a1693df81682a2446c20fa4941d566b003/internal%2Fstorage%2Fdolt%2Fissues.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/713a03a1693df81682a2446c20fa4941d566b003/internal%2Fstorage%2Fdolt%2Fissues.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fstorage%2Fdolt%2Fissues.go?ref=713a03a1693df81682a2446c20fa4941d566b003",
+      "patch": "@@ -271,24 +271,30 @@ func (s *DoltStore) GetIssue(ctx context.Context, id string) (*types.Issue, erro\n \t}\n \n \ts.mu.RLock()\n-\tdefer s.mu.RUnlock()\n-\n \tissue, err := scanIssue(ctx, s.db, id)\n \tif err != nil {\n+\t\ts.mu.RUnlock()\n \t\treturn nil, err\n \t}\n-\tif issue == nil {\n-\t\treturn nil, nil\n+\tif issue != nil {\n+\t\t// Fetch labels\n+\t\tlabels, err := s.GetLabels(ctx, issue.ID)\n+\t\ts.mu.RUnlock()\n+\t\tif err != nil {\n+\t\t\treturn nil, fmt.Errorf(\"failed to get labels: %w\", err)\n+\t\t}\n+\t\tissue.Labels = labels\n+\t\treturn issue, nil\n \t}\n+\ts.mu.RUnlock()\n \n-\t// Fetch labels\n-\tlabels, err := s.GetLabels(ctx, issue.ID)\n-\tif err != nil {\n-\t\treturn nil, fmt.Errorf(\"failed to get labels: %w\", err)\n+\t// Fallback: check ephemeral store for issues created with --ephemeral flag\n+\t// whose IDs don't match the wisp pattern (e.g., mail messages)\n+\tif s.ephemeralStore != nil {\n+\t\treturn s.ephemeralStore.GetIssue(ctx, id)\n \t}\n-\tissue.Labels = labels\n \n-\treturn issue, nil\n+\treturn nil, nil\n }\n \n // GetIssueByExternalRef retrieves an issue by external reference"
+    },
+    {
+      "sha": "168e94c114a1be65d91fda0e66a140f15bab8550",
+      "filename": "internal/storage/dolt/queries.go",
+      "status": "modified",
+      "additions": 25,
+      "deletions": 1,
+      "changes": 26,
+      "blob_url": "https://github.com/gastownhall/beads/blob/713a03a1693df81682a2446c20fa4941d566b003/internal%2Fstorage%2Fdolt%2Fqueries.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/713a03a1693df81682a2446c20fa4941d566b003/internal%2Fstorage%2Fdolt%2Fqueries.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fstorage%2Fdolt%2Fqueries.go?ref=713a03a1693df81682a2446c20fa4941d566b003",
+      "patch": "@@ -286,7 +286,31 @@ func (s *DoltStore) SearchIssues(ctx context.Context, query string, filter types\n \t}\n \tdefer rows.Close()\n \n-\treturn s.scanIssueIDs(ctx, rows)\n+\tdoltResults, err := s.scanIssueIDs(ctx, rows)\n+\tif err != nil {\n+\t\treturn nil, err\n+\t}\n+\n+\t// When filter.Ephemeral is nil (search everything) and ephemeral store exists,\n+\t// also search the ephemeral store and merge results. This ensures ephemeral\n+\t// beads (like mail messages created with --ephemeral) appear in queries.\n+\tif filter.Ephemeral == nil && s.ephemeralStore != nil {\n+\t\tephResults, ephErr := s.ephemeralStore.SearchIssues(ctx, query, filter)\n+\t\tif ephErr == nil && len(ephResults) > 0 {\n+\t\t\t// Deduplicate by ID (prefer Dolt version if exists in both)\n+\t\t\tseen := make(map[string]bool, len(doltResults))\n+\t\t\tfor _, issue := range doltResults {\n+\t\t\t\tseen[issue.ID] = true\n+\t\t\t}\n+\t\t\tfor _, issue := range ephResults {\n+\t\t\t\tif !seen[issue.ID] {\n+\t\t\t\t\tdoltResults = append(doltResults, issue)\n+\t\t\t\t}\n+\t\t\t}\n+\t\t}\n+\t}\n+\n+\treturn doltResults, nil\n }\n \n // GetReadyWork returns issues that are ready to work on (not blocked)"
+    },
+    {
+      "sha": "f4dd6dcb8a30515da1136cb8c36098e1332d221a",
+      "filename": "internal/storage/ephemeral/issues.go",
+      "status": "modified",
+      "additions": 54,
+      "deletions": 0,
+      "changes": 54,
+      "blob_url": "https://github.com/gastownhall/beads/blob/713a03a1693df81682a2446c20fa4941d566b003/internal%2Fstorage%2Fephemeral%2Fissues.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/713a03a1693df81682a2446c20fa4941d566b003/internal%2Fstorage%2Fephemeral%2Fissues.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fstorage%2Fephemeral%2Fissues.go?ref=713a03a1693df81682a2446c20fa4941d566b003",
+      "patch": "@@ -8,6 +8,7 @@ import (\n \t\"strings\"\n \t\"time\"\n \n+\t\"github.com/steveyegge/beads/internal/idgen\"\n \t\"github.com/steveyegge/beads/internal/storage\"\n \t\"github.com/steveyegge/beads/internal/types\"\n )\n@@ -29,9 +30,47 @@ func (s *Store) CreateIssue(ctx context.Context, issue *types.Issue, actor strin\n \t// Ensure ephemeral flag is set\n \tissue.Ephemeral = true\n \n+\t// Generate ID if not provided\n+\tif issue.ID == \"\" {\n+\t\tprefix := s.prefix\n+\t\tif issue.PrefixOverride != \"\" {\n+\t\t\tprefix = issue.PrefixOverride\n+\t\t} else if issue.IDPrefix != \"\" {\n+\t\t\tprefix = prefix + \"-\" + issue.IDPrefix\n+\t\t}\n+\t\tid, err := s.generateID(ctx, prefix, issue, actor)\n+\t\tif err != nil {\n+\t\t\treturn fmt.Errorf(\"failed to generate ephemeral issue ID: %w\", err)\n+\t\t}\n+\t\tissue.ID = id\n+\t}\n+\n \treturn s.insertIssue(ctx, s.db, issue, actor)\n }\n \n+// generateID generates a unique hash-based ID for an ephemeral issue (non-transaction path).\n+func (s *Store) generateID(ctx context.Context, prefix string, issue *types.Issue, actor string) (string, error) {\n+\tbaseLength := 4\n+\tmaxLength := 8\n+\n+\tfor length := baseLength; length <= maxLength; length++ {\n+\t\tfor nonce := 0; nonce < 10; nonce++ {\n+\t\t\tcandidate := idgen.GenerateHashID(prefix, issue.Title, issue.Description, actor, issue.CreatedAt, length, nonce)\n+\n+\t\t\tvar count int\n+\t\t\terr := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM issues WHERE id = ?`, candidate).Scan(&count)\n+\t\t\tif err != nil {\n+\t\t\t\treturn \"\", fmt.Errorf(\"failed to check for ID collision: %w\", err)\n+\t\t\t}\n+\t\t\tif count == 0 {\n+\t\t\t\treturn candidate, nil\n+\t\t\t}\n+\t\t}\n+\t}\n+\n+\treturn \"\", fmt.Errorf(\"failed to generate unique ephemeral ID after trying lengths %d-%d with 10 nonces each\", baseLength, maxLength)\n+}\n+\n // CreateIssues inserts multiple issues into the ephemeral store.\n func (s *Store) CreateIssues(ctx context.Context, issues []*types.Issue, actor string) error {\n \ttx, err := s.db.BeginTx(ctx, nil)\n@@ -50,6 +89,21 @@ func (s *Store) CreateIssues(ctx context.Context, issues []*types.Issue, actor s\n \t\t}\n \t\tissue.Ephemeral = true\n \n+\t\t// Generate ID if not provided\n+\t\tif issue.ID == \"\" {\n+\t\t\tprefix := s.prefix\n+\t\t\tif issue.PrefixOverride != \"\" {\n+\t\t\t\tprefix = issue.PrefixOverride\n+\t\t\t} else if issue.IDPrefix != \"\" {\n+\t\t\t\tprefix = prefix + \"-\" + issue.IDPrefix\n+\t\t\t}\n+\t\t\tid, err := generateEphemeralID(ctx, tx, prefix, issue, actor)\n+\t\t\tif err != nil {\n+\t\t\t\treturn fmt.Errorf(\"failed to generate ephemeral issue ID: %w\", err)\n+\t\t\t}\n+\t\t\tissue.ID = id\n+\t\t}\n+\n \t\tif err := s.insertIssue(ctx, tx, issue, actor); err != nil {\n \t\t\treturn err\n \t\t}"
+    },
+    {
+      "sha": "491885df5a6ee222ce601a0b668ebc3706343886",
+      "filename": "internal/storage/ephemeral/transaction.go",
+      "status": "modified",
+      "additions": 41,
+      "deletions": 0,
+      "changes": 41,
+      "blob_url": "https://github.com/gastownhall/beads/blob/713a03a1693df81682a2446c20fa4941d566b003/internal%2Fstorage%2Fephemeral%2Ftransaction.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/713a03a1693df81682a2446c20fa4941d566b003/internal%2Fstorage%2Fephemeral%2Ftransaction.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fstorage%2Fephemeral%2Ftransaction.go?ref=713a03a1693df81682a2446c20fa4941d566b003",
+      "patch": "@@ -7,6 +7,7 @@ import (\n \t\"strings\"\n \t\"time\"\n \n+\t\"github.com/steveyegge/beads/internal/idgen\"\n \t\"github.com/steveyegge/beads/internal/storage\"\n \t\"github.com/steveyegge/beads/internal/types\"\n )\n@@ -76,9 +77,49 @@ func (t *ephemeralTransaction) CreateIssue(ctx context.Context, issue *types.Iss\n \t\tissue.UpdatedAt = now\n \t}\n \tissue.Ephemeral = true\n+\n+\t// Generate ID if not provided (mirrors doltTransaction.CreateIssue behavior)\n+\tif issue.ID == \"\" {\n+\t\tprefix := t.store.prefix\n+\t\tif issue.PrefixOverride != \"\" {\n+\t\t\tprefix = issue.PrefixOverride\n+\t\t} else if issue.IDPrefix != \"\" {\n+\t\t\tprefix = prefix + \"-\" + issue.IDPrefix\n+\t\t}\n+\t\tid, err := generateEphemeralID(ctx, t.tx, prefix, issue, actor)\n+\t\tif err != nil {\n+\t\t\treturn fmt.Errorf(\"failed to generate ephemeral issue ID: %w\", err)\n+\t\t}\n+\t\tissue.ID = id\n+\t}\n+\n \treturn t.store.insertIssue(ctx, t.tx, issue, actor)\n }\n \n+// generateEphemeralID generates a unique hash-based ID for an ephemeral issue.\n+// Mirrors the logic in dolt.generateIssueID but queries the ephemeral sqlite store.\n+func generateEphemeralID(ctx context.Context, tx *sql.Tx, prefix string, issue *types.Issue, actor string) (string, error) {\n+\tbaseLength := 4\n+\tmaxLength := 8\n+\n+\tfor length := baseLength; length <= maxLength; length++ {\n+\t\tfor nonce := 0; nonce < 10; nonce++ {\n+\t\t\tcandidate := idgen.GenerateHashID(prefix, issue.Title, issue.Description, actor, issue.CreatedAt, length, nonce)\n+\n+\t\t\tvar count int\n+\t\t\terr := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM issues WHERE id = ?`, candidate).Scan(&count)\n+\t\t\tif err != nil {\n+\t\t\t\treturn \"\", fmt.Errorf(\"failed to check for ID collision: %w\", err)\n+\t\t\t}\n+\t\t\tif count == 0 {\n+\t\t\t\treturn candidate, nil\n+\t\t\t}\n+\t\t}\n+\t}\n+\n+\treturn \"\", fmt.Errorf(\"failed to generate unique ephemeral ID after trying lengths %d-%d with 10 nonces each\", baseLength, maxLength)\n+}\n+\n func (t *ephemeralTransaction) CreateIssues(ctx context.Context, issues []*types.Issue, actor string) error {\n \tfor _, issue := range issues {\n \t\tif err := t.CreateIssue(ctx, issue, actor); err != nil {"
+    }
+  ]
+}

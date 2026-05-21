@@ -1,0 +1,112 @@
+{
+  "message": "feat: swarm worker spawning, mail routing improvements, beads sync",
+  "files": [
+    {
+      "sha": "bf1326167fd6a65aac5afe6e17f4cf07b5986007",
+      "filename": ".beads/issues.jsonl",
+      "status": "modified",
+      "additions": 238,
+      "deletions": 242,
+      "changes": 480,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/dc09b0987e34891d1e52648d2a7d3f2e15fde624/.beads%2Fissues.jsonl",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/dc09b0987e34891d1e52648d2a7d3f2e15fde624/.beads%2Fissues.jsonl",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/.beads%2Fissues.jsonl?ref=dc09b0987e34891d1e52648d2a7d3f2e15fde624"
+    },
+    {
+      "sha": "ca472b6c25e332e15ed5714e32bb2ba6af0c90bc",
+      "filename": "internal/cmd/spawn.go",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 2,
+      "changes": 6,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/dc09b0987e34891d1e52648d2a7d3f2e15fde624/internal%2Fcmd%2Fspawn.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/dc09b0987e34891d1e52648d2a7d3f2e15fde624/internal%2Fcmd%2Fspawn.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fcmd%2Fspawn.go?ref=dc09b0987e34891d1e52648d2a7d3f2e15fde624",
+      "patch": "@@ -173,12 +173,14 @@ func runSpawn(cmd *cobra.Command, args []string) error {\n \t\tif err := sessMgr.Start(polecatName, session.StartOptions{}); err != nil {\n \t\t\treturn fmt.Errorf(\"starting session: %w\", err)\n \t\t}\n-\t\t// Wait for claude to initialize\n-\t\ttime.Sleep(2 * time.Second)\n+\t\t// Wait for Claude to fully initialize (needs 4-5s for prompt)\n+\t\tfmt.Printf(\"Waiting for Claude to initialize...\\n\")\n+\t\ttime.Sleep(5 * time.Second)\n \t}\n \n \t// Inject initial context\n \tcontext := buildSpawnContext(issue, spawnMessage)\n+\tfmt.Printf(\"Injecting work assignment...\\n\")\n \tif err := sessMgr.Inject(polecatName, context); err != nil {\n \t\treturn fmt.Errorf(\"injecting context: %w\", err)\n \t}"
+    },
+    {
+      "sha": "6cf1b5aff72b62de299ffd1560da69f4f2d8c5cc",
+      "filename": "internal/cmd/swarm.go",
+      "status": "modified",
+      "additions": 73,
+      "deletions": 1,
+      "changes": 74,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/dc09b0987e34891d1e52648d2a7d3f2e15fde624/internal%2Fcmd%2Fswarm.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/dc09b0987e34891d1e52648d2a7d3f2e15fde624/internal%2Fcmd%2Fswarm.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fcmd%2Fswarm.go?ref=dc09b0987e34891d1e52648d2a7d3f2e15fde624",
+      "patch": "@@ -11,9 +11,12 @@ import (\n \t\"github.com/spf13/cobra\"\n \t\"github.com/steveyegge/gastown/internal/config\"\n \t\"github.com/steveyegge/gastown/internal/git\"\n+\t\"github.com/steveyegge/gastown/internal/polecat\"\n \t\"github.com/steveyegge/gastown/internal/rig\"\n+\t\"github.com/steveyegge/gastown/internal/session\"\n \t\"github.com/steveyegge/gastown/internal/style\"\n \t\"github.com/steveyegge/gastown/internal/swarm\"\n+\t\"github.com/steveyegge/gastown/internal/tmux\"\n \t\"github.com/steveyegge/gastown/internal/workspace\"\n )\n \n@@ -291,13 +294,14 @@ func runSwarmCreate(cmd *cobra.Command, args []string) error {\n func runSwarmStart(cmd *cobra.Command, args []string) error {\n \tswarmID := args[0]\n \n-\t// Find the swarm\n+\t// Find the swarm and its rig\n \trigs, _, err := getAllRigs()\n \tif err != nil {\n \t\treturn err\n \t}\n \n \tvar store *SwarmStore\n+\tvar foundRig *rig.Rig\n \n \tfor _, r := range rigs {\n \t\ts, err := LoadSwarmStore(r.Path)\n@@ -307,6 +311,7 @@ func runSwarmStart(cmd *cobra.Command, args []string) error {\n \n \t\tif _, exists := s.Swarms[swarmID]; exists {\n \t\t\tstore = s\n+\t\t\tfoundRig = r\n \t\t\tbreak\n \t\t}\n \t}\n@@ -329,6 +334,73 @@ func runSwarmStart(cmd *cobra.Command, args []string) error {\n \t}\n \n \tfmt.Printf(\"%s Swarm %s started\\n\", style.Bold.Render(\"\u2713\"), swarmID)\n+\n+\t// Spawn sessions for workers with tasks\n+\tif len(sw.Workers) > 0 && len(sw.Tasks) > 0 {\n+\t\tfmt.Printf(\"\\nSpawning workers...\\n\")\n+\t\tif err := spawnSwarmWorkers(foundRig, sw); err != nil {\n+\t\t\tfmt.Printf(\"Warning: failed to spawn some workers: %v\\n\", err)\n+\t\t}\n+\t}\n+\n+\treturn nil\n+}\n+\n+// spawnSwarmWorkers spawns sessions for swarm workers with task assignments.\n+func spawnSwarmWorkers(r *rig.Rig, sw *swarm.Swarm) error {\n+\tt := tmux.NewTmux()\n+\tsessMgr := session.NewManager(t, r)\n+\tpolecatGit := git.NewGit(r.Path)\n+\tpolecatMgr := polecat.NewManager(r, polecatGit)\n+\n+\t// Pair workers with tasks (round-robin if more tasks than workers)\n+\tworkerIdx := 0\n+\tfor i, task := range sw.Tasks {\n+\t\tif task.State != swarm.TaskPending {\n+\t\t\tcontinue\n+\t\t}\n+\n+\t\tif workerIdx >= len(sw.Workers) {\n+\t\t\tbreak // No more workers\n+\t\t}\n+\n+\t\tworker := sw.Workers[workerIdx]\n+\t\tworkerIdx++\n+\n+\t\t// Assign task to worker in swarm state\n+\t\tsw.Tasks[i].Assignee = worker\n+\t\tsw.Tasks[i].State = swarm.TaskAssigned\n+\n+\t\t// Update polecat state\n+\t\tif err := polecatMgr.AssignIssue(worker, task.IssueID); err != nil {\n+\t\t\tfmt.Printf(\"  Warning: couldn't assign %s to %s: %v\\n\", task.IssueID, worker, err)\n+\t\t\tcontinue\n+\t\t}\n+\n+\t\t// Check if already running\n+\t\trunning, _ := sessMgr.IsRunning(worker)\n+\t\tif running {\n+\t\t\tfmt.Printf(\"  %s already running, injecting task...\\n\", worker)\n+\t\t} else {\n+\t\t\tfmt.Printf(\"  Starting %s...\\n\", worker)\n+\t\t\tif err := sessMgr.Start(worker, session.StartOptions{}); err != nil {\n+\t\t\t\tfmt.Printf(\"  Warning: couldn't start %s: %v\\n\", worker, err)\n+\t\t\t\tcontinue\n+\t\t\t}\n+\t\t\t// Wait for Claude to initialize\n+\t\t\ttime.Sleep(5 * time.Second)\n+\t\t}\n+\n+\t\t// Inject work assignment\n+\t\tcontext := fmt.Sprintf(\"[SWARM] You are part of swarm %s.\\n\\nAssigned task: %s\\nTitle: %s\\n\\nWork on this task. When complete, commit and signal DONE.\",\n+\t\t\tsw.ID, task.IssueID, task.Title)\n+\t\tif err := sessMgr.Inject(worker, context); err != nil {\n+\t\t\tfmt.Printf(\"  Warning: couldn't inject to %s: %v\\n\", worker, err)\n+\t\t} else {\n+\t\t\tfmt.Printf(\"  %s \u2192 %s \u2713\\n\", worker, task.IssueID)\n+\t\t}\n+\t}\n+\n \treturn nil\n }\n "
+    },
+    {
+      "sha": "d95548249cb4ab9b24a7af68285abd9a54dee633",
+      "filename": "internal/mail/mailbox.go",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 4,
+      "changes": 8,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/dc09b0987e34891d1e52648d2a7d3f2e15fde624/internal%2Fmail%2Fmailbox.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/dc09b0987e34891d1e52648d2a7d3f2e15fde624/internal%2Fmail%2Fmailbox.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fmail%2Fmailbox.go?ref=dc09b0987e34891d1e52648d2a7d3f2e15fde624",
+      "patch": "@@ -72,8 +72,8 @@ func (m *Mailbox) List() ([]*Message, error) {\n }\n \n func (m *Mailbox) listBeads() ([]*Message, error) {\n-\t// bd mail inbox --json\n-\tcmd := exec.Command(\"bd\", \"mail\", \"inbox\", \"--json\")\n+\t// bd message inbox --json\n+\tcmd := exec.Command(\"bd\", \"message\", \"inbox\", \"--json\")\n \tcmd.Dir = m.workDir\n \tcmd.Env = append(cmd.Environ(), \"BD_IDENTITY=\"+m.identity)\n \n@@ -173,7 +173,7 @@ func (m *Mailbox) Get(id string) (*Message, error) {\n }\n \n func (m *Mailbox) getBeads(id string) (*Message, error) {\n-\tcmd := exec.Command(\"bd\", \"mail\", \"read\", id, \"--json\")\n+\tcmd := exec.Command(\"bd\", \"message\", \"read\", id, \"--json\")\n \tcmd.Dir = m.workDir\n \n \tvar stdout, stderr bytes.Buffer\n@@ -221,7 +221,7 @@ func (m *Mailbox) MarkRead(id string) error {\n }\n \n func (m *Mailbox) markReadBeads(id string) error {\n-\tcmd := exec.Command(\"bd\", \"mail\", \"ack\", id)\n+\tcmd := exec.Command(\"bd\", \"message\", \"ack\", id)\n \tcmd.Dir = m.workDir\n \n \tvar stderr bytes.Buffer"
+    },
+    {
+      "sha": "7f8593627c9e11d91fe699bfd1ab1579a79843e1",
+      "filename": "internal/mail/router.go",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 7,
+      "changes": 13,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/dc09b0987e34891d1e52648d2a7d3f2e15fde624/internal%2Fmail%2Frouter.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/dc09b0987e34891d1e52648d2a7d3f2e15fde624/internal%2Fmail%2Frouter.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fmail%2Frouter.go?ref=dc09b0987e34891d1e52648d2a7d3f2e15fde624",
+      "patch": "@@ -25,25 +25,24 @@ func NewRouter(workDir string) *Router {\n \t}\n }\n \n-// Send delivers a message via beads mail.\n+// Send delivers a message via beads message.\n func (r *Router) Send(msg *Message) error {\n \t// Convert addresses to beads identities\n \ttoIdentity := addressToIdentity(msg.To)\n \tfromIdentity := addressToIdentity(msg.From)\n \n-\t// Build command: bd mail send <recipient> -s <subject> -m <body> --identity <sender>\n-\targs := []string{\"mail\", \"send\", toIdentity,\n+\t// Build command: bd message send <recipient> <body> -s <subject>\n+\targs := []string{\"message\", \"send\", toIdentity, msg.Body,\n \t\t\"-s\", msg.Subject,\n-\t\t\"-m\", msg.Body,\n-\t\t\"--identity\", fromIdentity,\n \t}\n \n-\t// Add --urgent flag for high priority\n+\t// Add importance flag for high priority\n \tif msg.Priority == PriorityHigh {\n-\t\targs = append(args, \"--urgent\")\n+\t\targs = append(args, \"--importance\", \"high\")\n \t}\n \n \tcmd := exec.Command(\"bd\", args...)\n+\tcmd.Env = append(cmd.Environ(), \"BEADS_AGENT_NAME=\"+fromIdentity)\n \tcmd.Dir = r.workDir\n \n \tvar stderr bytes.Buffer"
+    },
+    {
+      "sha": "59b979cb3488df81e1447554d37f763d337040a4",
+      "filename": "internal/polecat/manager_test.go",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/dc09b0987e34891d1e52648d2a7d3f2e15fde624/internal%2Fpolecat%2Fmanager_test.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/dc09b0987e34891d1e52648d2a7d3f2e15fde624/internal%2Fpolecat%2Fmanager_test.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fpolecat%2Fmanager_test.go?ref=dc09b0987e34891d1e52648d2a7d3f2e15fde624",
+      "patch": "@@ -105,7 +105,7 @@ func TestRemoveNotFound(t *testing.T) {\n \t}\n \tm := NewManager(r, git.NewGit(root))\n \n-\terr := m.Remove(\"nonexistent\")\n+\terr := m.Remove(\"nonexistent\", false)\n \tif err != ErrPolecatNotFound {\n \t\tt.Errorf(\"Remove = %v, want ErrPolecatNotFound\", err)\n \t}"
+    },
+    {
+      "sha": "5600b2575fa2853a46adb9230a189e3601d8bdac",
+      "filename": "internal/session/manager_test.go",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 0,
+      "changes": 11,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/dc09b0987e34891d1e52648d2a7d3f2e15fde624/internal%2Fsession%2Fmanager_test.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/dc09b0987e34891d1e52648d2a7d3f2e15fde624/internal%2Fsession%2Fmanager_test.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fsession%2Fmanager_test.go?ref=dc09b0987e34891d1e52648d2a7d3f2e15fde624",
+      "patch": "@@ -1,6 +1,8 @@\n package session\n \n import (\n+\t\"os\"\n+\t\"path/filepath\"\n \t\"testing\"\n \n \t\"github.com/steveyegge/gastown/internal/rig\"\n@@ -36,8 +38,17 @@ func TestPolecatDir(t *testing.T) {\n }\n \n func TestHasPolecat(t *testing.T) {\n+\troot := t.TempDir()\n+\t// hasPolecat checks filesystem, so create actual directories\n+\tfor _, name := range []string{\"Toast\", \"Cheedo\"} {\n+\t\tif err := os.MkdirAll(filepath.Join(root, \"polecats\", name), 0755); err != nil {\n+\t\t\tt.Fatalf(\"mkdir: %v\", err)\n+\t\t}\n+\t}\n+\n \tr := &rig.Rig{\n \t\tName:     \"gastown\",\n+\t\tPath:     root,\n \t\tPolecats: []string{\"Toast\", \"Cheedo\"},\n \t}\n \tm := NewManager(tmux.NewTmux(), r)"
+    },
+    {
+      "sha": "778158055fee501586bac445074138a93f6bab07",
+      "filename": "internal/swarm/manager.go",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 2,
+      "changes": 5,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/dc09b0987e34891d1e52648d2a7d3f2e15fde624/internal%2Fswarm%2Fmanager.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/dc09b0987e34891d1e52648d2a7d3f2e15fde624/internal%2Fswarm%2Fmanager.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fswarm%2Fmanager.go?ref=dc09b0987e34891d1e52648d2a7d3f2e15fde624",
+      "patch": "@@ -311,10 +311,11 @@ func (m *Manager) loadTasksFromBeads(epicID string) ([]SwarmTask, error) {\n \t\treturn nil, fmt.Errorf(\"epic not found: %s\", epicID)\n \t}\n \n-\t// Extract parent-child dependents as tasks\n+\t// Extract dependents as tasks (issues that depend on/are blocked by this epic)\n+\t// Accept both \"parent-child\" and \"blocks\" relationships\n \tvar tasks []SwarmTask\n \tfor _, dep := range issues[0].Dependents {\n-\t\tif dep.DependencyType != \"parent-child\" {\n+\t\tif dep.DependencyType != \"parent-child\" && dep.DependencyType != \"blocks\" {\n \t\t\tcontinue\n \t\t}\n "
+    },
+    {
+      "sha": "a4c8ebdaafae3877a6c4d9bd8050a79ced9ccbb6",
+      "filename": "internal/templates/roles/polecat.md.tmpl",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 0,
+      "changes": 8,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/dc09b0987e34891d1e52648d2a7d3f2e15fde624/internal%2Ftemplates%2Froles%2Fpolecat.md.tmpl",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/dc09b0987e34891d1e52648d2a7d3f2e15fde624/internal%2Ftemplates%2Froles%2Fpolecat.md.tmpl",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Ftemplates%2Froles%2Fpolecat.md.tmpl?ref=dc09b0987e34891d1e52648d2a7d3f2e15fde624",
+      "patch": "@@ -49,6 +49,14 @@ Town ({{ .TownRoot }})\n - `bd create --title=\"Found bug\" --type=bug` - File new issue\n - `bd create --title=\"Need feature\" --type=task` - File new task\n \n+### Agent UX: File Issues for CLI Surprises\n+If you guess how a `gt` or `bd` command should work and it fails, file a bead!\n+Example: If `gt session capture rig/polecat 50` fails but `-n 50` works, file:\n+```\n+bd create --title=\"gt session capture: Support positional line count\" --type=task --priority=1\n+```\n+Agent-friendly UX is critical. Your guesses reveal what's intuitive.\n+\n ### Completion\n - `gt done` - Signal work ready for merge queue\n - `bd sync` - Sync beads changes"
+    }
+  ]
+}

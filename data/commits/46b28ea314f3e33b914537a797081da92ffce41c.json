@@ -1,0 +1,41 @@
+{
+  "message": "fix(rpc): add MaxMessageSize limit to prevent unbounded memory allocation (bd-3)\n\nReplace bufio.NewReader + ReadBytes('\\n') with bufio.Scanner + Buffer()\ncapped at 10MB in both server and client RPC paths. This prevents a DoS\nvector where a client/server sends a line without a newline delimiter,\ncausing unbounded buffer growth.\n\nServer uses a custom scanCompleteLines split function that only returns\ncomplete newline-terminated lines, preserving correct timeout behavior.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\nExecuted-By: beads/polecats/onyx\nRig: beads\nRole: polecats",
+  "files": [
+    {
+      "sha": "264e022240245dac648bd58c486941016fa1bbf9",
+      "filename": "internal/rpc/client.go",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 4,
+      "changes": 12,
+      "blob_url": "https://github.com/gastownhall/beads/blob/46b28ea314f3e33b914537a797081da92ffce41c/internal%2Frpc%2Fclient.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/46b28ea314f3e33b914537a797081da92ffce41c/internal%2Frpc%2Fclient.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Frpc%2Fclient.go?ref=46b28ea314f3e33b914537a797081da92ffce41c",
+      "patch": "@@ -212,11 +212,15 @@ func (c *Client) ExecuteWithCwd(operation string, args interface{}, cwd string)\n \t\treturn nil, fmt.Errorf(\"failed to flush: %w\", err)\n \t}\n \n-\treader := bufio.NewReader(c.conn)\n-\trespLine, err := reader.ReadBytes('\\n')\n-\tif err != nil {\n-\t\treturn nil, fmt.Errorf(\"failed to read response: %w\", err)\n+\tscanner := bufio.NewScanner(c.conn)\n+\tscanner.Buffer(make([]byte, 0, 64*1024), MaxMessageSize)\n+\tif !scanner.Scan() {\n+\t\tif err := scanner.Err(); err != nil {\n+\t\t\treturn nil, fmt.Errorf(\"failed to read response: %w\", err)\n+\t\t}\n+\t\treturn nil, fmt.Errorf(\"failed to read response: connection closed\")\n \t}\n+\trespLine := scanner.Bytes()\n \n \tvar resp Response\n \tif err := json.Unmarshal(respLine, &resp); err != nil {"
+    },
+    {
+      "sha": "10386a6d0fa62b3c371b5b2bf742e17e6a4057ba",
+      "filename": "internal/rpc/protocol.go",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/gastownhall/beads/blob/46b28ea314f3e33b914537a797081da92ffce41c/internal%2Frpc%2Fprotocol.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/46b28ea314f3e33b914537a797081da92ffce41c/internal%2Frpc%2Fprotocol.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Frpc%2Fprotocol.go?ref=46b28ea314f3e33b914537a797081da92ffce41c",
+      "patch": "@@ -7,6 +7,11 @@ import (\n \t\"github.com/steveyegge/beads/internal/types\"\n )\n \n+// MaxMessageSize is the maximum size of a single RPC message (request or response).\n+// This prevents unbounded memory allocation from malicious or malformed messages.\n+// 10MB is generous for any legitimate beads operation (issue lists, batch ops, etc.).\n+const MaxMessageSize = 10 * 1024 * 1024 // 10MB\n+\n // Operation constants for all bd commands\n const (\n \tOpPing        = \"ping\""
+    },
+    {
+      "sha": "6252640b84ee2adf9057e65a444ffb85c921f891",
+      "filename": "internal/rpc/server_lifecycle_conn.go",
+      "status": "modified",
+      "additions": 21,
+      "deletions": 3,
+      "changes": 24,
+      "blob_url": "https://github.com/gastownhall/beads/blob/46b28ea314f3e33b914537a797081da92ffce41c/internal%2Frpc%2Fserver_lifecycle_conn.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/46b28ea314f3e33b914537a797081da92ffce41c/internal%2Frpc%2Fserver_lifecycle_conn.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Frpc%2Fserver_lifecycle_conn.go?ref=46b28ea314f3e33b914537a797081da92ffce41c",
+      "patch": "@@ -2,6 +2,7 @@ package rpc\n \n import (\n \t\"bufio\"\n+\t\"bytes\"\n \t\"context\"\n \t\"encoding/json\"\n \t\"errors\"\n@@ -220,7 +221,9 @@ func (s *Server) handleConnection(conn net.Conn) {\n \t\t}\n \t}()\n \n-\treader := bufio.NewReader(conn)\n+\tscanner := bufio.NewScanner(conn)\n+\tscanner.Buffer(make([]byte, 0, 64*1024), MaxMessageSize)\n+\tscanner.Split(scanCompleteLines)\n \twriter := bufio.NewWriter(conn)\n \n \tfor {\n@@ -229,10 +232,10 @@ func (s *Server) handleConnection(conn net.Conn) {\n \t\t\treturn\n \t\t}\n \n-\t\tline, err := reader.ReadBytes('\\n')\n-\t\tif err != nil {\n+\t\tif !scanner.Scan() {\n \t\t\treturn\n \t\t}\n+\t\tline := scanner.Bytes()\n \n \t\tvar req Request\n \t\tif err := json.Unmarshal(line, &req); err != nil {\n@@ -291,6 +294,21 @@ func (s *Server) writeResponse(writer *bufio.Writer, resp Response) error {\n \treturn nil\n }\n \n+// scanCompleteLines is a bufio.SplitFunc that only returns complete newline-terminated\n+// lines. Unlike bufio.ScanLines, it does NOT return partial data on EOF/timeout,\n+// ensuring that read deadline expiry causes the scanner to return false immediately\n+// rather than yielding an incomplete message for processing.\n+func scanCompleteLines(data []byte, atEOF bool) (advance int, token []byte, err error) {\n+\tif i := bytes.IndexByte(data, '\\n'); i >= 0 {\n+\t\tline := data[0:i]\n+\t\tif len(line) > 0 && line[len(line)-1] == '\\r' {\n+\t\t\tline = line[:len(line)-1]\n+\t\t}\n+\t\treturn i + 1, line, nil\n+\t}\n+\treturn 0, nil, nil\n+}\n+\n func (s *Server) handleShutdown(_ *Request) Response {\n \t// Signal pending shutdown - handleConnection will trigger Stop() after writing the response\n \ts.pendingShutdown.Store(true)"
+    }
+  ]
+}

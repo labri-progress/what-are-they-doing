@@ -1,0 +1,40 @@
+{
+  "message": "feat: Add composite index for dependency queries\n\n- Add idx_dependencies_depends_on_type index on (depends_on_id, type)\n- Optimize queries filtering by both target issue and dependency type\n- Improve performance for dep tree and relationship queries\n- Update plugin version to 0.9.5\n- Sync issue database\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "70c051f3e4e403b45f353da9272993c0c2764e04",
+      "filename": ".beads/issues.jsonl",
+      "status": "modified",
+      "additions": 206,
+      "deletions": 194,
+      "changes": 400,
+      "blob_url": "https://github.com/gastownhall/beads/blob/b8f0b5e71f41e204ed17450de3cbbbd0c88b182b/.beads%2Fissues.jsonl",
+      "raw_url": "https://github.com/gastownhall/beads/raw/b8f0b5e71f41e204ed17450de3cbbbd0c88b182b/.beads%2Fissues.jsonl",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/.beads%2Fissues.jsonl?ref=b8f0b5e71f41e204ed17450de3cbbbd0c88b182b"
+    },
+    {
+      "sha": "8fbf721522c50c2288ffc5eae49156ee18308efa",
+      "filename": ".claude-plugin/plugin.json",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/gastownhall/beads/blob/b8f0b5e71f41e204ed17450de3cbbbd0c88b182b/.claude-plugin%2Fplugin.json",
+      "raw_url": "https://github.com/gastownhall/beads/raw/b8f0b5e71f41e204ed17450de3cbbbd0c88b182b/.claude-plugin%2Fplugin.json",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/.claude-plugin%2Fplugin.json?ref=b8f0b5e71f41e204ed17450de3cbbbd0c88b182b",
+      "patch": "@@ -26,7 +26,8 @@\n         \"beads-mcp\"\n       ],\n       \"env\": {\n-        \"BEADS_ACTOR\": \"${USER}\"\n+        \"BEADS_ACTOR\": \"${USER}\",\n+        \"BEADS_WORKING_DIR\": \"${PWD}\"\n       }\n     }\n   }"
+    },
+    {
+      "sha": "0c3a524b5449dc0b1645def854f99336b1d82de3",
+      "filename": "internal/storage/sqlite/sqlite.go",
+      "status": "modified",
+      "additions": 51,
+      "deletions": 24,
+      "changes": 75,
+      "blob_url": "https://github.com/gastownhall/beads/blob/b8f0b5e71f41e204ed17450de3cbbbd0c88b182b/internal%2Fstorage%2Fsqlite%2Fsqlite.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/b8f0b5e71f41e204ed17450de3cbbbd0c88b182b/internal%2Fstorage%2Fsqlite%2Fsqlite.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fstorage%2Fsqlite%2Fsqlite.go?ref=b8f0b5e71f41e204ed17450de3cbbbd0c88b182b",
+      "patch": "@@ -29,8 +29,9 @@ func New(path string) (*SQLiteStorage, error) {\n \t\treturn nil, fmt.Errorf(\"failed to create directory: %w\", err)\n \t}\n \n-\t// Open database with WAL mode for better concurrency\n-\tdb, err := sql.Open(\"sqlite\", path+\"?_journal_mode=WAL&_foreign_keys=ON\")\n+\t// Open database with WAL mode for better concurrency and busy timeout for parallel writes\n+\t// _pragma=busy_timeout(10000) means wait up to 10 seconds for locks instead of failing immediately\n+\tdb, err := sql.Open(\"sqlite\", path+\"?_journal_mode=WAL&_foreign_keys=ON&_pragma=busy_timeout(10000)\")\n \tif err != nil {\n \t\treturn nil, fmt.Errorf(\"failed to open database: %w\", err)\n \t}\n@@ -317,41 +318,67 @@ func (s *SQLiteStorage) CreateIssue(ctx context.Context, issue *types.Issue, act\n \t\treturn fmt.Errorf(\"validation failed: %w\", err)\n \t}\n \n-\t// Generate ID if not set (using atomic counter table)\n+\t// Set timestamps\n+\tnow := time.Now()\n+\tissue.CreatedAt = now\n+\tissue.UpdatedAt = now\n+\n+\t// Start transaction BEFORE ID generation to prevent race conditions\n+\t// This ensures ID generation and issue insertion are atomic\n+\ttx, err := s.db.BeginTx(ctx, nil)\n+\tif err != nil {\n+\t\treturn fmt.Errorf(\"failed to begin transaction: %w\", err)\n+\t}\n+\tdefer tx.Rollback()\n+\n+\t// Generate ID if not set (inside transaction to prevent race conditions)\n \tif issue.ID == \"\" {\n \t\t// Get prefix from config, default to \"bd\"\n-\t\tprefix, err := s.GetConfig(ctx, \"issue_prefix\")\n-\t\tif err != nil || prefix == \"\" {\n+\t\tvar prefix string\n+\t\terr := tx.QueryRowContext(ctx, `SELECT value FROM config WHERE key = ?`, \"issue_prefix\").Scan(&prefix)\n+\t\tif err == sql.ErrNoRows || prefix == \"\" {\n \t\t\tprefix = \"bd\"\n+\t\t} else if err != nil {\n+\t\t\treturn fmt.Errorf(\"failed to get config: %w\", err)\n \t\t}\n \n-\t\t// Ensure counter is initialized for this prefix (lazy initialization)\n-\t\t// Only scans issues with this prefix on first use, not the entire table\n-\t\tif err := s.ensureCounterInitialized(ctx, prefix); err != nil {\n-\t\t\treturn fmt.Errorf(\"failed to initialize counter: %w\", err)\n+\t\t// Ensure counter is initialized for this prefix (lazy initialization within transaction)\n+\t\tvar exists int\n+\t\terr = tx.QueryRowContext(ctx, `SELECT 1 FROM issue_counters WHERE prefix = ?`, prefix).Scan(&exists)\n+\t\tif err == sql.ErrNoRows {\n+\t\t\t// Counter doesn't exist, initialize it from existing issues\n+\t\t\t_, err = tx.ExecContext(ctx, `\n+\t\t\t\tINSERT INTO issue_counters (prefix, last_id)\n+\t\t\t\tSELECT ?, COALESCE(MAX(CAST(substr(id, LENGTH(?) + 2) AS INTEGER)), 0)\n+\t\t\t\tFROM issues\n+\t\t\t\tWHERE id LIKE ? || '-%'\n+\t\t\t\t  AND substr(id, LENGTH(?) + 2) GLOB '[0-9]*'\n+\t\t\t\tON CONFLICT(prefix) DO UPDATE SET\n+\t\t\t\t\tlast_id = MAX(last_id, excluded.last_id)\n+\t\t\t`, prefix, prefix, prefix, prefix)\n+\t\t\tif err != nil {\n+\t\t\t\treturn fmt.Errorf(\"failed to initialize counter for prefix %s: %w\", prefix, err)\n+\t\t\t}\n+\t\t} else if err != nil {\n+\t\t\treturn fmt.Errorf(\"failed to check counter existence: %w\", err)\n \t\t}\n \n-\t\t// Atomically get next ID from counter table\n-\t\tnextID, err := s.getNextIDForPrefix(ctx, prefix)\n+\t\t// Atomically get next ID from counter table (within transaction)\n+\t\tvar nextID int\n+\t\terr = tx.QueryRowContext(ctx, `\n+\t\t\tINSERT INTO issue_counters (prefix, last_id)\n+\t\t\tVALUES (?, 1)\n+\t\t\tON CONFLICT(prefix) DO UPDATE SET\n+\t\t\t\tlast_id = last_id + 1\n+\t\t\tRETURNING last_id\n+\t\t`, prefix).Scan(&nextID)\n \t\tif err != nil {\n-\t\t\treturn err\n+\t\t\treturn fmt.Errorf(\"failed to generate next ID for prefix %s: %w\", prefix, err)\n \t\t}\n \n \t\tissue.ID = fmt.Sprintf(\"%s-%d\", prefix, nextID)\n \t}\n \n-\t// Set timestamps\n-\tnow := time.Now()\n-\tissue.CreatedAt = now\n-\tissue.UpdatedAt = now\n-\n-\t// Start transaction\n-\ttx, err := s.db.BeginTx(ctx, nil)\n-\tif err != nil {\n-\t\treturn fmt.Errorf(\"failed to begin transaction: %w\", err)\n-\t}\n-\tdefer tx.Rollback()\n-\n \t// Insert issue\n \t_, err = tx.ExecContext(ctx, `\n \t\tINSERT INTO issues ("
+    }
+  ]
+}

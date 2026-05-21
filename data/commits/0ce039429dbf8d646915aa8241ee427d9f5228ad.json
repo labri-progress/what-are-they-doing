@@ -1,0 +1,65 @@
+{
+  "message": "fix: tombstone/deletion overhaul for bd-4q8\n\n- IsExpired(): Negative TTL means immediately expired (for --hard mode)\n- IsExpired(): ClockSkewGrace only added for TTLs > 1 hour\n- bd cleanup --hard: Use negative TTL to prune freshly created tombstones\n- bd delete --hard: New flag to immediately prune tombstones from JSONL\n- Import: Add early tombstone check before all phases to prevent resurrection\n\nThe early tombstone check prevents ghost issues from being created when\ntombstones exist in the DB. However, a deeper git merge issue (bd-ncwo)\ncan still cause resurrection when remote's status:closed wins the merge.\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "5448147c2f99a77ed1269467411262a79f80ce4a",
+      "filename": "cmd/bd/cleanup.go",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 3,
+      "changes": 8,
+      "blob_url": "https://github.com/gastownhall/beads/blob/0ce039429dbf8d646915aa8241ee427d9f5228ad/cmd%2Fbd%2Fcleanup.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/0ce039429dbf8d646915aa8241ee427d9f5228ad/cmd%2Fbd%2Fcleanup.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/cmd%2Fbd%2Fcleanup.go?ref=0ce039429dbf8d646915aa8241ee427d9f5228ad",
+      "patch": "@@ -77,8 +77,9 @@ SEE ALSO:\n \t\t\tif olderThanDays > 0 {\n \t\t\t\tcustomTTL = time.Duration(olderThanDays) * 24 * time.Hour\n \t\t\t} else {\n-\t\t\t\t// --hard without --older-than: prune ALL tombstones (use 1 second TTL)\n-\t\t\t\tcustomTTL = time.Second\n+\t\t\t\t// --hard without --older-than: prune ALL tombstones immediately\n+\t\t\t\t// Negative TTL means \"immediately expired\" (bd-4q8 fix)\n+\t\t\t\tcustomTTL = -1\n \t\t\t}\n \t\t\tif !jsonOutput && !dryRun {\n \t\t\t\tfmt.Println(color.YellowString(\"\u26a0\ufe0f  HARD DELETE MODE: Bypassing tombstone TTL safety\"))\n@@ -186,7 +187,8 @@ SEE ALSO:\n \t\t}\n \n \t\t// Use the existing batch deletion logic\n-\t\tdeleteBatch(cmd, issueIDs, force, dryRun, cascade, jsonOutput, \"cleanup\")\n+\t\t// Note: cleanup always creates tombstones first; --hard prunes them after\n+\t\tdeleteBatch(cmd, issueIDs, force, dryRun, cascade, jsonOutput, false, \"cleanup\")\n \n \t\t// Also prune expired tombstones (bd-08ea)\n \t\t// This runs after closed issues are converted to tombstones, cleaning up old ones"
+    },
+    {
+      "sha": "3435390d9e9eba4981363534ce765b8cef34c068",
+      "filename": "cmd/bd/delete.go",
+      "status": "modified",
+      "additions": 39,
+      "deletions": 5,
+      "changes": 44,
+      "blob_url": "https://github.com/gastownhall/beads/blob/0ce039429dbf8d646915aa8241ee427d9f5228ad/cmd%2Fbd%2Fdelete.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/0ce039429dbf8d646915aa8241ee427d9f5228ad/cmd%2Fbd%2Fdelete.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/cmd%2Fbd%2Fdelete.go?ref=0ce039429dbf8d646915aa8241ee427d9f5228ad",
+      "patch": "@@ -91,29 +91,44 @@ var deleteCmd = &cobra.Command{\n This command will:\n 1. Remove all dependency links (any type, both directions) involving the issues\n 2. Update text references to \"[deleted:ID]\" in directly connected issues\n-3. Delete the issues from the database\n+3. Delete the issues from the database (creates tombstones by default)\n+\n This is a destructive operation that cannot be undone. Use with caution.\n+\n BATCH DELETION:\n Delete multiple issues at once:\n   bd delete bd-1 bd-2 bd-3 --force\n+\n Delete from file (one ID per line):\n   bd delete --from-file deletions.txt --force\n+\n Preview before deleting:\n   bd delete --from-file deletions.txt --dry-run\n+\n DEPENDENCY HANDLING:\n Default: Fails if any issue has dependents not in deletion set\n   bd delete bd-1 bd-2\n+\n Cascade: Recursively delete all dependents\n   bd delete bd-1 --cascade --force\n+\n Force: Delete and orphan dependents\n-  bd delete bd-1 --force`,\n+  bd delete bd-1 --force\n+\n+PERMANENT DELETION:\n+Use --hard to permanently delete (bypass tombstones):\n+  bd delete bd-1 bd-2 --hard --force\n+\n+WARNING: --hard bypasses sync safety. Use only when you are certain\n+the issues will not resurrect from remote branches.`,\n \tArgs: cobra.MinimumNArgs(0),\n \tRun: func(cmd *cobra.Command, args []string) {\n \t\tCheckReadonly(\"delete\")\n \t\tfromFile, _ := cmd.Flags().GetString(\"from-file\")\n \t\tforce, _ := cmd.Flags().GetBool(\"force\")\n \t\tdryRun, _ := cmd.Flags().GetBool(\"dry-run\")\n \t\tcascade, _ := cmd.Flags().GetBool(\"cascade\")\n+\t\thardDelete, _ := cmd.Flags().GetBool(\"hard\")\n \t\t// Use global jsonOutput set by PersistentPreRun\n \t\t// Collect issue IDs from args and/or file\n \t\tissueIDs := make([]string, 0, len(args))\n@@ -150,7 +165,7 @@ Force: Delete and orphan dependents\n \t\t\n \t\t// Handle batch deletion in direct mode\n \t\tif len(issueIDs) > 1 {\n-\t\t\tdeleteBatch(cmd, issueIDs, force, dryRun, cascade, jsonOutput, \"batch delete\")\n+\t\t\tdeleteBatch(cmd, issueIDs, force, dryRun, cascade, jsonOutput, hardDelete, \"batch delete\")\n \t\t\treturn\n \t\t}\n \t\t\n@@ -409,7 +424,7 @@ func removeIssueFromJSONL(issueID string) error {\n }\n // deleteBatch handles deletion of multiple issues\n //nolint:unparam // cmd parameter required for potential future use\n-func deleteBatch(_ *cobra.Command, issueIDs []string, force bool, dryRun bool, cascade bool, jsonOutput bool, reason string) {\n+func deleteBatch(_ *cobra.Command, issueIDs []string, force bool, dryRun bool, cascade bool, jsonOutput bool, hardDelete bool, reason string) {\n \t// Ensure we have a direct store\n \tif store == nil {\n \t\tif err := ensureStoreActive(); err != nil {\n@@ -499,12 +514,30 @@ func deleteBatch(_ *cobra.Command, issueIDs []string, force bool, dryRun bool, c\n \t\t\t}\n \t\t}\n \t}\n-\t// Actually delete\n+\t// Actually delete (creates tombstones)\n \tresult, err := d.DeleteIssues(ctx, issueIDs, cascade, force, false)\n \tif err != nil {\n \t\tfmt.Fprintf(os.Stderr, \"Error: %v\\n\", err)\n \t\tos.Exit(1)\n \t}\n+\n+\t// Hard delete: immediately prune tombstones from JSONL (bd-4q8)\n+\t// Note: We keep tombstones in DB to prevent resurrection during sync.\n+\t// The tombstones will be exported and synced to remote, blocking resurrection.\n+\t// Use 'bd cleanup --hard' after syncing to fully purge old tombstones.\n+\tif hardDelete {\n+\t\tif !jsonOutput {\n+\t\t\tfmt.Println(color.YellowString(\"\u26a0\ufe0f  HARD DELETE MODE: Pruning tombstones from JSONL\"))\n+\t\t\tfmt.Println(\"  Note: Tombstones kept in DB to prevent resurrection. Run 'bd sync' then 'bd cleanup --hard' to fully purge.\")\n+\t\t}\n+\t\t// Prune tombstones from JSONL using negative TTL (immediate expiration)\n+\t\tif pruneResult, err := pruneExpiredTombstones(-1); err != nil {\n+\t\t\tfmt.Fprintf(os.Stderr, \"Warning: failed to prune tombstones from JSONL: %v\\n\", err)\n+\t\t} else if pruneResult != nil && pruneResult.PrunedCount > 0 && !jsonOutput {\n+\t\t\tfmt.Printf(\"  Pruned %d tombstone(s) from JSONL\\n\", pruneResult.PrunedCount)\n+\t\t}\n+\t}\n+\n \t// Update text references in connected issues (using pre-collected issues)\n \tupdatedCount := updateTextReferencesInIssues(ctx, issueIDs, connectedIssues)\n \t// Note: No longer remove from JSONL - tombstones will be exported to JSONL (bd-3b4)\n@@ -663,5 +696,6 @@ func init() {\n \tdeleteCmd.Flags().String(\"from-file\", \"\", \"Read issue IDs from file (one per line)\")\n \tdeleteCmd.Flags().Bool(\"dry-run\", false, \"Preview what would be deleted without making changes\")\n \tdeleteCmd.Flags().Bool(\"cascade\", false, \"Recursively delete all dependent issues\")\n+\tdeleteCmd.Flags().Bool(\"hard\", false, \"Permanently delete (skip tombstone, cannot be recovered via sync)\")\n \trootCmd.AddCommand(deleteCmd)\n }"
+    },
+    {
+      "sha": "262bf62cd0fa1e292bdf0558ce18e232a91acb72",
+      "filename": "internal/importer/importer.go",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 1,
+      "changes": 12,
+      "blob_url": "https://github.com/gastownhall/beads/blob/0ce039429dbf8d646915aa8241ee427d9f5228ad/internal%2Fimporter%2Fimporter.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/0ce039429dbf8d646915aa8241ee427d9f5228ad/internal%2Fimporter%2Fimporter.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fimporter%2Fimporter.go?ref=0ce039429dbf8d646915aa8241ee427d9f5228ad",
+      "patch": "@@ -492,7 +492,17 @@ func upsertIssues(ctx context.Context, sqliteStore *sqlite.SQLiteStorage, issues\n \t\t\tcontinue\n \t\t}\n \t\tseenHashes[hash] = true\n-\t\t\n+\n+\t\t// CRITICAL: Check for tombstone FIRST, before any other matching (bd-4q8 fix)\n+\t\t// This prevents ghost resurrection regardless of which phase would normally match.\n+\t\t// If this ID has a tombstone in the DB, skip importing it entirely.\n+\t\tif existingByID, found := dbByID[incoming.ID]; found {\n+\t\t\tif existingByID.Status == types.StatusTombstone {\n+\t\t\t\tresult.Skipped++\n+\t\t\t\tcontinue\n+\t\t\t}\n+\t\t}\n+\n \t\t// Phase 0: Match by external_ref first (if present)\n \t\t// This enables re-syncing from external systems (Jira, GitHub, Linear)\n \t\tif incoming.ExternalRef != nil && *incoming.ExternalRef != \"\" {"
+    },
+    {
+      "sha": "3915e9403ca48c6f4e78dad1be9e31a752aed38d",
+      "filename": "internal/types/types.go",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 3,
+      "changes": 18,
+      "blob_url": "https://github.com/gastownhall/beads/blob/0ce039429dbf8d646915aa8241ee427d9f5228ad/internal%2Ftypes%2Ftypes.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/0ce039429dbf8d646915aa8241ee427d9f5228ad/internal%2Ftypes%2Ftypes.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Ftypes%2Ftypes.go?ref=0ce039429dbf8d646915aa8241ee427d9f5228ad",
+      "patch": "@@ -98,7 +98,10 @@ func (i *Issue) IsTombstone() bool {\n \n // IsExpired returns true if the tombstone has exceeded its TTL.\n // Non-tombstone issues always return false.\n-// ttl is the configured TTL duration; if zero, DefaultTombstoneTTL is used.\n+// ttl is the configured TTL duration:\n+//   - If zero, DefaultTombstoneTTL (30 days) is used\n+//   - If negative, the tombstone is immediately expired (for --hard mode)\n+//   - If positive, ClockSkewGrace is added only for TTLs > 1 hour\n func (i *Issue) IsExpired(ttl time.Duration) bool {\n \t// Non-tombstones never expire\n \tif !i.IsTombstone() {\n@@ -110,13 +113,22 @@ func (i *Issue) IsExpired(ttl time.Duration) bool {\n \t\treturn false\n \t}\n \n+\t// Negative TTL means \"immediately expired\" - for --hard mode (bd-4q8 fix)\n+\tif ttl < 0 {\n+\t\treturn true\n+\t}\n+\n \t// Use default TTL if not specified\n \tif ttl == 0 {\n \t\tttl = DefaultTombstoneTTL\n \t}\n \n-\t// Add clock skew grace period to the TTL\n-\teffectiveTTL := ttl + ClockSkewGrace\n+\t// Only add clock skew grace period for normal TTLs (> 1 hour).\n+\t// For short TTLs (testing/development), skip grace period.\n+\teffectiveTTL := ttl\n+\tif ttl > ClockSkewGrace {\n+\t\teffectiveTTL = ttl + ClockSkewGrace\n+\t}\n \n \t// Check if the tombstone has exceeded its TTL\n \texpirationTime := i.DeletedAt.Add(effectiveTTL)"
+    },
+    {
+      "sha": "904e7045bc59b2b5b602643bf1fed1cd505164dd",
+      "filename": "internal/types/types_test.go",
+      "status": "modified",
+      "additions": 25,
+      "deletions": 0,
+      "changes": 25,
+      "blob_url": "https://github.com/gastownhall/beads/blob/0ce039429dbf8d646915aa8241ee427d9f5228ad/internal%2Ftypes%2Ftypes_test.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/0ce039429dbf8d646915aa8241ee427d9f5228ad/internal%2Ftypes%2Ftypes_test.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Ftypes%2Ftypes_test.go?ref=0ce039429dbf8d646915aa8241ee427d9f5228ad",
+      "patch": "@@ -756,6 +756,31 @@ func TestIsExpired(t *testing.T) {\n \t\t\tttl:     7 * 24 * time.Hour,\n \t\t\texpired: false,\n \t\t},\n+\t\t{\n+\t\t\tname: \"negative TTL means immediately expired (bd-4q8 --hard mode)\",\n+\t\t\tissue: Issue{\n+\t\t\t\tID:        \"test-14\",\n+\t\t\t\tTitle:     \"(deleted)\",\n+\t\t\t\tStatus:    StatusTombstone,\n+\t\t\t\tPriority:  0,\n+\t\t\t\tIssueType: TypeTask,\n+\t\t\t\tDeletedAt: timePtr(now), // Just deleted NOW\n+\t\t\t},\n+\t\t\tttl:     -1, // Negative TTL = immediate expiration\n+\t\t\texpired: true,\n+\t\t},\n+\t\t{\n+\t\t\tname: \"non-tombstone never expires even with negative TTL\",\n+\t\t\tissue: Issue{\n+\t\t\t\tID:        \"test-15\",\n+\t\t\t\tTitle:     \"Open issue\",\n+\t\t\t\tStatus:    StatusOpen,\n+\t\t\t\tPriority:  0,\n+\t\t\t\tIssueType: TypeTask,\n+\t\t\t},\n+\t\t\tttl:     -1,\n+\t\t\texpired: false,\n+\t\t},\n \t}\n \n \tfor _, tt := range tests {"
+    }
+  ]
+}

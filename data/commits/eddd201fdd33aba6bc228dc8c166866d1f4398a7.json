@@ -1,0 +1,41 @@
+{
+  "message": "fix(daemon): drain in-flight sync operations on graceful shutdown (bd-17)\n\nAdd sync.WaitGroup to Debouncer to track in-flight actions. On shutdown,\nCancelAndWait() blocks until any running export/import completes, preventing\nthe daemon from exiting mid-write (JSONL write or git commit).\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\nExecuted-By: beads/polecats/ruby\nRig: beads\nRole: polecats",
+  "files": [
+    {
+      "sha": "8b09a39bb088a56e0a3538d15b734864a70b9698",
+      "filename": "cmd/bd/daemon_debouncer.go",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 3,
+      "changes": 25,
+      "blob_url": "https://github.com/gastownhall/beads/blob/eddd201fdd33aba6bc228dc8c166866d1f4398a7/cmd%2Fbd%2Fdaemon_debouncer.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/eddd201fdd33aba6bc228dc8c166866d1f4398a7/cmd%2Fbd%2Fdaemon_debouncer.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/cmd%2Fbd%2Fdaemon_debouncer.go?ref=eddd201fdd33aba6bc228dc8c166866d1f4398a7",
+      "patch": "@@ -12,7 +12,8 @@ type Debouncer struct {\n \ttimer    *time.Timer\n \tduration time.Duration\n \taction   func()\n-\tseq      uint64 // Sequence number to prevent stale timer fires\n+\tseq      uint64         // Sequence number to prevent stale timer fires\n+\twg       sync.WaitGroup // Tracks in-flight actions for graceful shutdown\n }\n \n // NewDebouncer creates a new debouncer with the given duration and action.\n@@ -32,14 +33,20 @@ func (d *Debouncer) Trigger() {\n \tdefer d.mu.Unlock()\n \n \tif d.timer != nil {\n-\t\td.timer.Stop()\n+\t\tif d.timer.Stop() {\n+\t\t\t// Timer was stopped before firing; release WaitGroup for it\n+\t\t\td.wg.Done()\n+\t\t}\n \t}\n \n \t// Increment sequence number to invalidate any pending timers\n \td.seq++\n \tcurrentSeq := d.seq\n \n+\td.wg.Add(1)\n \td.timer = time.AfterFunc(d.duration, func() {\n+\t\tdefer d.wg.Done()\n+\n \t\td.mu.Lock()\n \t\t// Only fire if this is still the latest trigger\n \t\tif d.seq != currentSeq {\n@@ -58,12 +65,24 @@ func (d *Debouncer) Trigger() {\n \n // Cancel stops any pending debounced action.\n // Safe to call even if no action is pending.\n+// Does NOT wait for an already-executing action to finish.\n func (d *Debouncer) Cancel() {\n \td.mu.Lock()\n \tdefer d.mu.Unlock()\n \n \tif d.timer != nil {\n-\t\td.timer.Stop()\n+\t\tif d.timer.Stop() {\n+\t\t\t// Timer was stopped before firing; release WaitGroup for it\n+\t\t\td.wg.Done()\n+\t\t}\n \t\td.timer = nil\n \t}\n }\n+\n+// CancelAndWait stops any pending debounced action and blocks until any\n+// in-flight action completes. Use this during graceful shutdown to drain\n+// in-flight sync operations (export/import).\n+func (d *Debouncer) CancelAndWait() {\n+\td.Cancel()\n+\td.wg.Wait()\n+}"
+    },
+    {
+      "sha": "6429d00c14aee09070a09a70b8f5c72dee280c15",
+      "filename": "cmd/bd/daemon_debouncer_test.go",
+      "status": "modified",
+      "additions": 75,
+      "deletions": 0,
+      "changes": 75,
+      "blob_url": "https://github.com/gastownhall/beads/blob/eddd201fdd33aba6bc228dc8c166866d1f4398a7/cmd%2Fbd%2Fdaemon_debouncer_test.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/eddd201fdd33aba6bc228dc8c166866d1f4398a7/cmd%2Fbd%2Fdaemon_debouncer_test.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/cmd%2Fbd%2Fdaemon_debouncer_test.go?ref=eddd201fdd33aba6bc228dc8c166866d1f4398a7",
+      "patch": "@@ -179,6 +179,81 @@ func TestDebouncer_MultipleSequentialTriggerCycles(t *testing.T) {\n \tawaitCount(3)\n }\n \n+func TestDebouncer_CancelAndWaitDrainsInFlight(t *testing.T) {\n+\tstarted := make(chan struct{})\n+\tdone := make(chan struct{})\n+\tdebouncer := NewDebouncer(10*time.Millisecond, func() {\n+\t\tclose(started)\n+\t\t// Simulate a long-running sync operation\n+\t\ttime.Sleep(200 * time.Millisecond)\n+\t\tclose(done)\n+\t})\n+\n+\tdebouncer.Trigger()\n+\n+\t// Wait for the action to start executing\n+\tselect {\n+\tcase <-started:\n+\tcase <-time.After(1 * time.Second):\n+\t\tt.Fatal(\"action did not start in time\")\n+\t}\n+\n+\t// CancelAndWait should block until the action finishes\n+\tdebouncer.CancelAndWait()\n+\n+\t// Verify the action completed\n+\tselect {\n+\tcase <-done:\n+\t\t// Success - action completed before CancelAndWait returned\n+\tdefault:\n+\t\tt.Error(\"CancelAndWait returned before in-flight action completed\")\n+\t}\n+}\n+\n+func TestDebouncer_CancelAndWaitNoPending(t *testing.T) {\n+\tdebouncer := NewDebouncer(50*time.Millisecond, func() {})\n+\n+\t// CancelAndWait with nothing pending should return immediately\n+\twaitDone := make(chan struct{})\n+\tgo func() {\n+\t\tdebouncer.CancelAndWait()\n+\t\tclose(waitDone)\n+\t}()\n+\n+\tselect {\n+\tcase <-waitDone:\n+\tcase <-time.After(1 * time.Second):\n+\t\tt.Fatal(\"CancelAndWait blocked with nothing pending\")\n+\t}\n+}\n+\n+func TestDebouncer_CancelAndWaitWithPendingTimer(t *testing.T) {\n+\tvar count int32\n+\tdebouncer := NewDebouncer(5*time.Second, func() {\n+\t\t// This should never fire - timer should be stopped\n+\t\tatomic.AddInt32(&count, 1)\n+\t})\n+\n+\tdebouncer.Trigger()\n+\n+\t// CancelAndWait should stop the timer and return immediately\n+\twaitDone := make(chan struct{})\n+\tgo func() {\n+\t\tdebouncer.CancelAndWait()\n+\t\tclose(waitDone)\n+\t}()\n+\n+\tselect {\n+\tcase <-waitDone:\n+\tcase <-time.After(1 * time.Second):\n+\t\tt.Fatal(\"CancelAndWait blocked with only a pending (not yet fired) timer\")\n+\t}\n+\n+\tif got := atomic.LoadInt32(&count); got != 0 {\n+\t\tt.Errorf(\"action should not have fired after CancelAndWait: got %d, want 0\", got)\n+\t}\n+}\n+\n func TestDebouncer_CancelImmediatelyAfterTrigger(t *testing.T) {\n \tvar count int32\n \tdebouncer := NewDebouncer(50*time.Millisecond, func() {"
+    },
+    {
+      "sha": "f02e78d860bfe61fe359356e717c2f0619229b4b",
+      "filename": "cmd/bd/daemon_event_loop.go",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/gastownhall/beads/blob/eddd201fdd33aba6bc228dc8c166866d1f4398a7/cmd%2Fbd%2Fdaemon_event_loop.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/eddd201fdd33aba6bc228dc8c166866d1f4398a7/cmd%2Fbd%2Fdaemon_event_loop.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/cmd%2Fbd%2Fdaemon_event_loop.go?ref=eddd201fdd33aba6bc228dc8c166866d1f4398a7",
+      "patch": "@@ -50,13 +50,13 @@ func runEventDrivenLoop(\n \t\tlog.Info(\"Export triggered by mutation events\")\n \t\tdoExport()\n \t})\n-\tdefer exportDebouncer.Cancel()\n+\tdefer exportDebouncer.CancelAndWait()\n \n \timportDebouncer := NewDebouncer(500*time.Millisecond, func() {\n \t\tlog.Info(\"Import triggered by file change\")\n \t\tdoAutoImport()\n \t})\n-\tdefer importDebouncer.Cancel()\n+\tdefer importDebouncer.CancelAndWait()\n \n \t// Start file watcher for JSONL changes\n \twatcher, err := NewFileWatcher(jsonlPath, func() {"
+    }
+  ]
+}

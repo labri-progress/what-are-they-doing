@@ -1,0 +1,29 @@
+{
+  "message": "fix: surface real errors from SearchIssues ephemeral fallthrough (bd-w59l)\n\nSearchIssues and GetReadyWork silently swallowed all errors from\nsearchWisps, falling through to the issues table. This masked real\nerrors (timeouts, connection failures, corrupt data) by returning\nstale/wrong results. Now only MySQL error 1146 (table does not exist)\ntriggers fallthrough; all other errors are surfaced to the caller.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\nExecuted-By: beads/polecats/98\nRig: beads\nRole: polecats",
+  "files": [
+    {
+      "sha": "a11750b64bd2de89a4562906a3a309995c5b1337",
+      "filename": "internal/storage/dolt/errors.go",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 0,
+      "changes": 11,
+      "blob_url": "https://github.com/gastownhall/beads/blob/9dc33be88978c6c3f4f037933956f69fec75b3e1/internal%2Fstorage%2Fdolt%2Ferrors.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/9dc33be88978c6c3f4f037933956f69fec75b3e1/internal%2Fstorage%2Fdolt%2Ferrors.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fstorage%2Fdolt%2Ferrors.go?ref=9dc33be88978c6c3f4f037933956f69fec75b3e1",
+      "patch": "@@ -5,6 +5,8 @@ import (\n \t\"errors\"\n \t\"fmt\"\n \n+\tmysql \"github.com/go-sql-driver/mysql\"\n+\n \t\"github.com/steveyegge/beads/internal/storage\"\n )\n \n@@ -25,6 +27,15 @@ var (\n \tErrExec = errors.New(\"exec error\")\n )\n \n+// isTableNotExistError returns true if the error indicates a MySQL/Dolt\n+// \"table doesn't exist\" error (error 1146). Used to distinguish legitimate\n+// fallthrough (pre-migration databases without wisps table) from real errors\n+// (timeouts, connection failures, corrupt data).\n+func isTableNotExistError(err error) bool {\n+\tvar mysqlErr *mysql.MySQLError\n+\treturn errors.As(err, &mysqlErr) && mysqlErr.Number == 1146\n+}\n+\n // wrapDBError wraps a database error with operation context.\n // If err is sql.ErrNoRows, it is converted to storage.ErrNotFound.\n // If err is nil, nil is returned."
+    },
+    {
+      "sha": "f66c2eec06514a953fc2c58f5ce881d45ddc7a53",
+      "filename": "internal/storage/dolt/queries.go",
+      "status": "modified",
+      "additions": 19,
+      "deletions": 7,
+      "changes": 26,
+      "blob_url": "https://github.com/gastownhall/beads/blob/9dc33be88978c6c3f4f037933956f69fec75b3e1/internal%2Fstorage%2Fdolt%2Fqueries.go",
+      "raw_url": "https://github.com/gastownhall/beads/raw/9dc33be88978c6c3f4f037933956f69fec75b3e1/internal%2Fstorage%2Fdolt%2Fqueries.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/beads/contents/internal%2Fstorage%2Fdolt%2Fqueries.go?ref=9dc33be88978c6c3f4f037933956f69fec75b3e1",
+      "patch": "@@ -17,20 +17,28 @@ func (s *DoltStore) SearchIssues(ctx context.Context, query string, filter types\n \t// Route ephemeral-only queries to wisps table, falling through to\n \t// issues table if wisps table doesn't exist (pre-migration databases).\n \tif filter.Ephemeral != nil && *filter.Ephemeral {\n-\t\tif results, err := s.searchWisps(ctx, query, filter); err == nil && len(results) > 0 {\n+\t\tresults, err := s.searchWisps(ctx, query, filter)\n+\t\tif err != nil && !isTableNotExistError(err) {\n+\t\t\treturn nil, fmt.Errorf(\"search wisps (ephemeral filter): %w\", err)\n+\t\t}\n+\t\tif len(results) > 0 {\n \t\t\treturn results, nil\n \t\t}\n-\t\t// Fall through: query issues table with ephemeral filter instead\n+\t\t// Fall through: wisps table doesn't exist or returned no results\n \t}\n \n \t// If searching by IDs that are all ephemeral, try wisps table first,\n \t// falling through to the issues table if not found (handles pre-migration\n \t// databases where ephemeral rows live in issues with ephemeral=1).\n \tif len(filter.IDs) > 0 && allEphemeral(filter.IDs) {\n-\t\tif results, err := s.searchWisps(ctx, query, filter); err == nil && len(results) > 0 {\n+\t\tresults, err := s.searchWisps(ctx, query, filter)\n+\t\tif err != nil && !isTableNotExistError(err) {\n+\t\t\treturn nil, fmt.Errorf(\"search wisps (ephemeral IDs): %w\", err)\n+\t\t}\n+\t\tif len(results) > 0 {\n \t\t\treturn results, nil\n \t\t}\n-\t\t// Fall through: wisps table may not exist or IDs may be in issues table\n+\t\t// Fall through: wisps table doesn't exist or IDs may be in issues table\n \t}\n \n \ts.mu.RLock()\n@@ -74,7 +82,10 @@ func (s *DoltStore) SearchIssues(ctx context.Context, query string, filter types\n \t// table and merge results. This ensures ephemeral beads appear in queries.\n \tif filter.Ephemeral == nil {\n \t\twispResults, wispErr := s.searchWisps(ctx, query, filter)\n-\t\tif wispErr == nil && len(wispResults) > 0 {\n+\t\tif wispErr != nil && !isTableNotExistError(wispErr) {\n+\t\t\treturn nil, fmt.Errorf(\"search wisps (merge): %w\", wispErr)\n+\t\t}\n+\t\tif len(wispResults) > 0 {\n \t\t\t// Deduplicate by ID (prefer Dolt version if exists in both)\n \t\t\tseen := make(map[string]bool, len(doltResults))\n \t\t\tfor _, issue := range doltResults {\n@@ -278,9 +289,10 @@ func (s *DoltStore) GetReadyWork(ctx context.Context, filter types.WorkFilter) (\n \t\t\twispFilter.Status = &s\n \t\t}\n \t\twisps, wErr := s.searchWisps(ctx, \"\", wispFilter)\n-\t\tif wErr == nil {\n-\t\t\tissues = append(issues, wisps...)\n+\t\tif wErr != nil && !isTableNotExistError(wErr) {\n+\t\t\treturn nil, fmt.Errorf(\"search wisps (ready work): %w\", wErr)\n \t\t}\n+\t\tissues = append(issues, wisps...)\n \t}\n \n \treturn issues, nil"
+    }
+  ]
+}

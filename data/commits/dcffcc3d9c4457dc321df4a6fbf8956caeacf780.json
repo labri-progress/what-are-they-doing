@@ -1,0 +1,29 @@
+{
+  "message": "Merge PR #1799: daemon: dedupe convoy close handling across stores\n\ndaemon: dedupe convoy close handling across stores",
+  "files": [
+    {
+      "sha": "34cc2120a264995bda209efad045812a1c564b89",
+      "filename": "internal/daemon/convoy_manager.go",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 2,
+      "changes": 9,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/dcffcc3d9c4457dc321df4a6fbf8956caeacf780/internal%2Fdaemon%2Fconvoy_manager.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/dcffcc3d9c4457dc321df4a6fbf8956caeacf780/internal%2Fdaemon%2Fconvoy_manager.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fdaemon%2Fconvoy_manager.go?ref=dcffcc3d9c4457dc321df4a6fbf8956caeacf780",
+      "patch": "@@ -172,11 +172,12 @@ func (m *ConvoyManager) runEventPoll() {\n // The first call is a warm-up: it advances high-water marks without\n // processing events, preventing a burst of historical replay on restart.\n func (m *ConvoyManager) pollAllStores() {\n+\tseenClosedIssues := make(map[string]struct{})\n \tfor name, store := range m.stores {\n \t\tif name != \"hq\" && m.isRigParked(name) {\n \t\t\tcontinue\n \t\t}\n-\t\tm.pollStore(name, store)\n+\t\tm.pollStore(name, store, seenClosedIssues)\n \t}\n \tif !m.seeded {\n \t\tm.seeded = true\n@@ -185,7 +186,7 @@ func (m *ConvoyManager) pollAllStores() {\n \n // pollStore fetches new events from a single store and processes close events.\n // Convoy lookups always use the hq store since convoys are hq-* prefixed.\n-func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage) {\n+func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, seenClosedIssues map[string]struct{}) {\n \t// Load per-store high-water mark\n \tvar highWater int64\n \tif v, ok := m.lastEventIDs.Load(name); ok {\n@@ -234,6 +235,10 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage) {\n \t\tif issueID == \"\" {\n \t\t\tcontinue\n \t\t}\n+\t\tif _, exists := seenClosedIssues[issueID]; exists {\n+\t\t\tcontinue\n+\t\t}\n+\t\tseenClosedIssues[issueID] = struct{}{}\n \n \t\tm.logger(\"Convoy: close detected: %s\", issueID)\n \t\tconvoy.CheckConvoysForIssue(m.ctx, hqStore, m.townRoot, issueID, \"Convoy\", m.logger, m.gtPath, m.isRigParked)"
+    },
+    {
+      "sha": "67663abd6515093cb19b95a2890fe7f5e9fa6268",
+      "filename": "internal/daemon/convoy_manager_test.go",
+      "status": "modified",
+      "additions": 62,
+      "deletions": 0,
+      "changes": 62,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/dcffcc3d9c4457dc321df4a6fbf8956caeacf780/internal%2Fdaemon%2Fconvoy_manager_test.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/dcffcc3d9c4457dc321df4a6fbf8956caeacf780/internal%2Fdaemon%2Fconvoy_manager_test.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Fdaemon%2Fconvoy_manager_test.go?ref=dcffcc3d9c4457dc321df4a6fbf8956caeacf780",
+      "patch": "@@ -164,6 +164,68 @@ func TestEventPoll_DetectsCloseEvents(t *testing.T) {\n \t}\n }\n \n+func TestEventPoll_DeduplicatesCloseEventsAcrossStores(t *testing.T) {\n+\tif runtime.GOOS == \"windows\" {\n+\t\tt.Skip(\"skipping on Windows\")\n+\t}\n+\thqStore, cleanupHQ := setupTestStore(t)\n+\tdefer cleanupHQ()\n+\trigStore, cleanupRig := setupTestStore(t)\n+\tdefer cleanupRig()\n+\n+\tctx := context.Background()\n+\tnow := time.Now().UTC()\n+\tissue := &beadsdk.Issue{\n+\t\tID:        \"gt-dedupe1\",\n+\t\tTitle:     \"Duplicate Close\",\n+\t\tStatus:    beadsdk.StatusOpen,\n+\t\tPriority:  2,\n+\t\tIssueType: beadsdk.TypeTask,\n+\t\tCreatedAt: now,\n+\t\tUpdatedAt: now,\n+\t}\n+\trequireCloseEvent := func(store beadsdk.Storage) {\n+\t\tif err := store.CreateIssue(ctx, issue, \"test\"); err != nil {\n+\t\t\tt.Fatalf(\"CreateIssue: %v\", err)\n+\t\t}\n+\t\tif err := store.CloseIssue(ctx, issue.ID, \"done\", \"test\", \"\"); err != nil {\n+\t\t\tt.Fatalf(\"CloseIssue: %v\", err)\n+\t\t}\n+\t}\n+\trequireCloseEvent(hqStore)\n+\trequireCloseEvent(rigStore)\n+\n+\tvar logged []string\n+\tlogger := func(format string, args ...interface{}) {\n+\t\tlogged = append(logged, fmt.Sprintf(format, args...))\n+\t}\n+\n+\tm := NewConvoyManager(\n+\t\tt.TempDir(),\n+\t\tlogger,\n+\t\t\"gt\",\n+\t\t10*time.Minute,\n+\t\tmap[string]beadsdk.Storage{\n+\t\t\t\"hq\":       hqStore,\n+\t\t\t\"gastown\":  rigStore,\n+\t\t},\n+\t\tnil,\n+\t\tnil,\n+\t)\n+\tm.seeded = true\n+\tm.pollAllStores()\n+\n+\tcloseDetectedCount := 0\n+\tfor _, s := range logged {\n+\t\tif strings.Contains(s, \"close detected\") && strings.Contains(s, issue.ID) {\n+\t\t\tcloseDetectedCount++\n+\t\t}\n+\t}\n+\tif closeDetectedCount != 1 {\n+\t\tt.Fatalf(\"expected exactly 1 close detected log, got %d: %v\", closeDetectedCount, logged)\n+\t}\n+}\n+\n func TestEventPoll_SkipsNonCloseEvents(t *testing.T) {\n \tif runtime.GOOS == \"windows\" {\n \t\tt.Skip(\"skipping on Windows\")"
+    }
+  ]
+}

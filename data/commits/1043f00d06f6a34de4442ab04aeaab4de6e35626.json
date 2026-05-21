@@ -1,0 +1,29 @@
+{
+  "message": "fix(shutdown): kill entire process tree to prevent orphaned Claude processes\n\nThe previous implementation used `pkill -P pid` which only kills direct\nchildren. When Claude spawns subprocesses (like node workers), those\ngrandchild processes would become orphaned (PPID=1) when their parent\nwas killed, causing them to survive `gt shutdown -fa`.\n\nThe fix recursively finds all descendant processes and kills them in\ndeepest-first order, ensuring no process becomes orphaned during\nshutdown.\n\nFixes: gt-wd3ce\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "29bebe1633e95ebaac379571033f983beb0e5ae9",
+      "filename": "internal/tmux/tmux.go",
+      "status": "modified",
+      "additions": 39,
+      "deletions": 9,
+      "changes": 48,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/1043f00d06f6a34de4442ab04aeaab4de6e35626/internal%2Ftmux%2Ftmux.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/1043f00d06f6a34de4442ab04aeaab4de6e35626/internal%2Ftmux%2Ftmux.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Ftmux%2Ftmux.go?ref=1043f00d06f6a34de4442ab04aeaab4de6e35626",
+      "patch": "@@ -139,12 +139,13 @@ func (t *Tmux) KillSession(name string) error {\n //\n // Process:\n // 1. Get the pane's main process PID\n-// 2. Send SIGTERM to all child processes (pkill -TERM -P <pid>)\n-// 3. Wait 100ms for graceful shutdown\n-// 4. Send SIGKILL to any remaining children (pkill -KILL -P <pid>)\n-// 5. Kill the tmux session\n+// 2. Find all descendant processes recursively (not just direct children)\n+// 3. Send SIGTERM to all descendants (deepest first)\n+// 4. Wait 100ms for graceful shutdown\n+// 5. Send SIGKILL to any remaining descendants\n+// 6. Kill the tmux session\n //\n-// This ensures Claude processes are properly terminated even if they ignore SIGHUP.\n+// This ensures Claude processes and all their children are properly terminated.\n func (t *Tmux) KillSessionWithProcesses(name string) error {\n \t// Get the pane PID\n \tpid, err := t.GetPanePID(name)\n@@ -154,20 +155,49 @@ func (t *Tmux) KillSessionWithProcesses(name string) error {\n \t}\n \n \tif pid != \"\" {\n-\t\t// Send SIGTERM to child processes\n-\t\t_ = exec.Command(\"pkill\", \"-TERM\", \"-P\", pid).Run()\n+\t\t// Get all descendant PIDs recursively (returns deepest-first order)\n+\t\tdescendants := getAllDescendants(pid)\n+\n+\t\t// Send SIGTERM to all descendants (deepest first to avoid orphaning)\n+\t\tfor _, dpid := range descendants {\n+\t\t\t_ = exec.Command(\"kill\", \"-TERM\", dpid).Run()\n+\t\t}\n \n \t\t// Wait for graceful shutdown\n \t\ttime.Sleep(100 * time.Millisecond)\n \n-\t\t// Send SIGKILL to any remaining children\n-\t\t_ = exec.Command(\"pkill\", \"-KILL\", \"-P\", pid).Run()\n+\t\t// Send SIGKILL to any remaining descendants\n+\t\tfor _, dpid := range descendants {\n+\t\t\t_ = exec.Command(\"kill\", \"-KILL\", dpid).Run()\n+\t\t}\n \t}\n \n \t// Kill the tmux session\n \treturn t.KillSession(name)\n }\n \n+// getAllDescendants recursively finds all descendant PIDs of a process.\n+// Returns PIDs in deepest-first order so killing them doesn't orphan grandchildren.\n+func getAllDescendants(pid string) []string {\n+\tvar result []string\n+\n+\t// Get direct children using pgrep\n+\tout, err := exec.Command(\"pgrep\", \"-P\", pid).Output()\n+\tif err != nil {\n+\t\treturn result\n+\t}\n+\n+\tchildren := strings.Fields(strings.TrimSpace(string(out)))\n+\tfor _, child := range children {\n+\t\t// First add grandchildren (recursively) - deepest first\n+\t\tresult = append(result, getAllDescendants(child)...)\n+\t\t// Then add this child\n+\t\tresult = append(result, child)\n+\t}\n+\n+\treturn result\n+}\n+\n // KillServer terminates the entire tmux server and all sessions.\n func (t *Tmux) KillServer() error {\n \t_, err := t.run(\"kill-server\")"
+    },
+    {
+      "sha": "092038312e572d19c5fbb8062f83421320d68cec",
+      "filename": "internal/tmux/tmux_test.go",
+      "status": "modified",
+      "additions": 25,
+      "deletions": 0,
+      "changes": 25,
+      "blob_url": "https://github.com/gastownhall/gastown/blob/1043f00d06f6a34de4442ab04aeaab4de6e35626/internal%2Ftmux%2Ftmux_test.go",
+      "raw_url": "https://github.com/gastownhall/gastown/raw/1043f00d06f6a34de4442ab04aeaab4de6e35626/internal%2Ftmux%2Ftmux_test.go",
+      "contents_url": "https://api.github.com/repos/gastownhall/gastown/contents/internal%2Ftmux%2Ftmux_test.go?ref=1043f00d06f6a34de4442ab04aeaab4de6e35626",
+      "patch": "@@ -527,3 +527,28 @@ func TestHasClaudeChild(t *testing.T) {\n \t\tt.Error(\"hasClaudeChild should return false for nonexistent PID\")\n \t}\n }\n+\n+func TestGetAllDescendants(t *testing.T) {\n+\t// Test the getAllDescendants helper function\n+\n+\t// Test with nonexistent PID - should return empty slice\n+\tgot := getAllDescendants(\"999999999\")\n+\tif len(got) != 0 {\n+\t\tt.Errorf(\"getAllDescendants(nonexistent) = %v, want empty slice\", got)\n+\t}\n+\n+\t// Test with PID 1 (init/launchd) - should find some descendants\n+\t// Note: We can't test exact PIDs, just that the function doesn't panic\n+\t// and returns reasonable results\n+\tdescendants := getAllDescendants(\"1\")\n+\tt.Logf(\"getAllDescendants(\\\"1\\\") found %d descendants\", len(descendants))\n+\n+\t// Verify returned PIDs are all numeric strings\n+\tfor _, pid := range descendants {\n+\t\tfor _, c := range pid {\n+\t\t\tif c < '0' || c > '9' {\n+\t\t\t\tt.Errorf(\"getAllDescendants returned non-numeric PID: %q\", pid)\n+\t\t\t}\n+\t\t}\n+\t}\n+}"
+    }
+  ]
+}
