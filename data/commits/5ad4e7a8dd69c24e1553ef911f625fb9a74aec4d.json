@@ -1,0 +1,77 @@
+{
+  "message": "\ud83d\udc1b Fix remaining GA4 errors: max call stack, stale HTML caching, clipboard (#2707)\n\nAddresses the remaining ~35 GA4 errors from the previous fix (PR #2704):\n\n**1. Fix \"Maximum call stack size exceeded\" (28 errors)**\n- Root cause: `useStablePageHeight` used `queueMicrotask` to reset an\n  update guard between React commit batches, but microtasks can fire\n  before React's next commit, allowing infinite useLayoutEffect \u2192 setState\n  \u2192 re-render loops\n- Fix: Remove queueMicrotask guard entirely; instead compare against\n  current state value (`height !== stableMinHeight`) to skip no-op\n  setState calls. The maxHeightRef guard already prevents re-measuring\n  the same height, so the loop self-terminates after one update.\n\n**2. Fix index.html cached with 1-year immutable TTL (chunk_load root cause)**\n- `preCompressedStatic()` in server.go applied `max-age=31536000, immutable`\n  to ALL files including HTML \u2014 browsers cached index.html for up to a year\n- After deploys, stale HTML referenced old chunk filenames \u2192 chunk_load errors\n- Fix: HTML files now use `max-age=0, must-revalidate` while hashed assets\n  (.js, .css) keep the 1-year immutable cache. SPA catch-all also sets\n  `must-revalidate` on index.html responses.\n\n**3. Fix clipboard API errors on non-HTTPS (3 unhandled_rejection errors)**\n- Add `copyToClipboard()` utility with execCommand fallback for non-secure\n  contexts where `navigator.clipboard` is undefined\n- Filter clipboard-related rejections from GA4 error tracking (they're\n  environment limitations, not bugs)\n- Update CodeBlock and ModalSections (shared components used across\n  40+ locations) to use the safe clipboard utility\n\nSigned-off-by: Andrew Anderson <andy@clubanderson.com>",
+  "files": [
+    {
+      "sha": "88e7a760d6a118f0e8bf8b057004ab7cb084c631",
+      "filename": "pkg/api/server.go",
+      "status": "modified",
+      "additions": 19,
+      "deletions": 3,
+      "changes": 22,
+      "blob_url": "https://github.com/kubestellar/console/blob/5ad4e7a8dd69c24e1553ef911f625fb9a74aec4d/pkg%2Fapi%2Fserver.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/5ad4e7a8dd69c24e1553ef911f625fb9a74aec4d/pkg%2Fapi%2Fserver.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fapi%2Fserver.go?ref=5ad4e7a8dd69c24e1553ef911f625fb9a74aec4d",
+      "patch": "@@ -877,6 +877,10 @@ func (s *Server) setupRoutes() {\n \t\t// Serve pre-compressed assets (.gz/.br) with Content-Length to avoid chunked encoding\n \t\ts.app.Use(preCompressedStatic(\"./web/dist\"))\n \t\ts.app.Get(\"/*\", func(c *fiber.Ctx) error {\n+\t\t\t// index.html must NOT be cached long-term \u2014 it contains chunk references\n+\t\t\t// that change on every deploy. Without this, browsers serve stale HTML\n+\t\t\t// for up to a year, causing chunk_load errors (+56% trend in GA4).\n+\t\t\tc.Set(\"Cache-Control\", \"public, max-age=0, must-revalidate\")\n \t\t\treturn c.SendFile(\"./web/dist/index.html\")\n \t\t})\n \t}\n@@ -903,13 +907,18 @@ func preCompressedStatic(root string) fiber.Handler {\n \t\t// Content type\n \t\text := filepath.Ext(filePath)\n \t\tcontentType := \"\"\n+\t\t// HTML files must not be cached with immutable \u2014 they contain chunk\n+\t\t// references that change on every deploy. Only hashed assets (.js, .css)\n+\t\t// should use long-term immutable caching.\n+\t\tisHTML := false\n \t\tswitch ext {\n \t\tcase \".js\":\n \t\t\tcontentType = \"application/javascript\"\n \t\tcase \".css\":\n \t\t\tcontentType = \"text/css\"\n \t\tcase \".html\":\n \t\t\tcontentType = \"text/html\"\n+\t\t\tisHTML = true\n \t\tcase \".json\":\n \t\t\tcontentType = \"application/json\"\n \t\tcase \".svg\":\n@@ -928,6 +937,13 @@ func preCompressedStatic(root string) fiber.Handler {\n \t\t\tcontentType = \"application/manifest+json\"\n \t\t}\n \n+\t\t// HTML must revalidate on every request so deploys take effect immediately.\n+\t\t// Hashed assets (.js, .css) are immutable \u2014 filenames change on rebuild.\n+\t\tcacheHeader := fmt.Sprintf(\"public, max-age=%d, immutable\", oneYear)\n+\t\tif isHTML {\n+\t\t\tcacheHeader = \"public, max-age=0, must-revalidate\"\n+\t\t}\n+\n \t\taccept := c.Get(\"Accept-Encoding\")\n \n \t\t// Try brotli first, then gzip\n@@ -936,7 +952,7 @@ func preCompressedStatic(root string) fiber.Handler {\n \t\t\tif brInfo, err := os.Stat(brPath); err == nil {\n \t\t\t\tc.Set(\"Content-Encoding\", \"br\")\n \t\t\t\tc.Set(\"Content-Type\", contentType)\n-\t\t\t\tc.Set(\"Cache-Control\", fmt.Sprintf(\"public, max-age=%d, immutable\", oneYear))\n+\t\t\t\tc.Set(\"Cache-Control\", cacheHeader)\n \t\t\t\tc.Set(\"Content-Length\", fmt.Sprintf(\"%d\", brInfo.Size()))\n \t\t\t\tc.Set(\"Vary\", \"Accept-Encoding\")\n \t\t\t\treturn c.SendFile(brPath)\n@@ -947,7 +963,7 @@ func preCompressedStatic(root string) fiber.Handler {\n \t\t\tif gzInfo, err := os.Stat(gzPath); err == nil {\n \t\t\t\tc.Set(\"Content-Encoding\", \"gzip\")\n \t\t\t\tc.Set(\"Content-Type\", contentType)\n-\t\t\t\tc.Set(\"Cache-Control\", fmt.Sprintf(\"public, max-age=%d, immutable\", oneYear))\n+\t\t\t\tc.Set(\"Cache-Control\", cacheHeader)\n \t\t\t\tc.Set(\"Content-Length\", fmt.Sprintf(\"%d\", gzInfo.Size()))\n \t\t\t\tc.Set(\"Vary\", \"Accept-Encoding\")\n \t\t\t\treturn c.SendFile(gzPath)\n@@ -958,7 +974,7 @@ func preCompressedStatic(root string) fiber.Handler {\n \t\tif contentType != \"\" {\n \t\t\tc.Set(\"Content-Type\", contentType)\n \t\t}\n-\t\tc.Set(\"Cache-Control\", fmt.Sprintf(\"public, max-age=%d, immutable\", oneYear))\n+\t\tc.Set(\"Cache-Control\", cacheHeader)\n \t\treturn c.SendFile(filePath)\n \t}\n }"
+    },
+    {
+      "sha": "a6d8cac971601fd35afbea56429d7e44f96f1751",
+      "filename": "web/src/components/ui/CodeBlock.tsx",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 4,
+      "changes": 8,
+      "blob_url": "https://github.com/kubestellar/console/blob/5ad4e7a8dd69c24e1553ef911f625fb9a74aec4d/web%2Fsrc%2Fcomponents%2Fui%2FCodeBlock.tsx",
+      "raw_url": "https://github.com/kubestellar/console/raw/5ad4e7a8dd69c24e1553ef911f625fb9a74aec4d/web%2Fsrc%2Fcomponents%2Fui%2FCodeBlock.tsx",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fsrc%2Fcomponents%2Fui%2FCodeBlock.tsx?ref=5ad4e7a8dd69c24e1553ef911f625fb9a74aec4d",
+      "patch": "@@ -6,6 +6,7 @@ import { useState, useEffect, useRef } from 'react'\n import { Copy, Check, AlertCircle } from 'lucide-react'\n import { UI_FEEDBACK_TIMEOUT_MS } from '../../lib/constants/network'\n import { Button } from './Button'\n+import { copyToClipboard } from '../../lib/clipboard'\n \n interface CodeBlockProps {\n   children: string\n@@ -24,13 +25,12 @@ export function CodeBlock({ children, language = 'text', fontSize = 'sm' }: Code\n       clearTimeout(timeoutRef.current)\n     }\n     \n-    try {\n-      await navigator.clipboard.writeText(children)\n+    const ok = await copyToClipboard(children)\n+    if (ok) {\n       setCopied(true)\n       setCopyFailed(false)\n       timeoutRef.current = setTimeout(() => setCopied(false), UI_FEEDBACK_TIMEOUT_MS)\n-    } catch (err) {\n-      console.error('Failed to copy:', err)\n+    } else {\n       setCopyFailed(true)\n       timeoutRef.current = setTimeout(() => setCopyFailed(false), UI_FEEDBACK_TIMEOUT_MS)\n     }"
+    },
+    {
+      "sha": "7c6b2fd3e84a25b640084ba5313959c9d9e99a7f",
+      "filename": "web/src/lib/analytics.ts",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 0,
+      "changes": 2,
+      "blob_url": "https://github.com/kubestellar/console/blob/5ad4e7a8dd69c24e1553ef911f625fb9a74aec4d/web%2Fsrc%2Flib%2Fanalytics.ts",
+      "raw_url": "https://github.com/kubestellar/console/raw/5ad4e7a8dd69c24e1553ef911f625fb9a74aec4d/web%2Fsrc%2Flib%2Fanalytics.ts",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fsrc%2Flib%2Fanalytics.ts?ref=5ad4e7a8dd69c24e1553ef911f625fb9a74aec4d",
+      "patch": "@@ -1023,6 +1023,8 @@ export function startGlobalErrorTracking() {\n       const msg = event.reason?.message || String(event.reason || 'unknown')\n       // Skip errors already reported by React error boundaries (prevents double-counting)\n       if (wasAlreadyReported(msg)) return\n+      // Skip clipboard API errors \u2014 expected on non-HTTPS and in restricted contexts\n+      if (msg.includes('writeText') || msg.includes('clipboard') || msg.includes('copy')) return\n       // Stale chunks can surface as unhandled rejections from dynamic import()\n       if (tryChunkReloadRecovery(msg)) return\n       emitError('unhandled_rejection', msg)"
+    },
+    {
+      "sha": "6de5e4662ba008712fba56dffdfd2dcb9577852b",
+      "filename": "web/src/lib/cards/useStablePageHeight.ts",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 21,
+      "changes": 31,
+      "blob_url": "https://github.com/kubestellar/console/blob/5ad4e7a8dd69c24e1553ef911f625fb9a74aec4d/web%2Fsrc%2Flib%2Fcards%2FuseStablePageHeight.ts",
+      "raw_url": "https://github.com/kubestellar/console/raw/5ad4e7a8dd69c24e1553ef911f625fb9a74aec4d/web%2Fsrc%2Flib%2Fcards%2FuseStablePageHeight.ts",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fsrc%2Flib%2Fcards%2FuseStablePageHeight.ts?ref=5ad4e7a8dd69c24e1553ef911f625fb9a74aec4d",
+      "patch": "@@ -27,16 +27,9 @@ export function useStablePageHeight(pageSize: number | string, totalItems: numbe\n   }, [totalItems, pageSize])\n \n   // Measure after each render and track max height.\n-  // Intentionally has no dependency array \u2014 must run on every render\n-  // to capture height changes from page navigation, data updates, etc.\n-  //\n-  // Safety: updatesInBatchRef prevents cascading useLayoutEffect \u2192 setState\n-  // loops. Each React commit batch allows one height update; subsequent\n-  // layout effects in the same batch skip the setState to avoid triggering\n-  // React error #185 (Maximum update depth exceeded).  The counter resets\n-  // via a microtask so the next user-initiated render batch starts fresh.\n-  const updatesInBatchRef = useRef(0)\n-\n+  // Uses a post-render effect to read scrollHeight and update minHeight\n+  // when a taller page is observed. The guard prevents calling setState\n+  // when the height hasn't actually changed (avoiding re-render loops).\n   // eslint-disable-next-line react-hooks/exhaustive-deps\n   useLayoutEffect(() => {\n     const el = containerRef.current\n@@ -46,19 +39,15 @@ export function useStablePageHeight(pageSize: number | string, totalItems: numbe\n \n     const height = el.scrollHeight\n     if (height > maxHeightRef.current) {\n-      // Allow at most one setState per React commit batch to prevent\n-      // infinite layout-effect cascades with other useLayoutEffect hooks\n-      // (e.g. useReportCardDataState) that also trigger re-renders.\n-      const MAX_HEIGHT_UPDATES_PER_BATCH = 1\n-      if (updatesInBatchRef.current >= MAX_HEIGHT_UPDATES_PER_BATCH) return\n-      updatesInBatchRef.current++\n-      // Reset counter after this batch completes (microtask runs between batches)\n-      queueMicrotask(() => { updatesInBatchRef.current = 0 })\n-\n       maxHeightRef.current = height\n-      setStableMinHeight(height)\n+      // Only call setState if the value actually changed \u2014 prevents\n+      // infinite useLayoutEffect \u2192 setState \u2192 re-render \u2192 useLayoutEffect\n+      // loops that cause \"Maximum call stack size exceeded\" (28 GA4 errors).\n+      if (height !== stableMinHeight) {\n+        setStableMinHeight(height)\n+      }\n     }\n-  })\n+  }) // no deps: must measure on every render\n \n   const containerStyle = stableMinHeight > 0\n     ? { minHeight: `${stableMinHeight}px` }"
+    },
+    {
+      "sha": "538b3f7b04ca4e33e7191c0feb6b4584426cf39c",
+      "filename": "web/src/lib/clipboard.ts",
+      "status": "added",
+      "additions": 38,
+      "deletions": 0,
+      "changes": 38,
+      "blob_url": "https://github.com/kubestellar/console/blob/5ad4e7a8dd69c24e1553ef911f625fb9a74aec4d/web%2Fsrc%2Flib%2Fclipboard.ts",
+      "raw_url": "https://github.com/kubestellar/console/raw/5ad4e7a8dd69c24e1553ef911f625fb9a74aec4d/web%2Fsrc%2Flib%2Fclipboard.ts",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fsrc%2Flib%2Fclipboard.ts?ref=5ad4e7a8dd69c24e1553ef911f625fb9a74aec4d",
+      "patch": "@@ -0,0 +1,38 @@\n+/**\n+ * Safe clipboard write that handles non-secure contexts (HTTP without localhost)\n+ * and browsers where the Clipboard API is unavailable.\n+ *\n+ * Falls back to the deprecated document.execCommand('copy') when\n+ * navigator.clipboard is undefined (Safari on HTTP, older browsers).\n+ *\n+ * Returns true if the copy succeeded, false otherwise.\n+ */\n+export async function copyToClipboard(text: string): Promise<boolean> {\n+  // Clipboard API is only available in secure contexts (HTTPS or localhost)\n+  if (navigator.clipboard?.writeText) {\n+    try {\n+      await navigator.clipboard.writeText(text)\n+      return true\n+    } catch {\n+      // Clipboard API can throw even when available (e.g., iframe restrictions)\n+      // Fall through to execCommand fallback\n+    }\n+  }\n+\n+  // Fallback: textarea + execCommand for non-secure contexts\n+  try {\n+    const textarea = document.createElement('textarea')\n+    textarea.value = text\n+    // Position off-screen to avoid visual flash\n+    textarea.style.position = 'fixed'\n+    textarea.style.left = '-9999px'\n+    textarea.style.top = '-9999px'\n+    document.body.appendChild(textarea)\n+    textarea.select()\n+    const ok = document.execCommand('copy')\n+    document.body.removeChild(textarea)\n+    return ok\n+  } catch {\n+    return false\n+  }\n+}"
+    },
+    {
+      "sha": "c784d385f0cb26644fb7eb35667fe7abc5910db9",
+      "filename": "web/src/lib/modals/ModalSections.tsx",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/kubestellar/console/blob/5ad4e7a8dd69c24e1553ef911f625fb9a74aec4d/web%2Fsrc%2Flib%2Fmodals%2FModalSections.tsx",
+      "raw_url": "https://github.com/kubestellar/console/raw/5ad4e7a8dd69c24e1553ef911f625fb9a74aec4d/web%2Fsrc%2Flib%2Fmodals%2FModalSections.tsx",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fsrc%2Flib%2Fmodals%2FModalSections.tsx?ref=5ad4e7a8dd69c24e1553ef911f625fb9a74aec4d",
+      "patch": "@@ -27,6 +27,7 @@ import { Copy, Check, ChevronDown, ChevronRight, ExternalLink, AlertCircle } fro\n import { getStatusColors, NavigationTarget } from './types'\n import { UI_FEEDBACK_TIMEOUT_MS } from '../constants/network'\n import { Button } from '../../components/ui/Button'\n+import { copyToClipboard } from '../clipboard'\n \n // ============================================================================\n // Key-Value Section\n@@ -92,7 +93,7 @@ function KeyValueItem({\n       ? item.value\n       : String(item.value)\n \n-    await navigator.clipboard.writeText(textValue)\n+    await copyToClipboard(textValue)\n     setCopied(true)\n     clearTimeout(copiedTimerRef.current)\n     copiedTimerRef.current = setTimeout(() => setCopied(false), UI_FEEDBACK_TIMEOUT_MS)"
+    }
+  ]
+}

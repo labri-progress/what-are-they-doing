@@ -1,0 +1,29 @@
+{
+  "message": "\ud83d\udc1b fix: add periodic cache refresh for cluster groups (#10007) (#10012)\n\nThe in-memory cluster group cache was only populated at startup from the\npersistent store. In multi-instance deployments, writes on one instance\nnever propagated to others, causing split-brain UI behavior.\n\nAdd a background goroutine that re-syncs the in-memory map from the DB\nevery 30 seconds, with proper shutdown cleanup to avoid goroutine leaks.\n\nSigned-off-by: Reviewer Agent <reviewer@claude-dev.local>\nCo-authored-by: Reviewer Agent <reviewer@claude-dev.local>",
+  "files": [
+    {
+      "sha": "77a3e0792f4f477868656991623c78751a4f2dae",
+      "filename": "pkg/api/handlers/workloads.go",
+      "status": "modified",
+      "additions": 43,
+      "deletions": 0,
+      "changes": 43,
+      "blob_url": "https://github.com/kubestellar/console/blob/6488167d523fe90b3bd3fccf413c0448fa5bda32/pkg%2Fapi%2Fhandlers%2Fworkloads.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/6488167d523fe90b3bd3fccf413c0448fa5bda32/pkg%2Fapi%2Fhandlers%2Fworkloads.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fapi%2Fhandlers%2Fworkloads.go?ref=6488167d523fe90b3bd3fccf413c0448fa5bda32",
+      "patch": "@@ -39,11 +39,21 @@ const (\n \tworkloadDeployLogsTimeout = 15 * time.Second\n )\n \n+const (\n+\t// clusterGroupRefreshInterval is how often the in-memory cluster group\n+\t// cache is re-synced from the persistent store. This ensures that in\n+\t// multi-instance deployments each backend picks up writes made by\n+\t// other instances within a bounded window (#10007).\n+\tclusterGroupRefreshInterval = 30 * time.Second\n+)\n+\n // WorkloadHandlers handles workload API endpoints\n type WorkloadHandlers struct {\n \tk8sClient *k8s.MultiClusterClient\n \thub       *Hub\n \tstore     store.Store\n+\tstopOnce  sync.Once\n+\tstopCh    chan struct{}\n }\n \n // NewWorkloadHandlers creates a new workload handlers instance\n@@ -52,6 +62,7 @@ func NewWorkloadHandlers(k8sClient *k8s.MultiClusterClient, hub *Hub, s store.St\n \t\tk8sClient: k8sClient,\n \t\thub:       hub,\n \t\tstore:     s,\n+\t\tstopCh:    make(chan struct{}),\n \t}\n }\n \n@@ -322,6 +333,38 @@ func (h *WorkloadHandlers) LoadPersistedClusterGroups() {\n \tslog.Info(\"[Workloads] loaded persisted cluster groups\", \"count\", len(persisted))\n }\n \n+// StartCacheRefresh launches a background goroutine that periodically reloads\n+// cluster groups from the persistent store. In multi-instance deployments this\n+// ensures each backend converges on the same state within\n+// clusterGroupRefreshInterval (#10007).\n+func (h *WorkloadHandlers) StartCacheRefresh() {\n+\tif h.store == nil {\n+\t\treturn\n+\t}\n+\tgo func() {\n+\t\tticker := time.NewTicker(clusterGroupRefreshInterval)\n+\t\tdefer ticker.Stop()\n+\t\tfor {\n+\t\t\tselect {\n+\t\t\tcase <-h.stopCh:\n+\t\t\t\treturn\n+\t\t\tcase <-ticker.C:\n+\t\t\t\th.LoadPersistedClusterGroups()\n+\t\t\t}\n+\t\t}\n+\t}()\n+\tslog.Info(\"[Workloads] started periodic cluster group cache refresh\",\n+\t\t\"interval\", clusterGroupRefreshInterval)\n+}\n+\n+// StopCacheRefresh signals the background refresh goroutine to exit.\n+func (h *WorkloadHandlers) StopCacheRefresh() {\n+\th.stopOnce.Do(func() {\n+\t\tclose(h.stopCh)\n+\t\tslog.Info(\"[Workloads] stopped periodic cluster group cache refresh\")\n+\t})\n+}\n+\n // persistClusterGroup saves a cluster group to the store for durability (#7013).\n func (h *WorkloadHandlers) persistClusterGroup(ctx context.Context, name string, g ClusterGroup) {\n \tif h.store == nil {"
+    },
+    {
+      "sha": "97dbde07b9722d6838c4c487775ec2341614d82c",
+      "filename": "pkg/api/server.go",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 1,
+      "changes": 10,
+      "blob_url": "https://github.com/kubestellar/console/blob/6488167d523fe90b3bd3fccf413c0448fa5bda32/pkg%2Fapi%2Fserver.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/6488167d523fe90b3bd3fccf413c0448fa5bda32/pkg%2Fapi%2Fserver.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fapi%2Fserver.go?ref=6488167d523fe90b3bd3fccf413c0448fa5bda32",
+      "patch": "@@ -177,6 +177,7 @@ type Server struct {\n \tloadingSrv          *http.Server // temporary loading screen server\n \tshuttingDown        int32        // atomic flag: 1 during graceful shutdown\n \tgpuUtilWorker       *GPUUtilizationWorker\n+\tworkloadHandlers    *handlers.WorkloadHandlers // for cache refresh shutdown (#10007)\n \tdone                chan struct{} // closed on Shutdown to stop background goroutines\n \tshutdownOnce        sync.Once     // ensures Shutdown is idempotent (#6478)\n }\n@@ -1235,8 +1236,11 @@ func (s *Server) setupRoutes() {\n \n \t// Workload routes\n \tworkloadHandlers := handlers.NewWorkloadHandlers(s.k8sClient, s.hub, s.store)\n-\t// Reload persisted cluster groups on startup (#7013).\n+\t// Reload persisted cluster groups on startup (#7013) and start periodic\n+\t// refresh so multi-instance deployments converge on DB state (#10007).\n \tworkloadHandlers.LoadPersistedClusterGroups()\n+\tworkloadHandlers.StartCacheRefresh()\n+\ts.workloadHandlers = workloadHandlers\n \tapi.Get(\"/workloads\", workloadHandlers.ListWorkloads)\n \tapi.Get(\"/workloads/capabilities\", workloadHandlers.GetClusterCapabilities)\n \tapi.Get(\"/workloads/policies\", workloadHandlers.ListBindingPolicies)\n@@ -1627,6 +1631,10 @@ func (s *Server) Shutdown() error {\n \t\t\ts.gpuUtilWorker.Stop()\n \t\t}\n \t\ts.hub.Close()\n+\t\t// #10007 \u2014 stop the periodic cluster group cache refresh goroutine.\n+\t\tif s.workloadHandlers != nil {\n+\t\t\ts.workloadHandlers.StopCacheRefresh()\n+\t\t}\n \t\t// #7043 \u2014 stop the SSE cache evictor goroutine that was started\n \t\t// lazily by sseCacheSet. Without this the goroutine leaks after\n \t\t// server shutdown."
+    }
+  ]
+}

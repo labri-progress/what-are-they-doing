@@ -1,0 +1,41 @@
+{
+  "message": "\ud83d\udc1b Add WaitGroup lifecycle coordination to cluster operation goroutines (#10719)\n\nAdd sync.WaitGroup tracking to the 5 background goroutines in\nserver_ops_clusters.go (cluster create, delete, lifecycle, vCluster\ncreate, vCluster delete) that previously ran with no lifecycle\ncoordination.\n\nChanges:\n- server.go: Add clusterOpsWG sync.WaitGroup field to Server struct\n- server.go: Add GracefulShutdown() method with 30s timeout\n- server_ops_clusters.go: Add wg.Add(1)/defer wg.Done() to all 5\n  goroutines\n- cmd/kc-agent/main.go: Wire GracefulShutdown into SIGINT/SIGTERM\n  handler\n\nWithout this, a SIGTERM during an in-flight cluster create/delete\norphans the goroutine, potentially leaving infrastructure in an\ninconsistent state.\n\nSigned-off-by: Copilot <copilot@github.com>\nCo-authored-by: Copilot <copilot@github.com>\nCo-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>",
+  "files": [
+    {
+      "sha": "116e552980285e6a6e6d62ac49b5e54a823c12c0",
+      "filename": "cmd/kc-agent/main.go",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/kubestellar/console/blob/535c7256c1cb78829ca1db3879c67d7377ada66c/cmd%2Fkc-agent%2Fmain.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/535c7256c1cb78829ca1db3879c67d7377ada66c/cmd%2Fkc-agent%2Fmain.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/cmd%2Fkc-agent%2Fmain.go?ref=535c7256c1cb78829ca1db3879c67d7377ada66c",
+      "patch": "@@ -62,7 +62,8 @@ func main() {\n \tsignal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)\n \tgo func() {\n \t\t<-sigChan\n-\t\tslog.Info(\"Shutting down\")\n+\t\tslog.Info(\"Shutting down \u2014 waiting for in-flight cluster operations\")\n+\t\tserver.GracefulShutdown()\n \t\tos.Exit(0)\n \t}()\n "
+    },
+    {
+      "sha": "12db60225092b9f1f084056785fd493b45e84d06",
+      "filename": "pkg/agent/server.go",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 0,
+      "changes": 22,
+      "blob_url": "https://github.com/kubestellar/console/blob/535c7256c1cb78829ca1db3879c67d7377ada66c/pkg%2Fagent%2Fserver.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/535c7256c1cb78829ca1db3879c67d7377ada66c/pkg%2Fagent%2Fserver.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fagent%2Fserver.go?ref=535c7256c1cb78829ca1db3879c67d7377ada66c",
+      "patch": "@@ -173,6 +173,7 @@ type Server struct {\n \n \t// Local cluster management\n \tlocalClusters *LocalClusterManager\n+\tclusterOpsWG  sync.WaitGroup // tracks in-flight cluster create/delete/lifecycle goroutines\n \n \t// Backend process management (for restart-from-UI)\n \tbackendCmd *exec.Cmd\n@@ -955,4 +956,25 @@ func generateRandomToken(nBytes int) (string, error) {\n \treturn hex.EncodeToString(buf), nil\n }\n \n+// clusterOpsShutdownTimeout is the maximum time GracefulShutdown waits for\n+// in-flight cluster create/delete/lifecycle goroutines to complete.\n+const clusterOpsShutdownTimeout = 30 * time.Second\n+\n+// GracefulShutdown waits for all in-flight cluster operation goroutines to\n+// finish (up to clusterOpsShutdownTimeout). Call this before process exit to\n+// avoid orphaning background cluster create/delete operations.\n+func (s *Server) GracefulShutdown() {\n+\tdone := make(chan struct{})\n+\tgo func() {\n+\t\ts.clusterOpsWG.Wait()\n+\t\tclose(done)\n+\t}()\n+\tselect {\n+\tcase <-done:\n+\t\tslog.Info(\"[Server] all cluster operations completed\")\n+\tcase <-time.After(clusterOpsShutdownTimeout):\n+\t\tslog.Warn(\"[Server] timed out waiting for cluster operations\", \"timeout\", clusterOpsShutdownTimeout)\n+\t}\n+}\n+\n // handleClustersHTTP returns the list of kubeconfig contexts"
+    },
+    {
+      "sha": "796dd55bc72b18ad94d83fbef627878c35864d95",
+      "filename": "pkg/agent/server_ops_clusters.go",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 0,
+      "changes": 10,
+      "blob_url": "https://github.com/kubestellar/console/blob/535c7256c1cb78829ca1db3879c67d7377ada66c/pkg%2Fagent%2Fserver_ops_clusters.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/535c7256c1cb78829ca1db3879c67d7377ada66c/pkg%2Fagent%2Fserver_ops_clusters.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fagent%2Fserver_ops_clusters.go?ref=535c7256c1cb78829ca1db3879c67d7377ada66c",
+      "patch": "@@ -130,7 +130,9 @@ func (s *Server) handleLocalClusters(w http.ResponseWriter, r *http.Request) {\n \t\t}\n \n \t\t// Create cluster in background and return immediately\n+\t\ts.clusterOpsWG.Add(1)\n \t\tgo func() {\n+\t\t\tdefer s.clusterOpsWG.Done()\n \t\t\tdefer func() {\n \t\t\t\tif r := recover(); r != nil {\n \t\t\t\t\tslog.Error(\"[LocalClusters] recovered from panic creating cluster\", \"cluster\", req.Name, \"panic\", r)\n@@ -193,7 +195,9 @@ func (s *Server) handleLocalClusters(w http.ResponseWriter, r *http.Request) {\n \t\t}\n \n \t\t// Delete cluster in background\n+\t\ts.clusterOpsWG.Add(1)\n \t\tgo func() {\n+\t\t\tdefer s.clusterOpsWG.Done()\n \t\t\tdefer func() {\n \t\t\t\tif r := recover(); r != nil {\n \t\t\t\t\tslog.Error(\"[LocalClusters] recovered from panic deleting cluster\", \"cluster\", name, \"panic\", r)\n@@ -289,7 +293,9 @@ func (s *Server) handleLocalClusterLifecycle(w http.ResponseWriter, r *http.Requ\n \t\treturn\n \t}\n \n+\ts.clusterOpsWG.Add(1)\n \tgo func() {\n+\t\tdefer s.clusterOpsWG.Done()\n \t\tdefer func() {\n \t\t\tif r := recover(); r != nil {\n \t\t\t\tslog.Error(\"[LocalClusters] recovered from panic during lifecycle action\", \"action\", req.Action, \"cluster\", req.Name, \"panic\", r)\n@@ -411,7 +417,9 @@ func (s *Server) handleVClusterCreate(w http.ResponseWriter, r *http.Request) {\n \t}\n \n \t// Create vCluster in background and return immediately\n+\ts.clusterOpsWG.Add(1)\n \tgo func() {\n+\t\tdefer s.clusterOpsWG.Done()\n \t\tdefer func() {\n \t\t\tif r := recover(); r != nil {\n \t\t\t\tslog.Error(\"[vCluster] recovered from panic creating vcluster\", \"name\", req.Name, \"panic\", r)\n@@ -606,7 +614,9 @@ func (s *Server) handleVClusterDelete(w http.ResponseWriter, r *http.Request) {\n \t}\n \n \t// Delete vCluster in background and return immediately\n+\ts.clusterOpsWG.Add(1)\n \tgo func() {\n+\t\tdefer s.clusterOpsWG.Done()\n \t\tdefer func() {\n \t\t\tif r := recover(); r != nil {\n \t\t\t\tslog.Error(\"[vCluster] recovered from panic deleting vcluster\", \"name\", req.Name, \"panic\", r)"
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "message": "fix: address Copilot review on PR #6031 (#6080)\n\nTwo cleanups flagged on the merged security bundle PR.\n\n1. exec.go race window \u2014 close the gap where /ws/exec could outlive\n   logout. Previously the exec context was created and registered\n   in the per-user registry only AFTER reading the init message,\n   looking up the k8s client + REST config, and building the SPDY\n   executor. If the user logged out during that ~hundreds-of-ms\n   window, CancelUserExecSessions had nothing to cancel \u2014 the\n   about-to-start exec session leaked past logout.\n\n   Move execCtx + registerExecSession() to immediately after JWT\n   validation, before any of the long-running setup. Registration\n   now happens essentially synchronously with the first byte the\n   handler receives, so a follow-up Logout always finds and cancels\n   the in-flight session.\n\n2. gitops_test.go \u2014 add /api/gitops/argocd/sync to gitopsMutationCases\n   so TriggerArgoSync is exercised by the editor/admin/viewer RBAC\n   matrix the same way the helm-* and sync handlers are.\n\n   Adding the test surfaced a pre-existing ordering bug in\n   TriggerArgoSync: the k8sClient nil check ran BEFORE body parsing\n   and required-field validation, so a request with valid auth and\n   a valid body shape would 503 instead of returning the 400 the\n   matrix expects. Reordered to body-parse \u2192 required-fields \u2192\n   validateK8sName \u2192 k8sClient check, matching Sync /\n   UpgradeHelmRelease conventions.\n\nFixes #6075\n\nSigned-off-by: Andrew Anderson <andy@clubanderson.com>",
+  "files": [
+    {
+      "sha": "e87e8981cfe1221a4f81dd2050249853b9754b9b",
+      "filename": "pkg/api/handlers/exec.go",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 14,
+      "changes": 34,
+      "blob_url": "https://github.com/kubestellar/console/blob/10d2ec44df04ae8b4b52512e3f417366ec6723b0/pkg%2Fapi%2Fhandlers%2Fexec.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/10d2ec44df04ae8b4b52512e3f417366ec6723b0/pkg%2Fapi%2Fhandlers%2Fexec.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fapi%2Fhandlers%2Fexec.go?ref=10d2ec44df04ae8b4b52512e3f417366ec6723b0",
+      "patch": "@@ -272,6 +272,23 @@ func (h *ExecHandlers) HandleExec(c *websocket.Conn) {\n \t// Clear read deadline after successful auth\n \tc.SetReadDeadline(time.Time{})\n \n+\t// Create the cancellable context and register it BEFORE any of the long-\n+\t// running setup (init message read, k8s client lookup, executor build).\n+\t// Without this, there is a race window: the user authenticates, then\n+\t// logs out before the registration call below, and CancelUserExecSessions\n+\t// has nothing to cancel \u2014 the about-to-start exec session leaks past\n+\t// logout. Registering up-front shrinks the window to roughly zero\n+\t// because the context is already in the per-user registry when the\n+\t// long-running operations begin (#6075).\n+\texecCtx, execCancel := context.WithCancel(context.Background())\n+\tdefer execCancel()\n+\n+\tvar execRegistrationID int64\n+\tif claims.UserID != uuid.Nil {\n+\t\texecRegistrationID = registerExecSession(claims.UserID, execCancel)\n+\t\tdefer unregisterExecSession(claims.UserID, execRegistrationID)\n+\t}\n+\n \tif h.k8sClient == nil {\n \t\twriteError(c, \"No Kubernetes client available\")\n \t\treturn\n@@ -381,20 +398,9 @@ func (h *ExecHandlers) HandleExec(c *websocket.Conn) {\n \t// Send initial terminal size\n \tsizeQueue.ch <- remotecommand.TerminalSize{Width: init.Cols, Height: init.Rows}\n \n-\t// Create a cancellable context so that when the WebSocket client disconnects,\n-\t// the exec stream is cancelled promptly \u2014 preventing goroutine and SPDY leaks.\n-\texecCtx, execCancel := context.WithCancel(context.Background())\n-\tdefer execCancel()\n-\n-\t// Register this cancel with the per-user exec session registry so a later\n-\t// Logout call can tear the stream down even though /ws/exec is not tracked\n-\t// by the WebSocket Hub (#6024). Only register when we have a real userID \u2014\n-\t// in dev/demo without a valid UserID claim there is nothing to key on.\n-\tvar execRegistrationID int64\n-\tif claims.UserID != uuid.Nil {\n-\t\texecRegistrationID = registerExecSession(claims.UserID, execCancel)\n-\t\tdefer unregisterExecSession(claims.UserID, execRegistrationID)\n-\t}\n+\t// execCtx / execCancel were created up-front (right after JWT validation)\n+\t// so the registry is populated before any long-running setup. See the\n+\t// comment above for the race-window rationale (#6075).\n \n \t// Start a goroutine to read WebSocket messages and route them\n \tdone := make(chan struct{})"
+    },
+    {
+      "sha": "5e7fc4c2e1725759342cb9a307a8ee69bdf918cd",
+      "filename": "pkg/api/handlers/gitops.go",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 6,
+      "changes": 17,
+      "blob_url": "https://github.com/kubestellar/console/blob/10d2ec44df04ae8b4b52512e3f417366ec6723b0/pkg%2Fapi%2Fhandlers%2Fgitops.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/10d2ec44df04ae8b4b52512e3f417366ec6723b0/pkg%2Fapi%2Fhandlers%2Fgitops.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fapi%2Fhandlers%2Fgitops.go?ref=10d2ec44df04ae8b4b52512e3f417366ec6723b0",
+      "patch": "@@ -2339,12 +2339,6 @@ func (h *GitOpsHandlers) TriggerArgoSync(c *fiber.Ctx) error {\n \tif err := requireEditorOrAdmin(c, h.userStore); err != nil {\n \t\treturn err\n \t}\n-\tif h.k8sClient == nil {\n-\t\treturn c.Status(503).JSON(fiber.Map{\n-\t\t\t\"error\":   \"Kubernetes client not configured\",\n-\t\t\t\"success\": false,\n-\t\t})\n-\t}\n \n \tvar req struct {\n \t\tAppName   string `json:\"appName\"`\n@@ -2358,6 +2352,10 @@ func (h *GitOpsHandlers) TriggerArgoSync(c *fiber.Ctx) error {\n \t\t})\n \t}\n \n+\t// Body-shape validation runs BEFORE the k8s client availability check\n+\t// so RBAC + body-shape errors surface to the caller even when the\n+\t// cluster connection is unavailable. Mirrors the Sync /\n+\t// UpgradeHelmRelease ordering and is what the #6022 RBAC tests assume.\n \tif req.AppName == \"\" || req.Cluster == \"\" {\n \t\treturn c.Status(400).JSON(fiber.Map{\n \t\t\t\"error\":   \"appName and cluster are required\",\n@@ -2372,6 +2370,13 @@ func (h *GitOpsHandlers) TriggerArgoSync(c *fiber.Ctx) error {\n \t\treturn c.Status(400).JSON(fiber.Map{\"error\": err.Error(), \"success\": false})\n \t}\n \n+\tif h.k8sClient == nil {\n+\t\treturn c.Status(503).JSON(fiber.Map{\n+\t\t\t\"error\":   \"Kubernetes client not configured\",\n+\t\t\t\"success\": false,\n+\t\t})\n+\t}\n+\n \t// Default namespace for ArgoCD applications\n \tnamespace := req.Namespace\n \tif namespace == \"\" {"
+    },
+    {
+      "sha": "15474d021993af12ce8758d8cadcf696dd7ad2c4",
+      "filename": "pkg/api/handlers/gitops_test.go",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 0,
+      "changes": 6,
+      "blob_url": "https://github.com/kubestellar/console/blob/10d2ec44df04ae8b4b52512e3f417366ec6723b0/pkg%2Fapi%2Fhandlers%2Fgitops_test.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/10d2ec44df04ae8b4b52512e3f417366ec6723b0/pkg%2Fapi%2Fhandlers%2Fgitops_test.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fapi%2Fhandlers%2Fgitops_test.go?ref=10d2ec44df04ae8b4b52512e3f417366ec6723b0",
+      "patch": "@@ -167,6 +167,12 @@ func gitopsMutationCases() []mutationCase {\n \t\t\tbody: `{}`,\n \t\t\twire: func(app *fiber.App, h *GitOpsHandlers, p string) { app.Post(p, h.RollbackHelmRelease) },\n \t\t},\n+\t\t{\n+\t\t\tname: \"argocd-sync\",\n+\t\t\tpath: \"/api/gitops/argocd/sync\",\n+\t\t\tbody: `{}`,\n+\t\t\twire: func(app *fiber.App, h *GitOpsHandlers, p string) { app.Post(p, h.TriggerArgoSync) },\n+\t\t},\n \t}\n }\n "
+    }
+  ]
+}

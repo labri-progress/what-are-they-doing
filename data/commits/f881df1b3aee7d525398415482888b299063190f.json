@@ -1,0 +1,41 @@
+{
+  "message": "\ud83d\udc1b Fix KEDA APIService race condition in nightly E2E (#761)\n\nKEDA operator continuously reconciles v1beta1.external.metrics.k8s.io\nAPIService back to keda-metrics-apiserver within ~2 minutes of any\npatch. This causes persistent 404 errors when HPA queries external\nmetrics for wva_desired_replicas, breaking scale-up tests.\n\nAdd a background APIService guard loop that checks every 10 seconds\nand re-patches the APIService to prometheus-adapter if KEDA reclaims\nit. The guard starts when KEDA is detected during deploy and stops\ncleanly during cleanup, without modifying KEDA itself.\n\nAlso increase external metrics and scale-to-zero test timeouts from\n5 to 10 minutes for additional margin on busy clusters.\n\nSigned-off-by: Andrew Anderson <andy@clubanderson.com>",
+  "files": [
+    {
+      "sha": "71bc311cd4e81fd92b387243f4ed672edf59ea7d",
+      "filename": "deploy/install.sh",
+      "status": "modified",
+      "additions": 66,
+      "deletions": 0,
+      "changes": 66,
+      "blob_url": "https://github.com/llm-d/llm-d-workload-variant-autoscaler/blob/f881df1b3aee7d525398415482888b299063190f/deploy%2Finstall.sh",
+      "raw_url": "https://github.com/llm-d/llm-d-workload-variant-autoscaler/raw/f881df1b3aee7d525398415482888b299063190f/deploy%2Finstall.sh",
+      "contents_url": "https://api.github.com/repos/llm-d/llm-d-workload-variant-autoscaler/contents/deploy%2Finstall.sh?ref=f881df1b3aee7d525398415482888b299063190f",
+      "patch": "@@ -136,6 +136,59 @@ log_error() {\n     exit 1\n }\n \n+# APIService guard: background loop that continuously ensures the\n+# v1beta1.external.metrics.k8s.io APIService points to prometheus-adapter.\n+# On clusters with KEDA, the operator continuously reconciles the APIService\n+# back to keda-metrics-apiserver, breaking HPA scaling for WVA.\n+# This guard re-patches it every 10 seconds without modifying KEDA itself.\n+APISERVICE_GUARD_PID=\"\"\n+\n+start_apiservice_guard() {\n+    local monitoring_ns=\"$1\"\n+    log_info \"Starting APIService guard (background re-patch loop every 10s)\"\n+    (\n+        while true; do\n+            sleep 10\n+            current_svc=$(kubectl get apiservice v1beta1.external.metrics.k8s.io \\\n+                -o jsonpath='{.spec.service.name}' 2>/dev/null || echo \"\")\n+            current_ns=$(kubectl get apiservice v1beta1.external.metrics.k8s.io \\\n+                -o jsonpath='{.spec.service.namespace}' 2>/dev/null || echo \"\")\n+            if [ \"$current_svc\" != \"prometheus-adapter\" ] || [ \"$current_ns\" != \"$monitoring_ns\" ]; then\n+                echo \"[apiservice-guard] KEDA reclaimed APIService (now: $current_svc/$current_ns), re-patching to prometheus-adapter/$monitoring_ns\"\n+                kubectl patch apiservice v1beta1.external.metrics.k8s.io --type=merge -p \"{\n+                    \\\"spec\\\": {\n+                        \\\"insecureSkipTLSVerify\\\": true,\n+                        \\\"service\\\": {\n+                            \\\"name\\\": \\\"prometheus-adapter\\\",\n+                            \\\"namespace\\\": \\\"$monitoring_ns\\\"\n+                        }\n+                    }\n+                }\" 2>/dev/null || true\n+            fi\n+        done\n+    ) &\n+    APISERVICE_GUARD_PID=$!\n+    echo \"$APISERVICE_GUARD_PID\" > /tmp/apiservice-guard.pid\n+    log_success \"APIService guard started (PID: $APISERVICE_GUARD_PID)\"\n+}\n+\n+stop_apiservice_guard() {\n+    if [ -n \"$APISERVICE_GUARD_PID\" ] && kill -0 \"$APISERVICE_GUARD_PID\" 2>/dev/null; then\n+        log_info \"Stopping APIService guard (PID: $APISERVICE_GUARD_PID)\"\n+        kill \"$APISERVICE_GUARD_PID\" 2>/dev/null || true\n+        wait \"$APISERVICE_GUARD_PID\" 2>/dev/null || true\n+    elif [ -f /tmp/apiservice-guard.pid ]; then\n+        local pid\n+        pid=$(cat /tmp/apiservice-guard.pid)\n+        if kill -0 \"$pid\" 2>/dev/null; then\n+            log_info \"Stopping APIService guard (PID: $pid from pidfile)\"\n+            kill \"$pid\" 2>/dev/null || true\n+        fi\n+    fi\n+    rm -f /tmp/apiservice-guard.pid\n+    APISERVICE_GUARD_PID=\"\"\n+}\n+\n print_help() {\n   cat <<EOF\n Usage: $(basename \"$0\") [OPTIONS]\n@@ -1019,6 +1072,12 @@ deploy_prometheus_adapter() {\n             }\" && log_success \"APIService patched to use Prometheus Adapter\" \\\n                || log_warning \"Failed to patch external.metrics.k8s.io APIService \u2014 HPA may not work\"\n         fi\n+\n+        # Start background guard to prevent KEDA from reclaiming the APIService.\n+        # KEDA's operator continuously reconciles the APIService back to its own\n+        # metrics server within ~2 minutes of any patch. The guard re-patches it\n+        # every 10 seconds without modifying KEDA itself.\n+        start_apiservice_guard \"$MONITORING_NAMESPACE\"\n     else\n         log_warning \"external.metrics.k8s.io APIService not found \u2014 skipping patch\"\n     fi\n@@ -1182,6 +1241,10 @@ print_summary() {\n # Undeployment functions\n undeploy_prometheus_adapter() {\n     log_info \"Uninstalling Prometheus Adapter...\"\n+\n+    # Stop the APIService guard if running\n+    stop_apiservice_guard\n+\n     helm uninstall prometheus-adapter -n $MONITORING_NAMESPACE 2>/dev/null || \\\n         log_warning \"Prometheus Adapter not found or already uninstalled\"\n \n@@ -1257,6 +1320,9 @@ cleanup() {\n     log_info \"======================================\"\n     echo \"\"\n \n+    # Stop the APIService guard if running (safety net)\n+    stop_apiservice_guard\n+\n     # Undeploy environment-specific components (Prometheus, etc.)\n     if [ \"$DEPLOY_PROMETHEUS\" = \"true\" ]; then\n         undeploy_prometheus_stack"
+    },
+    {
+      "sha": "5aa874250febd1705cd4e8867bc01f5e1fb4e9cc",
+      "filename": "test/e2e-openshift/scale_to_zero_test.go",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/llm-d/llm-d-workload-variant-autoscaler/blob/f881df1b3aee7d525398415482888b299063190f/test%2Fe2e-openshift%2Fscale_to_zero_test.go",
+      "raw_url": "https://github.com/llm-d/llm-d-workload-variant-autoscaler/raw/f881df1b3aee7d525398415482888b299063190f/test%2Fe2e-openshift%2Fscale_to_zero_test.go",
+      "contents_url": "https://api.github.com/repos/llm-d/llm-d-workload-variant-autoscaler/contents/test%2Fe2e-openshift%2Fscale_to_zero_test.go?ref=f881df1b3aee7d525398415482888b299063190f",
+      "patch": "@@ -155,8 +155,8 @@ retention_period: %s`, retentionPeriod),\n \t\t\t// and gracefully skip if scale-to-zero cannot be validated.\n \n \t\t\tscaledToZero := false\n-\t\t\t// Wait for retention period (3m) + buffer (2m) = 5m total\n-\t\t\tdeadline := time.Now().Add(5 * time.Minute)\n+\t\t\t// Wait for retention period (3m) + buffer (7m) = 10m total\n+\t\t\tdeadline := time.Now().Add(10 * time.Minute)\n \n \t\t\tfor time.Now().Before(deadline) {\n \t\t\t\tva := &v1alpha1.VariantAutoscaling{}"
+    },
+    {
+      "sha": "4b07c9106e2b5c01805421c6fd98fa19bd233ce8",
+      "filename": "test/e2e-openshift/sharegpt_scaleup_test.go",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/llm-d/llm-d-workload-variant-autoscaler/blob/f881df1b3aee7d525398415482888b299063190f/test%2Fe2e-openshift%2Fsharegpt_scaleup_test.go",
+      "raw_url": "https://github.com/llm-d/llm-d-workload-variant-autoscaler/raw/f881df1b3aee7d525398415482888b299063190f/test%2Fe2e-openshift%2Fsharegpt_scaleup_test.go",
+      "contents_url": "https://api.github.com/repos/llm-d/llm-d-workload-variant-autoscaler/contents/test%2Fe2e-openshift%2Fsharegpt_scaleup_test.go?ref=f881df1b3aee7d525398415482888b299063190f",
+      "patch": "@@ -359,7 +359,7 @@ var _ = Describe(\"ShareGPT Scale-Up Test\", Ordered, func() {\n \t\t\t\t\t\t_, _ = fmt.Fprintf(GinkgoWriter, \"External metrics API response (selector: %s): %s\\n\",\n \t\t\t\t\t\t\thpaMetricSelector, truncateString(resultStr, 500))\n \t\t\t\t\t}\n-\t\t\t\t}, 5*time.Minute, 5*time.Second).Should(Succeed())\n+\t\t\t\t}, 10*time.Minute, 5*time.Second).Should(Succeed())\n \t\t\t})\n \n \t\t\tIt(\"should create and run parallel load generation jobs\", func() {"
+    }
+  ]
+}

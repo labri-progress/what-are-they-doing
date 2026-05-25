@@ -1,0 +1,53 @@
+{
+  "message": "Add CI safety scan workflow and fix generator accuracy (#1451)\n\n- Add mission-safety-scan.yml CI workflow for all PRs touching solutions/**/*.json\n- Fix CNCF mission generator: check linked PR merge status before using as resolution\n- Fix CNCF mission generator: raise minimum comment score threshold from 3 to 8\n- Fix CNCF mission generator: add uppercase RFC variants for detection\n- Fix CNCF mission generator: add more non-K8s projects to skip set\n- Fix platform install generator: add Helm repo URL validation\n- Fix CNCF install generator: skip non-installable specs and circular installs\n\nSigned-off-by: Andrew Anderson <andy@clubanderson.com>",
+  "files": [
+    {
+      "sha": "4c80a0d953ad0b1b7506c4af9321f21505ac318d",
+      "filename": ".github/workflows/mission-safety-scan.yml",
+      "status": "added",
+      "additions": 69,
+      "deletions": 0,
+      "changes": 69,
+      "blob_url": "https://github.com/kubestellar/console-kb/blob/452aba0ea4457a86c08bf14f368cd549f4ebe2e0/.github%2Fworkflows%2Fmission-safety-scan.yml",
+      "raw_url": "https://github.com/kubestellar/console-kb/raw/452aba0ea4457a86c08bf14f368cd549f4ebe2e0/.github%2Fworkflows%2Fmission-safety-scan.yml",
+      "contents_url": "https://api.github.com/repos/kubestellar/console-kb/contents/.github%2Fworkflows%2Fmission-safety-scan.yml?ref=452aba0ea4457a86c08bf14f368cd549f4ebe2e0",
+      "patch": "@@ -0,0 +1,69 @@\n+name: Mission Safety Scan\n+on:\n+  pull_request:\n+    paths:\n+      - 'solutions/**/*.json'\n+\n+permissions:\n+  contents: read\n+\n+jobs:\n+  safety-scan:\n+    runs-on: ubuntu-latest\n+    steps:\n+      - uses: actions/checkout@v4\n+        with:\n+          fetch-depth: 0\n+      - name: Scan for dangerous commands\n+        run: |\n+          ERRORS=0\n+\n+          # Get changed JSON files\n+          FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }} -- 'solutions/**/*.json' 2>/dev/null || find solutions -name '*.json' -newer .git/index)\n+\n+          for f in $FILES; do\n+            [ -f \"$f\" ] || continue\n+\n+            # Check for kubectl delete namespace/all patterns (excluding documented uninstall sections)\n+            if grep -qP 'kubectl delete (namespace|ns|all)\\b.*--all' \"$f\"; then\n+              echo \"::error file=$f::Dangerous: kubectl delete all/namespace --all\"\n+              ERRORS=$((ERRORS + 1))\n+            fi\n+\n+            # Check for rm -rf with dangerous paths\n+            if grep -qP 'rm\\s+-rf?\\s+(/|/\\*|~|\\$HOME)' \"$f\"; then\n+              echo \"::error file=$f::Dangerous: rm -rf with root/home path\"\n+              ERRORS=$((ERRORS + 1))\n+            fi\n+\n+            # Check for kubectl delete kube-system\n+            if grep -qi 'kubectl delete.*kube-system' \"$f\"; then\n+              echo \"::error file=$f::Dangerous: kubectl delete in kube-system namespace\"\n+              ERRORS=$((ERRORS + 1))\n+            fi\n+\n+            # Check for placeholder container images\n+            if grep -q 'registry/org/image:tag' \"$f\"; then\n+              echo \"::error file=$f::Placeholder container image not replaced: registry/org/image:tag\"\n+              ERRORS=$((ERRORS + 1))\n+            fi\n+\n+            # Check for unverified curl|bash from non-official sources\n+            # (Allow known official domains)\n+            if grep -qP 'curl.*\\|\\s*(ba)?sh' \"$f\"; then\n+              if ! grep -qP 'curl.*(get\\.k3s\\.io|aka\\.ms/|sdk\\.cloud\\.google|clis\\.cloud\\.ibm|ollama\\.com|get\\.rke2\\.io|raw\\.githubusercontent\\.com).*\\|\\s*(ba)?sh' \"$f\"; then\n+                echo \"::warning file=$f::curl piped to shell from non-standard source \u2014 verify URL is official\"\n+              fi\n+            fi\n+\n+            # Check for force delete without grace period\n+            if grep -q '\\-\\-force.*grace-period=0' \"$f\"; then\n+              echo \"::warning file=$f::Force delete with grace-period=0 \u2014 ensure this is intentional\"\n+            fi\n+          done\n+\n+          if [ $ERRORS -gt 0 ]; then\n+            echo \"::error::Found $ERRORS safety issues. Fix before merging.\"\n+            exit 1\n+          fi\n+          echo \"Safety scan passed\""
+    },
+    {
+      "sha": "cdee57cf4778b97c5e5d2331cd031872c012ac89",
+      "filename": "scripts/generate-cncf-install-missions.mjs",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 2,
+      "changes": 17,
+      "blob_url": "https://github.com/kubestellar/console-kb/blob/452aba0ea4457a86c08bf14f368cd549f4ebe2e0/scripts%2Fgenerate-cncf-install-missions.mjs",
+      "raw_url": "https://github.com/kubestellar/console-kb/raw/452aba0ea4457a86c08bf14f368cd549f4ebe2e0/scripts%2Fgenerate-cncf-install-missions.mjs",
+      "contents_url": "https://api.github.com/repos/kubestellar/console-kb/contents/scripts%2Fgenerate-cncf-install-missions.mjs?ref=452aba0ea4457a86c08bf14f368cd549f4ebe2e0",
+      "patch": "@@ -700,8 +700,21 @@ async function main() {\n \n   const config = loadInstallSourcesConfig()\n \n-  // Filter projects \u2014 exclude kubestellar itself\n-  let projects = CNCF_PROJECTS.filter(p => p.name !== 'kubestellar')\n+  // Non-installable projects \u2014 specs, community orgs, and circular installs\n+  const NON_INSTALLABLE_PROJECTS = new Set([\n+    'cloudevents', 'openmetrics', 'opentelemetry-specification',\n+    'in-toto-spec', 'notary-project', 'kubernetes',  // K8s-on-K8s is circular\n+  ])\n+\n+  // Filter projects \u2014 exclude kubestellar itself and non-installable specs\n+  let projects = CNCF_PROJECTS.filter(p => {\n+    if (p.name === 'kubestellar') return false\n+    if (NON_INSTALLABLE_PROJECTS.has(p.name)) {\n+      console.log(`Skipping non-installable project: ${p.name}`)\n+      return false\n+    }\n+    return true\n+  })\n \n   if (TARGET_PROJECTS) {\n     projects = projects.filter(p => TARGET_PROJECTS.includes(p.name))"
+    },
+    {
+      "sha": "e27415c1dd4b0f9be81c0ceab57a868d95592160",
+      "filename": "scripts/generate-cncf-missions.mjs",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 2,
+      "changes": 13,
+      "blob_url": "https://github.com/kubestellar/console-kb/blob/452aba0ea4457a86c08bf14f368cd549f4ebe2e0/scripts%2Fgenerate-cncf-missions.mjs",
+      "raw_url": "https://github.com/kubestellar/console-kb/raw/452aba0ea4457a86c08bf14f368cd549f4ebe2e0/scripts%2Fgenerate-cncf-missions.mjs",
+      "contents_url": "https://api.github.com/repos/kubestellar/console-kb/contents/scripts%2Fgenerate-cncf-missions.mjs?ref=452aba0ea4457a86c08bf14f368cd549f4ebe2e0",
+      "patch": "@@ -290,6 +290,13 @@ async function getIssueDetails(owner, repo, issueNumber) {\n     // Timeline API may not be available; proceed without linked PR\n   }\n \n+  // Verify linked PR was actually merged \u2014 closed-without-merging PRs\n+  // should not be used as resolution sources\n+  if (linkedPR && !linkedPR.merged) {\n+    console.log(`    [SKIP PR] Linked PR #${linkedPR.number} was closed without merging \u2014 skipping as resolution source`)\n+    linkedPR = null\n+  }\n+\n   return { issue, comments: comments || [], linkedPR }\n }\n \n@@ -394,7 +401,7 @@ function extractResolutionFromIssue(issue, comments, linkedPR) {\n       })\n       .sort((a, b) => b.score - a.score)\n \n-    const MIN_COMMENT_SCORE = 3\n+    const MIN_COMMENT_SCORE = 8\n     if (scoredComments.length > 0 && scoredComments[0].score >= MIN_COMMENT_SCORE) {\n       resolution.solution = truncateAtWordBoundary(cleanText(scoredComments[0].comment.body), 1500)\n     }\n@@ -572,6 +579,8 @@ const NON_K8S_PROJECTS = new Set([\n   'visual-studio-code-kubernetes-tools',\n   // Policy language \u2014 library/CLI, not a K8s workload\n   'cedar',\n+  // Specifications and community projects \u2014 no installable component\n+  'opentelemetry-community', 'openssf', 'openmetrics', 'cloudevents-spec',\n ])\n \n function isKubernetesNative(project) {\n@@ -941,7 +950,7 @@ function detectMissionType(issue) {\n \n   // RFCs and proposals are features, not troubleshoot \u2014 check before bug keywords\n   // since RFCs may contain words like \"fix\" or \"error\" in their descriptions\n-  if (text.includes('[rfc]') || text.includes('rfc:') || text.includes('proposal') || text.includes('design doc')) return 'feature'\n+  if (text.includes('[rfc]') || text.includes('[RFC]') || text.includes('rfc:') || text.includes('RFC:') || text.includes('proposal') || text.includes('design doc')) return 'feature'\n \n   // Bug/error patterns \u2014 check first since these override feature keywords\n   if (text.includes('bug') || text.includes('crash') || text.includes('error') || text.includes('fix')) return 'troubleshoot'"
+    },
+    {
+      "sha": "c20d4ba61f0a0976cdc9d1d6bedcf3e94e67f219",
+      "filename": "scripts/generate-platform-missions.mjs",
+      "status": "modified",
+      "additions": 17,
+      "deletions": 0,
+      "changes": 17,
+      "blob_url": "https://github.com/kubestellar/console-kb/blob/452aba0ea4457a86c08bf14f368cd549f4ebe2e0/scripts%2Fgenerate-platform-missions.mjs",
+      "raw_url": "https://github.com/kubestellar/console-kb/raw/452aba0ea4457a86c08bf14f368cd549f4ebe2e0/scripts%2Fgenerate-platform-missions.mjs",
+      "contents_url": "https://api.github.com/repos/kubestellar/console-kb/contents/scripts%2Fgenerate-platform-missions.mjs?ref=452aba0ea4457a86c08bf14f368cd549f4ebe2e0",
+      "patch": "@@ -746,6 +746,23 @@ async function main() {\n     // 3. Build mission JSON\n     const mission = buildMissionJson(platform, llmResult, context)\n \n+    // 3.5. Validate Helm repo URL if install method is helm\n+    if (llmResult.installMethods?.includes('helm') && llmResult.helmRepoUrl) {\n+      try {\n+        const HELM_VALIDATE_TIMEOUT_MS = 10000\n+        const indexRes = await fetch(`${llmResult.helmRepoUrl}/index.yaml`, { signal: AbortSignal.timeout(HELM_VALIDATE_TIMEOUT_MS) })\n+        if (!indexRes.ok) {\n+          console.log(`  Helm repo URL ${llmResult.helmRepoUrl} returned ${indexRes.status} \u2014 flagging for review`)\n+          const HELM_URL_PENALTY = 30\n+          mission.metadata.qualityScore = Math.max(0, (mission.metadata.qualityScore || 100) - HELM_URL_PENALTY)\n+        }\n+      } catch {\n+        console.log(`  Helm repo URL ${llmResult.helmRepoUrl} unreachable \u2014 flagging for review`)\n+        const HELM_URL_PENALTY = 30\n+        mission.metadata.qualityScore = Math.max(0, (mission.metadata.qualityScore || 100) - HELM_URL_PENALTY)\n+      }\n+    }\n+\n     // 4. Apply quality gate\n     const gateResult = applyQualityGate(mission)\n     mission.metadata.qualityScore = gateResult.score"
+    }
+  ]
+}

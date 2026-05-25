@@ -1,0 +1,113 @@
+{
+  "message": "fix: batch security, timeout, and UX fixes (#7192-#7235) (#7301)\n\n* fix: harden Go backend security, timeouts, and resource cleanup\n\nSECURITY:\n- Add validateToken to handleMetricsHistory, handleDeviceInventory,\n  handleInsightsEnrich, handleInsightsAI (#7223, #7228, #7231, #7233)\n- Add io.LimitReader to handleSetKey and handlePredictionsAnalyze to\n  prevent DoS via large request bodies (#7234, #7235)\n- Gate kubectl auth to can-i/whoami only, blocking auth reconcile (#7204)\n- Gate kubectl rollout to status/history only, blocking restart/undo (#7205)\n\nRELIABILITY:\n- Add 30s timeout to KubectlProxy.Execute via process kill timer (#7206)\n- Add 60s timeout to gitStash/gitStashPop using exec.CommandContext (#7210)\n- Guard rollbackGit against empty repoPath + add 30s timeout (#7211)\n- Add eviction cap to Registry.selectedAgent map + RemoveSelectedAgent\n  method to prevent unbounded memory growth (#7209)\n- Return error from parseEnrichmentResponse when JSON lacks the\n  enrichments key so callers fall back to rule-based enrichments (#7208)\n\nSigned-off-by: Andy Anderson <andy@clubanderson.com>\n\n* fix: case-insensitive categories, project name trim, search improvements\n\n- Case-insensitive orbit template category matching (#7232)\n- Case-insensitive category fallback in project card mapping (#7230)\n- Trim whitespace from project names before direct mapping lookup (#7229)\n- Include sortBy and limit in usePods cache key to prevent cross-view\n  stale data between dashboard and search views (#7218)\n- Increase search pod index limit from 50 to 500 for more complete\n  search results (#7217)\n\nSigned-off-by: Andy Anderson <andy@clubanderson.com>\n\n---------\n\nSigned-off-by: Andy Anderson <andy@clubanderson.com>",
+  "files": [
+    {
+      "sha": "8d7ebc6e801640c10d3c73746cee9b86e67d85a6",
+      "filename": "pkg/agent/insight_worker.go",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 0,
+      "changes": 11,
+      "blob_url": "https://github.com/kubestellar/console/blob/9acf51764b7007de4aa929e42b7b7fedfc096593/pkg%2Fagent%2Finsight_worker.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/9acf51764b7007de4aa929e42b7b7fedfc096593/pkg%2Fagent%2Finsight_worker.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fagent%2Finsight_worker.go?ref=9acf51764b7007de4aa929e42b7b7fedfc096593",
+      "patch": "@@ -287,6 +287,17 @@ func parseEnrichmentResponse(response string, insights []InsightSummary) ([]AIIn\n \t\treturn nil, fmt.Errorf(\"JSON parse error: %w\", err)\n \t}\n \n+\t// If the JSON parsed but the expected \"enrichments\" key was absent, treat\n+\t// it as an error so the caller can fall back to rule-based enrichments (#7208).\n+\tif parsed.Enrichments == nil {\n+\t\tconst previewLen = 200\n+\t\tpreview := jsonStr\n+\t\tif len(preview) > previewLen {\n+\t\t\tpreview = preview[:previewLen] + \"...\"\n+\t\t}\n+\t\treturn nil, fmt.Errorf(\"response JSON lacks 'enrichments' key (preview: %s)\", preview)\n+\t}\n+\n \treturn parsed.Enrichments, nil\n }\n "
+    },
+    {
+      "sha": "0c84d0a1a80a69bb1ef44a133e08806cd6671d98",
+      "filename": "pkg/agent/kubectl.go",
+      "status": "modified",
+      "additions": 47,
+      "deletions": 0,
+      "changes": 47,
+      "blob_url": "https://github.com/kubestellar/console/blob/9acf51764b7007de4aa929e42b7b7fedfc096593/pkg%2Fagent%2Fkubectl.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/9acf51764b7007de4aa929e42b7b7fedfc096593/pkg%2Fagent%2Fkubectl.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fagent%2Fkubectl.go?ref=9acf51764b7007de4aa929e42b7b7fedfc096593",
+      "patch": "@@ -92,9 +92,22 @@ func (k *KubectlProxy) Execute(context, namespace string, args []string) protoco\n \tcmd.Stdout = &stdout\n \tcmd.Stderr = &stderr\n \n+\t// kubectlCommandTimeout prevents a hung kubectl call from blocking\n+\t// the handler indefinitely (e.g. unreachable apiserver) (#7206).\n+\tconst kubectlCommandTimeout = 30 * time.Second\n+\ttimer := time.AfterFunc(kubectlCommandTimeout, func() {\n+\t\tif cmd.Process != nil {\n+\t\t\tcmd.Process.Kill()\n+\t\t}\n+\t})\n+\n \terr := cmd.Run()\n+\ttimedOut := !timer.Stop()\n \texitCode := 0\n \tif err != nil {\n+\t\tif timedOut {\n+\t\t\treturn protocol.KubectlResponse{ExitCode: 1, Error: fmt.Sprintf(\"kubectl timed out after %s\", kubectlCommandTimeout)}\n+\t\t}\n \t\tif exitErr, ok := err.(*exec.ExitError); ok {\n \t\t\texitCode = exitErr.ExitCode()\n \t\t} else {\n@@ -174,6 +187,18 @@ var allowedScaleResources = map[string]bool{\n \t\"sts\":          true,\n }\n \n+// allowedRolloutSubcommands restricts rollout to read-only operations (#7205).\n+var allowedRolloutSubcommands = map[string]bool{\n+\t\"status\":  true,\n+\t\"history\": true,\n+}\n+\n+// allowedAuthSubcommands restricts auth to read-only operations (#7204).\n+var allowedAuthSubcommands = map[string]bool{\n+\t\"can-i\":  true,\n+\t\"whoami\": true,\n+}\n+\n // blockedConfigSubcommands are config subcommands that modify kubeconfig\n var blockedConfigSubcommands = map[string]bool{\n \t\"set\":             true,\n@@ -200,6 +225,28 @@ func (k *KubectlProxy) validateArgs(args []string) bool {\n \t\treturn false\n \t}\n \n+\t// Special case: rollout command - only allow read-only subcommands (#7205)\n+\tif command == \"rollout\" {\n+\t\tif len(args) < 2 {\n+\t\t\treturn false // Need at least \"rollout <subcommand>\"\n+\t\t}\n+\t\tsubcommand := strings.ToLower(args[1])\n+\t\tif !allowedRolloutSubcommands[subcommand] {\n+\t\t\treturn false\n+\t\t}\n+\t}\n+\n+\t// Special case: auth command - only allow read-only subcommands (#7204)\n+\tif command == \"auth\" {\n+\t\tif len(args) < 2 {\n+\t\t\treturn false // Need at least \"auth <subcommand>\"\n+\t\t}\n+\t\tsubcommand := strings.ToLower(args[1])\n+\t\tif !allowedAuthSubcommands[subcommand] {\n+\t\t\treturn false\n+\t\t}\n+\t}\n+\n \t// Special case: config command - block mutation subcommands\n \tif command == \"config\" && len(args) > 1 {\n \t\tsubcommand := strings.ToLower(args[1])"
+    },
+    {
+      "sha": "0e8426789037b70bb5c77f1082b44a6a185e5435",
+      "filename": "pkg/agent/registry.go",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 0,
+      "changes": 22,
+      "blob_url": "https://github.com/kubestellar/console/blob/9acf51764b7007de4aa929e42b7b7fedfc096593/pkg%2Fagent%2Fregistry.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/9acf51764b7007de4aa929e42b7b7fedfc096593/pkg%2Fagent%2Fregistry.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fagent%2Fregistry.go?ref=9acf51764b7007de4aa929e42b7b7fedfc096593",
+      "patch": "@@ -151,10 +151,32 @@ func (r *Registry) SetSelectedAgent(sessionID, agentName string) error {\n \t\treturn fmt.Errorf(\"provider %s is not available\", agentName)\n \t}\n \n+\t// Evict oldest entries when map exceeds a safety cap to prevent unbounded\n+\t// growth from sessions that never call RemoveSelectedAgent (#7209).\n+\tconst maxSelectedAgentEntries = 10000\n+\tif len(r.selectedAgent) >= maxSelectedAgentEntries {\n+\t\t// Delete an arbitrary entry (map iteration order is random in Go).\n+\t\tfor k := range r.selectedAgent {\n+\t\t\tdelete(r.selectedAgent, k)\n+\t\t\tbreak\n+\t\t}\n+\t}\n+\n \tr.selectedAgent[sessionID] = agentName\n \treturn nil\n }\n \n+// RemoveSelectedAgent cleans up the session entry from the selectedAgent map,\n+// preventing unbounded growth when sessions disconnect (#7209).\n+func (r *Registry) RemoveSelectedAgent(sessionID string) {\n+\tif r == nil || sessionID == \"\" {\n+\t\treturn\n+\t}\n+\tr.mu.Lock()\n+\tdefer r.mu.Unlock()\n+\tdelete(r.selectedAgent, sessionID)\n+}\n+\n // List returns all registered providers\n func (r *Registry) List() []ProviderInfo {\n \tif r == nil {"
+    },
+    {
+      "sha": "d57e7f0fbc38d8d7426bd6e0d55b8ca73f84896a",
+      "filename": "pkg/agent/server_operations.go",
+      "status": "modified",
+      "additions": 26,
+      "deletions": 2,
+      "changes": 28,
+      "blob_url": "https://github.com/kubestellar/console/blob/9acf51764b7007de4aa929e42b7b7fedfc096593/pkg%2Fagent%2Fserver_operations.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/9acf51764b7007de4aa929e42b7b7fedfc096593/pkg%2Fagent%2Fserver_operations.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fagent%2Fserver_operations.go?ref=9acf51764b7007de4aa929e42b7b7fedfc096593",
+      "patch": "@@ -325,7 +325,7 @@ func (s *Server) handleGetKeysStatus(w http.ResponseWriter, r *http.Request) {\n // handleSetKey saves a new API key\n func (s *Server) handleSetKey(w http.ResponseWriter, r *http.Request) {\n \tvar req SetKeyRequest\n-\tif err := json.NewDecoder(r.Body).Decode(&req); err != nil {\n+\tif err := json.NewDecoder(io.LimitReader(r.Body, maxRequestBodyBytes)).Decode(&req); err != nil {\n \t\tw.WriteHeader(http.StatusBadRequest)\n \t\tjson.NewEncoder(w).Encode(protocol.ErrorPayload{Code: \"invalid_json\", Message: \"Invalid JSON body\"})\n \t\treturn\n@@ -766,7 +766,7 @@ func (s *Server) handlePredictionsAnalyze(w http.ResponseWriter, r *http.Request\n \t// SECURITY: reject malformed JSON instead of silently using zero-value (#4156).\n \tvar req AIAnalysisRequest\n \tif r.Body != nil {\n-\t\tif err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {\n+\t\tif err := json.NewDecoder(io.LimitReader(r.Body, maxRequestBodyBytes)).Decode(&req); err != nil && err != io.EOF {\n \t\t\tw.Header().Set(\"Content-Type\", \"application/json\")\n \t\t\tw.WriteHeader(http.StatusBadRequest)\n \t\t\tjson.NewEncoder(w).Encode(map[string]string{\"error\": \"invalid JSON body\"})\n@@ -903,6 +903,12 @@ func (s *Server) handleMetricsHistory(w http.ResponseWriter, r *http.Request) {\n \t\treturn\n \t}\n \n+\t// SECURITY: require auth before returning sensitive metrics (#7223).\n+\tif !s.validateToken(r) {\n+\t\thttp.Error(w, \"Unauthorized\", http.StatusUnauthorized)\n+\t\treturn\n+\t}\n+\n \tif s.metricsHistory == nil {\n \t\tjson.NewEncoder(w).Encode(MetricsHistoryResponse{\n \t\t\tSnapshots: []MetricsSnapshot{},\n@@ -1022,6 +1028,12 @@ func (s *Server) handleDeviceInventory(w http.ResponseWriter, r *http.Request) {\n \t\treturn\n \t}\n \n+\t// SECURITY: require auth before returning device inventory (#7228).\n+\tif !s.validateToken(r) {\n+\t\thttp.Error(w, \"Unauthorized\", http.StatusUnauthorized)\n+\t\treturn\n+\t}\n+\n \tif s.deviceTracker == nil {\n \t\tjson.NewEncoder(w).Encode(DeviceInventoryResponse{\n \t\t\tNodes:     []NodeDeviceInventory{},\n@@ -1766,6 +1778,12 @@ func (s *Server) handleInsightsEnrich(w http.ResponseWriter, r *http.Request) {\n \t\treturn\n \t}\n \n+\t// SECURITY: require auth before triggering AI enrichment (#7231).\n+\tif !s.validateToken(r) {\n+\t\thttp.Error(w, \"Unauthorized\", http.StatusUnauthorized)\n+\t\treturn\n+\t}\n+\n \tif s.insightWorker == nil {\n \t\tjson.NewEncoder(w).Encode(InsightEnrichmentResponse{\n \t\t\tEnrichments: []AIInsightEnrichment{},\n@@ -1815,6 +1833,12 @@ func (s *Server) handleInsightsAI(w http.ResponseWriter, r *http.Request) {\n \t\treturn\n \t}\n \n+\t// SECURITY: require auth before returning cached AI enrichments (#7233).\n+\tif !s.validateToken(r) {\n+\t\thttp.Error(w, \"Unauthorized\", http.StatusUnauthorized)\n+\t\treturn\n+\t}\n+\n \tif s.insightWorker == nil {\n \t\tjson.NewEncoder(w).Encode(InsightEnrichmentResponse{\n \t\t\tEnrichments: []AIInsightEnrichment{},"
+    },
+    {
+      "sha": "44f7cfeeb3a7ce7e69789bdc07cb467e88eaec53",
+      "filename": "pkg/agent/update_checker.go",
+      "status": "modified",
+      "additions": 15,
+      "deletions": 4,
+      "changes": 19,
+      "blob_url": "https://github.com/kubestellar/console/blob/9acf51764b7007de4aa929e42b7b7fedfc096593/pkg%2Fagent%2Fupdate_checker.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/9acf51764b7007de4aa929e42b7b7fedfc096593/pkg%2Fagent%2Fupdate_checker.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fagent%2Fupdate_checker.go?ref=9acf51764b7007de4aa929e42b7b7fedfc096593",
+      "patch": "@@ -1383,13 +1383,18 @@ func runGitPullWithTimeout(repoPath string, timeout time.Duration) error {\n \treturn nil\n }\n \n+// gitStashTimeout is the hard deadline for git stash operations.\n+const gitStashTimeout = 60 * time.Second\n+\n // gitStash stashes uncommitted changes if any exist. Returns true if a stash was created.\n func gitStash(repoPath string) bool {\n \tif !hasUncommittedChanges(repoPath) {\n \t\treturn false\n \t}\n \tslog.Info(\"[AutoUpdate] Stashing uncommitted changes before update\")\n-\tcmd := exec.Command(\"git\", \"stash\", \"push\", \"-m\", \"auto-update: stashed by kc-agent\")\n+\tctx, cancel := context.WithTimeout(context.Background(), gitStashTimeout)\n+\tdefer cancel()\n+\tcmd := exec.CommandContext(ctx, \"git\", \"stash\", \"push\", \"-m\", \"auto-update: stashed by kc-agent\")\n \tcmd.Dir = repoPath\n \tcmd.Stdout = os.Stdout\n \tcmd.Stderr = os.Stderr\n@@ -1403,7 +1408,9 @@ func gitStash(repoPath string) bool {\n // gitStashPop restores previously stashed changes.\n func gitStashPop(repoPath string) {\n \tslog.Info(\"[AutoUpdate] Restoring stashed changes\")\n-\tcmd := exec.Command(\"git\", \"stash\", \"pop\")\n+\tctx, cancel := context.WithTimeout(context.Background(), gitStashTimeout)\n+\tdefer cancel()\n+\tcmd := exec.CommandContext(ctx, \"git\", \"stash\", \"pop\")\n \tcmd.Dir = repoPath\n \tcmd.Stdout = os.Stdout\n \tcmd.Stderr = os.Stderr\n@@ -1487,10 +1494,14 @@ func rebuildGoBinaries(repoPath string) error {\n }\n \n func rollbackGit(repoPath, sha string) {\n-\tif sha == \"\" {\n+\tif sha == \"\" || repoPath == \"\" {\n \t\treturn\n \t}\n-\tcmd := exec.Command(\"git\", \"reset\", \"--hard\", sha)\n+\t// gitRollbackTimeout is the hard deadline for a rollback git-reset.\n+\tconst gitRollbackTimeout = 30 * time.Second\n+\tctx, cancel := context.WithTimeout(context.Background(), gitRollbackTimeout)\n+\tdefer cancel()\n+\tcmd := exec.CommandContext(ctx, \"git\", \"reset\", \"--hard\", sha)\n \tcmd.Dir = repoPath\n \tif err := cmd.Run(); err != nil {\n \t\tslog.Error(\"[AutoUpdate] rollback failed\", \"sha\", short(sha), \"error\", err)"
+    },
+    {
+      "sha": "509d8dd21fe08687dd5543d803da90dae4b80001",
+      "filename": "web/src/hooks/mcp/workloads.ts",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/kubestellar/console/blob/9acf51764b7007de4aa929e42b7b7fedfc096593/web%2Fsrc%2Fhooks%2Fmcp%2Fworkloads.ts",
+      "raw_url": "https://github.com/kubestellar/console/raw/9acf51764b7007de4aa929e42b7b7fedfc096593/web%2Fsrc%2Fhooks%2Fmcp%2Fworkloads.ts",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fsrc%2Fhooks%2Fmcp%2Fworkloads.ts?ref=9acf51764b7007de4aa929e42b7b7fedfc096593",
+      "patch": "@@ -233,7 +233,8 @@ function savePodsCacheToStorage() {\n // ---------------------------------------------------------------------------\n \n export function usePods(cluster?: string, namespace?: string, sortBy: 'restarts' | 'name' = 'restarts', limit = 10) {\n-  const cacheKey = `pods:${cluster || 'all'}:${namespace || 'all'}`\n+  // Include sortBy and limit in cache key to prevent cross-view stale data (#7218)\n+  const cacheKey = `pods:${cluster || 'all'}:${namespace || 'all'}:${sortBy}:${limit}`\n \n   // Initialize from cache if available\n   const getCachedData = () => {"
+    },
+    {
+      "sha": "69070f667cedbdc216152fd344d42380b3adf216",
+      "filename": "web/src/hooks/useSearchIndex.ts",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 1,
+      "changes": 4,
+      "blob_url": "https://github.com/kubestellar/console/blob/9acf51764b7007de4aa929e42b7b7fedfc096593/web%2Fsrc%2Fhooks%2FuseSearchIndex.ts",
+      "raw_url": "https://github.com/kubestellar/console/raw/9acf51764b7007de4aa929e42b7b7fedfc096593/web%2Fsrc%2Fhooks%2FuseSearchIndex.ts",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fsrc%2Fhooks%2FuseSearchIndex.ts?ref=9acf51764b7007de4aa929e42b7b7fedfc096593",
+      "patch": "@@ -370,7 +370,9 @@ function matchesQuery(item: SearchItem, query: string): boolean {\n export function useSearchIndex(query: string) {\n   const { clusters } = useClusters()\n   const { deployments } = useDeployments()\n-  const { pods } = usePods(undefined, undefined, 'name', 50)\n+  // Search should index all available pods, not just a small subset (#7217).\n+  const SEARCH_POD_LIMIT = 500\n+  const { pods } = usePods(undefined, undefined, 'name', SEARCH_POD_LIMIT)\n   const { services } = useServices()\n   const { nodes } = useNodes()\n   const { releases } = useHelmReleases()"
+    },
+    {
+      "sha": "dd4288f39540973843ddaec033cac5896fe7ce97",
+      "filename": "web/src/lib/orbit/orbitTemplates.ts",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 4,
+      "changes": 10,
+      "blob_url": "https://github.com/kubestellar/console/blob/9acf51764b7007de4aa929e42b7b7fedfc096593/web%2Fsrc%2Flib%2Forbit%2ForbitTemplates.ts",
+      "raw_url": "https://github.com/kubestellar/console/raw/9acf51764b7007de4aa929e42b7b7fedfc096593/web%2Fsrc%2Flib%2Forbit%2ForbitTemplates.ts",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fsrc%2Flib%2Forbit%2ForbitTemplates.ts?ref=9acf51764b7007de4aa929e42b7b7fedfc096593",
+      "patch": "@@ -128,8 +128,10 @@ export const ORBIT_TEMPLATES: OrbitTemplate[] = [\n  * or match any of the provided categories.\n  */\n export function getApplicableOrbitTemplates(categories: string[]): OrbitTemplate[] {\n-  return ORBIT_TEMPLATES.filter(template =>\n-    template.applicableCategories.includes('*') ||\n-    (categories || []).some(cat => template.applicableCategories.includes(cat))\n-  )\n+  return ORBIT_TEMPLATES.filter(template => {\n+    if (template.applicableCategories.includes('*')) return true\n+    // Case-insensitive category matching (#7232)\n+    const lowerApplicable = template.applicableCategories.map(c => c.toLowerCase())\n+    return (categories || []).some(cat => lowerApplicable.includes(cat.toLowerCase()))\n+  })\n }"
+    },
+    {
+      "sha": "fdd6bfcc980d9fe3b2f7b0af3f0c1e1459d3d5a1",
+      "filename": "web/src/lib/orbit/projectCardMapping.ts",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 2,
+      "changes": 9,
+      "blob_url": "https://github.com/kubestellar/console/blob/9acf51764b7007de4aa929e42b7b7fedfc096593/web%2Fsrc%2Flib%2Forbit%2FprojectCardMapping.ts",
+      "raw_url": "https://github.com/kubestellar/console/raw/9acf51764b7007de4aa929e42b7b7fedfc096593/web%2Fsrc%2Flib%2Forbit%2FprojectCardMapping.ts",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fsrc%2Flib%2Forbit%2FprojectCardMapping.ts?ref=9acf51764b7007de4aa929e42b7b7fedfc096593",
+      "patch": "@@ -117,15 +117,20 @@ export function getMonitoringCardsForProject(\n   cncfProject?: string,\n   category?: string,\n ): ProjectCardMappingResult {\n-  const projectKey = cncfProject?.toLowerCase().replace(/\\s+/g, '-')\n+  const projectKey = cncfProject?.trim().toLowerCase().replace(/\\s+/g, '-')\n   const directCards = projectKey ? PROJECT_TO_CARDS[projectKey] : undefined\n \n   if (directCards) {\n     const merged = [...new Set([...BASELINE_CARDS, ...directCards])]\n     return { cards: merged, hasDirectMapping: true }\n   }\n \n-  const categoryCards = category ? CATEGORY_TO_CARDS[category] : undefined\n+  // Case-insensitive category lookup (#7230): find the canonical key that\n+  // matches the input regardless of casing.\n+  const categoryKey = category\n+    ? Object.keys(CATEGORY_TO_CARDS).find(k => k.toLowerCase() === category.toLowerCase())\n+    : undefined\n+  const categoryCards = categoryKey ? CATEGORY_TO_CARDS[categoryKey] : undefined\n   if (categoryCards) {\n     const merged = [...new Set([...BASELINE_CARDS, ...categoryCards])]\n     return { cards: merged, hasDirectMapping: false }"
+    }
+  ]
+}

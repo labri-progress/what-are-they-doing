@@ -1,0 +1,53 @@
+{
+  "message": "fix: prevent false 'Agent Not Responding' during long-running mission tool calls (#5363)\n\nLong-running CLI commands (e.g., `drasi init`, `helm install`) that take\n>90 seconds without producing stream output triggered the frontend's\ninactivity timeout, incorrectly marking missions as failed.\n\nTwo fixes:\n- Frontend: progress events now reset the inactivity timer (previously\n  only stream content chunks did)\n- Backend: sends periodic heartbeat progress events (every 30s) during\n  mission execution so the frontend always sees activity\n\nReported by @ruokun-niu in drasi-project/drasi-platform#400.\n\nSigned-off-by: Andrew Anderson <andy@clubanderson.com>",
+  "files": [
+    {
+      "sha": "a3e38533ee20551c7eaaaa7d29ba9db40b54232d",
+      "filename": "pkg/agent/server.go",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 0,
+      "changes": 7,
+      "blob_url": "https://github.com/kubestellar/console/blob/ca08a0851f1aa8ac82be742b14452503a4a7f268/pkg%2Fagent%2Fserver.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/ca08a0851f1aa8ac82be742b14452503a4a7f268/pkg%2Fagent%2Fserver.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fagent%2Fserver.go?ref=ca08a0851f1aa8ac82be742b14452503a4a7f268",
+      "patch": "@@ -42,6 +42,13 @@ const (\n \t// missions from staying in \"Running/Processing\" state indefinitely when the\n \t// AI provider hangs or never responds (#2375).\n \tmissionExecutionTimeout = 5 * time.Minute\n+\n+\t// missionHeartbeatInterval is how often the backend sends a heartbeat\n+\t// progress event during mission execution.  This prevents the frontend's\n+\t// stream-inactivity timer (90s) from firing during legitimate long-running\n+\t// tool calls (e.g., `drasi init`, `helm install`) that produce no output\n+\t// for extended periods.\n+\tmissionHeartbeatInterval = 30 * time.Second\n )\n \n // Version is set by ldflags during build"
+    },
+    {
+      "sha": "e2075f4c6a1923ffe257d6e2a4c4e95fcde31058",
+      "filename": "pkg/agent/server_ai.go",
+      "status": "modified",
+      "additions": 27,
+      "deletions": 0,
+      "changes": 27,
+      "blob_url": "https://github.com/kubestellar/console/blob/ca08a0851f1aa8ac82be742b14452503a4a7f268/pkg%2Fagent%2Fserver_ai.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/ca08a0851f1aa8ac82be742b14452503a4a7f268/pkg%2Fagent%2Fserver_ai.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fagent%2Fserver_ai.go?ref=ca08a0851f1aa8ac82be742b14452503a4a7f268",
+      "patch": "@@ -489,7 +489,34 @@ func (s *Server) handleChatMessageStreaming(conn *websocket.Conn, msg protocol.M\n \t\t\t})\n \t\t}\n \n+\t\t// Heartbeat goroutine: sends periodic progress events to prevent the\n+\t\t// frontend's stream-inactivity timer from firing during long-running\n+\t\t// tool calls (e.g., `drasi init` which deploys Kubernetes components\n+\t\t// and can take several minutes with no output).\n+\t\theartbeatDone := make(chan struct{})\n+\t\tgo func() {\n+\t\t\tticker := time.NewTicker(missionHeartbeatInterval)\n+\t\t\tdefer ticker.Stop()\n+\t\t\tfor {\n+\t\t\t\tselect {\n+\t\t\t\tcase <-heartbeatDone:\n+\t\t\t\t\treturn\n+\t\t\t\tcase <-ctx.Done():\n+\t\t\t\t\treturn\n+\t\t\t\tcase <-ticker.C:\n+\t\t\t\t\tsafeWrite(ctx, protocol.Message{\n+\t\t\t\t\t\tID:   msg.ID,\n+\t\t\t\t\t\tType: protocol.TypeProgress,\n+\t\t\t\t\t\tPayload: protocol.ProgressPayload{\n+\t\t\t\t\t\t\tStep: \"Still working...\",\n+\t\t\t\t\t\t},\n+\t\t\t\t\t})\n+\t\t\t\t}\n+\t\t\t}\n+\t\t}()\n+\n \t\tresp, err = streamingProvider.StreamChatWithProgress(ctx, chatReq, onChunk, onProgress)\n+\t\tclose(heartbeatDone)\n \t\tif err != nil {\n \t\t\tif ctx.Err() != nil {\n \t\t\t\t// Distinguish timeout from user-initiated cancel (#2375)"
+    },
+    {
+      "sha": "3ab6e7be370d013826cf8bfd558913ade6763348",
+      "filename": "web/src/hooks/useMissions.test.tsx",
+      "status": "modified",
+      "additions": 38,
+      "deletions": 0,
+      "changes": 38,
+      "blob_url": "https://github.com/kubestellar/console/blob/ca08a0851f1aa8ac82be742b14452503a4a7f268/web%2Fsrc%2Fhooks%2FuseMissions.test.tsx",
+      "raw_url": "https://github.com/kubestellar/console/raw/ca08a0851f1aa8ac82be742b14452503a4a7f268/web%2Fsrc%2Fhooks%2FuseMissions.test.tsx",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fsrc%2Fhooks%2FuseMissions.test.tsx?ref=ca08a0851f1aa8ac82be742b14452503a4a7f268",
+      "patch": "@@ -2358,6 +2358,44 @@ describe('mission timeout interval', () => {\n     }\n   })\n \n+  it('progress events reset inactivity timer so long-running tools do not timeout', async () => {\n+    vi.useFakeTimers()\n+    try {\n+      const { result } = renderHook(() => useMissions(), { wrapper })\n+      const { missionId, requestId } = await startMissionWithConnection(result)\n+\n+      // Send a stream chunk to start tracking inactivity\n+      act(() => {\n+        MockWebSocket.lastInstance?.simulateMessage({\n+          id: requestId,\n+          type: 'stream',\n+          payload: { content: 'Installing Drasi...', done: false },\n+        })\n+      })\n+\n+      // Advance 60s \u2014 within 90s window, still alive\n+      act(() => { vi.advanceTimersByTime(60_000) })\n+\n+      // Send a progress event (heartbeat from tool execution)\n+      act(() => {\n+        MockWebSocket.lastInstance?.simulateMessage({\n+          id: requestId,\n+          type: 'progress',\n+          payload: { step: 'Still working...' },\n+        })\n+      })\n+\n+      // Advance another 60s \u2014 120s total, but only 60s since last progress event\n+      act(() => { vi.advanceTimersByTime(60_000) })\n+\n+      // Mission should still be running (progress reset the timer)\n+      const mission = result.current.missions.find(m => m.id === missionId)\n+      expect(mission?.status).toBe('running')\n+    } finally {\n+      vi.useRealTimers()\n+    }\n+  })\n+\n   it('does not fire timeout when no running missions exist', async () => {\n     vi.useFakeTimers()\n     try {"
+    },
+    {
+      "sha": "6c2aa894cf4f9ee3b8f927353c9aaa86c0f5289a",
+      "filename": "web/src/hooks/useMissions.tsx",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/kubestellar/console/blob/ca08a0851f1aa8ac82be742b14452503a4a7f268/web%2Fsrc%2Fhooks%2FuseMissions.tsx",
+      "raw_url": "https://github.com/kubestellar/console/raw/ca08a0851f1aa8ac82be742b14452503a4a7f268/web%2Fsrc%2Fhooks%2FuseMissions.tsx",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fsrc%2Fhooks%2FuseMissions.tsx?ref=ca08a0851f1aa8ac82be742b14452503a4a7f268",
+      "patch": "@@ -833,6 +833,9 @@ Install the console locally with the KubeStellar Console agent to use AI mission\n           progress?: number\n           tokens?: { input?: number; output?: number; total?: number }\n         }\n+        // Reset inactivity timer \u2014 progress events prove the agent is alive,\n+        // even during long-running tool calls like `drasi init` (#5360).\n+        lastStreamTimestamp.current.set(missionId, Date.now())\n         // Track token delta for category usage\n         if (payload.tokens?.total) {\n           const previousTotal = m.tokenUsage?.total ?? 0"
+    }
+  ]
+}

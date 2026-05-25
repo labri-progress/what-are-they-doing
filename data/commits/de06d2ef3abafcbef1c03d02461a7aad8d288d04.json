@@ -1,0 +1,53 @@
+{
+  "message": "\ud83d\udc1b Fix arbitrary registry eviction and add provider validation (#10070)\n\nFixes #10063, Fixes #10060 \u2014 LRU eviction + provider validation",
+  "files": [
+    {
+      "sha": "d124537242d5576d1cd887331c6c5110443918ee",
+      "filename": "pkg/agent/registry.go",
+      "status": "modified",
+      "additions": 37,
+      "deletions": 14,
+      "changes": 51,
+      "blob_url": "https://github.com/kubestellar/console/blob/de06d2ef3abafcbef1c03d02461a7aad8d288d04/pkg%2Fagent%2Fregistry.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/de06d2ef3abafcbef1c03d02461a7aad8d288d04/pkg%2Fagent%2Fregistry.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fagent%2Fregistry.go?ref=de06d2ef3abafcbef1c03d02461a7aad8d288d04",
+      "patch": "@@ -5,14 +5,16 @@ import (\n \t\"log/slog\"\n \t\"os\"\n \t\"sync\"\n+\t\"time\"\n )\n \n // Registry manages available AI providers\n type Registry struct {\n-\tmu            sync.RWMutex\n-\tproviders     map[string]AIProvider\n-\tdefaultAgent  string\n-\tselectedAgent map[string]string // sessionID -> agentName\n+\tmu               sync.RWMutex\n+\tproviders        map[string]AIProvider\n+\tdefaultAgent     string\n+\tselectedAgent    map[string]string    // sessionID -> agentName\n+\tselectedAgentLRU map[string]time.Time // sessionID -> last access time\n }\n \n // Global registry instance\n@@ -25,8 +27,9 @@ var (\n func GetRegistry() *Registry {\n \tregistryOnce.Do(func() {\n \t\tglobalRegistry = &Registry{\n-\t\t\tproviders:     make(map[string]AIProvider),\n-\t\t\tselectedAgent: make(map[string]string),\n+\t\t\tproviders:        make(map[string]AIProvider),\n+\t\t\tselectedAgent:    make(map[string]string),\n+\t\t\tselectedAgentLRU: make(map[string]time.Time),\n \t\t}\n \t})\n \treturn globalRegistry\n@@ -127,10 +130,18 @@ func (r *Registry) GetSelectedAgent(sessionID string) string {\n \tif r == nil {\n \t\treturn \"\"\n \t}\n-\tr.mu.RLock()\n-\tdefer r.mu.RUnlock()\n+\tr.mu.Lock()\n+\tdefer r.mu.Unlock()\n+\n+\tif r.selectedAgent == nil {\n+\t\tr.selectedAgent = make(map[string]string)\n+\t}\n+\tif r.selectedAgentLRU == nil {\n+\t\tr.selectedAgentLRU = make(map[string]time.Time)\n+\t}\n \n \tif agent, ok := r.selectedAgent[sessionID]; ok {\n+\t\tr.selectedAgentLRU[sessionID] = time.Now()\n \t\treturn agent\n \t}\n \treturn r.defaultAgent\n@@ -152,18 +163,29 @@ func (r *Registry) SetSelectedAgent(sessionID, agentName string) error {\n \t\treturn fmt.Errorf(\"provider %s is not available\", agentName)\n \t}\n \n-\t// Evict oldest entries when map exceeds a safety cap to prevent unbounded\n-\t// growth from sessions that never call RemoveSelectedAgent (#7209).\n+\t// Evict the least-recently-used entry when map exceeds a safety cap to\n+\t// prevent unbounded growth from sessions that never call\n+\t// RemoveSelectedAgent (#7209, #10063).\n \tconst maxSelectedAgentEntries = 10000\n \tif len(r.selectedAgent) >= maxSelectedAgentEntries {\n-\t\t// Delete an arbitrary entry (map iteration order is random in Go).\n-\t\tfor k := range r.selectedAgent {\n-\t\t\tdelete(r.selectedAgent, k)\n-\t\t\tbreak\n+\t\tvar oldestKey string\n+\t\tvar oldestTime time.Time\n+\t\tvar foundOldest bool\n+\t\tfor k, t := range r.selectedAgentLRU {\n+\t\t\tif !foundOldest || t.Before(oldestTime) {\n+\t\t\t\toldestKey = k\n+\t\t\t\toldestTime = t\n+\t\t\t\tfoundOldest = true\n+\t\t\t}\n+\t\t}\n+\t\tif foundOldest {\n+\t\t\tdelete(r.selectedAgent, oldestKey)\n+\t\t\tdelete(r.selectedAgentLRU, oldestKey)\n \t\t}\n \t}\n \n \tr.selectedAgent[sessionID] = agentName\n+\tr.selectedAgentLRU[sessionID] = time.Now()\n \treturn nil\n }\n \n@@ -176,6 +198,7 @@ func (r *Registry) RemoveSelectedAgent(sessionID string) {\n \tr.mu.Lock()\n \tdefer r.mu.Unlock()\n \tdelete(r.selectedAgent, sessionID)\n+\tdelete(r.selectedAgentLRU, sessionID)\n }\n \n // List returns all registered providers"
+    },
+    {
+      "sha": "541412ff40d08467a0c9719dd0147bd1b8d32791",
+      "filename": "pkg/agent/registry_test.go",
+      "status": "modified",
+      "additions": 7,
+      "deletions": 4,
+      "changes": 11,
+      "blob_url": "https://github.com/kubestellar/console/blob/de06d2ef3abafcbef1c03d02461a7aad8d288d04/pkg%2Fagent%2Fregistry_test.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/de06d2ef3abafcbef1c03d02461a7aad8d288d04/pkg%2Fagent%2Fregistry_test.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fagent%2Fregistry_test.go?ref=de06d2ef3abafcbef1c03d02461a7aad8d288d04",
+      "patch": "@@ -4,6 +4,7 @@ import (\n \t\"context\"\n \t\"sync\"\n \t\"testing\"\n+\t\"time\"\n )\n \n // MockProvider for testing registry\n@@ -27,8 +28,9 @@ func (m *MockProvider) StreamChat(ctx context.Context, req *ChatRequest, onChunk\n \n func TestRegistry(t *testing.T) {\n \tr := &Registry{\n-\t\tproviders:     make(map[string]AIProvider),\n-\t\tselectedAgent: make(map[string]string),\n+\t\tproviders:        make(map[string]AIProvider),\n+\t\tselectedAgent:    make(map[string]string),\n+\t\tselectedAgentLRU: make(map[string]time.Time),\n \t}\n \n \tp1 := &MockProvider{name: \"p1\", available: true}\n@@ -96,8 +98,9 @@ func TestRegistry(t *testing.T) {\n func TestInitializeProviders(t *testing.T) {\n \t// Reset registry for test\n \tglobalRegistry = &Registry{\n-\t\tproviders:     make(map[string]AIProvider),\n-\t\tselectedAgent: make(map[string]string),\n+\t\tproviders:        make(map[string]AIProvider),\n+\t\tselectedAgent:    make(map[string]string),\n+\t\tselectedAgentLRU: make(map[string]time.Time),\n \t}\n \tregistryOnce = sync.Once{}\n "
+    },
+    {
+      "sha": "8887a40aaeb4b42302c7e7305095a8a113e7e07e",
+      "filename": "pkg/agent/server_operations.go",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 0,
+      "changes": 13,
+      "blob_url": "https://github.com/kubestellar/console/blob/de06d2ef3abafcbef1c03d02461a7aad8d288d04/pkg%2Fagent%2Fserver_operations.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/de06d2ef3abafcbef1c03d02461a7aad8d288d04/pkg%2Fagent%2Fserver_operations.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fagent%2Fserver_operations.go?ref=de06d2ef3abafcbef1c03d02461a7aad8d288d04",
+      "patch": "@@ -412,6 +412,19 @@ func (s *Server) handleSetKey(w http.ResponseWriter, r *http.Request) {\n \t\treturn\n \t}\n \n+\t// Reject unknown provider names so typos don't create orphaned config\n+\t// entries (#10060). Prefer the server's injected registry so tests\n+\t// validate against the active provider set for this server instance.\n+\tregistry := s.registry\n+\tif registry == nil {\n+\t\tregistry = GetRegistry()\n+\t}\n+\tif _, err := registry.Get(req.Provider); err != nil {\n+\t\tw.WriteHeader(http.StatusBadRequest)\n+\t\tjson.NewEncoder(w).Encode(protocol.ErrorPayload{Code: \"unknown_provider\", Message: fmt.Sprintf(\"Provider %q is not registered\", req.Provider)})\n+\t\treturn\n+\t}\n+\n \t// At least one actionable field must be present \u2014 a request with none\n \t// is a programming bug we should reject rather than silently store\n \t// nothing. ClearBaseURL counts as actionable (it reverts the URL to"
+    },
+    {
+      "sha": "e5217316cbccf95776762b3d5dacb80c82e42902",
+      "filename": "pkg/agent/server_test.go",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/kubestellar/console/blob/de06d2ef3abafcbef1c03d02461a7aad8d288d04/pkg%2Fagent%2Fserver_test.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/de06d2ef3abafcbef1c03d02461a7aad8d288d04/pkg%2Fagent%2Fserver_test.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fagent%2Fserver_test.go?ref=de06d2ef3abafcbef1c03d02461a7aad8d288d04",
+      "patch": "@@ -431,6 +431,10 @@ func TestServer_SettingsHandlers(t *testing.T) {\n \t\tSkipKeyValidation: true,\n \t}\n \n+\t// Register a mock \"openai\" provider so the validation gate accepts it.\n+\t// Ignore \"already registered\" errors from concurrent tests.\n+\t_ = GetRegistry().Register(&ServerMockProvider{name: \"openai\"})\n+\n \t// 2. Test handleSetKey\n \treqBody := `{\"provider\":\"openai\", \"apiKey\":\"test-key\", \"model\":\"gpt-4\"}`\n \treq := httptest.NewRequest(\"POST\", \"/settings/keys\", strings.NewReader(reqBody))"
+    }
+  ]
+}

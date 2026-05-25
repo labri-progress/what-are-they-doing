@@ -1,0 +1,41 @@
+{
+  "message": "\u2728 Track chunk reload recovery success/failure in GA4 (#2162)\n\nAfter ChunkErrorBoundary auto-reloads for stale chunks, we had no\nvisibility into whether the reload actually fixed the problem.\n\nNow emits `ksc_chunk_reload_recovery` with:\n- `recovery_result`: \"success\" (app loaded after reload) or \"failed\"\n  (chunks still stale, user sees manual reload UI)\n- `recovery_latency_ms`: time from reload trigger to successful load\n- `recovery_page`: which page the user was on\n\nExtracts sessionStorage key to shared constant in chunkErrors.ts.\n\nSigned-off-by: Andrew Anderson <andy@clubanderson.com>",
+  "files": [
+    {
+      "sha": "0377b72f8c338c640deb1b1d3a672cd873c1f2d3",
+      "filename": "web/src/components/ChunkErrorBoundary.tsx",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 5,
+      "changes": 14,
+      "blob_url": "https://github.com/kubestellar/console/blob/c8abf0da3e1ab60d0b3aadfe8ba66aec3c810ca6/web%2Fsrc%2Fcomponents%2FChunkErrorBoundary.tsx",
+      "raw_url": "https://github.com/kubestellar/console/raw/c8abf0da3e1ab60d0b3aadfe8ba66aec3c810ca6/web%2Fsrc%2Fcomponents%2FChunkErrorBoundary.tsx",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fsrc%2Fcomponents%2FChunkErrorBoundary.tsx?ref=c8abf0da3e1ab60d0b3aadfe8ba66aec3c810ca6",
+      "patch": "@@ -1,8 +1,8 @@\n import { Component, type ReactNode, type ErrorInfo } from 'react'\n import { RefreshCw } from 'lucide-react'\n import i18next from 'i18next'\n-import { emitError } from '../lib/analytics'\n-import { isChunkLoadError } from '../lib/chunkErrors'\n+import { emitError, emitChunkReloadRecoveryFailed } from '../lib/analytics'\n+import { isChunkLoadError, CHUNK_RELOAD_TS_KEY } from '../lib/chunkErrors'\n \n // Reload throttle interval in milliseconds to prevent infinite reload loops\n const RELOAD_THROTTLE_MS = 30_000 // 30 seconds\n@@ -46,12 +46,16 @@ export class ChunkErrorBoundary extends Component<Props, State> {\n     emitError('chunk_load', error.message)\n \n     // Auto-reload once. Use sessionStorage to prevent infinite loops.\n-    const key = 'chunk-reload-ts'\n-    const lastReload = sessionStorage.getItem(key)\n+    const lastReload = sessionStorage.getItem(CHUNK_RELOAD_TS_KEY)\n     const now = Date.now()\n     if (!lastReload || now - parseInt(lastReload) > RELOAD_THROTTLE_MS) {\n-      sessionStorage.setItem(key, String(now))\n+      sessionStorage.setItem(CHUNK_RELOAD_TS_KEY, String(now))\n       window.location.reload()\n+    } else {\n+      // Auto-reload already happened within the throttle window but chunks\n+      // are still stale \u2014 recovery failed, user sees manual reload UI\n+      sessionStorage.removeItem(CHUNK_RELOAD_TS_KEY)\n+      emitChunkReloadRecoveryFailed(error.message)\n     }\n   }\n "
+    },
+    {
+      "sha": "7f5da770cdf6267b3c55aa25c0465dcf8567dbd7",
+      "filename": "web/src/lib/analytics.ts",
+      "status": "modified",
+      "additions": 41,
+      "deletions": 0,
+      "changes": 41,
+      "blob_url": "https://github.com/kubestellar/console/blob/c8abf0da3e1ab60d0b3aadfe8ba66aec3c810ca6/web%2Fsrc%2Flib%2Fanalytics.ts",
+      "raw_url": "https://github.com/kubestellar/console/raw/c8abf0da3e1ab60d0b3aadfe8ba66aec3c810ca6/web%2Fsrc%2Flib%2Fanalytics.ts",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fsrc%2Flib%2Fanalytics.ts?ref=c8abf0da3e1ab60d0b3aadfe8ba66aec3c810ca6",
+      "patch": "@@ -11,6 +11,7 @@\n  */\n \n import { STORAGE_KEY_ANALYTICS_OPT_OUT } from './constants'\n+import { CHUNK_RELOAD_TS_KEY } from './chunkErrors'\n import { isDemoMode } from './demoMode'\n \n // DECOY Measurement ID \u2014 the proxy rewrites this to the real ID server-side.\n@@ -557,8 +558,39 @@ export function emitError(category: string, detail: string) {\n   })\n }\n \n+/**\n+ * Check if this page load is a recovery from a chunk-load auto-reload.\n+ * If CHUNK_RELOAD_TS_KEY exists in sessionStorage, the previous page load\n+ * hit a stale chunk error and triggered window.location.reload().\n+ * Emit a recovery event with the outcome and clear the marker.\n+ */\n+function checkChunkReloadRecovery() {\n+  try {\n+    const reloadTs = sessionStorage.getItem(CHUNK_RELOAD_TS_KEY)\n+    if (!reloadTs) return\n+\n+    const reloadTime = parseInt(reloadTs)\n+    const recoveryMs = Date.now() - reloadTime\n+\n+    // Clear the marker so we don't re-emit on subsequent navigations\n+    sessionStorage.removeItem(CHUNK_RELOAD_TS_KEY)\n+\n+    // Emit recovery event \u2014 the app loaded successfully after auto-reload\n+    send('ksc_chunk_reload_recovery', {\n+      recovery_result: 'success',\n+      recovery_latency_ms: recoveryMs,\n+      recovery_page: window.location.pathname,\n+    })\n+  } catch {\n+    // sessionStorage may be unavailable in some contexts\n+  }\n+}\n+\n /** Track unhandled promise rejections and runtime errors globally */\n export function startGlobalErrorTracking() {\n+  // Check if we just recovered from a chunk-load auto-reload\n+  checkChunkReloadRecovery()\n+\n   // Re-entrancy guard: if emitError() \u2192 send() triggers another error,\n   // the global handler must NOT call emitError() again (infinite recursion \u2192 max call stack)\n   let isEmitting = false\n@@ -591,6 +623,15 @@ export function emitSessionExpired() {\n   send('ksc_session_expired')\n }\n \n+/** Emit when auto-reload failed to fix stale chunks (user sees manual reload UI) */\n+export function emitChunkReloadRecoveryFailed(errorDetail: string) {\n+  send('ksc_chunk_reload_recovery', {\n+    recovery_result: 'failed',\n+    recovery_page: window.location.pathname,\n+    error_detail: errorDetail.slice(0, ERROR_DETAIL_MAX_LEN),\n+  })\n+}\n+\n // \u2500\u2500 Tour \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n \n export function emitTourStarted() {"
+    },
+    {
+      "sha": "149c47dfc84a2e9f8c67d1050d54b52ef15325c4",
+      "filename": "web/src/lib/chunkErrors.ts",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/kubestellar/console/blob/c8abf0da3e1ab60d0b3aadfe8ba66aec3c810ca6/web%2Fsrc%2Flib%2FchunkErrors.ts",
+      "raw_url": "https://github.com/kubestellar/console/raw/c8abf0da3e1ab60d0b3aadfe8ba66aec3c810ca6/web%2Fsrc%2Flib%2FchunkErrors.ts",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fsrc%2Flib%2FchunkErrors.ts?ref=c8abf0da3e1ab60d0b3aadfe8ba66aec3c810ca6",
+      "patch": "@@ -6,6 +6,10 @@\n  * content hashing. Browsers with cached HTML still reference old\n  * chunk URLs, producing these characteristic error messages.\n  */\n+\n+/** SessionStorage key set before auto-reload, checked after to measure recovery */\n+export const CHUNK_RELOAD_TS_KEY = 'chunk-reload-ts'\n+\n export function isChunkLoadError(error: Error): boolean {\n   const msg = error.message || ''\n   return ("
+    }
+  ]
+}

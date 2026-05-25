@@ -1,0 +1,53 @@
+{
+  "message": "fix: Go backend safety \u2014 drain resp bodies, fresh buffers, deep copy cache, propagate errors (#7757)\n\nFixes #7746, #7747, #7748, #7749, #7750, #7751, #7752\n\n- #7746: Drain ArgoCD sync response body before close to prevent HTTP\n  connection pool exhaustion from partially-read bodies.\n- #7747: Reset stdout/stderr buffers when rebuilding helm upgrade command\n  with values file, preventing stale data from the old cmd leaking in.\n- #7748: Return defensive copies from operator cache so callers cannot\n  mutate the cache's backing array.\n- #7749: Log subscription fetch errors in getSubscriptionsForCluster\n  instead of silently discarding them with _ = err.\n- #7750: Log per-cluster GPU node list errors instead of silently\n  skipping, making GPU metric gaps diagnosable.\n- #7751: Add context cancellation check before starting health probes\n  in GetAllClusterHealth goroutines. Prevents goroutine leaks when the\n  global deadline fires before all probes have started.\n- #7752: Call f.Sync() on encryption key temp file before close/link\n  to ensure durability on crash.\n\nSigned-off-by: Andy Anderson <andy@clubanderson.com>",
+  "files": [
+    {
+      "sha": "0e7131a585608791ef12ea7c1ee4e1c84f687432",
+      "filename": "pkg/agent/server_http.go",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 1,
+      "changes": 7,
+      "blob_url": "https://github.com/kubestellar/console/blob/e64048ebbc0f52e213fa2f6b58744398255c7490/pkg%2Fagent%2Fserver_http.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/e64048ebbc0f52e213fa2f6b58744398255c7490/pkg%2Fagent%2Fserver_http.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fagent%2Fserver_http.go?ref=e64048ebbc0f52e213fa2f6b58744398255c7490",
+      "patch": "@@ -112,7 +112,12 @@ func (s *Server) handleGPUNodesHTTP(w http.ResponseWriter, r *http.Request) {\n \t\t\t\tclusterCtx, clusterCancel := context.WithTimeout(ctx, agentDefaultTimeout)\n \t\t\t\tdefer clusterCancel()\n \t\t\t\tnodes, err := s.k8sClient.GetGPUNodes(clusterCtx, clusterName)\n-\t\t\t\tif err == nil && len(nodes) > 0 {\n+\t\t\t\tif err != nil {\n+\t\t\t\t\t// #7750: Log per-cluster errors so GPU metric gaps are diagnosable.\n+\t\t\t\t\tslog.Warn(\"[GPUNodes] failed to list GPU nodes for cluster\", \"cluster\", clusterName, \"error\", err)\n+\t\t\t\t\treturn\n+\t\t\t\t}\n+\t\t\t\tif len(nodes) > 0 {\n \t\t\t\t\tmu.Lock()\n \t\t\t\t\tallNodes = append(allNodes, nodes...)\n \t\t\t\t\tmu.Unlock()"
+    },
+    {
+      "sha": "ddd21d1f7bc5d2ad67938bb51d5b763761d43eff",
+      "filename": "pkg/api/handlers/gitops.go",
+      "status": "modified",
+      "additions": 29,
+      "deletions": 8,
+      "changes": 37,
+      "blob_url": "https://github.com/kubestellar/console/blob/e64048ebbc0f52e213fa2f6b58744398255c7490/pkg%2Fapi%2Fhandlers%2Fgitops.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/e64048ebbc0f52e213fa2f6b58744398255c7490/pkg%2Fapi%2Fhandlers%2Fgitops.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fapi%2Fhandlers%2Fgitops.go?ref=e64048ebbc0f52e213fa2f6b58744398255c7490",
+      "patch": "@@ -7,6 +7,7 @@ import (\n \t\"crypto/tls\"\n \t\"encoding/json\"\n \t\"fmt\"\n+\t\"io\"\n \t\"log/slog\"\n \t\"net/http\"\n \t\"net/url\"\n@@ -713,9 +714,12 @@ func (h *GitOpsHandlers) getOperatorsForCluster(ctx context.Context, cluster str\n \t\t\tttl = operatorCacheEmptyTTL\n \t\t}\n \t\tif time.Since(entry.fetchedAt) < ttl {\n-\t\t\toperators := entry.operators\n+\t\t\t// #7748: Return a defensive copy so callers cannot mutate\n+\t\t\t// the cache's backing array.\n+\t\t\tresult := make([]Operator, len(entry.operators))\n+\t\t\tcopy(result, entry.operators)\n \t\t\toperatorCacheMu.RUnlock()\n-\t\t\treturn operators\n+\t\t\treturn result\n \t\t}\n \t}\n \toperatorCacheMu.RUnlock()\n@@ -772,9 +776,12 @@ func (h *GitOpsHandlers) getOperatorsForClusterWithError(ctx context.Context, cl\n \t\t\tttl = operatorCacheEmptyTTL\n \t\t}\n \t\tif time.Since(entry.fetchedAt) < ttl {\n-\t\t\toperators := entry.operators\n+\t\t\t// #7748: Return a defensive copy so callers cannot mutate\n+\t\t\t// the cache's backing array.\n+\t\t\tresult := make([]Operator, len(entry.operators))\n+\t\t\tcopy(result, entry.operators)\n \t\t\toperatorCacheMu.RUnlock()\n-\t\t\treturn operators, nil\n+\t\t\treturn result, nil\n \t\t}\n \t}\n \toperatorCacheMu.RUnlock()\n@@ -1040,9 +1047,14 @@ func (h *GitOpsHandlers) getSubscriptionsForClusterWithError(ctx context.Context\n \treturn subs, nil\n }\n \n-// getSubscriptionsForCluster gets OLM subscriptions for a specific cluster using jsonpath\n+// getSubscriptionsForCluster gets OLM subscriptions for a specific cluster using jsonpath.\n+// #7749: Errors are logged instead of silently discarded so cluster failures\n+// are distinguishable from empty results in server logs.\n func (h *GitOpsHandlers) getSubscriptionsForCluster(ctx context.Context, cluster string) []OperatorSubscription {\n-\tsubs, _ := h.fetchSubscriptionsFromCluster(ctx, cluster)\n+\tsubs, err := h.fetchSubscriptionsFromCluster(ctx, cluster)\n+\tif err != nil {\n+\t\tslog.Warn(\"[GitOps] subscription fetch failed for cluster\", \"cluster\", cluster, \"error\", err)\n+\t}\n \treturn subs\n }\n \n@@ -2328,8 +2340,12 @@ func (h *GitOpsHandlers) UpgradeHelmRelease(c *fiber.Ctx) error {\n \t\ttmpFile.Close()\n \n \t\targs = append(args, \"-f\", tmpFile.Name())\n-\t\t// Rebuild command with values file\n+\t\t// Rebuild command with values file.\n+\t\t// #7747: Create fresh buffers \u2014 the previous stdout/stderr were\n+\t\t// assigned to the old cmd instance and must not be reused.\n \t\tcmd = exec.CommandContext(ctx, \"helm\", args...)\n+\t\tstdout.Reset()\n+\t\tstderr.Reset()\n \t\tcmd.Stdout = &stdout\n \t\tcmd.Stderr = &stderr\n \t}\n@@ -2587,7 +2603,12 @@ func (h *GitOpsHandlers) TriggerArgoSync(c *fiber.Ctx) error {\n \t\t\t\t}\n \t\t\t\tresp, err := client.Do(httpReq)\n \t\t\t\tif err == nil {\n-\t\t\t\t\tdefer resp.Body.Close()\n+\t\t\t\t\t// #7746: Drain the response body before closing to avoid\n+\t\t\t\t\t// HTTP connection pool exhaustion from partially-read bodies.\n+\t\t\t\t\tdefer func() {\n+\t\t\t\t\t\t_, _ = io.Copy(io.Discard, resp.Body)\n+\t\t\t\t\t\tresp.Body.Close()\n+\t\t\t\t\t}()\n \t\t\t\t\tif resp.StatusCode >= 200 && resp.StatusCode < 300 {\n \t\t\t\t\t\treturn c.JSON(fiber.Map{\n \t\t\t\t\t\t\t\"success\": true,"
+    },
+    {
+      "sha": "33e562931897b915719cbb02d5ecfd622ff55c08",
+      "filename": "pkg/k8s/client_health.go",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 0,
+      "changes": 9,
+      "blob_url": "https://github.com/kubestellar/console/blob/e64048ebbc0f52e213fa2f6b58744398255c7490/pkg%2Fk8s%2Fclient_health.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/e64048ebbc0f52e213fa2f6b58744398255c7490/pkg%2Fk8s%2Fclient_health.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fk8s%2Fclient_health.go?ref=e64048ebbc0f52e213fa2f6b58744398255c7490",
+      "patch": "@@ -395,6 +395,15 @@ func (m *MultiClusterClient) GetAllClusterHealth(ctx context.Context) ([]Cluster\n \t\twg.Add(1)\n \t\tgo func(idx int, c ClusterInfo) {\n \t\t\tdefer wg.Done()\n+\t\t\t// #7751: Check for context cancellation before starting an\n+\t\t\t// expensive health probe. Without this, goroutines that haven't\n+\t\t\t// begun probing yet still launch full k8s API calls even after\n+\t\t\t// the global deadline fires, leaking until the probe completes.\n+\t\t\tselect {\n+\t\t\tcase <-deadlineCtx.Done():\n+\t\t\t\treturn\n+\t\t\tdefault:\n+\t\t\t}\n \t\t\tperCtx, perCancel := context.WithTimeout(deadlineCtx, perClusterHealthTimeout)\n \t\t\tdefer perCancel()\n \t\t\thealth, _ := m.GetClusterHealth(perCtx, c.Name)"
+    },
+    {
+      "sha": "2b18c447df3f936df10def0f2e60ca5b69c71763",
+      "filename": "pkg/settings/crypto.go",
+      "status": "modified",
+      "additions": 8,
+      "deletions": 0,
+      "changes": 8,
+      "blob_url": "https://github.com/kubestellar/console/blob/e64048ebbc0f52e213fa2f6b58744398255c7490/pkg%2Fsettings%2Fcrypto.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/e64048ebbc0f52e213fa2f6b58744398255c7490/pkg%2Fsettings%2Fcrypto.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fsettings%2Fcrypto.go?ref=e64048ebbc0f52e213fa2f6b58744398255c7490",
+      "patch": "@@ -64,6 +64,14 @@ func ensureKeyFile(path string) ([]byte, error) {\n \t\tos.Remove(tmpPath)\n \t\treturn nil, fmt.Errorf(\"failed to chmod temp keyfile %s: %w\", tmpPath, chmodErr)\n \t}\n+\t// #7752: fsync before close/link so the key data is durable on disk.\n+\t// Without this, a crash between write and link could leave a zero-length\n+\t// or corrupt key file that breaks all encrypted settings on next start.\n+\tif syncErr := tmpFile.Sync(); syncErr != nil {\n+\t\ttmpFile.Close()\n+\t\tos.Remove(tmpPath)\n+\t\treturn nil, fmt.Errorf(\"failed to fsync temp keyfile %s: %w\", tmpPath, syncErr)\n+\t}\n \ttmpFile.Close()\n \n \t// Use os.Link + os.Remove for atomic creation (fails if target already exists on most filesystems)."
+    }
+  ]
+}

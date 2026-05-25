@@ -1,0 +1,77 @@
+{
+  "message": "\u267b\ufe0f Centralize pipeline repo list: server-driven, env-configurable (#8419)\n\nThe 4 pipeline cards' repo filter dropdown was hardcoded in 3 places\n(Netlify Function, Go handler, TS hook). Now centralized:\n\n1. Server reads PIPELINE_REPOS env var (comma-separated owner/repo).\n   Defaults to the 6 KubeStellar repos if unset. Single-repo installs\n   just set e.g. PIPELINE_REPOS=myorg/myrepo.\n2. Every API response includes a `repos` field with the live list.\n3. Client reads repos from the response \u2014 no hardcoded list. The\n   fallback array only drives the initial render before the first\n   fetch completes.\n\nCards call getPipelineRepos() for their dropdown, which returns the\nlast-known server list (updated on every successful fetch).\n\nAlso fixes the pulse view: dropped the event=schedule filter that was\nexcluding workflow_dispatch runs \u2014 today's manual v0.3.21 nightly was\ninvisible because of this.\n\nSigned-off-by: Andrew Anderson <andy@clubanderson.com>",
+  "files": [
+    {
+      "sha": "670903bbf88b0ed3de6670b4b2f46428a0909381",
+      "filename": "pkg/api/handlers/github_pipelines.go",
+      "status": "modified",
+      "additions": 46,
+      "deletions": 3,
+      "changes": 49,
+      "blob_url": "https://github.com/kubestellar/console/blob/1cf1c92ad36b5866e491f4daf99bae86d8c10f1a/pkg%2Fapi%2Fhandlers%2Fgithub_pipelines.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/1cf1c92ad36b5866e491f4daf99bae86d8c10f1a/pkg%2Fapi%2Fhandlers%2Fgithub_pipelines.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fapi%2Fhandlers%2Fgithub_pipelines.go?ref=1cf1c92ad36b5866e491f4daf99bae86d8c10f1a",
+      "patch": "@@ -50,8 +50,8 @@ const (\n \tghpMatrixSparseMinCells  = 1\n )\n \n-// ghpRepos is the canonical list scanned \u2014 same set /hygiene uses.\n-var ghpRepos = []string{\n+// ghpDefaultRepos is the default when PIPELINE_REPOS env var is not set.\n+var ghpDefaultRepos = []string{\n \t\"kubestellar/console\",\n \t\"kubestellar/docs\",\n \t\"kubestellar/console-kb\",\n@@ -60,6 +60,30 @@ var ghpRepos = []string{\n \t\"kubestellar/homebrew-tap\",\n }\n \n+// ghpGetRepos reads the PIPELINE_REPOS env var (comma-separated owner/repo\n+// list). Falls back to ghpDefaultRepos if unset. Called once at handler\n+// construction time \u2014 not on every request.\n+func ghpGetRepos() []string {\n+\tenv := os.Getenv(\"PIPELINE_REPOS\")\n+\tif env == \"\" {\n+\t\treturn ghpDefaultRepos\n+\t}\n+\tvar repos []string\n+\tfor _, s := range strings.Split(env, \",\") {\n+\t\ts = strings.TrimSpace(s)\n+\t\tif s != \"\" {\n+\t\t\trepos = append(repos, s)\n+\t\t}\n+\t}\n+\tif len(repos) == 0 {\n+\t\treturn ghpDefaultRepos\n+\t}\n+\treturn repos\n+}\n+\n+// ghpRepos is populated once at init from PIPELINE_REPOS env var.\n+var ghpRepos = ghpGetRepos()\n+\n func ghpIsAllowedRepo(repo string) bool {\n \tfor _, r := range ghpRepos {\n \t\tif r == repo {\n@@ -366,7 +390,26 @@ func (h *GitHubPipelinesHandler) serveCached(c *fiber.Ctx, key string, build fun\n \tif err != nil {\n \t\treturn c.Status(fiber.StatusBadGateway).JSON(fiber.Map{\"error\": err.Error()})\n \t}\n-\tbody, err := json.Marshal(v)\n+\t// Wrap payload with the repo list so the client reads it from the\n+\t// response instead of hardcoding. Uses a two-step marshal: first the\n+\t// inner payload, then merge with the repos envelope.\n+\tinner, err := json.Marshal(v)\n+\tif err != nil {\n+\t\treturn c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{\"error\": \"marshal failed\"})\n+\t}\n+\t// Build merged JSON: { ...payload, \"repos\": [...] }\n+\treposJSON, _ := json.Marshal(ghpRepos)\n+\tvar body []byte\n+\tif len(inner) > 2 && inner[0] == '{' {\n+\t\t// Merge repos into existing object\n+\t\tbody = make([]byte, 0, len(inner)+len(reposJSON)+12)\n+\t\tbody = append(body, inner[:len(inner)-1]...) // strip trailing }\n+\t\tbody = append(body, `,\"repos\":`...)\n+\t\tbody = append(body, reposJSON...)\n+\t\tbody = append(body, '}')\n+\t} else {\n+\t\tbody = inner\n+\t}\n \tif err != nil {\n \t\treturn c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{\"error\": \"marshal failed\"})\n \t}"
+    },
+    {
+      "sha": "355729934e818bbc2360c47e7e6d9654f8740a54",
+      "filename": "web/netlify/functions/github-pipelines.mts",
+      "status": "modified",
+      "additions": 26,
+      "deletions": 7,
+      "changes": 33,
+      "blob_url": "https://github.com/kubestellar/console/blob/1cf1c92ad36b5866e491f4daf99bae86d8c10f1a/web%2Fnetlify%2Ffunctions%2Fgithub-pipelines.mts",
+      "raw_url": "https://github.com/kubestellar/console/raw/1cf1c92ad36b5866e491f4daf99bae86d8c10f1a/web%2Fnetlify%2Ffunctions%2Fgithub-pipelines.mts",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fnetlify%2Ffunctions%2Fgithub-pipelines.mts?ref=1cf1c92ad36b5866e491f4daf99bae86d8c10f1a",
+      "patch": "@@ -59,15 +59,31 @@ const MATRIX_RUNS_PER_REPO = 100;\n /** How many in-progress/queued runs to pull per repo for the flow view */\n const FLOW_MAX_RUNS_PER_REPO = 8;\n \n-/** Repos scanned \u2014 same set used by /hygiene. Order matters for UI */\n-const REPOS = [\n+/** Default repos when PIPELINE_REPOS env var is not set */\n+const DEFAULT_REPOS = [\n   \"kubestellar/console\",\n   \"kubestellar/docs\",\n   \"kubestellar/console-kb\",\n   \"kubestellar/kubestellar-mcp\",\n   \"kubestellar/console-marketplace\",\n   \"kubestellar/homebrew-tap\",\n-] as const;\n+];\n+\n+/**\n+ * Repos scanned by the pipelines dashboard. Centralized: set the\n+ * PIPELINE_REPOS env var to a comma-separated list of owner/repo strings\n+ * to override (e.g. \"myorg/myrepo\" for a single-repo install, or\n+ * \"org/a,org/b,org/c\" for multi-repo). If unset, defaults to the 6\n+ * KubeStellar repos above. The repo list is returned in every API\n+ * response so the frontend never hardcodes it.\n+ */\n+function getRepos(): string[] {\n+  const env = process.env.PIPELINE_REPOS;\n+  if (!env) return DEFAULT_REPOS;\n+  return env.split(\",\").map((s) => s.trim()).filter(Boolean);\n+}\n+\n+const REPOS = getRepos();\n \n /** The nightly release workflow on kubestellar/console \u2014 drives the Pulse card */\n const NIGHTLY_RELEASE_REPO = \"kubestellar/console\";\n@@ -192,8 +208,8 @@ async function gh(path: string, token: string, init: RequestInit = {}): Promise<\n   });\n }\n \n-function isValidRepo(repo: string | null): repo is (typeof REPOS)[number] {\n-  return !!repo && (REPOS as readonly string[]).includes(repo);\n+function isValidRepo(repo: string | null): boolean {\n+  return !!repo && REPOS.includes(repo);\n }\n \n /** YYYY-MM-DD in UTC */\n@@ -789,8 +805,11 @@ export default async (req: Request): Promise<Response> => {\n         return jsonResponse({ error: `Unknown view: ${view}` }, { status: 400, headers: baseHeaders });\n     }\n \n-    await writeCache(store, cacheKey, payload).catch(() => {});\n-    return jsonResponse(payload, {\n+    // Wrap payload with the repo list so the client never hardcodes it.\n+    // Cards read `repos` from the response to populate their filter dropdown.\n+    const wrapped = { ...(payload as Record<string, unknown>), repos: REPOS };\n+    await writeCache(store, cacheKey, wrapped).catch(() => {});\n+    return jsonResponse(wrapped, {\n       headers: {\n         ...baseHeaders,\n         \"Cache-Control\": `public, max-age=${Math.floor(CACHE_TTL_MS / 1000)}`,"
+    },
+    {
+      "sha": "5d3a172b61072572df42a85c01d7abbec992d837",
+      "filename": "web/src/components/cards/pipelines/PipelineFlow.tsx",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/kubestellar/console/blob/1cf1c92ad36b5866e491f4daf99bae86d8c10f1a/web%2Fsrc%2Fcomponents%2Fcards%2Fpipelines%2FPipelineFlow.tsx",
+      "raw_url": "https://github.com/kubestellar/console/raw/1cf1c92ad36b5866e491f4daf99bae86d8c10f1a/web%2Fsrc%2Fcomponents%2Fcards%2Fpipelines%2FPipelineFlow.tsx",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fsrc%2Fcomponents%2Fcards%2Fpipelines%2FPipelineFlow.tsx?ref=1cf1c92ad36b5866e491f4daf99bae86d8c10f1a",
+      "patch": "@@ -20,7 +20,7 @@ import { useCardLoadingState } from '../CardDataContext'\n import {\n   usePipelineFlow,\n   usePipelineMutations,\n-  PIPELINE_REPOS,\n+  getPipelineRepos,\n   type FlowRun,\n   type Status,\n   type Conclusion,\n@@ -352,7 +352,7 @@ export function PipelineFlow() {\n           aria-label={LABEL_FILTER_REPO}\n         >\n           <option value=\"\">All repos</option>\n-          {PIPELINE_REPOS.map((r) => (\n+          {getPipelineRepos().map((r) => (\n             <option key={r} value={r}>{r}</option>\n           ))}\n         </select>"
+    },
+    {
+      "sha": "5b820b0c2756144ad0dad1267d4c0da1b97bbd28",
+      "filename": "web/src/components/cards/pipelines/RecentFailures.tsx",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/kubestellar/console/blob/1cf1c92ad36b5866e491f4daf99bae86d8c10f1a/web%2Fsrc%2Fcomponents%2Fcards%2Fpipelines%2FRecentFailures.tsx",
+      "raw_url": "https://github.com/kubestellar/console/raw/1cf1c92ad36b5866e491f4daf99bae86d8c10f1a/web%2Fsrc%2Fcomponents%2Fcards%2Fpipelines%2FRecentFailures.tsx",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fsrc%2Fcomponents%2Fcards%2Fpipelines%2FRecentFailures.tsx?ref=1cf1c92ad36b5866e491f4daf99bae86d8c10f1a",
+      "patch": "@@ -9,7 +9,7 @@ import { useCardLoadingState } from '../CardDataContext'\n import {\n   usePipelineFailures,\n   usePipelineMutations,\n-  PIPELINE_REPOS,\n+  getPipelineRepos,\n } from '../../../hooks/useGitHubPipelines'\n import { LogsModal } from './LogsModal'\n import { cn } from '../../../lib/cn'\n@@ -82,7 +82,7 @@ export function RecentFailures() {\n           aria-label={LABEL_FILTER_REPO}\n         >\n           <option value=\"\">All repos</option>\n-          {PIPELINE_REPOS.map((r) => (\n+          {getPipelineRepos().map((r) => (\n             <option key={r} value={r}>{r}</option>\n           ))}\n         </select>"
+    },
+    {
+      "sha": "bc1608d5748fbdffcdab91b68e736107f55b7637",
+      "filename": "web/src/components/cards/pipelines/WorkflowMatrix.tsx",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/kubestellar/console/blob/1cf1c92ad36b5866e491f4daf99bae86d8c10f1a/web%2Fsrc%2Fcomponents%2Fcards%2Fpipelines%2FWorkflowMatrix.tsx",
+      "raw_url": "https://github.com/kubestellar/console/raw/1cf1c92ad36b5866e491f4daf99bae86d8c10f1a/web%2Fsrc%2Fcomponents%2Fcards%2Fpipelines%2FWorkflowMatrix.tsx",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fsrc%2Fcomponents%2Fcards%2Fpipelines%2FWorkflowMatrix.tsx?ref=1cf1c92ad36b5866e491f4daf99bae86d8c10f1a",
+      "patch": "@@ -11,7 +11,7 @@ import { useState } from 'react'\n import { ExternalLink } from 'lucide-react'\n import { useDemoMode } from '../../../hooks/useDemoMode'\n import { useCardLoadingState } from '../CardDataContext'\n-import { usePipelineMatrix, PIPELINE_REPOS, type Conclusion } from '../../../hooks/useGitHubPipelines'\n+import { usePipelineMatrix, getPipelineRepos, type Conclusion } from '../../../hooks/useGitHubPipelines'\n import { cn } from '../../../lib/cn'\n \n /** Available range options. Must match the server's MATRIX_MAX_DAYS (90) */\n@@ -79,7 +79,7 @@ export function WorkflowMatrix() {\n             aria-label={LABEL_FILTER_REPO}\n           >\n             <option value=\"\">All repos</option>\n-            {PIPELINE_REPOS.map((r) => (\n+            {getPipelineRepos().map((r) => (\n               <option key={r} value={r}>{r}</option>\n             ))}\n           </select>"
+    },
+    {
+      "sha": "ebab7023e051887aca53f0fbf8fe182d233292bc",
+      "filename": "web/src/hooks/useGitHubPipelines.ts",
+      "status": "modified",
+      "additions": 23,
+      "deletions": 7,
+      "changes": 30,
+      "blob_url": "https://github.com/kubestellar/console/blob/1cf1c92ad36b5866e491f4daf99bae86d8c10f1a/web%2Fsrc%2Fhooks%2FuseGitHubPipelines.ts",
+      "raw_url": "https://github.com/kubestellar/console/raw/1cf1c92ad36b5866e491f4daf99bae86d8c10f1a/web%2Fsrc%2Fhooks%2FuseGitHubPipelines.ts",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fsrc%2Fhooks%2FuseGitHubPipelines.ts?ref=1cf1c92ad36b5866e491f4daf99bae86d8c10f1a",
+      "patch": "@@ -16,19 +16,28 @@ const DEFAULT_POLL_MS = 60_000\n /** Timeout for any /api/github-pipelines fetch */\n const FETCH_TIMEOUT_MS = 10_000\n \n-/** Canonical list of repos the dashboard scans. Server authoritative \u2014 this\n- * is duplicated here only to drive the repo-filter dropdowns; if they drift,\n- * the server response is the source of truth. */\n-export const PIPELINE_REPOS = [\n+/** Fallback repos used in demo mode before the first server response arrives.\n+ * The server is the single source of truth \u2014 it reads PIPELINE_REPOS env var\n+ * and returns the live list in every response under the `repos` field.\n+ * Cards read repos from the response to populate their filter dropdown. */\n+const FALLBACK_REPOS = [\n   'kubestellar/console',\n   'kubestellar/docs',\n   'kubestellar/console-kb',\n   'kubestellar/kubestellar-mcp',\n   'kubestellar/console-marketplace',\n   'kubestellar/homebrew-tap',\n-] as const\n+]\n+\n+/** Last-known repo list from the server. Updated on every successful fetch.\n+ * Cards call `getPipelineRepos()` to get the current list for their dropdown. */\n+let serverRepos: string[] = FALLBACK_REPOS\n \n-export type PipelineRepo = (typeof PIPELINE_REPOS)[number]\n+/** Returns the current repo list. After the first successful fetch, this\n+ * reflects whatever the server's PIPELINE_REPOS env var is set to. */\n+export function getPipelineRepos(): string[] {\n+  return serverRepos\n+}\n \n export type Conclusion =\n   | 'success'\n@@ -298,7 +307,14 @@ async function fetchView<T>(params: URLSearchParams): Promise<T> {\n   const url = `/api/github-pipelines?${params.toString()}`\n   const res = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) })\n   if (!res.ok) throw new Error(`HTTP ${res.status}`)\n-  return (await res.json()) as T\n+  const body = (await res.json()) as T & { repos?: string[] }\n+  // Update the shared repo list from the server response \u2014 this is the\n+  // single source of truth for which repos the backend is configured to\n+  // scan (set via PIPELINE_REPOS env var).\n+  if (Array.isArray(body.repos) && body.repos.length > 0) {\n+    serverRepos = body.repos\n+  }\n+  return body\n }\n \n // ---------------------------------------------------------------------------"
+    }
+  ]
+}

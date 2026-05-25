@@ -1,0 +1,65 @@
+{
+  "message": "\ud83d\udc1b Fix 5 backend robustness issues (#4281, #4280, #4265, #4263, #4262) (#4328)\n\n- Use strings.EqualFold for WebSocket Upgrade header comparison (#4281)\n- Add non-blocking send on ping to prevent reader loop deadlock (#4280)\n- Log errors from fallback ListClusters in prediction worker (#4265)\n- Generate UUID session ID when client omits one to prevent key collision (#4263)\n- Check os.Rename/os.Chmod errors during binary auto-update with rollback (#4262)\n\nSigned-off-by: Andrew Anderson <andy@clubanderson.com>",
+  "files": [
+    {
+      "sha": "9eb3f938546df89b2a1edf7d6e4391f0d63f5e1e",
+      "filename": "pkg/agent/prediction_worker.go",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 1,
+      "changes": 6,
+      "blob_url": "https://github.com/kubestellar/console/blob/30c7a96405f3a854833f00e253570371645c0367/pkg%2Fagent%2Fprediction_worker.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/30c7a96405f3a854833f00e253570371645c0367/pkg%2Fagent%2Fprediction_worker.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fagent%2Fprediction_worker.go?ref=30c7a96405f3a854833f00e253570371645c0367",
+      "patch": "@@ -427,7 +427,11 @@ func (w *PredictionWorker) gatherClusterData(ctx context.Context) (*ClusterAnaly\n \n \t// Get GPU nodes from healthy clusters only\n \tif clusters == nil {\n-\t\tclusters, _ = w.k8sClient.ListClusters(ctx)\n+\t\tvar fallbackErr error\n+\t\tclusters, fallbackErr = w.k8sClient.ListClusters(ctx)\n+\t\tif fallbackErr != nil {\n+\t\t\tlog.Printf(\"[PredictionWorker] Fallback ListClusters for GPU nodes failed: %v\", fallbackErr)\n+\t\t}\n \t}\n \tfor _, cluster := range clusters {\n \t\tif !healthyClusterSet[cluster.Name] {"
+    },
+    {
+      "sha": "c788d3c4d655937dd94a627bfa2eaae706906e36",
+      "filename": "pkg/agent/server.go",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 0,
+      "changes": 13,
+      "blob_url": "https://github.com/kubestellar/console/blob/30c7a96405f3a854833f00e253570371645c0367/pkg%2Fagent%2Fserver.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/30c7a96405f3a854833f00e253570371645c0367/pkg%2Fagent%2Fserver.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fagent%2Fserver.go?ref=30c7a96405f3a854833f00e253570371645c0367",
+      "patch": "@@ -15,6 +15,7 @@ import (\n \t\"sync/atomic\"\n \t\"time\"\n \n+\t\"github.com/google/uuid\"\n \t\"github.com/gorilla/websocket\"\n \t\"github.com/kubestellar/console/pkg/agent/protocol\"\n \t\"github.com/kubestellar/console/pkg/k8s\"\n@@ -2508,6 +2509,12 @@ func (s *Server) handleChatMessageStreaming(conn *websocket.Conn, msg protocol.M\n \t\treturn\n \t}\n \n+\t// Generate a unique session ID when the client omits one so that\n+\t// concurrent anonymous chats do not collide in activeChatCtxs (#4263).\n+\tif req.SessionID == \"\" {\n+\t\treq.SessionID = uuid.New().String()\n+\t}\n+\n \t// Create a context with both cancel and timeout so that:\n \t//   1. cancel_chat messages can stop this session immediately, and\n \t//   2. a hard deadline prevents missions from running forever when the\n@@ -2864,6 +2871,12 @@ func (s *Server) handleChatMessage(msg protocol.Message, forceAgent string) prot\n \t\treturn s.errorResponse(msg.ID, \"empty_prompt\", \"Prompt cannot be empty\")\n \t}\n \n+\t// Generate a unique session ID when the client omits one so that\n+\t// concurrent anonymous chats do not collide (#4263).\n+\tif req.SessionID == \"\" {\n+\t\treq.SessionID = uuid.New().String()\n+\t}\n+\n \t// Determine which agent to use\n \tagentName := req.Agent\n \tif forceAgent != \"\" {"
+    },
+    {
+      "sha": "638c53839c1b4fb52c8f3092c7ce0ace3a710ca5",
+      "filename": "pkg/agent/update_checker.go",
+      "status": "modified",
+      "additions": 35,
+      "deletions": 4,
+      "changes": 39,
+      "blob_url": "https://github.com/kubestellar/console/blob/30c7a96405f3a854833f00e253570371645c0367/pkg%2Fagent%2Fupdate_checker.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/30c7a96405f3a854833f00e253570371645c0367/pkg%2Fagent%2Fupdate_checker.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fagent%2Fupdate_checker.go?ref=30c7a96405f3a854833f00e253570371645c0367",
+      "patch": "@@ -735,11 +735,42 @@ func (uc *UpdateChecker) executeBinaryUpdate(release *githubReleaseInfo) {\n \t}\n \n \t// Backup current binary\n-\tos.Rename(consolePath, consolePath+\".backup\")\n+\tif err := os.Rename(consolePath, consolePath+\".backup\"); err != nil {\n+\t\tuc.recordError(fmt.Sprintf(\"backup rename failed: %v\", err))\n+\t\tuc.broadcast(\"update_progress\", UpdateProgressPayload{\n+\t\t\tStatus:  \"failed\",\n+\t\t\tMessage: \"Failed to back up current binary\",\n+\t\t\tError:   err.Error(),\n+\t\t})\n+\t\treturn\n+\t}\n \n-\t// Replace\n-\tos.Rename(stagingDir+\"/console\", consolePath)\n-\tos.Chmod(consolePath, 0755)\n+\t// Replace with new binary\n+\tif err := os.Rename(stagingDir+\"/console\", consolePath); err != nil {\n+\t\t// Attempt to restore the backup before returning\n+\t\tos.Rename(consolePath+\".backup\", consolePath) //nolint:errcheck\n+\t\tuc.recordError(fmt.Sprintf(\"replace rename failed: %v\", err))\n+\t\tuc.broadcast(\"update_progress\", UpdateProgressPayload{\n+\t\t\tStatus:  \"failed\",\n+\t\t\tMessage: \"Failed to install new binary, rolled back\",\n+\t\t\tError:   err.Error(),\n+\t\t})\n+\t\treturn\n+\t}\n+\n+\t// fileModeBinary is the permission bits for the installed console binary.\n+\tconst fileModeBinary = 0755\n+\tif err := os.Chmod(consolePath, fileModeBinary); err != nil {\n+\t\t// Attempt to restore the backup before returning\n+\t\tos.Rename(consolePath+\".backup\", consolePath) //nolint:errcheck\n+\t\tuc.recordError(fmt.Sprintf(\"chmod failed: %v\", err))\n+\t\tuc.broadcast(\"update_progress\", UpdateProgressPayload{\n+\t\t\tStatus:  \"failed\",\n+\t\t\tMessage: \"Failed to set binary permissions, rolled back\",\n+\t\t\tError:   err.Error(),\n+\t\t})\n+\t\treturn\n+\t}\n \n \tuc.broadcast(\"update_progress\", UpdateProgressPayload{\n \t\tStatus:   \"restarting\","
+    },
+    {
+      "sha": "3720e403da40bc0ca684ce48577eda26154dd70b",
+      "filename": "pkg/api/handlers/websocket.go",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 1,
+      "changes": 6,
+      "blob_url": "https://github.com/kubestellar/console/blob/30c7a96405f3a854833f00e253570371645c0367/pkg%2Fapi%2Fhandlers%2Fwebsocket.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/30c7a96405f3a854833f00e253570371645c0367/pkg%2Fapi%2Fhandlers%2Fwebsocket.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fapi%2Fhandlers%2Fwebsocket.go?ref=30c7a96405f3a854833f00e253570371645c0367",
+      "patch": "@@ -373,7 +373,11 @@ func (h *Hub) HandleConnection(conn *websocket.Conn) {\n \n \t\tswitch msg.Type {\n \t\tcase \"ping\":\n-\t\t\tclient.send <- []byte(`{\"type\":\"pong\"}`)\n+\t\t\tselect {\n+\t\t\tcase client.send <- []byte(`{\"type\":\"pong\"}`):\n+\t\t\tdefault:\n+\t\t\t\tlog.Printf(\"[WebSocket] Dropping pong for client %s: send channel full\", client.userID)\n+\t\t\t}\n \t\t}\n \t}\n }"
+    },
+    {
+      "sha": "d8e39eea09770a9c641f2f0244916fdb1901dd26",
+      "filename": "pkg/api/middleware/auth.go",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/kubestellar/console/blob/30c7a96405f3a854833f00e253570371645c0367/pkg%2Fapi%2Fmiddleware%2Fauth.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/30c7a96405f3a854833f00e253570371645c0367/pkg%2Fapi%2Fmiddleware%2Fauth.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fapi%2Fmiddleware%2Fauth.go?ref=30c7a96405f3a854833f00e253570371645c0367",
+      "patch": "@@ -250,7 +250,7 @@ func GetGitHubLogin(c *fiber.Ctx) string {\n // WebSocketUpgrade handles WebSocket upgrade\n func WebSocketUpgrade() fiber.Handler {\n \treturn func(c *fiber.Ctx) error {\n-\t\tif c.Get(\"Upgrade\") != \"websocket\" {\n+\t\tif !strings.EqualFold(c.Get(\"Upgrade\"), \"websocket\") {\n \t\t\treturn fiber.ErrUpgradeRequired\n \t\t}\n \t\treturn c.Next()"
+    }
+  ]
+}

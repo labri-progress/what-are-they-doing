@@ -1,0 +1,89 @@
+{
+  "message": "Add multi-backend support with dynamic rate-limit switching\n\n- agent-launch.sh: unified launcher abstracting claude/copilot CLIs\n- kick-agents.sh: auto-switch to fallback backend on rate limit,\n  capture handoff state for session continuity, switch back after reset\n- All .env files: use AGENT_BACKEND/AGENT_FALLBACK_BACKEND/AGENT_MODEL\n  with agent-launch.sh instead of hardcoded claude-dev commands\n\nSigned-off-by: Andy Anderson <andy@clubanderson.com>",
+  "files": [
+    {
+      "sha": "e1e1d591f833cb10e6230bf535ded3b601b1574a",
+      "filename": "bin/agent-launch.sh",
+      "status": "added",
+      "additions": 72,
+      "deletions": 0,
+      "changes": 72,
+      "blob_url": "https://github.com/kubestellar/hive/blob/ce230e96b8b4c7b494cfb699cdc473cb33b80860/bin%2Fagent-launch.sh",
+      "raw_url": "https://github.com/kubestellar/hive/raw/ce230e96b8b4c7b494cfb699cdc473cb33b80860/bin%2Fagent-launch.sh",
+      "contents_url": "https://api.github.com/repos/kubestellar/hive/contents/bin%2Fagent-launch.sh?ref=ce230e96b8b4c7b494cfb699cdc473cb33b80860",
+      "patch": "@@ -0,0 +1,72 @@\n+#!/bin/bash\n+# agent-launch.sh \u2014 Unified launcher for any AI coding CLI backend.\n+#\n+# Supported backends: claude, copilot (add more in the case block below)\n+#\n+# Usage (in .env files):\n+#   AGENT_LAUNCH_CMD=\"agent-launch.sh --backend copilot --model claude-opus-4.6\"\n+#   AGENT_LAUNCH_CMD=\"agent-launch.sh --backend claude --model claude-opus-4-6\"\n+#\n+# Or override with env vars:\n+#   AGENT_BACKEND=copilot AGENT_MODEL=claude-opus-4.6 agent-launch.sh\n+#\n+# Adding a new backend:\n+#   1. Add a case block below with CMD, PERM_FLAG, MODEL_FLAG\n+#   2. Add idle prompt pattern to BACKENDS.md\n+#   3. Update kick-agents.sh session_idle() if prompt differs\n+\n+set -euo pipefail\n+\n+BACKEND=\"${AGENT_BACKEND:-claude}\"\n+MODEL=\"${AGENT_MODEL:-}\"\n+EXTRA_ARGS=()\n+\n+while [[ $# -gt 0 ]]; do\n+  case \"$1\" in\n+    --backend)  BACKEND=\"$2\"; shift 2 ;;\n+    --model)    MODEL=\"$2\"; shift 2 ;;\n+    *)          EXTRA_ARGS+=(\"$1\"); shift ;;\n+  esac\n+done\n+\n+# \u2500\u2500 Backend definitions \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n+# To add a new backend:\n+#   CMD          = binary name or path\n+#   PERM_FLAG    = flag to bypass all permission prompts\n+#   MODEL_FLAG   = flag to select model (empty if backend doesn't support it)\n+#   RENAME_CMD   = slash command to rename session (empty if unsupported)\n+#   IDLE_PROMPT  = regex for idle detection (used by kick-agents.sh)\n+\n+case \"$BACKEND\" in\n+  claude)\n+    CMD=\"claude\"\n+    PERM_FLAG=\"--dangerously-skip-permissions\"\n+    MODEL_FLAG=\"--model\"\n+    ;;\n+  copilot)\n+    CMD=\"copilot\"\n+    PERM_FLAG=\"--allow-all\"\n+    MODEL_FLAG=\"--model\"\n+    ;;\n+  # \u2500\u2500 Add new backends here \u2500\u2500\n+  # aider)\n+  #   CMD=\"aider\"\n+  #   PERM_FLAG=\"--yes\"\n+  #   MODEL_FLAG=\"--model\"\n+  #   ;;\n+  *)\n+    echo \"Unknown backend: $BACKEND\" >&2\n+    echo \"Supported: claude, copilot\" >&2\n+    exit 1\n+    ;;\n+esac\n+\n+FULL_CMD=(\"$CMD\" \"$PERM_FLAG\")\n+if [[ -n \"$MODEL\" ]]; then\n+  FULL_CMD+=(\"$MODEL_FLAG\" \"$MODEL\")\n+fi\n+if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then\n+  FULL_CMD+=(\"${EXTRA_ARGS[@]}\")\n+fi\n+\n+exec \"${FULL_CMD[@]}\""
+    },
+    {
+      "sha": "af53a8d69f10fa1e9b8210669e10fe3ea4c0126c",
+      "filename": "bin/kick-agents.sh",
+      "status": "modified",
+      "additions": 137,
+      "deletions": 13,
+      "changes": 150,
+      "blob_url": "https://github.com/kubestellar/hive/blob/ce230e96b8b4c7b494cfb699cdc473cb33b80860/bin%2Fkick-agents.sh",
+      "raw_url": "https://github.com/kubestellar/hive/raw/ce230e96b8b4c7b494cfb699cdc473cb33b80860/bin%2Fkick-agents.sh",
+      "contents_url": "https://api.github.com/repos/kubestellar/hive/contents/bin%2Fkick-agents.sh?ref=ce230e96b8b4c7b494cfb699cdc473cb33b80860",
+      "patch": "@@ -22,9 +22,125 @@ TIMESTAMP=\"$(TZ=America/New_York date '+%Y-%m-%d %H:%M:%S %Z')\"\n ET_NOW=\"$(TZ=America/New_York date '+%I:%M %p ET')\"\n NTFY_TOPIC=\"ntfy.sh/issue-scanner\"\n \n+# Backend state directory \u2014 tracks which backend each agent is currently using.\n+# On rate limit, the agent switches to its fallback backend.\n+BACKEND_STATE_DIR=\"/var/run/agent-backends\"\n+mkdir -p \"$BACKEND_STATE_DIR\" 2>/dev/null || true\n+\n+# Agent handoff state \u2014 captures last N lines of work context when switching backends\n+HANDOFF_DIR=\"/tmp/agent-handoff\"\n+mkdir -p \"$HANDOFF_DIR\" 2>/dev/null || true\n+\n log() { echo \"[$TIMESTAMP] $*\" | tee -a \"$LOG\"; }\n ntfy() { curl -s -H \"Title: $1\" -d \"$2\" \"$NTFY_TOPIC\" > /dev/null 2>&1 || true; }\n \n+# \u2500\u2500 Backend management \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n+# Each agent has a primary and fallback backend. State is tracked in\n+# /var/run/agent-backends/<agent> (contains \"claude\" or \"copilot\").\n+\n+# Default backend assignments per agent\n+declare -A AGENT_PRIMARY_BACKEND=(\n+  [scanner]=copilot\n+  [reviewer]=claude\n+  [architect]=claude\n+  [outreach]=claude\n+)\n+declare -A AGENT_FALLBACK_BACKEND=(\n+  [scanner]=claude\n+  [reviewer]=copilot\n+  [architect]=copilot\n+  [outreach]=copilot\n+)\n+# Model to use per backend \u2014 Copilot uses dots, Claude uses hyphens\n+declare -A BACKEND_MODEL=(\n+  [copilot]=claude-opus-4.6\n+  [claude]=claude-sonnet-4-5\n+)\n+# Scanner runs Opus on both backends\n+declare -A AGENT_MODEL_OVERRIDE=(\n+  [scanner-copilot]=claude-opus-4.6\n+  [scanner-claude]=claude-opus-4-6\n+)\n+\n+get_current_backend() {\n+  local agent=\"$1\"\n+  if [ -f \"$BACKEND_STATE_DIR/$agent\" ]; then\n+    cat \"$BACKEND_STATE_DIR/$agent\"\n+  else\n+    echo \"${AGENT_PRIMARY_BACKEND[$agent]:-claude}\"\n+  fi\n+}\n+\n+set_current_backend() {\n+  local agent=\"$1\" backend=\"$2\"\n+  echo \"$backend\" > \"$BACKEND_STATE_DIR/$agent\"\n+}\n+\n+get_model_for() {\n+  local agent=\"$1\" backend=\"$2\"\n+  local override_key=\"${agent}-${backend}\"\n+  if [ -n \"${AGENT_MODEL_OVERRIDE[$override_key]+x}\" ]; then\n+    echo \"${AGENT_MODEL_OVERRIDE[$override_key]}\"\n+  else\n+    echo \"${BACKEND_MODEL[$backend]}\"\n+  fi\n+}\n+\n+capture_handoff_state() {\n+  local session=\"$1\" agent=\"$2\"\n+  local handoff_file=\"$HANDOFF_DIR/${agent}-handoff.md\"\n+  local pane_text\n+  pane_text=$($TMUX_BIN capture-pane -t \"$session\" -p -S -200 2>/dev/null || true)\n+  if [ -n \"$pane_text\" ]; then\n+    cat > \"$handoff_file\" <<HANDOFF_EOF\n+# Agent Handoff \u2014 $agent\n+# Captured at: $(date -Is)\n+# Reason: Backend switch due to rate limit\n+\n+## Last 200 lines of session output:\n+\\`\\`\\`\n+$pane_text\n+\\`\\`\\`\n+\n+## Instructions\n+Continue where the previous session left off. Read your CLAUDE.md for standing instructions.\n+HANDOFF_EOF\n+    log \"HANDOFF $agent \u2014 saved context to $handoff_file\"\n+  fi\n+}\n+\n+switch_backend() {\n+  local session=\"$1\" agent=\"$2\"\n+  local current_backend fallback_backend model\n+\n+  current_backend=$(get_current_backend \"$agent\")\n+  fallback_backend=\"${AGENT_FALLBACK_BACKEND[$agent]:-claude}\"\n+\n+  if [ \"$current_backend\" = \"$fallback_backend\" ]; then\n+    fallback_backend=\"${AGENT_PRIMARY_BACKEND[$agent]:-claude}\"\n+  fi\n+\n+  model=$(get_model_for \"$agent\" \"$fallback_backend\")\n+\n+  log \"SWITCH $agent: $current_backend \u2192 $fallback_backend (model: $model)\"\n+  ntfy \"$agent \u2014 switching backend\" \"Rate limited on $current_backend. Switching to $fallback_backend ($model)\"\n+\n+  capture_handoff_state \"$session\" \"$agent\"\n+\n+  $TMUX_BIN send-keys -t \"$session\" Escape 2>/dev/null || true\n+  sleep 2\n+  $TMUX_BIN send-keys -t \"$session\" \"/exit\" 2>/dev/null || true\n+  $TMUX_BIN send-keys -t \"$session\" Enter 2>/dev/null || true\n+  sleep 3\n+\n+  $TMUX_BIN send-keys -t \"$session\" \"agent-launch.sh --backend $fallback_backend --model $model\" 2>/dev/null || true\n+  $TMUX_BIN send-keys -t \"$session\" Enter 2>/dev/null || true\n+\n+  set_current_backend \"$agent\" \"$fallback_backend\"\n+\n+  log \"SWITCH $agent \u2014 launched $fallback_backend in $session\"\n+}\n+\n session_exists() {\n   $TMUX_BIN has-session -t \"$1\" 2>/dev/null\n }\n@@ -111,19 +227,26 @@ check_rate_limit() {\n     local reset_et\n     reset_et=$(TZ=America/New_York date -d \"@$reset_epoch\" '+%I:%M %p ET' 2>/dev/null || echo \"$reset_time UTC\")\n \n-    log \"RATE-LIMITED $session \u2014 scheduling re-kick in ${wait_secs}s (1 min after $reset_time UTC / $reset_et)\"\n-    ntfy \"$agent \u2014 rate limited\" \"Resets $reset_time UTC ($reset_et). Auto re-kick scheduled.\"\n+    log \"RATE-LIMITED $session \u2014 resets $reset_time UTC ($reset_et), wait ${wait_secs}s\"\n \n-    # Send Escape to dismiss the error, then sleep and re-kick\n-    $TMUX_BIN send-keys -t \"$session\" Escape\n-    sleep \"$wait_secs\"\n+    # Strategy: switch to fallback backend immediately, AND schedule a\n+    # re-kick on the original backend after the rate limit resets.\n+    switch_backend \"$session\" \"$agent\"\n \n-    # Re-check: if session is idle, re-kick with the same agent target\n-    if session_idle \"$session\"; then\n-      log \"RE-KICK $session after rate limit reset\"\n+    # After the new backend starts, kick it with the agent's work order\n+    sleep 15\n+    /usr/local/bin/kick-agents.sh \"$agent\"\n+\n+    # Also schedule a switch back to the primary backend after rate limit resets\n+    sleep \"$wait_secs\"\n+    local current_after_switch\n+    current_after_switch=$(get_current_backend \"$agent\")\n+    local primary=\"${AGENT_PRIMARY_BACKEND[$agent]:-claude}\"\n+    if [ \"$current_after_switch\" != \"$primary\" ]; then\n+      log \"RATE-LIMIT RESET $agent \u2014 switching back to primary ($primary)\"\n+      switch_backend \"$session\" \"$agent\"\n+      sleep 15\n       /usr/local/bin/kick-agents.sh \"$agent\"\n-    else\n-      log \"SKIP RE-KICK $session \u2014 not idle after rate limit reset\"\n     fi\n   ) &\n }\n@@ -144,9 +267,10 @@ kick() {\n     local pane_text\n     pane_text=$($TMUX_BIN capture-pane -t \"$session\" -p 2>/dev/null || true)\n     if echo \"$pane_text\" | grep -qi \"out of.*usage\\|rate limit\"; then\n-      log \"RATE-LIMITED $session \u2014 sending Escape and scheduling re-kick\"\n-      $TMUX_BIN send-keys -t \"$session\" Escape\n-      check_rate_limit \"$session\" \"$agent\" 5\n+      log \"RATE-LIMITED $session \u2014 switching backend\"\n+      switch_backend \"$session\" \"$agent\"\n+      sleep 15\n+      /usr/local/bin/kick-agents.sh \"$agent\"\n       return\n     fi\n     log \"SKIP $session \u2014 already working\""
+    },
+    {
+      "sha": "38670b677ecc5f26e2b91ec441327795f26444ef",
+      "filename": "examples/kubestellar/agents/architect.env",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 1,
+      "changes": 5,
+      "blob_url": "https://github.com/kubestellar/hive/blob/ce230e96b8b4c7b494cfb699cdc473cb33b80860/examples%2Fkubestellar%2Fagents%2Farchitect.env",
+      "raw_url": "https://github.com/kubestellar/hive/raw/ce230e96b8b4c7b494cfb699cdc473cb33b80860/examples%2Fkubestellar%2Fagents%2Farchitect.env",
+      "contents_url": "https://api.github.com/repos/kubestellar/hive/contents/examples%2Fkubestellar%2Fagents%2Farchitect.env?ref=ce230e96b8b4c7b494cfb699cdc473cb33b80860",
+      "patch": "@@ -2,7 +2,10 @@\n \n AGENT_USER=andan02\n AGENT_WORKDIR=/root/.kubestellar-agents/architect/console\n-AGENT_LAUNCH_CMD=\"claude-dev --dangerously-skip-permissions --model claude-sonnet-4-5\"\n+AGENT_BACKEND=claude\n+AGENT_FALLBACK_BACKEND=copilot\n+AGENT_MODEL=claude-sonnet-4-5\n+AGENT_LAUNCH_CMD=\"agent-launch.sh --backend ${AGENT_BACKEND} --model ${AGENT_MODEL}\"\n AGENT_SESSION_NAME=ks-architect\n AGENT_LOG_FILE=/root/.kubestellar-agents/architect/heartbeat.log\n "
+    },
+    {
+      "sha": "4a0bfbaa8628108ec82ebdf5e3a080acd9dbf77f",
+      "filename": "examples/kubestellar/agents/fixer.env",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 1,
+      "changes": 5,
+      "blob_url": "https://github.com/kubestellar/hive/blob/ce230e96b8b4c7b494cfb699cdc473cb33b80860/examples%2Fkubestellar%2Fagents%2Ffixer.env",
+      "raw_url": "https://github.com/kubestellar/hive/raw/ce230e96b8b4c7b494cfb699cdc473cb33b80860/examples%2Fkubestellar%2Fagents%2Ffixer.env",
+      "contents_url": "https://api.github.com/repos/kubestellar/hive/contents/examples%2Fkubestellar%2Fagents%2Ffixer.env?ref=ce230e96b8b4c7b494cfb699cdc473cb33b80860",
+      "patch": "@@ -2,7 +2,10 @@\n \n AGENT_USER=andan02\n AGENT_WORKDIR=/root/.kubestellar-agents/fixer/console\n-AGENT_LAUNCH_CMD=\"claude-dev --dangerously-skip-permissions --model claude-sonnet-4-5\"\n+AGENT_BACKEND=claude\n+AGENT_FALLBACK_BACKEND=copilot\n+AGENT_MODEL=claude-sonnet-4-5\n+AGENT_LAUNCH_CMD=\"agent-launch.sh --backend ${AGENT_BACKEND} --model ${AGENT_MODEL}\"\n AGENT_SESSION_NAME=ks-fixer\n AGENT_LOG_FILE=/root/.kubestellar-agents/fixer/heartbeat.log\n "
+    },
+    {
+      "sha": "73e677f563905541c7c43d3f5fd979e3231ef232",
+      "filename": "examples/kubestellar/agents/outreacher.env",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 1,
+      "changes": 5,
+      "blob_url": "https://github.com/kubestellar/hive/blob/ce230e96b8b4c7b494cfb699cdc473cb33b80860/examples%2Fkubestellar%2Fagents%2Foutreacher.env",
+      "raw_url": "https://github.com/kubestellar/hive/raw/ce230e96b8b4c7b494cfb699cdc473cb33b80860/examples%2Fkubestellar%2Fagents%2Foutreacher.env",
+      "contents_url": "https://api.github.com/repos/kubestellar/hive/contents/examples%2Fkubestellar%2Fagents%2Foutreacher.env?ref=ce230e96b8b4c7b494cfb699cdc473cb33b80860",
+      "patch": "@@ -2,7 +2,10 @@\n \n AGENT_USER=andan02\n AGENT_WORKDIR=/root/.kubestellar-agents/outreacher/console\n-AGENT_LAUNCH_CMD=\"claude-dev --dangerously-skip-permissions --model claude-sonnet-4-5\"\n+AGENT_BACKEND=claude\n+AGENT_FALLBACK_BACKEND=copilot\n+AGENT_MODEL=claude-sonnet-4-5\n+AGENT_LAUNCH_CMD=\"agent-launch.sh --backend ${AGENT_BACKEND} --model ${AGENT_MODEL}\"\n AGENT_SESSION_NAME=ks-outreacher\n AGENT_LOG_FILE=/root/.kubestellar-agents/outreacher/heartbeat.log\n "
+    },
+    {
+      "sha": "525643b4d22756ded12dd5f0a0fed8bf0c25945f",
+      "filename": "examples/kubestellar/agents/reviewer.env",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 1,
+      "changes": 5,
+      "blob_url": "https://github.com/kubestellar/hive/blob/ce230e96b8b4c7b494cfb699cdc473cb33b80860/examples%2Fkubestellar%2Fagents%2Freviewer.env",
+      "raw_url": "https://github.com/kubestellar/hive/raw/ce230e96b8b4c7b494cfb699cdc473cb33b80860/examples%2Fkubestellar%2Fagents%2Freviewer.env",
+      "contents_url": "https://api.github.com/repos/kubestellar/hive/contents/examples%2Fkubestellar%2Fagents%2Freviewer.env?ref=ce230e96b8b4c7b494cfb699cdc473cb33b80860",
+      "patch": "@@ -2,7 +2,10 @@\n \n AGENT_USER=andan02\n AGENT_WORKDIR=/root/.kubestellar-agents/reviewer/console\n-AGENT_LAUNCH_CMD=\"claude-dev --dangerously-skip-permissions --model claude-sonnet-4-5\"\n+AGENT_BACKEND=claude\n+AGENT_FALLBACK_BACKEND=copilot\n+AGENT_MODEL=claude-sonnet-4-5\n+AGENT_LAUNCH_CMD=\"agent-launch.sh --backend ${AGENT_BACKEND} --model ${AGENT_MODEL}\"\n AGENT_SESSION_NAME=ks-reviewer\n AGENT_LOG_FILE=/root/.kubestellar-agents/reviewer/heartbeat.log\n "
+    },
+    {
+      "sha": "3b5eff4d95b474499ce6a1f2fb29742b4ce77187",
+      "filename": "examples/kubestellar/agents/supervisor.env",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 1,
+      "changes": 5,
+      "blob_url": "https://github.com/kubestellar/hive/blob/ce230e96b8b4c7b494cfb699cdc473cb33b80860/examples%2Fkubestellar%2Fagents%2Fsupervisor.env",
+      "raw_url": "https://github.com/kubestellar/hive/raw/ce230e96b8b4c7b494cfb699cdc473cb33b80860/examples%2Fkubestellar%2Fagents%2Fsupervisor.env",
+      "contents_url": "https://api.github.com/repos/kubestellar/hive/contents/examples%2Fkubestellar%2Fagents%2Fsupervisor.env?ref=ce230e96b8b4c7b494cfb699cdc473cb33b80860",
+      "patch": "@@ -3,7 +3,10 @@\n \n AGENT_USER=andan02\n AGENT_WORKDIR=/root/.kubestellar-agents/supervisor\n-AGENT_LAUNCH_CMD=\"claude-dev --dangerously-skip-permissions --model claude-opus-4-6\"\n+AGENT_BACKEND=claude\n+AGENT_FALLBACK_BACKEND=copilot\n+AGENT_MODEL=claude-opus-4-6\n+AGENT_LAUNCH_CMD=\"agent-launch.sh --backend ${AGENT_BACKEND} --model ${AGENT_MODEL}\"\n AGENT_SESSION_NAME=ks-supervisor\n AGENT_LOG_FILE=/root/.kubestellar-agents/supervisor/heartbeat.log\n "
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "message": "fix(agent): Windows build \u2014 guard Setpgid + syscall.Exec with build tags (#6297) (#6298)\n\n@rishi-jat reported that `go build ./cmd/kc-agent` fails on Windows:\n\n    pkg/agent/update_checker.go:738: unknown field Setpgid in syscall.SysProcAttr\n\nRoot cause verified in pkg/agent/update_checker.go:\n* line 738 (restartViaStartupScript) sets `cmd.SysProcAttr =\n  &syscall.SysProcAttr{Setpgid: true}` \u2014 `Setpgid` is a POSIX-only\n  field that doesn't exist in `syscall.SysProcAttr` on Windows.\n* line 784 (selfUpdateFallback) calls `syscall.Exec(...)` \u2014 Unix-only;\n  Windows has no equivalent \"replace current process image\" primitive.\n\nBoth usages are fenced via two new build-tagged helper files:\n* `pkg/agent/restart_unix.go` (`//go:build !windows`) \u2014 implements\n  `setDetachedProcessGroup(cmd)` with `Setpgid: true` and\n  `execReplace(...)` with `syscall.Exec`.\n* `pkg/agent/restart_windows.go` (`//go:build windows`) \u2014 implements\n  `setDetachedProcessGroup(cmd)` as a no-op (Windows detaches children\n  differently; redirecting stdio to a file, which the caller already\n  does, is sufficient for survival across parent exit) and\n  `execReplace(...)` as an error-returning stub (kc-agent logs the\n  failure and keeps running; user must restart manually to apply\n  a Windows auto-update).\n\n`update_checker.go` now calls the helpers instead of referencing\n`syscall` directly. Removed the now-unused `\"syscall\"` import.\n\nVerified:\n* `go build ./...` (Unix) \u2014 clean\n* `GOOS=windows go build ./...` \u2014 clean\n* `go vet ./pkg/agent/...` \u2014 clean\n* `GOOS=windows go vet ./pkg/agent/...` \u2014 clean\n\nCloses #6297\n\nSigned-off-by: Andrew Anderson <andy@clubanderson.com>",
+  "files": [
+    {
+      "sha": "0f7eada06c69b645a79daea447de4b5b65dd7771",
+      "filename": "pkg/agent/restart_unix.go",
+      "status": "added",
+      "additions": 28,
+      "deletions": 0,
+      "changes": 28,
+      "blob_url": "https://github.com/kubestellar/console/blob/5d401f7358dda78fb76303799fe39a0dd4db497c/pkg%2Fagent%2Frestart_unix.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/5d401f7358dda78fb76303799fe39a0dd4db497c/pkg%2Fagent%2Frestart_unix.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fagent%2Frestart_unix.go?ref=5d401f7358dda78fb76303799fe39a0dd4db497c",
+      "patch": "@@ -0,0 +1,28 @@\n+//go:build !windows\n+\n+// Platform-specific helpers for the auto-update restart path.\n+// Unix implementation uses Setpgid (to detach the restart script so it\n+// survives the parent process exit) and syscall.Exec (to replace the\n+// kc-agent binary atomically in the fallback path).\n+//\n+// See restart_windows.go for the Windows equivalents (#6297).\n+package agent\n+\n+import (\n+\t\"os/exec\"\n+\t\"syscall\"\n+)\n+\n+// setDetachedProcessGroup detaches the child into a new process group so\n+// it survives the parent exiting (Setpgid). On Windows this is a no-op.\n+func setDetachedProcessGroup(cmd *exec.Cmd) {\n+\tcmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}\n+}\n+\n+// execReplace replaces the current process image with the given binary.\n+// Unix uses `syscall.Exec` which preserves PID and does not return on\n+// success. Windows cannot replace a running process \u2014 see the Windows\n+// implementation for the fallback behavior.\n+func execReplace(binary string, args, env []string) error {\n+\treturn syscall.Exec(binary, args, env)\n+}"
+    },
+    {
+      "sha": "9e8be5669d25991089eb7e50397a3745c96812d3",
+      "filename": "pkg/agent/restart_windows.go",
+      "status": "added",
+      "additions": 33,
+      "deletions": 0,
+      "changes": 33,
+      "blob_url": "https://github.com/kubestellar/console/blob/5d401f7358dda78fb76303799fe39a0dd4db497c/pkg%2Fagent%2Frestart_windows.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/5d401f7358dda78fb76303799fe39a0dd4db497c/pkg%2Fagent%2Frestart_windows.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fagent%2Frestart_windows.go?ref=5d401f7358dda78fb76303799fe39a0dd4db497c",
+      "patch": "@@ -0,0 +1,33 @@\n+//go:build windows\n+\n+// Platform-specific helpers for the auto-update restart path.\n+// Windows implementation \u2014 #6297.\n+//\n+// Windows does not have POSIX process groups or a syscall.Exec equivalent\n+// that replaces the running process image in place. These helpers become\n+// no-ops / best-effort fallbacks on Windows so kc-agent at least compiles\n+// on that platform. The auto-update flow itself is still expected to run\n+// primarily on Unix hosts where the startup-oauth.sh script lives.\n+package agent\n+\n+import (\n+\t\"fmt\"\n+\t\"os/exec\"\n+)\n+\n+// setDetachedProcessGroup is a no-op on Windows. The parent exits a few\n+// moments after spawning the child, and Windows lets the child keep\n+// running on its own as long as it has its own stdio handles (which the\n+// caller already redirects to a log file).\n+func setDetachedProcessGroup(_ *exec.Cmd) {\n+\t// intentionally empty\n+}\n+\n+// execReplace is unsupported on Windows because CreateProcess cannot\n+// replace the current process image in place. The Unix-only selfUpdateFallback\n+// path that calls this helper is effectively a no-op on Windows: kc-agent\n+// logs the failure and continues running the old binary until the user\n+// restarts manually.\n+func execReplace(_ string, _, _ []string) error {\n+\treturn fmt.Errorf(\"execReplace is not supported on Windows \u2014 user must restart kc-agent manually to apply the update\")\n+}"
+    },
+    {
+      "sha": "54eb34c85eefd52d4db66cd04d271675cdde01e4",
+      "filename": "pkg/agent/update_checker.go",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 5,
+      "changes": 14,
+      "blob_url": "https://github.com/kubestellar/console/blob/5d401f7358dda78fb76303799fe39a0dd4db497c/pkg%2Fagent%2Fupdate_checker.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/5d401f7358dda78fb76303799fe39a0dd4db497c/pkg%2Fagent%2Fupdate_checker.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fagent%2Fupdate_checker.go?ref=5d401f7358dda78fb76303799fe39a0dd4db497c",
+      "patch": "@@ -14,7 +14,6 @@ import (\n \t\"strings\"\n \t\"sync\"\n \t\"sync/atomic\"\n-\t\"syscall\"\n \t\"time\"\n )\n \n@@ -735,7 +734,9 @@ func (uc *UpdateChecker) restartViaStartupScript(repoPath string) {\n \t\tcmd.Stdout = logFile\n \t\tcmd.Stderr = logFile\n \t}\n-\tcmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}\n+\t// #6297: Setpgid is Unix-only; routed through a build-tagged helper\n+\t// (restart_unix.go / restart_windows.go) so kc-agent compiles on Windows.\n+\tsetDetachedProcessGroup(cmd)\n \n \tif err := cmd.Start(); err != nil {\n \t\tslog.Error(\"[AutoUpdate] failed to spawn startup-oauth.sh\", \"error\", err)\n@@ -780,11 +781,14 @@ func (uc *UpdateChecker) selfUpdateFallback(repoPath string) {\n \t\tslog.Error(\"[AutoUpdate] backend restart failed\", \"error\", err)\n \t}\n \n-\t// Re-exec with the same args \u2014 replaces this process atomically\n-\tif err := syscall.Exec(currentBinary, os.Args, os.Environ()); err != nil {\n+\t// Re-exec with the same args \u2014 replaces this process atomically on Unix.\n+\t// #6297: Windows can't replace the current process image in place;\n+\t// execReplace returns an error there and kc-agent logs it and keeps\n+\t// running the old binary until the user restarts manually.\n+\tif err := execReplace(currentBinary, os.Args, os.Environ()); err != nil {\n \t\tslog.Error(\"[AutoUpdate] exec into new kc-agent failed\", \"error\", err)\n \t}\n-\t// If exec succeeds, this line is never reached\n+\t// If exec succeeds on Unix, this line is never reached\n }\n \n func (uc *UpdateChecker) checkReleaseChannel(channel string) {"
+    }
+  ]
+}

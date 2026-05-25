@@ -1,0 +1,41 @@
+{
+  "message": "\ud83d\udc1b Fix initialization race condition in cache worker (#2306)\n\n* \ud83d\udc1b Fix initialization race condition in cache worker\n\nMessages arriving before initDatabase() completes got null from\nhandleGet because db was still null. Queue incoming messages during\ninitialization and drain the queue once ready.\n\nFixes #2230\n\nSigned-off-by: Andrew Anderson <andy@clubanderson.com>\n\n* \ud83d\udc1b Queue payload not MessageEvent, rename dbReady to initComplete\n\nAddress Copilot review:\n- Store just WorkerRequest payload in pendingMessages queue instead\n  of the full MessageEvent wrapper.\n- Rename dbReady to initComplete since setting it to true on failure\n  was misleading \u2014 the flag tracks init completion, not DB health.\n\nSigned-off-by: Andrew Anderson <andy@clubanderson.com>\n\n* \ud83d\udc1b Fix worker init error reporting and bound pending queue\n\nAddress Copilot review comments on PR #2306:\n\n1. Bound the pending message queue to MAX_PENDING_MESSAGES (1000) to\n   prevent unbounded memory growth if SQLite init stalls. Messages\n   arriving after the limit get an error response instead of being\n   silently queued.\n\n2. On initDatabase() failure, post {type:'init-error'} instead of\n   {type:'ready'} so the RPC layer rejects the ready promise and\n   the consumer (initCacheWorker) correctly falls back to IndexedDB.\n   Queued messages are rejected with error responses rather than\n   processed against a null database.\n\n3. The pending queue already stores WorkerRequest payloads (not full\n   MessageEvent objects), which was addressed in the original PR.\n\nSigned-off-by: Andrew Anderson <andy@clubanderson.com>\n\n---------\n\nSigned-off-by: Andrew Anderson <andy@clubanderson.com>",
+  "files": [
+    {
+      "sha": "3e6e1088e283fb4747127fa3ac464b2f3c110c04",
+      "filename": "web/src/lib/cache/worker.ts",
+      "status": "modified",
+      "additions": 42,
+      "deletions": 4,
+      "changes": 46,
+      "blob_url": "https://github.com/kubestellar/console/blob/774273414bb49f64e380e8836fcdc807a81dc29b/web%2Fsrc%2Flib%2Fcache%2Fworker.ts",
+      "raw_url": "https://github.com/kubestellar/console/raw/774273414bb49f64e380e8836fcdc807a81dc29b/web%2Fsrc%2Flib%2Fcache%2Fworker.ts",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fsrc%2Flib%2Fcache%2Fworker.ts?ref=774273414bb49f64e380e8836fcdc807a81dc29b",
+      "patch": "@@ -274,8 +274,14 @@ function respondError(id: number, message: string): void {\n   self.postMessage(msg)\n }\n \n-self.onmessage = (event: MessageEvent<WorkerRequest>) => {\n-  const msg = event.data\n+// Queue of messages received before the database is ready.\n+// Bounded to prevent unbounded memory growth if init stalls.\n+/** Maximum number of messages to queue while waiting for database init. */\n+const MAX_PENDING_MESSAGES = 1000\n+const pendingMessages: WorkerRequest[] = []\n+let initComplete = false\n+\n+function processMessage(msg: WorkerRequest): void {\n \n   try {\n     switch (msg.type) {\n@@ -332,18 +338,50 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {\n   }\n }\n \n+self.onmessage = (event: MessageEvent<WorkerRequest>) => {\n+  if (!initComplete) {\n+    if (pendingMessages.length >= MAX_PENDING_MESSAGES) {\n+      console.warn(\n+        `[CacheWorker] Pending message queue full (${MAX_PENDING_MESSAGES}), dropping message:`,\n+        event.data.type,\n+      )\n+      respondError(event.data.id, 'Worker initializing and message queue is full')\n+      return\n+    }\n+    // Queue messages until database initialization completes\n+    pendingMessages.push(event.data)\n+    return\n+  }\n+  processMessage(event.data)\n+}\n+\n // ---------------------------------------------------------------------------\n // Initialize SQLite and signal readiness\n // ---------------------------------------------------------------------------\n \n initDatabase()\n   .then(() => {\n+    initComplete = true\n+    // Drain any messages that arrived during initialization\n+    for (const queued of pendingMessages) {\n+      processMessage(queued)\n+    }\n+    pendingMessages.length = 0\n     const msg: WorkerResponse = { id: -1, type: 'ready' }\n     self.postMessage(msg)\n   })\n   .catch((e) => {\n+    const reason = e instanceof Error ? e.message : String(e)\n     console.error('[CacheWorker] Init failed:', e)\n-    // Signal ready anyway \u2014 the main thread will fall back to IndexedDB\n-    const msg: WorkerResponse = { id: -1, type: 'ready' }\n+    // Reject all queued messages so callers aren't left waiting\n+    for (const queued of pendingMessages) {\n+      respondError(queued.id, `Worker init failed: ${reason}`)\n+    }\n+    pendingMessages.length = 0\n+    // Mark init complete so future messages are processed (handlers\n+    // gracefully return null/empty when db is null)\n+    initComplete = true\n+    // Signal failure \u2014 the main thread will fall back to IndexedDB\n+    const msg: WorkerResponse = { id: -1, type: 'init-error', message: reason }\n     self.postMessage(msg)\n   })"
+    },
+    {
+      "sha": "d454d17452d585e81c6b06b7ffa812ff5fded1b7",
+      "filename": "web/src/lib/cache/workerMessages.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 0,
+      "changes": 1,
+      "blob_url": "https://github.com/kubestellar/console/blob/774273414bb49f64e380e8836fcdc807a81dc29b/web%2Fsrc%2Flib%2Fcache%2FworkerMessages.ts",
+      "raw_url": "https://github.com/kubestellar/console/raw/774273414bb49f64e380e8836fcdc807a81dc29b/web%2Fsrc%2Flib%2Fcache%2FworkerMessages.ts",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fsrc%2Flib%2Fcache%2FworkerMessages.ts?ref=774273414bb49f64e380e8836fcdc807a81dc29b",
+      "patch": "@@ -47,6 +47,7 @@ export type WorkerResponse =\n   | { id: number; type: 'result'; value: unknown }\n   | { id: number; type: 'error'; message: string }\n   | { id: -1; type: 'ready' }\n+  | { id: -1; type: 'init-error'; message: string }\n \n // ---------------------------------------------------------------------------\n // Preload result (returned by 'preloadAll')"
+    },
+    {
+      "sha": "7b93bab1e49c57f8ddf65cd3aa0801a9162712fd",
+      "filename": "web/src/lib/cache/workerRpc.ts",
+      "status": "modified",
+      "additions": 9,
+      "deletions": 1,
+      "changes": 10,
+      "blob_url": "https://github.com/kubestellar/console/blob/774273414bb49f64e380e8836fcdc807a81dc29b/web%2Fsrc%2Flib%2Fcache%2FworkerRpc.ts",
+      "raw_url": "https://github.com/kubestellar/console/raw/774273414bb49f64e380e8836fcdc807a81dc29b/web%2Fsrc%2Flib%2Fcache%2FworkerRpc.ts",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fsrc%2Flib%2Fcache%2FworkerRpc.ts?ref=774273414bb49f64e380e8836fcdc807a81dc29b",
+      "patch": "@@ -27,11 +27,13 @@ export class CacheWorkerRpc {\n   private pending = new Map<number, PendingCall>()\n   private readyPromise: Promise<void>\n   private resolveReady!: () => void\n+  private rejectReady!: (error: Error) => void\n \n   constructor(worker: Worker) {\n     this.worker = worker\n-    this.readyPromise = new Promise<void>((resolve) => {\n+    this.readyPromise = new Promise<void>((resolve, reject) => {\n       this.resolveReady = resolve\n+      this.rejectReady = reject\n     })\n \n     this.worker.onmessage = (event: MessageEvent<WorkerResponse>) => {\n@@ -43,6 +45,12 @@ export class CacheWorkerRpc {\n         return\n       }\n \n+      // Handle init failure \u2014 reject the ready promise so callers know init failed\n+      if (msg.id === -1 && msg.type === 'init-error') {\n+        this.rejectReady(new Error(msg.message))\n+        return\n+      }\n+\n       const pending = this.pending.get(msg.id)\n       if (!pending) return\n "
+    }
+  ]
+}

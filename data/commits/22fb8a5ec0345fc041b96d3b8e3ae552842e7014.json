@@ -1,0 +1,29 @@
+{
+  "message": "fix: SQLite store safety \u2014 revoke tokens, swap constants, query limits, dead schema (#7755)\n\n- #7731: RevokeToken uses INSERT OR IGNORE instead of INSERT OR REPLACE\n  so re-revoking a token cannot silently extend its expiry\n- #7732: SnoozeSwap and handler use models.SwapStatusSnoozed constant\n  instead of hardcoded \"snoozed\" string literal\n- #7733: GetDashboardCards query bounded by maxDashboardCards (500)\n- #7734: ListClusterGroups query bounded by maxClusterGroups (200)\n- #7735: Removed dead github_issue_url column from feature_requests\n  schema \u2014 never written to or read by any SQL query (handler\n  populates QueueItem.GitHubIssueURL from the live GitHub API)\n\nFixes #7731, #7732, #7733, #7734, #7735\n\nSigned-off-by: Andy Anderson <andy@clubanderson.com>",
+  "files": [
+    {
+      "sha": "7ad9ca38365c1d726f81c939243ecfc7f1bf8009",
+      "filename": "pkg/api/handlers/swap.go",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/kubestellar/console/blob/22fb8a5ec0345fc041b96d3b8e3ae552842e7014/pkg%2Fapi%2Fhandlers%2Fswap.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/22fb8a5ec0345fc041b96d3b8e3ae552842e7014/pkg%2Fapi%2Fhandlers%2Fswap.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fapi%2Fhandlers%2Fswap.go?ref=22fb8a5ec0345fc041b96d3b8e3ae552842e7014",
+      "patch": "@@ -89,7 +89,7 @@ func (h *SwapHandler) SnoozeSwap(c *fiber.Ctx) error {\n \t})\n \n \treturn c.JSON(fiber.Map{\n-\t\t\"status\":  \"snoozed\",\n+\t\t\"status\":  string(models.SwapStatusSnoozed),\n \t\t\"swap_at\": newSwapAt,\n \t})\n }"
+    },
+    {
+      "sha": "be678a25f5297159323564930a60892189e42778",
+      "filename": "pkg/store/sqlite.go",
+      "status": "modified",
+      "additions": 16,
+      "deletions": 5,
+      "changes": 21,
+      "blob_url": "https://github.com/kubestellar/console/blob/22fb8a5ec0345fc041b96d3b8e3ae552842e7014/pkg%2Fstore%2Fsqlite.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/22fb8a5ec0345fc041b96d3b8e3ae552842e7014/pkg%2Fstore%2Fsqlite.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fstore%2Fsqlite.go?ref=22fb8a5ec0345fc041b96d3b8e3ae552842e7014",
+      "patch": "@@ -327,7 +327,10 @@ func (s *SQLiteStore) migrate() error {\n \t\tdescription TEXT NOT NULL,\n \t\trequest_type TEXT NOT NULL,\n \t\tgithub_issue_number INTEGER,\n-\t\tgithub_issue_url TEXT,\n+\t\t-- NOTE: github_issue_url was removed (#7735) \u2014 it was never\n+\t\t-- populated or read by any INSERT/SELECT/UPDATE query.  The\n+\t\t-- handler's QueueItem.GitHubIssueURL is populated from the\n+\t\t-- live GitHub API, not from this table.\n \t\tstatus TEXT DEFAULT 'submitted',\n \t\tpr_number INTEGER,\n \t\tpr_url TEXT,\n@@ -887,8 +890,11 @@ func (s *SQLiteStore) GetCard(id uuid.UUID) (*models.Card, error) {\n \treturn s.scanCard(row)\n }\n \n+// maxDashboardCards is the upper bound on cards returned per dashboard (#7733).\n+const maxDashboardCards = 500\n+\n func (s *SQLiteStore) GetDashboardCards(dashboardID uuid.UUID) ([]models.Card, error) {\n-\trows, err := s.db.Query(`SELECT id, dashboard_id, card_type, config, position, last_summary, last_focus, created_at FROM cards WHERE dashboard_id = ? ORDER BY created_at`, dashboardID.String())\n+\trows, err := s.db.Query(`SELECT id, dashboard_id, card_type, config, position, last_summary, last_focus, created_at FROM cards WHERE dashboard_id = ? ORDER BY created_at LIMIT ?`, dashboardID.String(), maxDashboardCards)\n \tif err != nil {\n \t\treturn nil, err\n \t}\n@@ -1292,7 +1298,7 @@ func (s *SQLiteStore) UpdateSwapStatus(id uuid.UUID, status models.SwapStatus) e\n }\n \n func (s *SQLiteStore) SnoozeSwap(id uuid.UUID, newSwapAt time.Time) error {\n-\t_, err := s.db.Exec(`UPDATE pending_swaps SET swap_at = ?, status = 'snoozed' WHERE id = ?`, newSwapAt, id.String())\n+\t_, err := s.db.Exec(`UPDATE pending_swaps SET swap_at = ?, status = ? WHERE id = ?`, newSwapAt, string(models.SwapStatusSnoozed), id.String())\n \treturn err\n }\n \n@@ -2255,9 +2261,11 @@ func boolToInt(b bool) int {\n // Token Revocation methods\n \n // RevokeToken persists a revoked token JTI with its expiration time.\n+// INSERT OR IGNORE ensures re-revoking a token cannot silently extend\n+// its expiry \u2014 the first revocation is authoritative (#7731).\n func (s *SQLiteStore) RevokeToken(jti string, expiresAt time.Time) error {\n \t_, err := s.db.Exec(\n-\t\t`INSERT OR REPLACE INTO revoked_tokens (jti, expires_at) VALUES (?, ?)`,\n+\t\t`INSERT OR IGNORE INTO revoked_tokens (jti, expires_at) VALUES (?, ?)`,\n \t\tjti, expiresAt,\n \t)\n \treturn err\n@@ -2891,9 +2899,12 @@ func (s *SQLiteStore) DeleteClusterGroup(name string) error {\n \treturn err\n }\n \n+// maxClusterGroups is the upper bound on cluster groups returned (#7734).\n+const maxClusterGroups = 200\n+\n // ListClusterGroups returns all persisted cluster group definitions (#7013).\n func (s *SQLiteStore) ListClusterGroups() (map[string][]byte, error) {\n-\trows, err := s.db.Query(`SELECT name, data FROM cluster_groups`)\n+\trows, err := s.db.Query(`SELECT name, data FROM cluster_groups LIMIT ?`, maxClusterGroups)\n \tif err != nil {\n \t\treturn nil, err\n \t}"
+    }
+  ]
+}

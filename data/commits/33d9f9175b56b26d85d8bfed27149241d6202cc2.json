@@ -1,0 +1,137 @@
+{
+  "message": "\ud83d\udc1b Fix 12 Go backend security, resource leak, and race condition bugs (#4755)\n\nSecurity:\n- Include auth token in SSE cache key and clear cache on logout (#4712)\n- Restrict service-account listing to admin users (#4713)\n- Length-limit PromQL queries to prevent resource abuse (#4721)\n- Enforce STARTTLS for non-localhost SMTP connections (#4730)\n\nResource leaks:\n- Move defer r.Body.Close() before early returns in settings handlers (#4715)\n- Add defer r.Body.Close() to cancel-chat HTTP handler (#4716)\n- Call cmd.Wait() after Kill in MCP client Stop to reap zombie processes (#4727)\n- Call Stop() on MCP client init failure to prevent goroutine leaks (#4729)\n\nBugs:\n- Call cancelFn inside mutex to prevent race in activeChatCtxs map (#4717)\n- Guard AuthInfos map lookup for nil in kubectl ListContexts (#4719)\n- Derive analysis context from worker lifecycle context for graceful shutdown (#4720)\n- Return nil from NewDeviceTracker when k8s client is nil (#4723)\n\nFixes #4712, #4713, #4715, #4716, #4717, #4719, #4720, #4721, #4723, #4727, #4729, #4730\n\nSigned-off-by: Andrew Anderson <andy@clubanderson.com>",
+  "files": [
+    {
+      "sha": "ca4397dfc99adf80bd9085e06207500682717158",
+      "filename": "pkg/agent/device_tracker.go",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 1,
+      "changes": 7,
+      "blob_url": "https://github.com/kubestellar/console/blob/33d9f9175b56b26d85d8bfed27149241d6202cc2/pkg%2Fagent%2Fdevice_tracker.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/33d9f9175b56b26d85d8bfed27149241d6202cc2/pkg%2Fagent%2Fdevice_tracker.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fagent%2Fdevice_tracker.go?ref=33d9f9175b56b26d85d8bfed27149241d6202cc2",
+      "patch": "@@ -79,8 +79,13 @@ type DeviceTracker struct {\n \tloggedClusterError bool // suppress repeated \"no kubeconfig\" errors\n }\n \n-// NewDeviceTracker creates a new device tracker\n+// NewDeviceTracker creates a new device tracker.\n+// Returns nil if k8sClient is nil so the caller can skip starting it (#4723).\n func NewDeviceTracker(k8sClient *k8s.MultiClusterClient, broadcast func(string, interface{})) *DeviceTracker {\n+\tif k8sClient == nil {\n+\t\tslog.Warn(\"[DeviceTracker] created with nil k8s client \u2014 device tracking disabled\")\n+\t\treturn nil\n+\t}\n \treturn &DeviceTracker{\n \t\tk8sClient: k8sClient,\n \t\thistory:   make(map[string][]DeviceSnapshot),"
+    },
+    {
+      "sha": "580288aa48349b2f4c1ea6762784e2bc8fe468aa",
+      "filename": "pkg/agent/kubectl.go",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 1,
+      "changes": 5,
+      "blob_url": "https://github.com/kubestellar/console/blob/33d9f9175b56b26d85d8bfed27149241d6202cc2/pkg%2Fagent%2Fkubectl.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/33d9f9175b56b26d85d8bfed27149241d6202cc2/pkg%2Fagent%2Fkubectl.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fagent%2Fkubectl.go?ref=33d9f9175b56b26d85d8bfed27149241d6202cc2",
+      "patch": "@@ -53,7 +53,10 @@ func (k *KubectlProxy) ListContexts() ([]protocol.ClusterInfo, string) {\n \t\tif cluster != nil {\n \t\t\tserver = cluster.Server\n \t\t}\n-\t\tauthMethod := detectAuthMethod(k.config.AuthInfos[ctx.AuthInfo])\n+\t\t// Guard against nil AuthInfo \u2014 the referenced user entry may not exist\n+\t\t// in the kubeconfig AuthInfos map. detectAuthMethod handles nil safely.\n+\t\tauthInfo := k.config.AuthInfos[ctx.AuthInfo]\n+\t\tauthMethod := detectAuthMethod(authInfo)\n \t\tclusters = append(clusters, protocol.ClusterInfo{\n \t\t\tName: name, Context: name, Server: server,\n \t\t\tUser: ctx.AuthInfo, Namespace: ctx.Namespace,"
+    },
+    {
+      "sha": "cfaeae53ffbf338bf5371191ec548f072bea819f",
+      "filename": "pkg/agent/prediction_worker.go",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 3,
+      "changes": 16,
+      "blob_url": "https://github.com/kubestellar/console/blob/33d9f9175b56b26d85d8bfed27149241d6202cc2/pkg%2Fagent%2Fprediction_worker.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/33d9f9175b56b26d85d8bfed27149241d6202cc2/pkg%2Fagent%2Fprediction_worker.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fagent%2Fprediction_worker.go?ref=33d9f9175b56b26d85d8bfed27149241d6202cc2",
+      "patch": "@@ -79,6 +79,11 @@ type PredictionWorker struct {\n \trunning     bool\n \tmu          sync.RWMutex\n \tstopCh      chan struct{}\n+\t// ctx is the worker's lifecycle context; cancelled when Stop() is called.\n+\t// All in-flight analysis goroutines derive their context from this so\n+\t// they are cancelled promptly during graceful shutdown (#4720).\n+\tctx       context.Context\n+\tctxCancel context.CancelFunc\n \n \t// WebSocket broadcast function\n \tbroadcast func(msgType string, payload interface{})\n@@ -90,13 +95,16 @@ type PredictionWorker struct {\n \n // NewPredictionWorker creates a new prediction worker\n func NewPredictionWorker(k8sClient *k8s.MultiClusterClient, registry *Registry, broadcast func(string, interface{}), trackTokens func(*ProviderTokenUsage)) *PredictionWorker {\n+\tctx, cancel := context.WithCancel(context.Background())\n \treturn &PredictionWorker{\n \t\tk8sClient:   k8sClient,\n \t\tregistry:    registry,\n \t\tsettings:    DefaultPredictionSettings(),\n \t\tpredictions: []AIPrediction{},\n \t\tproviders:   []string{},\n \t\tstopCh:      make(chan struct{}),\n+\t\tctx:         ctx,\n+\t\tctxCancel:   cancel,\n \t\tbroadcast:   broadcast,\n \t\ttrackTokens: trackTokens,\n \t}\n@@ -107,8 +115,9 @@ func (w *PredictionWorker) Start() {\n \tgo w.runLoop()\n }\n \n-// Stop gracefully shuts down the worker\n+// Stop gracefully shuts down the worker and cancels all in-flight analyses.\n func (w *PredictionWorker) Stop() {\n+\tw.ctxCancel()\n \tclose(w.stopCh)\n }\n \n@@ -221,8 +230,9 @@ func (w *PredictionWorker) runLoop() {\n func (w *PredictionWorker) runAnalysis(specificProviders []string) {\n \tslog.Info(\"[PredictionWorker] Starting AI prediction analysis\")\n \n-\t// Gather cluster data\n-\tctx, cancel := context.WithTimeout(context.Background(), predictionTimeout)\n+\t// Gather cluster data \u2014 derive from the worker's lifecycle context so that\n+\t// in-flight analysis is cancelled promptly during graceful shutdown (#4720).\n+\tctx, cancel := context.WithTimeout(w.ctx, predictionTimeout)\n \tdefer cancel()\n \n \tclusterData, err := w.gatherClusterData(ctx)"
+    },
+    {
+      "sha": "aaed1c46aa00a14ec0e8ec253101e85a332e94dd",
+      "filename": "pkg/agent/prometheus.go",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 0,
+      "changes": 11,
+      "blob_url": "https://github.com/kubestellar/console/blob/33d9f9175b56b26d85d8bfed27149241d6202cc2/pkg%2Fagent%2Fprometheus.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/33d9f9175b56b26d85d8bfed27149241d6202cc2/pkg%2Fagent%2Fprometheus.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fagent%2Fprometheus.go?ref=33d9f9175b56b26d85d8bfed27149241d6202cc2",
+      "patch": "@@ -16,6 +16,10 @@ const (\n \tprometheusQueryTimeout = 10 * time.Second\n \tprometheusServicePort  = \"9090\"\n \tprometheusServiceName  = \"prometheus\"\n+\t// maxPromQLQueryLength is the maximum allowed length for a PromQL query string.\n+\t// This prevents users from crafting arbitrarily large queries that could cause\n+\t// excessive resource consumption on the Prometheus server (#4721).\n+\tmaxPromQLQueryLength = 2048\n )\n \n // handlePrometheusQuery proxies a Prometheus query through the K8s API server.\n@@ -49,6 +53,13 @@ func (s *Server) handlePrometheusQuery(w http.ResponseWriter, r *http.Request) {\n \t\treturn\n \t}\n \n+\t// SECURITY: Length-limit the PromQL query to prevent arbitrarily expensive\n+\t// queries from consuming excessive Prometheus resources (#4721).\n+\tif len(query) > maxPromQLQueryLength {\n+\t\thttp.Error(w, `{\"error\":\"query exceeds maximum allowed length\"}`, http.StatusBadRequest)\n+\t\treturn\n+\t}\n+\n \t// Optional: specific evaluation time\n \tqueryTime := r.URL.Query().Get(\"time\")\n "
+    },
+    {
+      "sha": "2a806243f7c10f66fdd21540ba22a536ee8eaa96",
+      "filename": "pkg/agent/server_ai.go",
+      "status": "modified",
+      "additions": 13,
+      "deletions": 2,
+      "changes": 15,
+      "blob_url": "https://github.com/kubestellar/console/blob/33d9f9175b56b26d85d8bfed27149241d6202cc2/pkg%2Fagent%2Fserver_ai.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/33d9f9175b56b26d85d8bfed27149241d6202cc2/pkg%2Fagent%2Fserver_ai.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fagent%2Fserver_ai.go?ref=33d9f9175b56b26d85d8bfed27149241d6202cc2",
+      "patch": "@@ -602,10 +602,15 @@ func (s *Server) handleCancelChat(conn *websocket.Conn, msg protocol.Message, wr\n \n \ts.activeChatCtxsMu.Lock()\n \tcancelFn, ok := s.activeChatCtxs[req.SessionID]\n+\tif ok {\n+\t\t// Call cancelFn inside the lock to prevent a concurrent goroutine from\n+\t\t// deleting or overwriting the entry between unlock and the call (#4717).\n+\t\tcancelFn()\n+\t\tdelete(s.activeChatCtxs, req.SessionID)\n+\t}\n \ts.activeChatCtxsMu.Unlock()\n \n \tif ok {\n-\t\tcancelFn()\n \t\tslog.Info(\"[Chat] cancelled chat\", \"sessionID\", req.SessionID)\n \t} else {\n \t\tslog.Info(\"[Chat] no active chat to cancel\", \"sessionID\", req.SessionID)\n@@ -648,6 +653,7 @@ func (s *Server) handleCancelChatHTTP(w http.ResponseWriter, r *http.Request) {\n \t\treturn\n \t}\n \n+\tdefer r.Body.Close()\n \tvar req struct {\n \t\tSessionID string `json:\"sessionId\"`\n \t}\n@@ -658,10 +664,15 @@ func (s *Server) handleCancelChatHTTP(w http.ResponseWriter, r *http.Request) {\n \n \ts.activeChatCtxsMu.Lock()\n \tcancelFn, ok := s.activeChatCtxs[req.SessionID]\n+\tif ok {\n+\t\t// Call cancelFn inside the lock to prevent a concurrent goroutine from\n+\t\t// deleting or overwriting the entry between unlock and the call (#4717).\n+\t\tcancelFn()\n+\t\tdelete(s.activeChatCtxs, req.SessionID)\n+\t}\n \ts.activeChatCtxsMu.Unlock()\n \n \tif ok {\n-\t\tcancelFn()\n \t\tslog.Info(\"[Chat] cancelled chat via HTTP\", \"sessionID\", req.SessionID)\n \t} else {\n \t\tslog.Info(\"[Chat] no active chat to cancel via HTTP\", \"sessionID\", req.SessionID)"
+    },
+    {
+      "sha": "099c5065bc45ae220bf2293b6bffdb80d95fb69a",
+      "filename": "pkg/agent/server_operations.go",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/kubestellar/console/blob/33d9f9175b56b26d85d8bfed27149241d6202cc2/pkg%2Fagent%2Fserver_operations.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/33d9f9175b56b26d85d8bfed27149241d6202cc2/pkg%2Fagent%2Fserver_operations.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fagent%2Fserver_operations.go?ref=33d9f9175b56b26d85d8bfed27149241d6202cc2",
+      "patch": "@@ -149,13 +149,13 @@ func (s *Server) handleSettingsAll(w http.ResponseWriter, r *http.Request) {\n \t\tjson.NewEncoder(w).Encode(all)\n \n \tcase \"PUT\":\n+\t\tdefer r.Body.Close()\n \t\tbody, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBodyBytes))\n \t\tif err != nil {\n \t\t\tw.WriteHeader(http.StatusBadRequest)\n \t\t\tjson.NewEncoder(w).Encode(protocol.ErrorPayload{Code: \"read_error\", Message: \"Failed to read request body\"})\n \t\t\treturn\n \t\t}\n-\t\tdefer r.Body.Close()\n \n \t\tvar all settings.AllSettings\n \t\tif err := json.Unmarshal(body, &all); err != nil {\n@@ -251,13 +251,13 @@ func (s *Server) handleSettingsImport(w http.ResponseWriter, r *http.Request) {\n \t\treturn\n \t}\n \n+\tdefer r.Body.Close()\n \tbody, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBodyBytes))\n \tif err != nil || len(body) == 0 {\n \t\tw.WriteHeader(http.StatusBadRequest)\n \t\tjson.NewEncoder(w).Encode(protocol.ErrorPayload{Code: \"empty_body\", Message: \"Empty request body\"})\n \t\treturn\n \t}\n-\tdefer r.Body.Close()\n \n \tsm := settings.GetSettingsManager()\n \tif err := sm.ImportEncrypted(body); err != nil {"
+    },
+    {
+      "sha": "4ff445d9508f600353c74ec8505b8d1a766f7160",
+      "filename": "pkg/api/handlers/rbac.go",
+      "status": "modified",
+      "additions": 10,
+      "deletions": 1,
+      "changes": 11,
+      "blob_url": "https://github.com/kubestellar/console/blob/33d9f9175b56b26d85d8bfed27149241d6202cc2/pkg%2Fapi%2Fhandlers%2Frbac.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/33d9f9175b56b26d85d8bfed27149241d6202cc2/pkg%2Fapi%2Fhandlers%2Frbac.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fapi%2Fhandlers%2Frbac.go?ref=33d9f9175b56b26d85d8bfed27149241d6202cc2",
+      "patch": "@@ -162,8 +162,17 @@ func (h *RBACHandler) GetUserManagementSummary(c *fiber.Ctx) error {\n \treturn c.JSON(summary)\n }\n \n-// ListK8sServiceAccounts returns service accounts from clusters\n+// ListK8sServiceAccounts returns service accounts from clusters.\n+// SECURITY: Restricted to admin users to prevent non-admin users from\n+// enumerating cluster RBAC information (#4713).\n func (h *RBACHandler) ListK8sServiceAccounts(c *fiber.Ctx) error {\n+\t// Require admin role to list service accounts across clusters\n+\tuserID := middleware.GetUserID(c)\n+\tcurrentUser, err := h.store.GetUser(userID)\n+\tif err != nil || currentUser == nil || currentUser.Role != models.UserRoleAdmin {\n+\t\treturn fiber.NewError(fiber.StatusForbidden, \"Admin access required to list service accounts\")\n+\t}\n+\n \tif h.k8sClient == nil {\n \t\treturn fiber.NewError(fiber.StatusServiceUnavailable, \"Kubernetes client not available\")\n \t}"
+    },
+    {
+      "sha": "8c5234e525b4be0d2b914ad18282b8e3b59f49ed",
+      "filename": "pkg/mcp/client.go",
+      "status": "modified",
+      "additions": 20,
+      "deletions": 3,
+      "changes": 23,
+      "blob_url": "https://github.com/kubestellar/console/blob/33d9f9175b56b26d85d8bfed27149241d6202cc2/pkg%2Fmcp%2Fclient.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/33d9f9175b56b26d85d8bfed27149241d6202cc2/pkg%2Fmcp%2Fclient.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fmcp%2Fclient.go?ref=33d9f9175b56b26d85d8bfed27149241d6202cc2",
+      "patch": "@@ -147,7 +147,9 @@ func NewClient(name, binaryPath string, args ...string) (*Client, error) {\n \treturn client, nil\n }\n \n-// Start starts the MCP server process and initializes the connection\n+// Start starts the MCP server process and initializes the connection.\n+// On failure, Stop() is called to reap the child process and terminate\n+// the readResponses goroutine, preventing goroutine and zombie leaks (#4729).\n func (c *Client) Start(ctx context.Context) error {\n \tif err := c.cmd.Start(); err != nil {\n \t\treturn fmt.Errorf(\"failed to start %s: %w\", c.name, err)\n@@ -158,19 +160,23 @@ func (c *Client) Start(ctx context.Context) error {\n \n \t// Initialize the connection\n \tif err := c.initialize(ctx); err != nil {\n+\t\tc.Stop() // clean up readResponses goroutine and child process\n \t\treturn fmt.Errorf(\"failed to initialize %s: %w\", c.name, err)\n \t}\n \n \t// Get available tools\n \tif err := c.listTools(ctx); err != nil {\n+\t\tc.Stop() // clean up readResponses goroutine and child process\n \t\treturn fmt.Errorf(\"failed to list tools from %s: %w\", c.name, err)\n \t}\n \n \tc.ready = true\n \treturn nil\n }\n \n-// Stop stops the MCP server process\n+// Stop stops the MCP server process and reaps the child to avoid zombie\n+// processes. Also closes the stderr pipe to release associated file\n+// descriptors (#4727).\n func (c *Client) Stop() error {\n \t// Signal readResponses goroutine to exit\n \tclose(c.done)\n@@ -179,8 +185,19 @@ func (c *Client) Stop() error {\n \tc.stdin.Close()\n \n \tif c.cmd.Process != nil {\n-\t\treturn c.cmd.Process.Kill()\n+\t\t// Kill the process, then Wait() to reap it and release OS resources\n+\t\t// (process table entry, pipes, file descriptors).\n+\t\t_ = c.cmd.Process.Kill()\n+\t\t// Wait releases all resources associated with the Cmd.\n+\t\t// The error from Wait is expected (killed process returns non-zero).\n+\t\t_ = c.cmd.Wait()\n \t}\n+\n+\t// Close stderr pipe to release the file descriptor\n+\tif c.stderr != nil {\n+\t\tc.stderr.Close()\n+\t}\n+\n \treturn nil\n }\n "
+    },
+    {
+      "sha": "38fb2f5dea0f9dd624a2d42a35c67f040c530d7d",
+      "filename": "pkg/notifications/email.go",
+      "status": "modified",
+      "additions": 74,
+      "deletions": 2,
+      "changes": 76,
+      "blob_url": "https://github.com/kubestellar/console/blob/33d9f9175b56b26d85d8bfed27149241d6202cc2/pkg%2Fnotifications%2Femail.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/33d9f9175b56b26d85d8bfed27149241d6202cc2/pkg%2Fnotifications%2Femail.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fnotifications%2Femail.go?ref=33d9f9175b56b26d85d8bfed27149241d6202cc2",
+      "patch": "@@ -2,8 +2,11 @@ package notifications\n \n import (\n \t\"bytes\"\n+\t\"crypto/tls\"\n \t\"fmt\"\n \t\"html/template\"\n+\t\"log/slog\"\n+\t\"net\"\n \t\"net/smtp\"\n \t\"time\"\n )\n@@ -48,24 +51,93 @@ func (e *EmailNotifier) Send(alert Alert) error {\n \t}\n \n \t// Build email message\n-\tmsg := e.buildMessage(subject, body)\n+\temailMsg := e.buildMessage(subject, body)\n \n \t// Send email\n \taddr := fmt.Sprintf(\"%s:%d\", e.SMTPHost, e.SMTPPort)\n+\tisLocalhost := e.SMTPHost == \"localhost\" || e.SMTPHost == \"127.0.0.1\" || e.SMTPHost == \"::1\"\n \n \tvar auth smtp.Auth\n \tif e.Username != \"\" && e.Password != \"\" {\n \t\tauth = smtp.PlainAuth(\"\", e.Username, e.Password, e.SMTPHost)\n \t}\n \n-\terr = smtp.SendMail(addr, auth, e.From, e.To, []byte(msg))\n+\t// SECURITY: Enforce TLS for non-localhost SMTP connections to prevent\n+\t// credentials from being transmitted in plaintext (#4730).\n+\tif !isLocalhost && e.UseTLS {\n+\t\treturn e.sendWithTLS(addr, auth, emailMsg)\n+\t}\n+\n+\tif !isLocalhost && auth != nil {\n+\t\tslog.Warn(\"[Email] SMTP credentials sent without TLS to remote host \u2014 enable UseTLS for security\", \"host\", e.SMTPHost)\n+\t}\n+\n+\terr = smtp.SendMail(addr, auth, e.From, e.To, []byte(emailMsg))\n \tif err != nil {\n \t\treturn fmt.Errorf(\"failed to send email: %w\", err)\n \t}\n \n \treturn nil\n }\n \n+// sendWithTLS sends an email using STARTTLS to encrypt the connection before\n+// transmitting SMTP credentials. This prevents plaintext credential exposure\n+// on non-localhost connections (#4730).\n+func (e *EmailNotifier) sendWithTLS(addr string, auth smtp.Auth, msg string) error {\n+\t// Connect to SMTP server\n+\tconn, err := net.DialTimeout(\"tcp\", addr, 10*time.Second)\n+\tif err != nil {\n+\t\treturn fmt.Errorf(\"failed to connect to SMTP server: %w\", err)\n+\t}\n+\n+\tclient, err := smtp.NewClient(conn, e.SMTPHost)\n+\tif err != nil {\n+\t\tconn.Close()\n+\t\treturn fmt.Errorf(\"failed to create SMTP client: %w\", err)\n+\t}\n+\tdefer client.Close()\n+\n+\t// Upgrade to TLS\n+\ttlsConfig := &tls.Config{\n+\t\tServerName: e.SMTPHost,\n+\t\tMinVersion: tls.VersionTLS12,\n+\t}\n+\tif err := client.StartTLS(tlsConfig); err != nil {\n+\t\treturn fmt.Errorf(\"STARTTLS failed (SMTP server may not support TLS): %w\", err)\n+\t}\n+\n+\t// Authenticate after TLS is established\n+\tif auth != nil {\n+\t\tif err := client.Auth(auth); err != nil {\n+\t\t\treturn fmt.Errorf(\"SMTP auth failed: %w\", err)\n+\t\t}\n+\t}\n+\n+\t// Set sender and recipients\n+\tif err := client.Mail(e.From); err != nil {\n+\t\treturn fmt.Errorf(\"SMTP MAIL FROM failed: %w\", err)\n+\t}\n+\tfor _, recipient := range e.To {\n+\t\tif err := client.Rcpt(recipient); err != nil {\n+\t\t\treturn fmt.Errorf(\"SMTP RCPT TO failed for %s: %w\", recipient, err)\n+\t\t}\n+\t}\n+\n+\t// Write message body\n+\tw, err := client.Data()\n+\tif err != nil {\n+\t\treturn fmt.Errorf(\"SMTP DATA failed: %w\", err)\n+\t}\n+\tif _, err := w.Write([]byte(msg)); err != nil {\n+\t\treturn fmt.Errorf(\"failed to write email body: %w\", err)\n+\t}\n+\tif err := w.Close(); err != nil {\n+\t\treturn fmt.Errorf(\"failed to close email body: %w\", err)\n+\t}\n+\n+\treturn client.Quit()\n+}\n+\n // Test sends a test email to verify configuration\n func (e *EmailNotifier) Test() error {\n \ttestAlert := Alert{"
+    },
+    {
+      "sha": "a4c8778ebdab293dea7c88715024411fde5f7d76",
+      "filename": "web/src/lib/auth.tsx",
+      "status": "modified",
+      "additions": 3,
+      "deletions": 0,
+      "changes": 3,
+      "blob_url": "https://github.com/kubestellar/console/blob/33d9f9175b56b26d85d8bfed27149241d6202cc2/web%2Fsrc%2Flib%2Fauth.tsx",
+      "raw_url": "https://github.com/kubestellar/console/raw/33d9f9175b56b26d85d8bfed27149241d6202cc2/web%2Fsrc%2Flib%2Fauth.tsx",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fsrc%2Flib%2Fauth.tsx?ref=33d9f9175b56b26d85d8bfed27149241d6202cc2",
+      "patch": "@@ -2,6 +2,7 @@ import { createContext, useContext, useState, useEffect, useCallback, ReactNode\n import { checkOAuthConfigured } from './api'\n import { dashboardSync } from './dashboards/dashboardSync'\n import { clearPermissionsCache } from '../hooks/usePermissions'\n+import { clearSSECache } from './sseClient'\n import { STORAGE_KEY_TOKEN, DEMO_TOKEN_VALUE, STORAGE_KEY_DEMO_MODE, STORAGE_KEY_ONBOARDED, STORAGE_KEY_USER_CACHE, FETCH_DEFAULT_TIMEOUT_MS } from './constants'\n import { emitLogin, emitLogout, setAnalyticsUserId, setAnalyticsUserProperties, emitConversionStep, emitDeveloperSession } from './analytics'\n import { setDemoMode as setGlobalDemoMode } from './demoMode'\n@@ -162,6 +163,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {\n     dashboardSync.clearCache()\n     // Clear permissions cache so the next login doesn't serve stale data\n     clearPermissionsCache()\n+    // Clear SSE result cache to prevent stale data from previous session (#4712)\n+    clearSSECache()\n   }, [])\n \n   const setDemoMode = useCallback(() => {"
+    },
+    {
+      "sha": "57da3e140fa602605f7332fc77873e059a54c6fd",
+      "filename": "web/src/lib/sseClient.ts",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 2,
+      "changes": 16,
+      "blob_url": "https://github.com/kubestellar/console/blob/33d9f9175b56b26d85d8bfed27149241d6202cc2/web%2Fsrc%2Flib%2FsseClient.ts",
+      "raw_url": "https://github.com/kubestellar/console/raw/33d9f9175b56b26d85d8bfed27149241d6202cc2/web%2Fsrc%2Flib%2FsseClient.ts",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fsrc%2Flib%2FsseClient.ts?ref=33d9f9175b56b26d85d8bfed27149241d6202cc2",
+      "patch": "@@ -50,6 +50,15 @@ const resultCache = new Map<string, { data: unknown[]; at: number }>()\n /** Cache TTL: 10 seconds */\n const RESULT_CACHE_TTL_MS = 10_000\n \n+/**\n+ * Clear the SSE result cache. Call on logout or auth context change to\n+ * prevent stale data from a previous user session being served (#4712).\n+ */\n+export function clearSSECache(): void {\n+  resultCache.clear()\n+  inflightRequests.clear()\n+}\n+\n /**\n  * Parse an SSE text stream and dispatch events.\n  * SSE format: `event: <type>\\ndata: <json>\\n\\n`\n@@ -105,8 +114,11 @@ export function fetchSSE<T>(options: SSEFetchOptions<T>): Promise<T[]> {\n   const queryString = searchParams.toString()\n   const fullUrl = queryString ? `${url}?${queryString}` : url\n \n-  // Build cache key including token hash (different users get different caches)\n-  const cacheKey = fullUrl\n+  // SECURITY: Include the current auth token in the cache key so that data\n+  // fetched under one user session is never served to a different user within\n+  // the cache TTL window (#4712).\n+  const currentTokenForKey = localStorage.getItem(STORAGE_KEY_TOKEN) || ''\n+  const cacheKey = `${fullUrl}::${currentTokenForKey}`\n \n   // Check result cache \u2014 if fresh, replay cached data via callbacks and resolve\n   const cached = resultCache.get(cacheKey)"
+    }
+  ]
+}

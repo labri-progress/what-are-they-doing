@@ -1,0 +1,29 @@
+{
+  "message": "\ud83d\udc1b Fix Event Stream empty on load + remove Latest Benchmark from main dashboard (#2777)\n\n**Event Stream fix:**\nThe events hook only fetched via the Go backend REST API, which requires\nOAuth authentication. On initial load (before auth completes) or for\nlocal-only setups, the fetcher returned [] immediately.\n\nAdded agent-first path matching the pattern used by pod issues and\ndeployments \u2014 tries kubectlProxy.getEvents() across all clusters before\nfalling back to the REST API. Progressive fetcher also uses the agent\npath, streaming events cluster-by-cluster as they arrive.\n\n**Latest Benchmark removal:**\nRemoved benchmark_hero card from the main dashboard default card set.\nIt belongs on the llm-d Benchmarks dashboard, not the main dashboard.\nCompliance Score card expanded to full width to fill the space.\n\nSigned-off-by: Andrew Anderson <andy@clubanderson.com>",
+  "files": [
+    {
+      "sha": "1941f28d997dbe2c383822ec2fb9d485a459964c",
+      "filename": "web/src/config/dashboards/main.ts",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 7,
+      "changes": 8,
+      "blob_url": "https://github.com/kubestellar/console/blob/cd6ec6467a427cd2afcf00febeb6cd285e4c4959/web%2Fsrc%2Fconfig%2Fdashboards%2Fmain.ts",
+      "raw_url": "https://github.com/kubestellar/console/raw/cd6ec6467a427cd2afcf00febeb6cd285e4c4959/web%2Fsrc%2Fconfig%2Fdashboards%2Fmain.ts",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fsrc%2Fconfig%2Fdashboards%2Fmain.ts?ref=cd6ec6467a427cd2afcf00febeb6cd285e4c4959",
+      "patch": "@@ -122,12 +122,7 @@ export const mainDashboardConfig: UnifiedDashboardConfig = {\n     {\n       id: 'default-8',\n       cardType: 'compliance_score',\n-      position: { w: 6, h: 3, x: 0, y: 13 },\n-    },\n-    {\n-      id: 'default-9',\n-      cardType: 'benchmark_hero',\n-      position: { w: 6, h: 3, x: 6, y: 13 },\n+      position: { w: 12, h: 3, x: 0, y: 13 },\n     },\n   ],\n \n@@ -143,7 +138,6 @@ export const mainDashboardConfig: UnifiedDashboardConfig = {\n     'cluster_metrics',\n     'events_timeline',\n     'compliance_score',\n-    'benchmark_hero',\n     'nightly_e2e_status',\n   ],\n "
+    },
+    {
+      "sha": "6c6867bc69a1f2741845c3da4bae9b70166b7416",
+      "filename": "web/src/hooks/useCachedData.ts",
+      "status": "modified",
+      "additions": 53,
+      "deletions": 0,
+      "changes": 53,
+      "blob_url": "https://github.com/kubestellar/console/blob/cd6ec6467a427cd2afcf00febeb6cd285e4c4959/web%2Fsrc%2Fhooks%2FuseCachedData.ts",
+      "raw_url": "https://github.com/kubestellar/console/raw/cd6ec6467a427cd2afcf00febeb6cd285e4c4959/web%2Fsrc%2Fhooks%2FuseCachedData.ts",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fsrc%2Fhooks%2FuseCachedData.ts?ref=cd6ec6467a427cd2afcf00febeb6cd285e4c4959",
+      "patch": "@@ -528,13 +528,66 @@ export function useCachedEvents(\n     initialData: [] as ClusterEvent[],\n     demoData: getDemoEvents(),\n     fetcher: async () => {\n+      // Try agent first (direct kubectl proxy \u2014 works before backend auth)\n+      if (clusterCacheRef.clusters.length > 0 && !isAgentUnavailable()) {\n+        if (cluster) {\n+          const ci = clusterCacheRef.clusters.find(c => c.name === cluster)\n+          const ctx = ci?.context || cluster\n+          const events = await kubectlProxy.getEvents(ctx, namespace, limit)\n+          return events.map(e => ({ ...e, cluster }))\n+        }\n+        // Fetch from all clusters via agent\n+        const clusters = getAgentClusters()\n+        const allEvents: ClusterEvent[] = []\n+        const results = await Promise.allSettled(\n+          clusters.map(async (ci) => {\n+            const ctx = ci.context || ci.name\n+            const events = await kubectlProxy.getEvents(ctx, namespace, limit)\n+            return events.map(e => ({ ...e, cluster: ci.name }))\n+          })\n+        )\n+        for (const r of results) {\n+          if (r.status === 'fulfilled') allEvents.push(...r.value)\n+        }\n+        return allEvents\n+          .sort((a, b) => {\n+            const timeA = a.lastSeen ? new Date(a.lastSeen).getTime() : 0\n+            const timeB = b.lastSeen ? new Date(b.lastSeen).getTime() : 0\n+            return timeB - timeA\n+          })\n+          .slice(0, limit)\n+      }\n+\n+      // Fall back to REST API (requires backend auth)\n       if (cluster) {\n         const data = await fetchAPI<{ events: ClusterEvent[] }>('events', { cluster, namespace, limit })\n         return data.events || []\n       }\n       return await fetchFromAllClusters<ClusterEvent>('events', 'events', { namespace, limit })\n     },\n     progressiveFetcher: cluster ? undefined : async (onProgress) => {\n+      // Try agent-based progressive fetch first\n+      if (clusterCacheRef.clusters.length > 0 && !isAgentUnavailable()) {\n+        const clusters = getAgentClusters()\n+        const accumulated: ClusterEvent[] = []\n+        for (const ci of clusters) {\n+          try {\n+            const ctx = ci.context || ci.name\n+            const events = await kubectlProxy.getEvents(ctx, namespace, limit)\n+            accumulated.push(...events.map(e => ({ ...e, cluster: ci.name })))\n+            accumulated.sort((a, b) => {\n+              const timeA = a.lastSeen ? new Date(a.lastSeen).getTime() : 0\n+              const timeB = b.lastSeen ? new Date(b.lastSeen).getTime() : 0\n+              return timeB - timeA\n+            })\n+            onProgress([...accumulated].slice(0, limit))\n+          } catch {\n+            // Skip failed clusters, continue with others\n+          }\n+        }\n+        return accumulated.slice(0, limit)\n+      }\n+      // Fall back to SSE via backend\n       return await fetchViaSSE<ClusterEvent>('events', 'events', { namespace, limit }, onProgress)\n     },\n   })"
+    }
+  ]
+}

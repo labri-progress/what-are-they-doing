@@ -1,0 +1,53 @@
+{
+  "message": "feat: add rate-limit admin visibility + metrics endpoint (Phase 3 of #8676) (#8784)\n\nAdd GET /api/admin/rate-limit-status returning a snapshot of all tracked\nkeys with failure count, tier (normal/escalate/soft-lock/hard-lock),\nlast-failure timestamp, and Retry-After value. Demo mode returns an\nempty set.\n\nEmit structured slog.Error with event=rate_limit_hard_lock when a key\ncrosses the hard-lock threshold (21+ failures) so GA4 error monitors\ncan alert on brute-force attempts.\n\nRefactor GetRetryAfter to share retryAfterForCount helper, removing\nduplicated tier-switch logic.\n\nFixes #8676\n\nSigned-off-by: Andy Anderson <andy@clubanderson.com>",
+  "files": [
+    {
+      "sha": "424a8e50ec9bbce597eb4c782b82750f4313487f",
+      "filename": "pkg/api/handlers/admin.go",
+      "status": "added",
+      "additions": 28,
+      "deletions": 0,
+      "changes": 28,
+      "blob_url": "https://github.com/kubestellar/console/blob/5b87aed5dca925ac714a0a8c4d0535bf3af8cb0a/pkg%2Fapi%2Fhandlers%2Fadmin.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/5b87aed5dca925ac714a0a8c4d0535bf3af8cb0a/pkg%2Fapi%2Fhandlers%2Fadmin.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fapi%2Fhandlers%2Fadmin.go?ref=5b87aed5dca925ac714a0a8c4d0535bf3af8cb0a",
+      "patch": "@@ -0,0 +1,28 @@\n+package handlers\n+\n+import (\n+\t\"github.com/gofiber/fiber/v2\"\n+\t\"github.com/kubestellar/console/pkg/api/middleware\"\n+)\n+\n+// AdminHandler exposes internal operational state for administrator visibility.\n+type AdminHandler struct {\n+\ttracker *middleware.FailureTracker\n+}\n+\n+// NewAdminHandler creates a handler wired to the given FailureTracker.\n+func NewAdminHandler(ft *middleware.FailureTracker) *AdminHandler {\n+\treturn &AdminHandler{tracker: ft}\n+}\n+\n+// GetRateLimitStatus returns a snapshot of every tracked key, its failure count,\n+// tier, and Retry-After value. In demo mode it returns an empty set.\n+func (h *AdminHandler) GetRateLimitStatus(c *fiber.Ctx) error {\n+\tif isDemoMode(c) {\n+\t\treturn c.JSON(middleware.StatusResponse{\n+\t\t\tKeys:  make([]middleware.KeyStatus, 0),\n+\t\t\tTotal: 0,\n+\t\t})\n+\t}\n+\treturn c.JSON(h.tracker.Status())\n+}"
+    },
+    {
+      "sha": "bac63d04cbe95a1275f7b17580a51e5bf3732d8e",
+      "filename": "pkg/api/middleware/ratelimit.go",
+      "status": "modified",
+      "additions": 63,
+      "deletions": 1,
+      "changes": 64,
+      "blob_url": "https://github.com/kubestellar/console/blob/5b87aed5dca925ac714a0a8c4d0535bf3af8cb0a/pkg%2Fapi%2Fmiddleware%2Fratelimit.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/5b87aed5dca925ac714a0a8c4d0535bf3af8cb0a/pkg%2Fapi%2Fmiddleware%2Fratelimit.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fapi%2Fmiddleware%2Fratelimit.go?ref=5b87aed5dca925ac714a0a8c4d0535bf3af8cb0a",
+      "patch": "@@ -58,6 +58,8 @@ func NewFailureTracker() *FailureTracker {\n }\n \n // RecordFailure increments the failure count for key and updates timestamps.\n+// When the count crosses the hard-lock threshold, a structured log event is\n+// emitted so that external monitors (e.g. GA4 error workflow) can alert on it.\n func (ft *FailureTracker) RecordFailure(key string) {\n \tft.mu.Lock()\n \tdefer ft.mu.Unlock()\n@@ -69,6 +71,15 @@ func (ft *FailureTracker) RecordFailure(key string) {\n \t}\n \trec.Count++\n \trec.LastAt = now\n+\n+\t// Emit structured log when crossing the hard-lock threshold (#8676 Phase 3).\n+\tif rec.Count == FailureThresholdHardLock {\n+\t\tslog.Error(\"[RateLimit] hard-lock threshold reached\",\n+\t\t\t\"event\", \"rate_limit_hard_lock\",\n+\t\t\t\"key\", key,\n+\t\t\t\"failures\", rec.Count,\n+\t\t)\n+\t}\n }\n \n // GetFailureCount returns the current failure count for key (0 if absent).\n@@ -92,7 +103,58 @@ func (ft *FailureTracker) Reset(key string) {\n // GetRetryAfter returns the Retry-After value (seconds) for the given key\n // based on which failure-count tier it falls into (#8676 Phase 2).\n func (ft *FailureTracker) GetRetryAfter(key string) int {\n-\tcount := ft.GetFailureCount(key)\n+\treturn retryAfterForCount(ft.GetFailureCount(key))\n+}\n+\n+// KeyStatus describes the rate-limit state for a single tracked key.\n+type KeyStatus struct {\n+\tKey           string `json:\"key\"`\n+\tFailures      int    `json:\"failures\"`\n+\tTier          string `json:\"tier\"`\n+\tLastFailure   string `json:\"lastFailure\"`\n+\tRetryAfterSec int    `json:\"retryAfterSec\"`\n+}\n+\n+// TierName returns the human-readable tier for the given failure count.\n+func TierName(count int) string {\n+\tswitch {\n+\tcase count >= FailureThresholdHardLock:\n+\t\treturn \"hard-lock\"\n+\tcase count >= FailureThresholdSoftLock:\n+\t\treturn \"soft-lock\"\n+\tcase count >= FailureThresholdEscalate:\n+\t\treturn \"escalate\"\n+\tdefault:\n+\t\treturn \"normal\"\n+\t}\n+}\n+\n+// StatusResponse is the JSON shape returned by the admin metrics endpoint.\n+type StatusResponse struct {\n+\tKeys  []KeyStatus `json:\"keys\"`\n+\tTotal int         `json:\"total\"`\n+}\n+\n+// Status returns a snapshot of all tracked keys and their current tier.\n+func (ft *FailureTracker) Status() StatusResponse {\n+\tft.mu.Lock()\n+\tdefer ft.mu.Unlock()\n+\tkeys := make([]KeyStatus, 0, len(ft.failures))\n+\tfor k, rec := range ft.failures {\n+\t\tkeys = append(keys, KeyStatus{\n+\t\t\tKey:           k,\n+\t\t\tFailures:      rec.Count,\n+\t\t\tTier:          TierName(rec.Count),\n+\t\t\tLastFailure:   rec.LastAt.UTC().Format(time.RFC3339),\n+\t\t\tRetryAfterSec: retryAfterForCount(rec.Count),\n+\t\t})\n+\t}\n+\treturn StatusResponse{Keys: keys, Total: len(keys)}\n+}\n+\n+// retryAfterForCount returns the Retry-After seconds for a given count without\n+// acquiring the lock (used internally by Status which already holds it).\n+func retryAfterForCount(count int) int {\n \tswitch {\n \tcase count >= FailureThresholdHardLock:\n \t\treturn RetryAfterHardLockSec"
+    },
+    {
+      "sha": "b7d0e4ac13f3f49f2ebdfcd33cc13eda62f7e16c",
+      "filename": "pkg/api/middleware/ratelimit_test.go",
+      "status": "modified",
+      "additions": 68,
+      "deletions": 0,
+      "changes": 68,
+      "blob_url": "https://github.com/kubestellar/console/blob/5b87aed5dca925ac714a0a8c4d0535bf3af8cb0a/pkg%2Fapi%2Fmiddleware%2Fratelimit_test.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/5b87aed5dca925ac714a0a8c4d0535bf3af8cb0a/pkg%2Fapi%2Fmiddleware%2Fratelimit_test.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fapi%2Fmiddleware%2Fratelimit_test.go?ref=5b87aed5dca925ac714a0a8c4d0535bf3af8cb0a",
+      "patch": "@@ -108,6 +108,74 @@ func TestFailureTracker_GetRetryAfter(t *testing.T) {\n \t}\n }\n \n+func TestTierName(t *testing.T) {\n+\ttests := []struct {\n+\t\tcount int\n+\t\twant  string\n+\t}{\n+\t\t{0, \"normal\"},\n+\t\t{FailureThresholdEscalate - 1, \"normal\"},\n+\t\t{FailureThresholdEscalate, \"escalate\"},\n+\t\t{FailureThresholdSoftLock, \"soft-lock\"},\n+\t\t{FailureThresholdHardLock, \"hard-lock\"},\n+\t\t{FailureThresholdHardLock + 10, \"hard-lock\"},\n+\t}\n+\tfor _, tt := range tests {\n+\t\tif got := TierName(tt.count); got != tt.want {\n+\t\t\tt.Errorf(\"TierName(%d) = %q, want %q\", tt.count, got, tt.want)\n+\t\t}\n+\t}\n+}\n+\n+func TestFailureTracker_Status(t *testing.T) {\n+\tft := NewFailureTracker()\n+\tdefer ft.Stop()\n+\n+\t// Empty tracker.\n+\ts := ft.Status()\n+\tif s.Total != 0 {\n+\t\tt.Fatalf(\"empty tracker: want total=0, got %d\", s.Total)\n+\t}\n+\tif len(s.Keys) != 0 {\n+\t\tt.Fatalf(\"empty tracker: want 0 keys, got %d\", len(s.Keys))\n+\t}\n+\n+\t// Add some keys at different tiers.\n+\tft.RecordFailure(\"a\")\n+\tfor i := 0; i < FailureThresholdSoftLock; i++ {\n+\t\tft.RecordFailure(\"b\")\n+\t}\n+\n+\ts = ft.Status()\n+\tif s.Total != 2 {\n+\t\tt.Fatalf(\"want total=2, got %d\", s.Total)\n+\t}\n+\n+\tbyKey := make(map[string]KeyStatus)\n+\tfor _, ks := range s.Keys {\n+\t\tbyKey[ks.Key] = ks\n+\t}\n+\n+\taStatus := byKey[\"a\"]\n+\tif aStatus.Failures != 1 || aStatus.Tier != \"normal\" {\n+\t\tt.Fatalf(\"key a: want 1/normal, got %d/%s\", aStatus.Failures, aStatus.Tier)\n+\t}\n+\tif aStatus.RetryAfterSec != RetryAfterNormalSec {\n+\t\tt.Fatalf(\"key a retryAfter: want %d, got %d\", RetryAfterNormalSec, aStatus.RetryAfterSec)\n+\t}\n+\n+\tbStatus := byKey[\"b\"]\n+\tif bStatus.Tier != \"soft-lock\" {\n+\t\tt.Fatalf(\"key b: want soft-lock, got %s\", bStatus.Tier)\n+\t}\n+\tif bStatus.RetryAfterSec != RetryAfterSoftLockSec {\n+\t\tt.Fatalf(\"key b retryAfter: want %d, got %d\", RetryAfterSoftLockSec, bStatus.RetryAfterSec)\n+\t}\n+\tif bStatus.LastFailure == \"\" {\n+\t\tt.Fatal(\"key b: LastFailure should not be empty\")\n+\t}\n+}\n+\n func TestFailureTracker_Timestamps(t *testing.T) {\n \tft := NewFailureTracker()\n \tdefer ft.Stop()"
+    },
+    {
+      "sha": "d0fb384a49b1a8268bc7ef30579969825b30fc9e",
+      "filename": "pkg/api/server.go",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/kubestellar/console/blob/5b87aed5dca925ac714a0a8c4d0535bf3af8cb0a/pkg%2Fapi%2Fserver.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/5b87aed5dca925ac714a0a8c4d0535bf3af8cb0a/pkg%2Fapi%2Fserver.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fapi%2Fserver.go?ref=5b87aed5dca925ac714a0a8c4d0535bf3af8cb0a",
+      "patch": "@@ -944,6 +944,10 @@ func (s *Server) setupRoutes() {\n \tapi.Get(\"/namespaces\", namespaces.ListNamespaces)\n \tapi.Get(\"/namespaces/:name/access\", namespaces.GetNamespaceAccess)\n \n+\t// Admin visibility routes \u2014 rate-limit metrics (#8676 Phase 3).\n+\tadminHandler := handlers.NewAdminHandler(failureTracker)\n+\tapi.Get(\"/admin/rate-limit-status\", adminHandler.GetRateLimitStatus)\n+\n \t// Mission knowledge base routes (validate, share \u2014 protected)\n \tmissions.RegisterRoutes(api.Group(\"/missions\"))\n "
+    }
+  ]
+}

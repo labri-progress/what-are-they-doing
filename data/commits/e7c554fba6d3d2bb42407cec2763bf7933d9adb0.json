@@ -1,0 +1,65 @@
+{
+  "message": "\ud83d\udc1b fix: auth security \u2014 JWT revocation on WS, token leak, 401 flag, stale tokens (#3961)\n\nFixes #3894 #3895 #3899 #3897 #3909\n\nSigned-off-by: Andrew Anderson <andy@clubanderson.com>",
+  "files": [
+    {
+      "sha": "60b325b78886bf580d84a50a1e2d71f38632f158",
+      "filename": "pkg/agent/server.go",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 7,
+      "changes": 11,
+      "blob_url": "https://github.com/kubestellar/console/blob/e7c554fba6d3d2bb42407cec2763bf7933d9adb0/pkg%2Fagent%2Fserver.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/e7c554fba6d3d2bb42407cec2763bf7933d9adb0/pkg%2Fagent%2Fserver.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fagent%2Fserver.go?ref=e7c554fba6d3d2bb42407cec2763bf7933d9adb0",
+      "patch": "@@ -252,14 +252,16 @@ func (s *Server) checkOrigin(r *http.Request) bool {\n \treturn false\n }\n \n-// validateToken checks the authentication token (if configured)\n+// validateToken checks the authentication token (if configured).\n+// Tokens are accepted ONLY via the Authorization header to keep secrets out\n+// of server logs, browser history, and proxy access logs (#3895).\n func (s *Server) validateToken(r *http.Request) bool {\n \t// If no token configured, skip token validation\n \tif s.agentToken == \"\" {\n \t\treturn true\n \t}\n \n-\t// Check Authorization header first\n+\t// Accept token exclusively from the Authorization header\n \tauthHeader := r.Header.Get(\"Authorization\")\n \tif strings.HasPrefix(authHeader, \"Bearer \") {\n \t\ttoken := strings.TrimPrefix(authHeader, \"Bearer \")\n@@ -268,11 +270,6 @@ func (s *Server) validateToken(r *http.Request) bool {\n \t\t}\n \t}\n \n-\t// Check query parameter as fallback (for WebSocket connections)\n-\tif r.URL.Query().Get(\"token\") == s.agentToken {\n-\t\treturn true\n-\t}\n-\n \treturn false\n }\n "
+    },
+    {
+      "sha": "df7a677b310fae8e093fb956898d8e9e52962608",
+      "filename": "pkg/api/middleware/auth.go",
+      "status": "modified",
+      "additions": 14,
+      "deletions": 2,
+      "changes": 16,
+      "blob_url": "https://github.com/kubestellar/console/blob/e7c554fba6d3d2bb42407cec2763bf7933d9adb0/pkg%2Fapi%2Fmiddleware%2Fauth.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/e7c554fba6d3d2bb42407cec2763bf7933d9adb0/pkg%2Fapi%2Fmiddleware%2Fauth.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fapi%2Fmiddleware%2Fauth.go?ref=e7c554fba6d3d2bb42407cec2763bf7933d9adb0",
+      "patch": "@@ -1,6 +1,7 @@\n package middleware\n \n import (\n+\t\"fmt\"\n \t\"log\"\n \t\"strings\"\n \t\"sync\"\n@@ -256,8 +257,13 @@ func WebSocketUpgrade() fiber.Handler {\n \t}\n }\n \n-// ValidateJWT validates a JWT token string and returns the claims\n-// Used for WebSocket connections where token is passed via query param\n+// ErrTokenRevoked is returned when a validated JWT has been server-side revoked.\n+var ErrTokenRevoked = fmt.Errorf(\"token has been revoked\")\n+\n+// ValidateJWT validates a JWT token string and returns the claims.\n+// Used for WebSocket connections where token is passed via query param.\n+// This performs the same revocation check as the HTTP JWTAuth middleware\n+// so that revoked tokens are rejected on WebSocket/exec paths too (#3894).\n func ValidateJWT(tokenString, secret string) (*UserClaims, error) {\n \ttoken, err := jwt.ParseWithClaims(tokenString, &UserClaims{}, func(token *jwt.Token) (interface{}, error) {\n \t\treturn []byte(secret), nil\n@@ -276,5 +282,11 @@ func ValidateJWT(tokenString, secret string) (*UserClaims, error) {\n \t\treturn nil, jwt.ErrTokenInvalidClaims\n \t}\n \n+\t// Check if token has been revoked (server-side logout) \u2014 mirrors the\n+\t// check in JWTAuth middleware so WS/exec paths are equally protected.\n+\tif claims.ID != \"\" && IsTokenRevoked(claims.ID) {\n+\t\treturn nil, ErrTokenRevoked\n+\t}\n+\n \treturn claims, nil\n }"
+    },
+    {
+      "sha": "43543dc4d368c608e4568f62fe2e369ae8a64df3",
+      "filename": "web/src/lib/api.ts",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 0,
+      "changes": 11,
+      "blob_url": "https://github.com/kubestellar/console/blob/e7c554fba6d3d2bb42407cec2763bf7933d9adb0/web%2Fsrc%2Flib%2Fapi.ts",
+      "raw_url": "https://github.com/kubestellar/console/raw/e7c554fba6d3d2bb42407cec2763bf7933d9adb0/web%2Fsrc%2Flib%2Fapi.ts",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fsrc%2Flib%2Fapi.ts?ref=e7c554fba6d3d2bb42407cec2763bf7933d9adb0",
+      "patch": "@@ -38,15 +38,26 @@ export class UnauthorizedError extends Error {\n \n // Debounce 401 handling to avoid multiple simultaneous logouts\n let handling401 = false\n+/** Safety cap: reset the 401 debounce flag after this many ms so future\n+ *  auth failures aren't permanently silenced if the redirect doesn't fire (#3899). */\n+const HANDLING_401_RESET_MS = 10_000\n \n /**\n  * Handle 401 Unauthorized responses by clearing auth state and redirecting to login.\n  * This is debounced to avoid multiple simultaneous logouts from parallel API calls.\n+ * The flag auto-resets after HANDLING_401_RESET_MS so a failed redirect doesn't\n+ * permanently block all API calls.\n  */\n function handle401(): void {\n   if (handling401) return\n   handling401 = true\n \n+  // Auto-reset the flag after a safety timeout so the app isn't permanently\n+  // blocked if the redirect fails (e.g. service-worker intercept, popup blocker).\n+  setTimeout(() => {\n+    handling401 = false\n+  }, HANDLING_401_RESET_MS)\n+\n   console.warn('[API] Received 401 Unauthorized - token invalid or expired, logging out')\n \n   // Show an in-page notification before redirecting (DOM-injected, no React dependency)"
+    },
+    {
+      "sha": "2c839c482f54824297dd2b751197577541d14488",
+      "filename": "web/src/lib/auth.tsx",
+      "status": "modified",
+      "additions": 6,
+      "deletions": 1,
+      "changes": 7,
+      "blob_url": "https://github.com/kubestellar/console/blob/e7c554fba6d3d2bb42407cec2763bf7933d9adb0/web%2Fsrc%2Flib%2Fauth.tsx",
+      "raw_url": "https://github.com/kubestellar/console/raw/e7c554fba6d3d2bb42407cec2763bf7933d9adb0/web%2Fsrc%2Flib%2Fauth.tsx",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fsrc%2Flib%2Fauth.tsx?ref=e7c554fba6d3d2bb42407cec2763bf7933d9adb0",
+      "patch": "@@ -329,12 +329,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {\n         return\n       }\n       showExpiryWarningBanner(async () => {\n+        // Re-read the token at click time instead of using the stale closure\n+        // value \u2014 the token may have been silently refreshed since the banner\n+        // was shown (#3909).\n+        const freshToken = localStorage.getItem(STORAGE_KEY_TOKEN)\n+        if (!freshToken || freshToken === DEMO_TOKEN_VALUE) return\n         try {\n           const response = await fetch('/auth/refresh', {\n             method: 'POST',\n             headers: {\n               'Content-Type': 'application/json',\n-              Authorization: `Bearer ${currentToken}`,\n+              Authorization: `Bearer ${freshToken}`,\n             },\n             signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS),\n           })"
+    },
+    {
+      "sha": "fd143da6c3e5d0e8c483667fff0688498631034d",
+      "filename": "web/src/lib/sseClient.ts",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 8,
+      "changes": 19,
+      "blob_url": "https://github.com/kubestellar/console/blob/e7c554fba6d3d2bb42407cec2763bf7933d9adb0/web%2Fsrc%2Flib%2FsseClient.ts",
+      "raw_url": "https://github.com/kubestellar/console/raw/e7c554fba6d3d2bb42407cec2763bf7933d9adb0/web%2Fsrc%2Flib%2FsseClient.ts",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fsrc%2Flib%2FsseClient.ts?ref=e7c554fba6d3d2bb42407cec2763bf7933d9adb0",
+      "patch": "@@ -93,7 +93,6 @@ function parseSSEChunk(\n  */\n export function fetchSSE<T>(options: SSEFetchOptions<T>): Promise<T[]> {\n   const { url, params, onClusterData, onDone, itemsKey, signal } = options\n-  const token = localStorage.getItem(STORAGE_KEY_TOKEN)\n \n   const searchParams = new URLSearchParams()\n   if (params) {\n@@ -170,18 +169,22 @@ export function fetchSSE<T>(options: SSEFetchOptions<T>): Promise<T[]> {\n       })\n     }\n \n-    const headers: Record<string, string> = {\n-      Accept: 'text/event-stream',\n-    }\n-    if (token) {\n-      headers.Authorization = `Bearer ${token}`\n-    }\n-\n     /**\n      * Execute one SSE fetch attempt. On recoverable errors, schedules a retry\n      * with exponential backoff up to SSE_MAX_RECONNECT_ATTEMPTS.\n+     *\n+     * The auth token is read from localStorage on EVERY attempt so that\n+     * reconnects after a silent token refresh use the fresh token (#3897).\n      */\n     const attempt = (attemptNumber: number): void => {\n+      const headers: Record<string, string> = {\n+        Accept: 'text/event-stream',\n+      }\n+      const currentToken = localStorage.getItem(STORAGE_KEY_TOKEN)\n+      if (currentToken) {\n+        headers.Authorization = `Bearer ${currentToken}`\n+      }\n+\n       fetch(fullUrl, {\n         headers,\n         signal: timeoutController.signal,"
+    }
+  ]
+}

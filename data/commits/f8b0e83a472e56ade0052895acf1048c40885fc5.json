@@ -1,0 +1,29 @@
+{
+  "message": "fix: use per-client write mutex in BroadcastToClients to avoid global lock (#3368) (#3381)\n\nBroadcastToClients held a global wsMux lock during all WebSocket writes,\nso a single slow or dead client blocked broadcasts to every other client.\n\nReplace the global wsMux with a per-client write mutex (wsClient struct).\nEach broadcast write now locks only its target connection, so slow clients\nonly block their own writes. Dead connections are still cleaned up after\na failed write.\n\nCo-authored-by: andy anderson <andy@andys-MacBook-Pro.local>\nCo-authored-by: Claude Opus 4.6 <noreply@anthropic.com>",
+  "files": [
+    {
+      "sha": "adc0c79dae1319fcdfbd5b647a8329dec5cfb8ce",
+      "filename": "pkg/agent/prediction_worker.go",
+      "status": "modified",
+      "additions": 21,
+      "deletions": 13,
+      "changes": 34,
+      "blob_url": "https://github.com/kubestellar/console/blob/f8b0e83a472e56ade0052895acf1048c40885fc5/pkg%2Fagent%2Fprediction_worker.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/f8b0e83a472e56ade0052895acf1048c40885fc5/pkg%2Fagent%2Fprediction_worker.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fagent%2Fprediction_worker.go?ref=f8b0e83a472e56ade0052895acf1048c40885fc5",
+      "patch": "@@ -667,7 +667,9 @@ func (w *PredictionWorker) mergePredictions(byProvider map[string][]AIPrediction\n }\n \n // BroadcastToClients sends a message to all connected WebSocket clients.\n-// Uses wsMux to prevent concurrent writes which cause gorilla/websocket to panic.\n+// Uses per-client write mutexes to prevent gorilla/websocket panics from\n+// concurrent writes without holding a global lock during I/O. A slow or\n+// dead client no longer blocks broadcasts to other clients.\n // Dead connections are removed so they don't leak file descriptors.\n func (s *Server) BroadcastToClients(msgType string, payload interface{}) {\n \tmessage := map[string]interface{}{\n@@ -681,24 +683,30 @@ func (s *Server) BroadcastToClients(msgType string, payload interface{}) {\n \t\treturn\n \t}\n \n-\ts.wsMux.Lock()\n-\tdefer s.wsMux.Unlock()\n-\n+\t// Snapshot current clients under read lock \u2014 no I/O while holding this.\n \ts.clientsMux.RLock()\n-\tclients := make([]*websocket.Conn, 0, len(s.clients))\n-\tfor conn := range s.clients {\n-\t\tclients = append(clients, conn)\n+\ttype clientEntry struct {\n+\t\tconn *websocket.Conn\n+\t\twsc  *wsClient\n+\t}\n+\tclients := make([]clientEntry, 0, len(s.clients))\n+\tfor conn, wsc := range s.clients {\n+\t\tclients = append(clients, clientEntry{conn: conn, wsc: wsc})\n \t}\n \ts.clientsMux.RUnlock()\n \n+\t// Write to each client using its per-connection mutex + deadline.\n+\t// A slow client only blocks its own write, not other clients.\n \tvar dead []*websocket.Conn\n-\tfor _, conn := range clients {\n-\t\tconn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))\n-\t\tif err := conn.WriteMessage(websocket.TextMessage, data); err != nil {\n-\t\t\tlog.Printf(\"[Server] Error broadcasting to client %s: %v\", conn.RemoteAddr(), err)\n-\t\t\tdead = append(dead, conn)\n+\tfor _, c := range clients {\n+\t\tc.wsc.writeMu.Lock()\n+\t\tc.conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))\n+\t\tif err := c.conn.WriteMessage(websocket.TextMessage, data); err != nil {\n+\t\t\tlog.Printf(\"[Server] Error broadcasting to client %s: %v\", c.conn.RemoteAddr(), err)\n+\t\t\tdead = append(dead, c.conn)\n \t\t}\n-\t\tconn.SetWriteDeadline(time.Time{}) // clear for normal writes\n+\t\tc.conn.SetWriteDeadline(time.Time{}) // clear for normal writes\n+\t\tc.wsc.writeMu.Unlock()\n \t}\n \n \t// Remove dead clients so they don't accumulate"
+    },
+    {
+      "sha": "467c2c98b2f8dc05440434383f6b75ef56eba69a",
+      "filename": "pkg/agent/server.go",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 5,
+      "changes": 16,
+      "blob_url": "https://github.com/kubestellar/console/blob/f8b0e83a472e56ade0052895acf1048c40885fc5/pkg%2Fagent%2Fserver.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/f8b0e83a472e56ade0052895acf1048c40885fc5/pkg%2Fagent%2Fserver.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fagent%2Fserver.go?ref=f8b0e83a472e56ade0052895acf1048c40885fc5",
+      "patch": "@@ -71,16 +71,22 @@ var defaultAllowedOrigins = []string{\n \t\"http://*.ibm.com\",\n }\n \n+// wsClient wraps a WebSocket connection with a per-connection write mutex\n+// to prevent gorilla/websocket panics from concurrent writes without\n+// requiring a global lock across all clients.\n+type wsClient struct {\n+\twriteMu sync.Mutex\n+}\n+\n // Server is the local agent WebSocket server\n type Server struct {\n \tconfig         Config\n \tupgrader       websocket.Upgrader\n \tkubectl        *KubectlProxy\n \tk8sClient      *k8s.MultiClusterClient // For rich cluster data queries\n \tregistry       *Registry\n-\tclients        map[*websocket.Conn]bool\n-\tclientsMux     sync.RWMutex\n-\twsMux          sync.Mutex // protects concurrent WebSocket writes\n+\tclients    map[*websocket.Conn]*wsClient\n+\tclientsMux sync.RWMutex\n \tallowedOrigins []string\n \tagentToken     string // Optional shared secret for authentication\n \n@@ -178,7 +184,7 @@ func NewServer(cfg Config) (*Server, error) {\n \t\tkubectl:        kubectl,\n \t\tk8sClient:      k8sClient,\n \t\tregistry:       GetRegistry(),\n-\t\tclients:        make(map[*websocket.Conn]bool),\n+\t\tclients:        make(map[*websocket.Conn]*wsClient),\n \t\tallowedOrigins: allowedOrigins,\n \t\tagentToken:     agentToken,\n \t\tsessionStart:   now,\n@@ -1865,7 +1871,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {\n \tdefer conn.Close()\n \n \ts.clientsMux.Lock()\n-\ts.clients[conn] = true\n+\ts.clients[conn] = &wsClient{}\n \ts.clientsMux.Unlock()\n \n \tdefer func() {"
+    }
+  ]
+}

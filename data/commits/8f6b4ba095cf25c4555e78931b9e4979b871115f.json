@@ -1,0 +1,77 @@
+{
+  "message": "fix: resolve SSE cache poisoning, cluster data leak on logout, exec audit logging, and self-upgrade admin check (#5412)\n\n- SSE non-retryable errors (401/503) now clear the in-flight cache entry\n  before resolving, preventing stale promises from blocking future\n  requests to the same URL (#5404)\n\n- Logout now clears cluster caches (both localStorage keys and in-memory\n  module state) so cluster names, metrics, and distributions from a\n  previous user session do not persist across logins (#5405)\n\n- Pod exec handler now logs a SECURITY warning with user identity and\n  target pod details on every exec session, acknowledging that\n  authorization (RBAC) is not yet enforced \u2014 only authentication is\n  checked (#5406)\n\n- Self-upgrade trigger endpoint now requires admin role before allowing\n  Deployment image patches, preventing non-admin authenticated users\n  from rolling the console to arbitrary image tags (#5409)\n\nSigned-off-by: Andrew Anderson <andy@clubanderson.com>",
+  "files": [
+    {
+      "sha": "dee6a070f96d2410d15c4f286553061f62724584",
+      "filename": "pkg/api/handlers/exec.go",
+      "status": "modified",
+      "additions": 22,
+      "deletions": 1,
+      "changes": 23,
+      "blob_url": "https://github.com/kubestellar/console/blob/8f6b4ba095cf25c4555e78931b9e4979b871115f/pkg%2Fapi%2Fhandlers%2Fexec.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/8f6b4ba095cf25c4555e78931b9e4979b871115f/pkg%2Fapi%2Fhandlers%2Fexec.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fapi%2Fhandlers%2Fexec.go?ref=8f6b4ba095cf25c4555e78931b9e4979b871115f",
+      "patch": "@@ -171,7 +171,17 @@ func (h *ExecHandlers) HandleExec(c *websocket.Conn) {\n \t\treturn\n \t}\n \n-\tslog.Info(\"[Exec] authenticated user for pod exec\", \"user\", claims.GitHubLogin)\n+\t// SECURITY WARNING (#5406): This handler validates authentication (JWT) but\n+\t// does NOT perform authorization. Any authenticated user can open a shell to\n+\t// any pod in any cluster. Full RBAC scoping requires checking the user's\n+\t// Kubernetes RBAC permissions (SubjectAccessReview with \"create\" verb on\n+\t// \"pods/exec\" in the target namespace/cluster) before establishing the exec\n+\t// session. This is a known limitation tracked in issue #5406.\n+\tslog.Warn(\"[Exec] SECURITY: pod exec session opened \u2014 no authorization check performed\",\n+\t\t\"user\", claims.GitHubLogin,\n+\t\t\"user_id\", claims.UserID,\n+\t\t\"remote_addr\", c.RemoteAddr().String(),\n+\t)\n \n \t// Clear read deadline after successful auth\n \tc.SetReadDeadline(time.Time{})\n@@ -204,6 +214,17 @@ func (h *ExecHandlers) HandleExec(c *websocket.Conn) {\n \t\treturn\n \t}\n \n+\t// SECURITY: Log exec target details for audit trail (#5406)\n+\tslog.Warn(\"[Exec] SECURITY: exec session targeting pod\",\n+\t\t\"user\", claims.GitHubLogin,\n+\t\t\"user_id\", claims.UserID,\n+\t\t\"cluster\", init.Cluster,\n+\t\t\"namespace\", init.Namespace,\n+\t\t\"pod\", init.Pod,\n+\t\t\"container\", init.Container,\n+\t\t\"command\", init.Command,\n+\t)\n+\n \t// Default command\n \tif len(init.Command) == 0 {\n \t\tinit.Command = []string{\"/bin/sh\"}"
+    },
+    {
+      "sha": "452f5b3facbe3a47f96fc3417827e4f8fc1782e7",
+      "filename": "pkg/api/handlers/self_upgrade.go",
+      "status": "modified",
+      "additions": 33,
+      "deletions": 1,
+      "changes": 34,
+      "blob_url": "https://github.com/kubestellar/console/blob/8f6b4ba095cf25c4555e78931b9e4979b871115f/pkg%2Fapi%2Fhandlers%2Fself_upgrade.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/8f6b4ba095cf25c4555e78931b9e4979b871115f/pkg%2Fapi%2Fhandlers%2Fself_upgrade.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fapi%2Fhandlers%2Fself_upgrade.go?ref=8f6b4ba095cf25c4555e78931b9e4979b871115f",
+      "patch": "@@ -19,6 +19,9 @@ import (\n \t\"k8s.io/client-go/rest\"\n \n \tk8sclient \"github.com/kubestellar/console/pkg/k8s\"\n+\t\"github.com/kubestellar/console/pkg/api/middleware\"\n+\t\"github.com/kubestellar/console/pkg/models\"\n+\t\"github.com/kubestellar/console/pkg/store\"\n )\n \n // imageTagMaxLen is the maximum allowed length for an image tag to prevent abuse.\n@@ -36,13 +39,15 @@ const selfUpgradeTimeout = 30 * time.Second\n type SelfUpgradeHandler struct {\n \tk8sClient *k8sclient.MultiClusterClient\n \thub       *Hub\n+\tstore     store.Store\n }\n \n // NewSelfUpgradeHandler creates a new SelfUpgradeHandler.\n-func NewSelfUpgradeHandler(k8sClient *k8sclient.MultiClusterClient, hub *Hub) *SelfUpgradeHandler {\n+func NewSelfUpgradeHandler(k8sClient *k8sclient.MultiClusterClient, hub *Hub, store store.Store) *SelfUpgradeHandler {\n \treturn &SelfUpgradeHandler{\n \t\tk8sClient: k8sClient,\n \t\thub:       hub,\n+\t\tstore:     store,\n \t}\n }\n \n@@ -203,6 +208,33 @@ func (h *SelfUpgradeHandler) GetStatus(c *fiber.Ctx) error {\n // TriggerUpgrade patches the Deployment image tag to trigger a rolling update.\n // POST /api/self-upgrade/trigger\n func (h *SelfUpgradeHandler) TriggerUpgrade(c *fiber.Ctx) error {\n+\t// SECURITY (#5409): Only admin users may trigger a self-upgrade. Without\n+\t// this check any authenticated user could roll the console to an arbitrary\n+\t// image tag using the in-cluster service account's RBAC permissions.\n+\tuserID := middleware.GetUserID(c)\n+\tif h.store != nil {\n+\t\tuser, err := h.store.GetUser(userID)\n+\t\tif err != nil {\n+\t\t\tslog.Warn(\"[self-upgrade] SECURITY: failed to look up user for role check\",\n+\t\t\t\t\"user_id\", userID, \"error\", err)\n+\t\t\treturn c.Status(fiber.StatusForbidden).JSON(SelfUpgradeTriggerResponse{\n+\t\t\t\tError: \"unable to verify user role \u2014 access denied\",\n+\t\t\t})\n+\t\t}\n+\t\tif user.Role != models.UserRoleAdmin {\n+\t\t\tslog.Warn(\"[self-upgrade] SECURITY: non-admin user attempted self-upgrade\",\n+\t\t\t\t\"user_id\", userID,\n+\t\t\t\t\"github_login\", middleware.GetGitHubLogin(c),\n+\t\t\t\t\"role\", user.Role)\n+\t\t\treturn c.Status(fiber.StatusForbidden).JSON(SelfUpgradeTriggerResponse{\n+\t\t\t\tError: \"self-upgrade requires admin role\",\n+\t\t\t})\n+\t\t}\n+\t}\n+\tslog.Info(\"[self-upgrade] admin user triggering upgrade\",\n+\t\t\"user_id\", userID,\n+\t\t\"github_login\", middleware.GetGitHubLogin(c))\n+\n \tvar req SelfUpgradeTriggerRequest\n \tif err := c.BodyParser(&req); err != nil {\n \t\treturn c.Status(fiber.StatusBadRequest).JSON(SelfUpgradeTriggerResponse{"
+    },
+    {
+      "sha": "8fedf3115a2c75b53b89e5d5f4a922ffae53be02",
+      "filename": "pkg/api/server.go",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/kubestellar/console/blob/8f6b4ba095cf25c4555e78931b9e4979b871115f/pkg%2Fapi%2Fserver.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/8f6b4ba095cf25c4555e78931b9e4979b871115f/pkg%2Fapi%2Fserver.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fapi%2Fserver.go?ref=8f6b4ba095cf25c4555e78931b9e4979b871115f",
+      "patch": "@@ -866,7 +866,7 @@ func (s *Server) setupRoutes() {\n \tapi.Post(\"/gitops/helm-uninstall\", gitopsHandlers.UninstallHelmRelease)\n \tapi.Post(\"/gitops/helm-upgrade\", gitopsHandlers.UpgradeHelmRelease)\n \t// Helm self-upgrade (in-cluster Deployment patch)\n-\tselfUpgradeHandler := handlers.NewSelfUpgradeHandler(s.k8sClient, s.hub)\n+\tselfUpgradeHandler := handlers.NewSelfUpgradeHandler(s.k8sClient, s.hub, s.store)\n \tapi.Get(\"/self-upgrade/status\", selfUpgradeHandler.GetStatus)\n \tapi.Post(\"/self-upgrade/trigger\", selfUpgradeHandler.TriggerUpgrade)\n \t// ArgoCD routes (Application CRD discovery and sync)"
+    },
+    {
+      "sha": "f7fa72f8a6e0bf3034992d53230a91afe425c47b",
+      "filename": "web/src/hooks/mcp/shared.ts",
+      "status": "modified",
+      "additions": 27,
+      "deletions": 0,
+      "changes": 27,
+      "blob_url": "https://github.com/kubestellar/console/blob/8f6b4ba095cf25c4555e78931b9e4979b871115f/web%2Fsrc%2Fhooks%2Fmcp%2Fshared.ts",
+      "raw_url": "https://github.com/kubestellar/console/raw/8f6b4ba095cf25c4555e78931b9e4979b871115f/web%2Fsrc%2Fhooks%2Fmcp%2Fshared.ts",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fsrc%2Fhooks%2Fmcp%2Fshared.ts?ref=8f6b4ba095cf25c4555e78931b9e4979b871115f",
+      "patch": "@@ -256,6 +256,33 @@ export function notifyClusterSubscribers() {\n   clusterSubscribers.forEach(subscriber => subscriber(clusterCache))\n }\n \n+/**\n+ * Clear all cluster caches on logout so data from a previous user session\n+ * does not leak to the next login (#5405). Clears both localStorage keys\n+ * and the module-level in-memory cache, then notifies subscribers so the\n+ * UI resets to a loading/empty state.\n+ */\n+export function clearClusterCacheOnLogout(): void {\n+  try {\n+    localStorage.removeItem(CLUSTER_CACHE_KEY)\n+    localStorage.removeItem(CLUSTER_DIST_CACHE_KEY)\n+  } catch {\n+    // Ignore storage errors\n+  }\n+\n+  clusterCache = {\n+    clusters: [],\n+    lastUpdated: null,\n+    isLoading: true,\n+    isRefreshing: false,\n+    error: null,\n+    consecutiveFailures: 0,\n+    isFailed: false,\n+    lastRefresh: null,\n+  }\n+  notifyClusterSubscribers()\n+}\n+\n // ============================================================================\n // Demo Mode Integration - Clear cluster cache when demo mode toggles ON\n // ============================================================================"
+    },
+    {
+      "sha": "90cc484ad684dddc0aeac1738c33bdaa402154a9",
+      "filename": "web/src/lib/auth.tsx",
+      "status": "modified",
+      "additions": 4,
+      "deletions": 0,
+      "changes": 4,
+      "blob_url": "https://github.com/kubestellar/console/blob/8f6b4ba095cf25c4555e78931b9e4979b871115f/web%2Fsrc%2Flib%2Fauth.tsx",
+      "raw_url": "https://github.com/kubestellar/console/raw/8f6b4ba095cf25c4555e78931b9e4979b871115f/web%2Fsrc%2Flib%2Fauth.tsx",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fsrc%2Flib%2Fauth.tsx?ref=8f6b4ba095cf25c4555e78931b9e4979b871115f",
+      "patch": "@@ -4,6 +4,7 @@ import { dashboardSync } from './dashboards/dashboardSync'\n import { clearPermissionsCache } from '../hooks/usePermissions'\n import { disconnectPresence } from '../hooks/useActiveUsers'\n import { clearSSECache } from './sseClient'\n+import { clearClusterCacheOnLogout } from '../hooks/mcp/shared'\n import { STORAGE_KEY_TOKEN, DEMO_TOKEN_VALUE, STORAGE_KEY_DEMO_MODE, STORAGE_KEY_ONBOARDED, STORAGE_KEY_USER_CACHE, FETCH_DEFAULT_TIMEOUT_MS } from './constants'\n import { emitLogin, emitLogout, setAnalyticsUserId, setAnalyticsUserProperties, emitConversionStep, emitDeveloperSession } from './analytics'\n import { setDemoMode as setGlobalDemoMode } from './demoMode'\n@@ -179,6 +180,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {\n     clearPermissionsCache()\n     // Clear SSE result cache to prevent stale data from previous session (#4712)\n     clearSSECache()\n+    // Clear cluster caches (localStorage + in-memory) so the next user\n+    // doesn't see stale cluster names, metrics, or distributions (#5405)\n+    clearClusterCacheOnLogout()\n     // Disconnect presence WebSocket to stop transmitting stale auth tokens (#4936)\n     disconnectPresence()\n   }"
+    },
+    {
+      "sha": "19eea0b8af6ca4434ce1f68540f54514b9045ebb",
+      "filename": "web/src/lib/sseClient.ts",
+      "status": "modified",
+      "additions": 5,
+      "deletions": 0,
+      "changes": 5,
+      "blob_url": "https://github.com/kubestellar/console/blob/8f6b4ba095cf25c4555e78931b9e4979b871115f/web%2Fsrc%2Flib%2FsseClient.ts",
+      "raw_url": "https://github.com/kubestellar/console/raw/8f6b4ba095cf25c4555e78931b9e4979b871115f/web%2Fsrc%2Flib%2FsseClient.ts",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/web%2Fsrc%2Flib%2FsseClient.ts?ref=8f6b4ba095cf25c4555e78931b9e4979b871115f",
+      "patch": "@@ -316,6 +316,11 @@ export function fetchSSE<T>(options: SSEFetchOptions<T>): Promise<T[]> {\n           const isNonRetryable = err.message?.includes('401') || err.message?.includes('503')\n           if (isNonRetryable) {\n             console.debug('[SSE] Non-retryable error \u2014 skipping retries (demo mode)')\n+            // Clear the in-flight entry and timers so future requests for the\n+            // same URL start a fresh stream instead of reusing this stale\n+            // resolved promise (#5404).\n+            clearTimeout(timeoutId)\n+            cleanup(/* wasAborted */ true)\n             resolve(accumulated)\n             return\n           }"
+    }
+  ]
+}

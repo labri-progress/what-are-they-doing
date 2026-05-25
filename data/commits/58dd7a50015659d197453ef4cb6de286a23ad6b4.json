@@ -1,0 +1,101 @@
+{
+  "message": "fix: EPG parsing off main thread + branding/UX polish\n\n- Move EPG decompression + XML parsing to background isolate via compute()\n- Batch DB inserts (5000 rows) with event loop yields to prevent ANR\n- Rename 'clubtivi' \u2192 'clubTivi' in all platform display names\n- Add version watermark to channel sidebar\n- Cache startup update check (once per session)\n- Show channel count in sidebar 'All' item\n- Add scroll fade gradient at bottom of channel list\n\nCo-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>",
+  "files": [
+    {
+      "sha": "34a4722af78f512eb70abfc6a010e493a3d96eb9",
+      "filename": "android/app/src/main/AndroidManifest.xml",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/clubanderson/clubTivi/blob/58dd7a50015659d197453ef4cb6de286a23ad6b4/android%2Fapp%2Fsrc%2Fmain%2FAndroidManifest.xml",
+      "raw_url": "https://github.com/clubanderson/clubTivi/raw/58dd7a50015659d197453ef4cb6de286a23ad6b4/android%2Fapp%2Fsrc%2Fmain%2FAndroidManifest.xml",
+      "contents_url": "https://api.github.com/repos/clubanderson/clubTivi/contents/android%2Fapp%2Fsrc%2Fmain%2FAndroidManifest.xml?ref=58dd7a50015659d197453ef4cb6de286a23ad6b4",
+      "patch": "@@ -7,7 +7,7 @@\n     <uses-feature android:name=\"android.software.leanback\" android:required=\"false\"/>\n \n     <application\n-        android:label=\"clubtivi\"\n+        android:label=\"clubTivi\"\n         android:name=\"${applicationName}\"\n         android:icon=\"@mipmap/ic_launcher\"\n         android:banner=\"@mipmap/ic_launcher\">"
+    },
+    {
+      "sha": "351a723367beecdbc2cd571c082ad56fefa9434f",
+      "filename": "ios/Runner/Info.plist",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/clubanderson/clubTivi/blob/58dd7a50015659d197453ef4cb6de286a23ad6b4/ios%2FRunner%2FInfo.plist",
+      "raw_url": "https://github.com/clubanderson/clubTivi/raw/58dd7a50015659d197453ef4cb6de286a23ad6b4/ios%2FRunner%2FInfo.plist",
+      "contents_url": "https://api.github.com/repos/clubanderson/clubTivi/contents/ios%2FRunner%2FInfo.plist?ref=58dd7a50015659d197453ef4cb6de286a23ad6b4",
+      "patch": "@@ -15,7 +15,7 @@\n \t<key>CFBundleInfoDictionaryVersion</key>\n \t<string>6.0</string>\n \t<key>CFBundleName</key>\n-\t<string>clubtivi</string>\n+\t<string>clubTivi</string>\n \t<key>CFBundlePackageType</key>\n \t<string>APPL</string>\n \t<key>CFBundleShortVersionString</key>"
+    },
+    {
+      "sha": "021bb81df88763c890c1f91480dec7b04fa73d4c",
+      "filename": "lib/data/services/epg_refresh_service.dart",
+      "status": "modified",
+      "additions": 41,
+      "deletions": 14,
+      "changes": 55,
+      "blob_url": "https://github.com/clubanderson/clubTivi/blob/58dd7a50015659d197453ef4cb6de286a23ad6b4/lib%2Fdata%2Fservices%2Fepg_refresh_service.dart",
+      "raw_url": "https://github.com/clubanderson/clubTivi/raw/58dd7a50015659d197453ef4cb6de286a23ad6b4/lib%2Fdata%2Fservices%2Fepg_refresh_service.dart",
+      "contents_url": "https://api.github.com/repos/clubanderson/clubTivi/contents/lib%2Fdata%2Fservices%2Fepg_refresh_service.dart?ref=58dd7a50015659d197453ef4cb6de286a23ad6b4",
+      "patch": "@@ -9,11 +9,22 @@ import 'package:uuid/uuid.dart';\n \n import '../datasources/local/database.dart' as db;\n import '../datasources/parsers/xmltv_parser.dart';\n+import '../models/epg.dart';\n import '../../features/providers/provider_manager.dart';\n \n+/// Runs heavy XML parsing in a background isolate.\n+XmltvResult _parseInIsolate(_ParseArgs args) {\n+  return XmltvParser().parse(args.xml, sourceId: args.sourceId);\n+}\n+\n+class _ParseArgs {\n+  final String xml;\n+  final String sourceId;\n+  const _ParseArgs(this.xml, this.sourceId);\n+}\n+\n class EpgRefreshService {\n   final db.AppDatabase _db;\n-  final _parser = XmltvParser();\n   final _uuid = const Uuid();\n \n   EpgRefreshService(this._db);\n@@ -39,17 +50,8 @@ class EpgRefreshService {\n       final bytes = response.data!;\n       debugPrint('[EPG] Downloaded ${bytes.length} bytes');\n \n-      // Decompress if gzipped\n-      List<int> decompressed;\n-      try {\n-        decompressed = gzip.decode(bytes);\n-        debugPrint('[EPG] Decompressed to ${decompressed.length} bytes');\n-      } catch (_) {\n-        decompressed = bytes;\n-      }\n-\n-      final xmlContent = utf8.decode(decompressed, allowMalformed: true);\n-      final result = _parser.parse(xmlContent, sourceId: sourceId);\n+      // Decompress + parse in background isolate to avoid ANR\n+      final result = await compute(_decompressAndParse, _DecompressParseArgs(bytes, sourceId));\n       debugPrint('[EPG] Parsed ${result.channels.length} channels, ${result.programmes.length} programmes');\n \n       // Store channels\n@@ -64,7 +66,7 @@ class EpgRefreshService {\n       }).toList();\n       await _db.upsertEpgChannels(channelCompanions);\n \n-      // Delete old programmes for this source, then insert new ones\n+      // Delete old programmes for this source, then insert new ones in batches\n       await _db.deleteEpgProgrammesForSource(sourceId);\n       final programmeCompanions = result.programmes.map((p) {\n         return db.EpgProgrammesCompanion.insert(\n@@ -80,7 +82,13 @@ class EpgRefreshService {\n         );\n       }).toList();\n       if (programmeCompanions.isNotEmpty) {\n-        await _db.insertEpgProgrammes(programmeCompanions);\n+        // Insert in batches of 5000 to avoid blocking the main thread\n+        for (var i = 0; i < programmeCompanions.length; i += 5000) {\n+          final end = (i + 5000).clamp(0, programmeCompanions.length);\n+          await _db.insertEpgProgrammes(programmeCompanions.sublist(i, end));\n+          // Yield to the event loop between batches\n+          await Future<void>.delayed(Duration.zero);\n+        }\n       }\n \n       // Update last refresh timestamp\n@@ -146,3 +154,22 @@ class EpgRefreshService {\n final epgRefreshServiceProvider = Provider<EpgRefreshService>((ref) {\n   return EpgRefreshService(ref.watch(databaseProvider));\n });\n+\n+/// Args for the background isolate (must be serializable).\n+class _DecompressParseArgs {\n+  final List<int> bytes;\n+  final String sourceId;\n+  const _DecompressParseArgs(this.bytes, this.sourceId);\n+}\n+\n+/// Top-level function for compute() \u2014 runs decompression + XML parsing off the main thread.\n+XmltvResult _decompressAndParse(_DecompressParseArgs args) {\n+  List<int> decompressed;\n+  try {\n+    decompressed = gzip.decode(args.bytes);\n+  } catch (_) {\n+    decompressed = args.bytes;\n+  }\n+  final xmlContent = utf8.decode(decompressed, allowMalformed: true);\n+  return XmltvParser().parse(xmlContent, sourceId: args.sourceId);\n+}"
+    },
+    {
+      "sha": "5300d8bf2a4c0d3cb95c7a524cfb888fb3945b3c",
+      "filename": "lib/features/channels/channels_screen.dart",
+      "status": "modified",
+      "additions": 43,
+      "deletions": 3,
+      "changes": 46,
+      "blob_url": "https://github.com/clubanderson/clubTivi/blob/58dd7a50015659d197453ef4cb6de286a23ad6b4/lib%2Ffeatures%2Fchannels%2Fchannels_screen.dart",
+      "raw_url": "https://github.com/clubanderson/clubTivi/raw/58dd7a50015659d197453ef4cb6de286a23ad6b4/lib%2Ffeatures%2Fchannels%2Fchannels_screen.dart",
+      "contents_url": "https://api.github.com/repos/clubanderson/clubTivi/contents/lib%2Ffeatures%2Fchannels%2Fchannels_screen.dart?ref=58dd7a50015659d197453ef4cb6de286a23ad6b4",
+      "patch": "@@ -33,6 +33,7 @@ class ChannelsScreen extends ConsumerStatefulWidget {\n }\n \n class _ChannelsScreenState extends ConsumerState<ChannelsScreen> {\n+  static bool _updateCheckDone = false;\n   List<db.Channel> _allChannels = [];\n   List<db.Channel> _filteredChannels = [];\n   List<String> _groups = [];\n@@ -140,7 +141,8 @@ class _ChannelsScreenState extends ConsumerState<ChannelsScreen> {\n   }\n \n   Future<void> _checkForUpdateOnStartup() async {\n-    if (!mounted) return;\n+    if (_updateCheckDone || !mounted) return;\n+    _updateCheckDone = true;\n     final release = await AppUpdateService.checkForUpdate();\n     if (!mounted || release == null || !release.isNewer) return;\n \n@@ -1563,6 +1565,20 @@ class _ChannelsScreenState extends ConsumerState<ChannelsScreen> {\n           Expanded(\n             child: _sidebarExpanded ? _buildSidebarTree() : _buildCollapsedSidebar(),\n           ),\n+          // Version watermark\n+          Padding(\n+            padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 8),\n+            child: Text(\n+              _sidebarExpanded ? 'clubTivi v${AppUpdateService.currentVersion}' : 'v${AppUpdateService.currentVersion}',\n+              style: const TextStyle(\n+                fontSize: 10,\n+                color: Colors.white24,\n+                letterSpacing: 0.5,\n+              ),\n+              textAlign: TextAlign.center,\n+              overflow: TextOverflow.ellipsis,\n+            ),\n+          ),\n         ],\n       ),\n     );\n@@ -1624,7 +1640,7 @@ class _ChannelsScreenState extends ConsumerState<ChannelsScreen> {\n       padding: const EdgeInsets.symmetric(vertical: 4),\n       children: [\n         if (showAll)\n-          _buildTreeItem('All', 'All', Icons.grid_view_rounded, indent: 0),\n+          _buildTreeItem('All (${_allChannels.length})', 'All', Icons.grid_view_rounded, indent: 0),\n         if (showFavSection)\n           _buildTreeSection(\n             'favorites',\n@@ -1834,7 +1850,7 @@ class _ChannelsScreenState extends ConsumerState<ChannelsScreen> {\n       );\n     }\n \n-    return FocusTraversalGroup(\n+    final listWidget = FocusTraversalGroup(\n       child: ListView.builder(\n       controller: _channelListController,\n       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),\n@@ -1993,6 +2009,30 @@ class _ChannelsScreenState extends ConsumerState<ChannelsScreen> {\n       },\n     ),\n     );\n+\n+    return Stack(\n+      children: [\n+        listWidget,\n+        Positioned(\n+          left: 0, right: 0, bottom: 0,\n+          height: 40,\n+          child: IgnorePointer(\n+            child: DecoratedBox(\n+              decoration: BoxDecoration(\n+                gradient: LinearGradient(\n+                  begin: Alignment.topCenter,\n+                  end: Alignment.bottomCenter,\n+                  colors: [\n+                    Colors.transparent,\n+                    const Color(0xFF0A0A0F),\n+                  ],\n+                ),\n+              ),\n+            ),\n+          ),\n+        ),\n+      ],\n+    );\n   }\n \n   // ---------------------------------------------------------------------------"
+    },
+    {
+      "sha": "21884a3a0d08ddda798966b3ae06e2981e2ab9e6",
+      "filename": "linux/runner/my_application.cc",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/clubanderson/clubTivi/blob/58dd7a50015659d197453ef4cb6de286a23ad6b4/linux%2Frunner%2Fmy_application.cc",
+      "raw_url": "https://github.com/clubanderson/clubTivi/raw/58dd7a50015659d197453ef4cb6de286a23ad6b4/linux%2Frunner%2Fmy_application.cc",
+      "contents_url": "https://api.github.com/repos/clubanderson/clubTivi/contents/linux%2Frunner%2Fmy_application.cc?ref=58dd7a50015659d197453ef4cb6de286a23ad6b4",
+      "patch": "@@ -45,11 +45,11 @@ static void my_application_activate(GApplication* application) {\n   if (use_header_bar) {\n     GtkHeaderBar* header_bar = GTK_HEADER_BAR(gtk_header_bar_new());\n     gtk_widget_show(GTK_WIDGET(header_bar));\n-    gtk_header_bar_set_title(header_bar, \"clubtivi\");\n+    gtk_header_bar_set_title(header_bar, \"clubTivi\");\n     gtk_header_bar_set_show_close_button(header_bar, TRUE);\n     gtk_window_set_titlebar(window, GTK_WIDGET(header_bar));\n   } else {\n-    gtk_window_set_title(window, \"clubtivi\");\n+    gtk_window_set_title(window, \"clubTivi\");\n   }\n \n   gtk_window_set_default_size(window, 1280, 720);"
+    },
+    {
+      "sha": "cd7213e4fc1c4ec29b596d68ce74b97a0a2d8a92",
+      "filename": "macos/Runner/Configs/AppInfo.xcconfig",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/clubanderson/clubTivi/blob/58dd7a50015659d197453ef4cb6de286a23ad6b4/macos%2FRunner%2FConfigs%2FAppInfo.xcconfig",
+      "raw_url": "https://github.com/clubanderson/clubTivi/raw/58dd7a50015659d197453ef4cb6de286a23ad6b4/macos%2FRunner%2FConfigs%2FAppInfo.xcconfig",
+      "contents_url": "https://api.github.com/repos/clubanderson/clubTivi/contents/macos%2FRunner%2FConfigs%2FAppInfo.xcconfig?ref=58dd7a50015659d197453ef4cb6de286a23ad6b4",
+      "patch": "@@ -5,7 +5,7 @@\n // 'flutter create' template.\n \n // The application's name. By default this is also the title of the Flutter window.\n-PRODUCT_NAME = clubtivi\n+PRODUCT_NAME = clubTivi\n \n // The application's bundle identifier\n PRODUCT_BUNDLE_IDENTIFIER = io.github.clubanderson.clubtivi"
+    },
+    {
+      "sha": "7d98b36ac8f9aa3aa6eae60a61ef710c3b0e0a0c",
+      "filename": "windows/runner/Runner.rc",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 2,
+      "changes": 4,
+      "blob_url": "https://github.com/clubanderson/clubTivi/blob/58dd7a50015659d197453ef4cb6de286a23ad6b4/windows%2Frunner%2FRunner.rc",
+      "raw_url": "https://github.com/clubanderson/clubTivi/raw/58dd7a50015659d197453ef4cb6de286a23ad6b4/windows%2Frunner%2FRunner.rc",
+      "contents_url": "https://api.github.com/repos/clubanderson/clubTivi/contents/windows%2Frunner%2FRunner.rc?ref=58dd7a50015659d197453ef4cb6de286a23ad6b4",
+      "patch": "@@ -90,12 +90,12 @@ BEGIN\n         BLOCK \"040904e4\"\n         BEGIN\n             VALUE \"CompanyName\", \"io.github.clubanderson\" \"\\0\"\n-            VALUE \"FileDescription\", \"clubtivi\" \"\\0\"\n+            VALUE \"FileDescription\", \"clubTivi\" \"\\0\"\n             VALUE \"FileVersion\", VERSION_AS_STRING \"\\0\"\n             VALUE \"InternalName\", \"clubtivi\" \"\\0\"\n             VALUE \"LegalCopyright\", \"Copyright (C) 2026 io.github.clubanderson. All rights reserved.\" \"\\0\"\n             VALUE \"OriginalFilename\", \"clubtivi.exe\" \"\\0\"\n-            VALUE \"ProductName\", \"clubtivi\" \"\\0\"\n+            VALUE \"ProductName\", \"clubTivi\" \"\\0\"\n             VALUE \"ProductVersion\", VERSION_AS_STRING \"\\0\"\n         END\n     END"
+    },
+    {
+      "sha": "a690268c383891900bd108926036cdd9f4a8ba13",
+      "filename": "windows/runner/main.cpp",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/clubanderson/clubTivi/blob/58dd7a50015659d197453ef4cb6de286a23ad6b4/windows%2Frunner%2Fmain.cpp",
+      "raw_url": "https://github.com/clubanderson/clubTivi/raw/58dd7a50015659d197453ef4cb6de286a23ad6b4/windows%2Frunner%2Fmain.cpp",
+      "contents_url": "https://api.github.com/repos/clubanderson/clubTivi/contents/windows%2Frunner%2Fmain.cpp?ref=58dd7a50015659d197453ef4cb6de286a23ad6b4",
+      "patch": "@@ -27,7 +27,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,\n   FlutterWindow window(project);\n   Win32Window::Point origin(10, 10);\n   Win32Window::Size size(1280, 720);\n-  if (!window.Create(L\"clubtivi\", origin, size)) {\n+  if (!window.Create(L\"clubTivi\", origin, size)) {\n     return EXIT_FAILURE;\n   }\n   window.SetQuitOnClose(true);"
+    }
+  ]
+}

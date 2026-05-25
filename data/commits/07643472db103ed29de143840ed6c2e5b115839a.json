@@ -1,0 +1,65 @@
+{
+  "message": "fix(gpu): utilization query limit, cancellable worker, per-reservation context (#6965-#6967) (#6974)\n\n- Add configurable LIMIT to GetUtilizationSnapshots SQL query with\n  DefaultSnapshotQueryLimit constant (default 500) to prevent unbounded\n  result sets from long-lived reservations (#6965)\n- Derive collection contexts from a cancellable baseCtx so Stop() can\n  immediately cancel in-flight Kubernetes API calls (#6966)\n- Give each reservation its own goroutine and timeout via sync.WaitGroup\n  so a slow cluster cannot starve subsequent reservations (#6967)\n\nSigned-off-by: Andy Anderson <andy@clubanderson.com>",
+  "files": [
+    {
+      "sha": "846e73245c3984abfd319a1da7284760f8baadea",
+      "filename": "pkg/api/gpu_utilization_worker.go",
+      "status": "modified",
+      "additions": 35,
+      "deletions": 13,
+      "changes": 48,
+      "blob_url": "https://github.com/kubestellar/console/blob/07643472db103ed29de143840ed6c2e5b115839a/pkg%2Fapi%2Fgpu_utilization_worker.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/07643472db103ed29de143840ed6c2e5b115839a/pkg%2Fapi%2Fgpu_utilization_worker.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fapi%2Fgpu_utilization_worker.go?ref=07643472db103ed29de143840ed6c2e5b115839a",
+      "patch": "@@ -24,13 +24,22 @@ const (\n \tfullUtilizationPct = 100.0\n )\n \n+const (\n+\t// perReservationTimeoutDivisor divides the poll interval to derive a\n+\t// per-reservation collection timeout so that a single slow cluster\n+\t// cannot starve subsequent reservations (#6967).\n+\tperReservationTimeoutDivisor = 2\n+)\n+\n // GPUUtilizationWorker periodically collects GPU utilization data for active reservations\n type GPUUtilizationWorker struct {\n-\tstore     store.Store\n-\tk8sClient *k8s.MultiClusterClient\n-\tinterval  time.Duration\n-\tstopCh    chan struct{}\n-\tstopOnce  sync.Once // protects stopCh from double-close panic\n+\tstore      store.Store\n+\tk8sClient  *k8s.MultiClusterClient\n+\tinterval   time.Duration\n+\tstopCh     chan struct{}\n+\tstopOnce   sync.Once // protects stopCh from double-close panic\n+\tbaseCtx    context.Context\n+\tbaseCancel context.CancelFunc\n }\n \n // NewGPUUtilizationWorker creates a new GPU utilization worker\n@@ -42,11 +51,14 @@ func NewGPUUtilizationWorker(s store.Store, k8sClient *k8s.MultiClusterClient) *\n \t\t}\n \t}\n \n+\tctx, cancel := context.WithCancel(context.Background())\n \treturn &GPUUtilizationWorker{\n-\t\tstore:     s,\n-\t\tk8sClient: k8sClient,\n-\t\tinterval:  time.Duration(intervalMs) * time.Millisecond,\n-\t\tstopCh:    make(chan struct{}),\n+\t\tstore:      s,\n+\t\tk8sClient:  k8sClient,\n+\t\tinterval:   time.Duration(intervalMs) * time.Millisecond,\n+\t\tstopCh:     make(chan struct{}),\n+\t\tbaseCtx:    ctx,\n+\t\tbaseCancel: cancel,\n \t}\n }\n \n@@ -78,6 +90,7 @@ func (w *GPUUtilizationWorker) Start() {\n // only the first call actually closes the stop channel.\n func (w *GPUUtilizationWorker) Stop() {\n \tw.stopOnce.Do(func() {\n+\t\tw.baseCancel() // cancel all in-flight Kubernetes API calls (#6966)\n \t\tclose(w.stopCh)\n \t})\n }\n@@ -98,12 +111,21 @@ func (w *GPUUtilizationWorker) collectUtilization() {\n \t\treturn\n \t}\n \n-\tctx, cancel := context.WithTimeout(context.Background(), w.interval/2)\n-\tdefer cancel()\n+\t// Per-reservation timeout so a slow cluster cannot starve others (#6967).\n+\t// Derived from w.baseCtx so Stop() cancels in-flight calls immediately (#6966).\n+\tperReservationTimeout := w.interval / time.Duration(perReservationTimeoutDivisor)\n \n+\tvar wg sync.WaitGroup\n \tfor i := range reservations {\n-\t\tw.collectForReservation(ctx, &reservations[i])\n-\t}\n+\t\twg.Add(1)\n+\t\tgo func(r *models.GPUReservation) {\n+\t\t\tdefer wg.Done()\n+\t\t\tctx, cancel := context.WithTimeout(w.baseCtx, perReservationTimeout)\n+\t\t\tdefer cancel()\n+\t\t\tw.collectForReservation(ctx, r)\n+\t\t}(&reservations[i])\n+\t}\n+\twg.Wait()\n }\n \n // collectForReservation collects utilization for a single reservation"
+    },
+    {
+      "sha": "4f7c6a8eb6c325b74968612abc2140b10b3bd614",
+      "filename": "pkg/api/handlers/gpu.go",
+      "status": "modified",
+      "additions": 2,
+      "deletions": 1,
+      "changes": 3,
+      "blob_url": "https://github.com/kubestellar/console/blob/07643472db103ed29de143840ed6c2e5b115839a/pkg%2Fapi%2Fhandlers%2Fgpu.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/07643472db103ed29de143840ed6c2e5b115839a/pkg%2Fapi%2Fhandlers%2Fgpu.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fapi%2Fhandlers%2Fgpu.go?ref=07643472db103ed29de143840ed6c2e5b115839a",
+      "patch": "@@ -421,7 +421,8 @@ func (h *GPUHandler) GetReservationUtilization(c *fiber.Ctx) error {\n \t\treturn authErr\n \t}\n \n-\tsnapshots, err := h.store.GetUtilizationSnapshots(id)\n+\tlimit := c.QueryInt(\"limit\", store.DefaultSnapshotQueryLimit)\n+\tsnapshots, err := h.store.GetUtilizationSnapshots(id, limit)\n \tif err != nil {\n \t\treturn fiber.NewError(fiber.StatusInternalServerError, \"Failed to get utilization data\")\n \t}"
+    },
+    {
+      "sha": "54e1b57178faca056ad894a23aeb4d045af159b2",
+      "filename": "pkg/store/sqlite.go",
+      "status": "modified",
+      "additions": 11,
+      "deletions": 3,
+      "changes": 14,
+      "blob_url": "https://github.com/kubestellar/console/blob/07643472db103ed29de143840ed6c2e5b115839a/pkg%2Fstore%2Fsqlite.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/07643472db103ed29de143840ed6c2e5b115839a/pkg%2Fstore%2Fsqlite.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fstore%2Fsqlite.go?ref=07643472db103ed29de143840ed6c2e5b115839a",
+      "patch": "@@ -2068,10 +2068,13 @@ func (s *SQLiteStore) InsertUtilizationSnapshot(snapshot *models.GPUUtilizationS\n \treturn err\n }\n \n-func (s *SQLiteStore) GetUtilizationSnapshots(reservationID string) ([]models.GPUUtilizationSnapshot, error) {\n+func (s *SQLiteStore) GetUtilizationSnapshots(reservationID string, limit int) ([]models.GPUUtilizationSnapshot, error) {\n+\tif limit <= 0 {\n+\t\tlimit = DefaultSnapshotQueryLimit\n+\t}\n \trows, err := s.db.Query(\n-\t\t`SELECT id, reservation_id, timestamp, gpu_utilization_pct, memory_utilization_pct, active_gpu_count, total_gpu_count FROM gpu_utilization_snapshots WHERE reservation_id = ? ORDER BY timestamp ASC`,\n-\t\treservationID,\n+\t\t`SELECT id, reservation_id, timestamp, gpu_utilization_pct, memory_utilization_pct, active_gpu_count, total_gpu_count FROM gpu_utilization_snapshots WHERE reservation_id = ? ORDER BY timestamp DESC LIMIT ?`,\n+\t\treservationID, limit,\n \t)\n \tif err != nil {\n \t\treturn nil, err\n@@ -2091,6 +2094,11 @@ func (s *SQLiteStore) GetUtilizationSnapshots(reservationID string) ([]models.GP\n \treturn snapshots, rows.Err()\n }\n \n+// DefaultSnapshotQueryLimit caps the number of rows returned by\n+// GetUtilizationSnapshots to prevent unbounded result sets for\n+// long-lived reservations (#6965). Configurable via the limit parameter.\n+const DefaultSnapshotQueryLimit = 500\n+\n // sqliteMaxVars is the maximum number of bind variables per SQL statement.\n // SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 999; we use 500 as a safe\n // batch size to stay well under that limit (#6888)."
+    },
+    {
+      "sha": "050d5ebe06e11700220a096fd2a871deeea9607b",
+      "filename": "pkg/store/store.go",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/kubestellar/console/blob/07643472db103ed29de143840ed6c2e5b115839a/pkg%2Fstore%2Fstore.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/07643472db103ed29de143840ed6c2e5b115839a/pkg%2Fstore%2Fstore.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Fstore%2Fstore.go?ref=07643472db103ed29de143840ed6c2e5b115839a",
+      "patch": "@@ -169,7 +169,7 @@ type Store interface {\n \n \t// GPU Utilization Snapshots\n \tInsertUtilizationSnapshot(snapshot *models.GPUUtilizationSnapshot) error\n-\tGetUtilizationSnapshots(reservationID string) ([]models.GPUUtilizationSnapshot, error)\n+\tGetUtilizationSnapshots(reservationID string, limit int) ([]models.GPUUtilizationSnapshot, error)\n \tGetBulkUtilizationSnapshots(reservationIDs []string) (map[string][]models.GPUUtilizationSnapshot, error)\n \tDeleteOldUtilizationSnapshots(before time.Time) (int64, error)\n \tListActiveGPUReservations() ([]models.GPUReservation, error)"
+    },
+    {
+      "sha": "dc2d0b3316cd2c6c6a1b85944ee34f5341e59c9b",
+      "filename": "pkg/test/mock_store.go",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 1,
+      "changes": 2,
+      "blob_url": "https://github.com/kubestellar/console/blob/07643472db103ed29de143840ed6c2e5b115839a/pkg%2Ftest%2Fmock_store.go",
+      "raw_url": "https://github.com/kubestellar/console/raw/07643472db103ed29de143840ed6c2e5b115839a/pkg%2Ftest%2Fmock_store.go",
+      "contents_url": "https://api.github.com/repos/kubestellar/console/contents/pkg%2Ftest%2Fmock_store.go?ref=07643472db103ed29de143840ed6c2e5b115839a",
+      "patch": "@@ -175,7 +175,7 @@ func (m *MockStore) GetClusterReservedGPUCount(cluster string, excludeID *uuid.U\n func (m *MockStore) InsertUtilizationSnapshot(snapshot *models.GPUUtilizationSnapshot) error {\n \treturn nil\n }\n-func (m *MockStore) GetUtilizationSnapshots(reservationID string) ([]models.GPUUtilizationSnapshot, error) {\n+func (m *MockStore) GetUtilizationSnapshots(reservationID string, limit int) ([]models.GPUUtilizationSnapshot, error) {\n \treturn nil, nil\n }\n func (m *MockStore) GetBulkUtilizationSnapshots(reservationIDs []string) (map[string][]models.GPUUtilizationSnapshot, error) {"
+    }
+  ]
+}
