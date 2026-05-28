@@ -38,6 +38,9 @@ from datetime import date, datetime
 from pathlib import Path
 from statistics import median
 from typing import Any
+import csv
+import os
+import re
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = REPO_ROOT / "data"
@@ -102,7 +105,7 @@ def parse_args() -> argparse.Namespace:
         description="Analyze how a developer distributes work across repositories."
     )
     parser.add_argument("developers_file", help="Path to developers.json")
-    parser.add_argument("--author", required=True, help="GitHub handle to inspect")
+    parser.add_argument("--author", required=False, help="GitHub handle to inspect")
     parser.add_argument(
         "--month",
         type=parse_month_arg,
@@ -131,6 +134,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=TIMELINE_WIDTH,
         help="Width of the per-day timeline stripes (default: 56).",
+    )
+    parser.add_argument(
+        "--export-all",
+        action="store_true",
+        help="Process all local monthly sample JSON files in data/ and export aggregated CSVs to data/exports-RQ4.",
+    )
+    parser.add_argument(
+        "--export-dir",
+        type=str,
+        default=str(DATA_DIR / "exports-RQ4"),
+        help="Directory to write CSV exports when using --export-all (default: data/exports-RQ4)",
     )
     return parser.parse_args()
 
@@ -382,15 +396,36 @@ def extract_commits(sample: dict[str, Any]) -> tuple[list[CommitRecord], dict[st
             commits.append(
                 CommitRecord(
                     sha=item.get("sha", ""),
-                    repo=repo_meta.get("full_name") or repo_meta.get("name") or "(unknown)",
+                    repo=(repo_meta.get("full_name") or repo_meta.get("name") or None)
+                    if isinstance(repo_meta, dict)
+                    else None,
                     committed_at=parse_github_datetime(committed_at),
                     day=day,
-                    message=commit_meta.get("message", "").splitlines()[0].strip(),
+                    message=(lambda m: (m.splitlines()[0].strip() if (m or "").splitlines() else ""))(commit_meta.get("message", "")),
                     url=item.get("html_url") or item.get("url") or "",
                 )
             )
 
     commits.sort(key=lambda commit: (commit.committed_at, commit.sha))
+    # Fill missing repo names from URLs when possible
+    for c in commits:
+        if not c.repo or c.repo == "(unknown)":
+            html = c.url or ""
+            m = re.search(r"github\.com/([^/]+/[^/]+)/", html)
+            if m:
+                # mutate dataclass by creating a new one — simpler to replace in place
+                c_repo = m.group(1)
+                # dataclass is frozen; recreate object
+                new = CommitRecord(
+                    sha=c.sha,
+                    repo=c_repo,
+                    committed_at=c.committed_at,
+                    day=c.day,
+                    message=c.message,
+                    url=c.url,
+                )
+                commits[commits.index(c)] = new
+
     return commits, day_totals
 
 
@@ -487,6 +522,206 @@ def bucket_streak_lengths(runs: list[RepoRun]) -> Counter[str]:
         else:
             buckets["8+"] += 1
     return buckets
+
+
+# --- RQ4 helpers: Gini, sessionization, weekly aggregation -----------------
+def gini_coefficient_from_counts(counter: Counter[str]) -> float:
+    """Compute the Gini coefficient for the distribution given by the counter values.
+
+    Returns a value between 0 (perfect equality) and 1 (max inequality).
+    """
+    values = sorted([v for v in counter.values() if v >= 0])
+    n = len(values)
+    total = sum(values)
+    if n == 0 or total == 0:
+        return 0.0
+    cumulative = 0
+    for i, val in enumerate(values, 1):
+        cumulative += i * val
+    gini = (2 * cumulative) / (n * total) - (n + 1) / n
+    # numeric guard
+    return max(0.0, min(1.0, gini))
+
+
+def sessionize_commits(commits: list[CommitRecord], threshold_minutes: int = 30) -> list[list[CommitRecord]]:
+    """Split a time-ordered commit stream into sessions separated by > threshold_minutes inactivity.
+
+    Returns a list of sessions, each a list of CommitRecord in chronological order.
+    """
+    if not commits:
+        return []
+    sessions: list[list[CommitRecord]] = []
+    current: list[CommitRecord] = [commits[0]]
+    for commit in commits[1:]:
+        delta_min = (commit.committed_at - current[-1].committed_at).total_seconds() / 60.0
+        if delta_min > threshold_minutes:
+            sessions.append(current)
+            current = [commit]
+        else:
+            current.append(commit)
+    if current:
+        sessions.append(current)
+    return sessions
+
+
+def session_switch_counts(sessions: list[list[CommitRecord]]) -> list[int]:
+    """Return the number of repository switches inside each session."""
+    counts: list[int] = []
+    for s in sessions:
+        seq = [c.repo for c in s]
+        switches = sum(1 for a, b in zip(seq, seq[1:]) if a != b)
+        counts.append(switches)
+    return counts
+
+
+def group_commits_by_iso_week(commits: list[CommitRecord]) -> dict[str, list[CommitRecord]]:
+    groups: dict[str, list[CommitRecord]] = defaultdict(list)
+    for c in commits:
+        iso = c.committed_at.isocalendar()
+        # iso is (year, week, weekday) - use year-week key
+        key = f"{iso.year}-{iso.week:02d}"
+        groups[key].append(c)
+    return dict(sorted(groups.items()))
+
+
+# --- Export / batch processing helpers ---------------------------------
+SAMPLE_FILE_RE = re.compile(r"(?P<dev>.+)-(?P<year>\d{4})-(?P<month>\d{2})(?:-\d+)?$")
+
+
+def find_sample_groups(data_dir: Path) -> dict[tuple[str, str], list[Path]]:
+    """Return mapping (developer, month) -> list of sample file paths."""
+    groups: dict[tuple[str, str], list[Path]] = defaultdict(list)
+    for path in data_dir.glob("*.json"):
+        m = SAMPLE_FILE_RE.match(path.stem)
+        if not m:
+            continue
+        dev = m.group("dev")
+        month = f"{m.group('year')}-{m.group('month')}"
+        groups[(dev, month)].append(path)
+    return dict(sorted(groups.items()))
+
+
+def aggregate_day_totals(all_day_totals: dict[str, dict[str, int]], new: dict[str, dict[str, int]]) -> None:
+    """Merge day_totals from one sample into the aggregator in-place.
+
+    We sum 'sampled' values and take max of 'total_count' to be conservative.
+    """
+    for day, vals in new.items():
+        if day not in all_day_totals:
+            all_day_totals[day] = {"sampled": vals.get("sampled", 0), "total_count": int(vals.get("total_count", 0) or 0)}
+        else:
+            all_day_totals[day]["sampled"] += vals.get("sampled", 0)
+            all_day_totals[day]["total_count"] = max(all_day_totals[day]["total_count"], int(vals.get("total_count", 0) or 0))
+
+
+def export_all_samples(data_dir: Path, export_dir: Path) -> None:
+    export_dir = Path(export_dir)
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    groups = find_sample_groups(data_dir)
+
+    # prepare CSV writers
+    commits_f = open(export_dir / "commits.csv", "w", newline="", encoding="utf-8")
+    day_f = open(export_dir / "day_summary.csv", "w", newline="", encoding="utf-8")
+    weekly_f = open(export_dir / "weekly_summary.csv", "w", newline="", encoding="utf-8")
+    sessions_f = open(export_dir / "sessions.csv", "w", newline="", encoding="utf-8")
+    runs_f = open(export_dir / "runs.csv", "w", newline="", encoding="utf-8")
+    handoffs_f = open(export_dir / "handoffs.csv", "w", newline="", encoding="utf-8")
+    repo_dist_f = open(export_dir / "repo_distribution.csv", "w", newline="", encoding="utf-8")
+
+    commits_w = csv.writer(commits_f)
+    day_w = csv.writer(day_f)
+    weekly_w = csv.writer(weekly_f)
+    sessions_w = csv.writer(sessions_f)
+    runs_w = csv.writer(runs_f)
+    handoffs_w = csv.writer(handoffs_f)
+    repo_dist_w = csv.writer(repo_dist_f)
+
+    commits_w.writerow(["developer", "month", "commit_sha", "repo", "committed_at_iso", "day_iso", "message_preview", "url"])
+    day_w.writerow(["developer", "month", "day_iso", "sampled_commits", "reported_commits", "unique_repos", "switches", "effective_repos"])
+    weekly_w.writerow(["developer", "iso_week", "week_start_iso", "commits_in_week", "gini", "active_repos_ge2", "top_repo", "top_repo_share"])
+    sessions_w.writerow(["developer", "month", "session_id", "start_iso", "end_iso", "duration_minutes", "commits_in_session", "switches_in_session", "unique_repos_in_session"])
+    runs_w.writerow(["developer", "month", "run_id", "repo", "start_iso", "end_iso", "start_day", "end_day", "commits", "duration_minutes"])
+    handoffs_w.writerow(["developer", "month", "left_repo", "right_repo", "count"])
+    repo_dist_w.writerow(["developer", "month", "repo", "commits", "share"])
+
+    try:
+        for (dev, month), paths in groups.items():
+            # load and aggregate commits from all files for this developer-month
+            all_commits: list[CommitRecord] = []
+            all_day_totals: dict[str, dict[str, int]] = {}
+            for p in sorted(paths):
+                sample = json.loads(Path(p).read_text())
+                commits, day_totals = extract_commits(sample)
+                all_commits.extend(commits)
+                aggregate_day_totals(all_day_totals, day_totals)
+
+            if not all_commits:
+                continue
+
+            # sort full commit stream
+            all_commits.sort(key=lambda c: (c.committed_at, c.sha))
+
+            # per-developer-month aggregates
+            seq = [c.repo for c in all_commits]
+            repo_counts = Counter(seq)
+            runs = build_runs(all_commits)
+            day_summaries = build_day_summaries(all_commits)
+            sessions = sessionize_commits(all_commits, threshold_minutes=30)
+            session_switches = session_switch_counts(sessions)
+            weekly_groups = group_commits_by_iso_week(all_commits)
+            handoffs = Counter((l, r) for l, r in zip(seq, seq[1:]) if l != r)
+
+            # write commits
+            for c in all_commits:
+                commits_w.writerow([dev, month, c.sha, c.repo, c.committed_at.isoformat(), c.day, c.message[:200], c.url])
+
+            # write day summaries (use day_summaries which reflect sampled commits)
+            for ds in day_summaries:
+                totals = all_day_totals.get(ds.day, {})
+                reported = totals.get("total_count", ds.commits)
+                eff = ""
+                day_w.writerow([dev, month, ds.day, ds.commits, reported, ds.unique_repos, ds.switches, eff])
+
+            # weekly summary
+            for wk, wk_commits in weekly_groups.items():
+                wcount = len(wk_commits)
+                w_repo_counts = Counter(c.repo for c in wk_commits)
+                w_gini = gini_coefficient_from_counts(w_repo_counts)
+                w_active = sum(1 for v in w_repo_counts.values() if v >= 2)
+                top_repo, top_count = w_repo_counts.most_common(1)[0]
+                week_start = min(c.committed_at for c in wk_commits).isoformat()
+                weekly_w.writerow([dev, wk, week_start, wcount, f"{w_gini:.6f}", w_active, top_repo, f"{top_count/wcount:.4f}"])
+
+            # sessions
+            for i, s in enumerate(sessions, 1):
+                start = s[0].committed_at.isoformat()
+                end = s[-1].committed_at.isoformat()
+                duration = max(0, int((s[-1].committed_at - s[0].committed_at).total_seconds() // 60))
+                seqs = [c.repo for c in s]
+                switches = sum(1 for a, b in zip(seqs, seqs[1:]) if a != b)
+                sessions_w.writerow([dev, month, i, start, end, duration, len(s), switches, len(set(seqs))])
+
+            # runs
+            for i, r in enumerate(runs, 1):
+                runs_w.writerow([dev, month, i, r.repo, r.start_at.isoformat(), r.end_at.isoformat(), r.start_day, r.end_day, r.commits, r.duration_minutes])
+
+            # handoffs
+            for (l, r), cnt in handoffs.most_common():
+                handoffs_w.writerow([dev, month, l, r, cnt])
+
+            # repo distribution
+            total_commits = len(all_commits)
+            for repo, cnt in repo_counts.most_common():
+                repo_dist_w.writerow([dev, month, repo, cnt, f"{cnt/total_commits:.6f}"])
+    finally:
+        commits_f.close()
+        day_f.close()
+        weekly_f.close()
+        sessions_f.close()
+        runs_f.close()
+        handoffs_f.close()
+        repo_dist_f.close()
 
 
 def classify_style(
@@ -660,6 +895,11 @@ def main() -> None:
         raise SystemExit(f"Developers file not found: {developers_path}")
 
     developers = load_developers(developers_path)
+    if args.export_all:
+        export_all_samples(DATA_DIR, Path(args.export_dir))
+        print(f"Exported CSVs to {args.export_dir}")
+        return
+
     developer = resolve_developer(developers, args.author)
     if developer is None:
         raise SystemExit(f"Developer '{args.author}' not found in {developers_path}.")
@@ -716,6 +956,18 @@ def main() -> None:
         longest_run=longest_run,
     )
 
+    # RQ4 additional metrics
+    monthly_gini = gini_coefficient_from_counts(repo_counts)
+    active_repos_month = sum(1 for c in repo_counts.values() if c >= 2)
+    sessions = sessionize_commits(commits, threshold_minutes=30)
+    session_switches = session_switch_counts(sessions)
+    session_durations = [
+        max(0, int((s[-1].committed_at - s[0].committed_at).total_seconds() // 60))
+        for s in sessions
+        if s
+    ]
+    weekly_groups = group_commits_by_iso_week(commits)
+
     print(f"\nRepository Switching Analysis - @{handle} - {month_string(year, month)}")
     print("=" * 68)
     print_summary_line("Sample source", str(source_path.relative_to(REPO_ROOT)))
@@ -725,6 +977,8 @@ def main() -> None:
     print_summary_line("Repositories touched", str(len(repo_counts)))
     print_summary_line("Active days", str(len(day_summaries)))
     print_summary_line("Style", f"{style} ({style_note})")
+    print_summary_line("Active repos (>=2 commits)", str(active_repos_month))
+    print_summary_line("Gini (month)", f"{monthly_gini:.3f}")
 
     if coverage < 0.95:
         print()
@@ -767,6 +1021,38 @@ def main() -> None:
     section("Daily Flow")
     print_timeline(day_summaries, repo_counts, args.timeline_width)
     print()
+
+    section("Weekly Concentration")
+    if not weekly_groups:
+        print("  No weekly data available.")
+    else:
+        print("  Week   Commits  Gini   ActiveRepos(>=2)")
+        for week, week_commits in weekly_groups.items():
+            wcount = len(week_commits)
+            w_repo_counts = Counter(c.repo for c in week_commits)
+            w_gini = gini_coefficient_from_counts(w_repo_counts)
+            w_active = sum(1 for v in w_repo_counts.values() if v >= 2)
+            print(f"  {week}  {wcount:>7}  {w_gini:>4.3f}     {w_active}")
+
+    section("Session Metrics (30m inactivity)")
+    if not sessions:
+        print("  No sessions found in the sample.")
+    else:
+        total_sessions = len(sessions)
+        avg_switches = sum(session_switches) / total_sessions if total_sessions else 0.0
+        median_switches = float(median(session_switches)) if session_switches else 0.0
+        avg_session_minutes = float(median(session_durations)) if session_durations else 0.0
+        print_summary_line("Total sessions", str(total_sessions))
+        print_summary_line("Median switches/session", f"{median_switches:.1f}")
+        print_summary_line("Avg switches/session", f"{avg_switches:.2f}")
+        print_summary_line("Median session length", f"{avg_session_minutes:.0f} minutes")
+        print()
+
+    # If requested, run export across all local sample files and exit
+    if args.export_all:
+        export_all_samples(DATA_DIR, Path(args.export_dir))
+        print(f"Exported CSVs to {args.export_dir}")
+        return
 
 
 if __name__ == "__main__":
