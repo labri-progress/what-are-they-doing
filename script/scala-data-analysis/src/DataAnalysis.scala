@@ -141,6 +141,26 @@ object DataAnalysis {
       println()
     }
 
+  lazy val coAuthorAgentCounts: Vector[(String, Int)] =
+    allCommitDetails.valuesIterator
+      .flatMap { entry =>
+        entry.classification.agentSignals.iterator.collect {
+          case (agent, signals) if signals.contains(SignalType.CoAuthor) => agent
+        }
+      }
+      .toVector
+      .groupBy(identity)
+      .view
+      .mapValues(_.size)
+      .toVector
+      .sortBy(-_._2)
+
+  @main def coauthored() =
+    println("Detections via CoAuthor signal per agent:")
+    coAuthorAgentCounts.foreach { case (agent, count) =>
+      println(s"  $count  $agent")
+    }
+
   private val conventionalCommitPattern =
     "^([a-z]+)(?:\\([^\\r\\n()]+\\))?(!)?:\\s+(.+)$".r
 
