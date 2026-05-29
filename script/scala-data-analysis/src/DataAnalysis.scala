@@ -89,24 +89,22 @@ object DataAnalysis {
 
   lazy val aggregateData: Vector[(dev: String, month: YearMonth, path: Path, data: MonthlySnapshot)] =
     time("loading aggregate data") {
-      val snapshotPattern = raw"(.+)-(\d{4}-\d{2})".r
-      val jsonsFiles      = Using(Files.list(dataPath)) {
-        _.iterator().asScala.flatMap { path =>
-          if Files.isRegularFile(path) && path.getFileName.toString.endsWith(".json")
-          then
-              snapshotPattern.findFirstMatchIn(path.getFileName.toString.stripSuffix(".json")) match {
-                case Some(m) =>
-                  Some((developer = m.group(1).nn, month = YearMonth.parse(m.group(2)).nn, path = path))
-                case _ => None
-              }
-          else None
+      val jsonFiles = Using(Files.list(dataPath)) {
+        _.iterator().asScala.filter { path =>
+          Files.isRegularFile(path) && path.getFileName.toString.endsWith(".json")
         }.toVector
       }.get
 
-      jsonsFiles.flatMap { (dev, month, path) =>
-        if trackedHandles.contains(dev) then
-            Some((dev, month, path, readFromArray[MonthlySnapshot](Files.readAllBytes(path))))
-        else None
+      jsonFiles.flatMap { path =>
+        try
+            val snapshot = readFromArray[MonthlySnapshot](Files.readAllBytes(path))
+            if trackedHandles.contains(snapshot.developer) then
+                Some((snapshot.developer, YearMonth.parse(snapshot.month), path, snapshot))
+            else None
+        catch
+            case _: Exception =>
+                System.err.println(s"Warning: could not parse ${path.getFileName} as MonthlySnapshot, skipping")
+                None
       }.toVector
     }
 
