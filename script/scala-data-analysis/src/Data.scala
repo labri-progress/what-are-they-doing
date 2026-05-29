@@ -2,6 +2,7 @@ package whataretheydoing
 
 import com.github.plokhotnyuk.jsoniter_scala.core.*
 import com.github.plokhotnyuk.jsoniter_scala.macros.*
+import de.rmgk.Associative
 
 import java.time.LocalDate
 
@@ -109,6 +110,9 @@ case class AgentHeuristic(
     period_start: String,
     period_end: Option[String]
 )
+object  AgentHeuristic {
+  given Associative[AgentHeuristic] = Associative.derived
+}
 
 case class DevSummary(
     handle: String,

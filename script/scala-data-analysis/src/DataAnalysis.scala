@@ -6,6 +6,7 @@ import whataretheydoing.HeuristicMatcher.SignalType
 
 import java.nio.file.{Files, Path}
 import java.time.{DayOfWeek, LocalDate, YearMonth}
+import java.util.Locale
 import scala.collection.parallel.immutable.ParVector
 import scala.jdk.CollectionConverters.*
 import scala.util.Using
@@ -28,7 +29,7 @@ object DataAnalysis {
       commitType: CommitType,
       message: String,
       files: List[String],
-      trailers: Map[String, String]
+      trailers: Seq[(key: String, value: String)]
   ) {
     def agents: Set[String] = agentSignals.keySet
   }
@@ -86,8 +87,12 @@ object DataAnalysis {
 
   lazy val trackedHandles: Set[String] = developers.map(_.handle).toSet
 
-  lazy val heuristicsByAgent: Map[String, List[AgentHeuristic]] =
+  lazy val baseHeuristics: Map[String, AgentHeuristic] =
     time("load heuristics")(HeuristicMatcher.loadHeuristics(heuristics))
+
+  lazy val heuristicsByAgent: Map[String, AgentHeuristic] =
+    import de.rmgk.Associative.mapAssoc
+    mapAssoc.combine(baseHeuristics, CustomHeuristics.customHeuristics)
 
   lazy val aggregateData: Vector[(dev: String, month: YearMonth, path: Path, data: MonthlySnapshot)] =
     time("loading aggregate data") {
@@ -301,26 +306,26 @@ object DataAnalysis {
 
   private val trailerPattern: Regex = """^([a-zA-Z][a-zA-Z0-9_.-]+):\s+(.+)$""".r
 
-  private def parseTrailers(message: String): Map[String, String] =
+  private def parseTrailers(message: String): Seq[(key: String, value: String)] =
     message.linesIterator.toVector
       .drop(1)
       .map(_.trim)
       .filter(_.nonEmpty)
       .flatMap { line =>
         line match
-          case trailerPattern(key, value) => Some((key.nn, value.nn))
-          case _                          => None
+            case trailerPattern(key, value) => Some((key.nn.toLowerCase(Locale.ROOT).nn, value.nn))
+            case _                          => None
       }
-      .toMap
 
   private def classifyCommit(commit: CommitEntry, detail: CommitDetail): ClassifiedCommit = {
 
-    val message = detail.message.get
+    val message  = detail.message.get
     val trailers = parseTrailers(message)
 
     val agentSignals = HeuristicMatcher.detectAgents(
       commit,
       detail,
+      trailers,
       heuristicsByAgent
     )
 
@@ -530,5 +535,38 @@ object DataAnalysis {
     )
     ()
   }
+
+  @main def trailerStats() =
+      val counts = allCommitDetails.valuesIterator
+        .flatMap(_.classification.trailers.map(_.key))
+        .toVector
+        .groupBy(identity)
+        .view
+        .mapValues(_.size)
+        .toVector
+        .sortBy(-_._2)
+
+      println("Trailer key counts across all commits:")
+      // counts.foreach { case (key, count) => println(s"  $count  $key") }
+
+
+
+      val trailerCategories: Map[String, String] = Map(
+        "co-authored-by" -> "signal",
+        "signed-off-by" -> "signal"
+      )
+
+      val knownTrailersSet = trailerCategories.keys
+
+      val topUnknown = counts.filter((k, _) => !trailerCategories.contains(k)).maxByOption(_._2)
+      topUnknown match
+        case Some((key, count)) =>
+          println(s"\nMost common uncategorized trailer: '$key' ($count occurrences)")
+          println("All values:")
+          val values = allCommitDetails.valuesIterator
+            .flatMap(_.classification.trailers.collect { case (k, v) if k == key => v })
+            .toVector.groupBy(identity).view.mapValues(_.size).toVector.sortBy(-_._2)
+          values.foreach(v => println(s"  ${v._2} ${v._1}"))
+        case None => println("No uncategorized trailers found")
 
 }
