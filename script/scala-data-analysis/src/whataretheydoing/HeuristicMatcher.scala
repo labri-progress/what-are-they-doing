@@ -145,7 +145,7 @@ object HeuristicMatcher {
       trailers: Seq[(key: String, value: String)],
   ): Map[String, Set[SignalType]] =
     heuristicsByAgent.iterator.flatMap { case (agentName, heuristics) =>
-      val signals = detectSignals(commit, detail, trailers, heuristics).toSet
+      val signals = detectSignals(commit, detail, trailers, heuristics)
       if signals.nonEmpty then Some(agentName -> signals) else None
     }.toMap
 

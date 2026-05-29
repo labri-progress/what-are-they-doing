@@ -3,13 +3,10 @@ package whataretheydoing
 import com.github.plokhotnyuk.jsoniter_scala.core.*
 import whataretheydoing.CommitProcessing.{aggregateCommitData, commitSignals}
 import whataretheydoing.HeuristicMatcher.SignalType
-import whataretheydoing.definitions.CustomHeuristics
-import whataretheydoing.{AgentHeuristic, CommitDetail, CommitEntry, CommitProcessing, DayData, DevSummary, HeuristicMatcher, MonthlySnapshot, SVGGraphLib}
+import whataretheydoing.{CommitDetail, CommitEntry, CommitProcessing, DayData, DevSummary, SVGGraphLib}
 
 import java.nio.file.{Files, Path}
-import java.time.{DayOfWeek, LocalDate, YearMonth}
-import scala.jdk.CollectionConverters.*
-import scala.util.Using
+import java.time.{DayOfWeek, LocalDate}
 
 object DataAnalysis {
 

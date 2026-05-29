@@ -118,13 +118,13 @@ object CommitProcessing {
 
   lazy val allDays: Seq[LocalDate] = aggregateCommitData.flatMap(_.data.days.keysIterator)
 
-  lazy val allCommitDetails: Vector[(commit: CommitEntry, detail: CommitDetail, classification: ClassifiedCommit)] = {
+  lazy val allCommitDetails: ParVector[(commit: CommitEntry, detail: CommitDetail, classification: ClassifiedCommit)] = {
     DataAnalysis.time("load commit details") {
       allCommits.to(ParVector).map { commit =>
         val detail         = loadFullCommitData(commit)
         val classification = classifyCommit(commit, detail)
         (commit = commit, detail = detail, classification = classification)
-      }.toVector
+      }
     }
   }
 
