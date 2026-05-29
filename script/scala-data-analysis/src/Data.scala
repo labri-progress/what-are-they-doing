@@ -123,3 +123,22 @@ case class DevSummary(
     handle: String,
     repos: Option[List[String]] = None
 )
+
+// ── Data models for GitHub contribution summaries ────────────────────────
+
+case class GraphQLQuery(query: String)
+
+case class ContributionDay(date: String, contributionCount: Int)
+case class Week(contributionDays: List[ContributionDay])
+case class ContributionCalendar(totalContributions: Int, weeks: List[Week])
+case class ContributionsCollection(contributionCalendar: ContributionCalendar)
+case class UserData(contributionsCollection: ContributionsCollection)
+case class GraphQLData(user: Option[UserData])
+case class GraphQLResponse(data: Option[GraphQLData])
+
+case class DeveloperContributionSummary(
+    developer: String,
+    fromDate: String,
+    toDate: String,
+    contributions: List[ContributionDay]
+)
