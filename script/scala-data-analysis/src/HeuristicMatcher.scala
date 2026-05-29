@@ -11,7 +11,7 @@ import scala.util.matching.Regex
 object HeuristicMatcher {
 
   enum SignalType:
-      case CommitAuthor, Committer, CoAuthoredBy, SignedOffBy, ExecutedBy, Role, CommitMessage, Files
+      case CommitAuthor, Committer, CoAuthoredBy, SignedOffBy, ExecutedBy, Role, AgentLogUrl, CommitMessage, Files
 
   private val trailerPersonPattern: Regex = """^\s*(.+?)\s*<\s*([^>]+)\s*>\s*$""".r
 
@@ -100,13 +100,21 @@ object HeuristicMatcher {
         else Set.empty
 
       val roleSignal =
-        if roles.nonEmpty && h.executed_by_prefixes.exists(prefix =>
+        if roles.nonEmpty && h.role_prefixes.exists(prefix =>
               roles.exists(r => matchPattern(prefix, r))
             )
         then Set(SignalType.Role)
         else Set.empty
 
-      coauthorSignal ++ signedOffBySignal ++ executedBySignal ++ roleSignal
+      val agentLogUrlSignal =
+        if h.agent_log_url_patterns.nonEmpty then
+          val logUrls = trailers.collect { case ("agent-logs-url", v) => normalize(v) }
+          if logUrls.exists(url => h.agent_log_url_patterns.exists(p => url.contains(p.toLowerCase)))
+          then Set(SignalType.AgentLogUrl)
+          else Set.empty
+        else Set.empty
+
+      coauthorSignal ++ signedOffBySignal ++ executedBySignal ++ roleSignal ++ agentLogUrlSignal
 
   def detectAgents(
       commit: CommitEntry,

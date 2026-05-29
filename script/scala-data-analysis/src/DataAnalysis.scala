@@ -1,6 +1,7 @@
 package whataretheydoing
 
 import com.github.plokhotnyuk.jsoniter_scala.core.*
+import definitions.CustomHeuristics
 import whataretheydoing.DataAnalysis.CommitType.Unknown
 import whataretheydoing.HeuristicMatcher.SignalType
 
@@ -556,9 +557,10 @@ object DataAnalysis {
         "rig"         -> "unused", // also gastown
         "bead" -> "unused", // likely also gastown
         "beads" -> "unused", // likely also gastown
+        "agent-logs-url" -> "signal", // copilot
         "fixes" -> "unused", // may have some stuff, but unclear
         "ref" -> "unused", // mayb have some bead stuff
-      ) ++ (List("note", "verified", "before", "resolves", "covers) ++ CustomHeuristics.noSignalTrailers).map(key => key -> "no-signal").toMap
+      ) ++ (List("note", "verified", "before", "resolves", "covers") ++ definitions.NoSignalList.noSignalTrailers).map(key => key -> "no-signal").toMap
 
       val allTrailersByKey = allTrailers.groupBy(_.key)
 

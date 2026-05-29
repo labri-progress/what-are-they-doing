@@ -110,7 +110,9 @@ case class AgentHeuristic(
     period_start: String,
     period_end: Option[String],
     executed_by_prefixes: List[String] = Nil,
+    role_prefixes: List[String] = Nil,
     data_source: Option[String] = None,
+    agent_log_url_patterns: List[String] = Nil,
 )
 object  AgentHeuristic {
   given Associative[AgentHeuristic] = Associative.derived
