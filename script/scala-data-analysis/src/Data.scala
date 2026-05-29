@@ -38,7 +38,7 @@ case class CommitEntry(
     commit: CommitInfo,
     url: String,
     html_url: Option[String],
-    author: Option[GitHubUser],
+    author: GitHubUser,
     committer: Option[GitHubUser]
 )
 
