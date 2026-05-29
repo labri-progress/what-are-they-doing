@@ -1,7 +1,6 @@
 package whataretheydoing
 
 import com.github.plokhotnyuk.jsoniter_scala.core.*
-import whataretheydoing.DataAnalysis.{ClassifiedCommit, CommitType}
 
 import java.nio.file.Files
 import java.time.LocalDate

@@ -1,10 +1,10 @@
 package whataretheydoing
 
 import com.github.plokhotnyuk.jsoniter_scala.core.*
-import definitions.CustomHeuristics
 import whataretheydoing.CommitProcessing.commitSignals
-import whataretheydoing.DataAnalysis.CommitType.Unknown
 import whataretheydoing.HeuristicMatcher.SignalType
+import whataretheydoing.definitions.CustomHeuristics
+import whataretheydoing.{AgentHeuristic, CommitDetail, CommitEntry, CommitProcessing, DayData, DevSummary, HeuristicMatcher, MonthlySnapshot, SVGGraphLib}
 
 import java.nio.file.{Files, Path}
 import java.time.{DayOfWeek, LocalDate, YearMonth}
@@ -12,55 +12,6 @@ import scala.jdk.CollectionConverters.*
 import scala.util.Using
 
 object DataAnalysis {
-
-  enum CommitType:
-      case Build, Chore, Ci, Docs, Feat, Fix, Perf, Refactor, Revert, Style, Test, Unknown
-
-  case class ClassifiedCommit(
-      agentSignals: Map[String, Set[SignalType]],
-      commitType: CommitType,
-      message: String,
-      files: List[String],
-      trailers: Seq[(key: String, value: String)]
-  ) {
-    def agents: Set[String] = agentSignals.keySet
-  }
-
-  case class PeriodCsvRow(
-      developer: String,
-      period_iso: String,
-      total_commits: Int,
-      sampled_commits: Int,
-      agent: String,
-      count: Int
-  )
-
-  case class AgentPeriodRow(
-      periodIso: String,
-      totalCommits: Int,
-      sampledCommits: Int,
-      countsByAgent: Map[String, Int]
-  )
-
-  case class TimeSeriesData(
-      points: Vector[SVGGraphLib.StackedBarPoint],
-      totalCommits: Vector[Int],
-      sampledCommits: Vector[Int]
-  )
-
-  case class LinesChangedStats(
-      count: Int,
-      min: Int,
-      q1: Double,
-      median: Double,
-      q3: Double,
-      max: Int,
-      mean: Double,
-      standardDeviation: Double,
-      whiskerLow: Int,
-      whiskerHigh: Int,
-      outliers: Vector[Int]
-  )
 
 // ── Shared output helpers ──────────────────────────────────────────────────
 
@@ -417,7 +368,8 @@ object DataAnalysis {
   }
 
   def writeUnknowCommitTypes(): Unit = {
-    val unknownType = CommitProcessing.allCommitDetails.filter((_, cc) => cc.classification.commitType == Unknown)
+    val unknownType =
+      CommitProcessing.allCommitDetails.filter((_, cc) => cc.classification.commitType == CommitType.Unknown)
     Files.writeString(
       Path.of("commitheader.txt"),
       unknownType.values.map(

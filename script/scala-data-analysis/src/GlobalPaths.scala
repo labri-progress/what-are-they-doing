@@ -1,3 +1,5 @@
+package whataretheydoing
+
 import java.nio.file.Path
 
 object GlobalPaths {

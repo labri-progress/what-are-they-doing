@@ -1,7 +1,7 @@
 package whataretheydoing
 
 import de.rmgk.delay.Sync
-import whataretheydoing.DataAnalysis.*
+import DataAnalysis.*
 import whataretheydoing.CommitProcessing.{allCommitDetails, commitSignals}
 import whataretheydoing.SVGGraphLib.*
 
