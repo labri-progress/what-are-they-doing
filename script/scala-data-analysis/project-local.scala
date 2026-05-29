@@ -1,7 +1,7 @@
 //> using build-info
 
-//> using dep "com.github.plokhotnyuk.jsoniter-scala::jsoniter-scala-core::2.38.12"
-//> using dep "com.github.plokhotnyuk.jsoniter-scala::jsoniter-scala-macros::2.38.12"
+//> using dep "com.github.plokhotnyuk.jsoniter-scala::jsoniter-scala-core::2.38.13"
+//> using dep "com.github.plokhotnyuk.jsoniter-scala::jsoniter-scala-macros::2.38.13"
 //> using dep "com.lihaoyi::pprint::0.9.6"
 //> using dep "commons-io:commons-io:2.22.0"
 //> using dep "de.rmgk.slips::partypack::0.17.0"
