@@ -2,6 +2,7 @@ package whataretheydoing
 
 import de.rmgk.delay.Sync
 import whataretheydoing.DataAnalysis.*
+import whataretheydoing.CommitProcessing.{allCommitDetails, commitSignals}
 import whataretheydoing.SVGGraphLib.*
 
 import java.nio.file.Files
