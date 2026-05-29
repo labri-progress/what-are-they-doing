@@ -103,14 +103,43 @@ object DataAnalysis {
             else None
         catch
             case _: Exception =>
-                System.err.println(s"Warning: could not parse ${path.getFileName} as MonthlySnapshot, skipping")
-                None
+              System.err.println(s"Warning: could not parse ${path.getFileName} as MonthlySnapshot, skipping")
+              None
       }.toVector
     }
 
   def allCommits: Iterator[CommitEntry] = aggregateData.iterator.flatMap(_.data.days.valuesIterator.flatMap(_.commits))
 
   lazy val allDays: Seq[LocalDate] = aggregateData.flatMap(_.data.days.keysIterator)
+
+  case class AuthorStats(
+      login: String,
+      totalCommits: Int,
+      authorCounts: Vector[((String, String), Int)],
+      committerCounts: Vector[((String, String), Int)]
+  )
+
+  lazy val allAuthorStats: Vector[AuthorStats] =
+    val grouped = allCommits.toVector.groupBy(_.author.login)
+    grouped.toVector.sortBy((k, _) => k)(using summon[Ordering[String]]).map { case (login, commits) =>
+      val authorCounts = commits.groupBy(e => (e.commit.author.name, e.commit.author.email)).view.mapValues(_.size).toVector.sortBy(-_._2)
+      val committerCounts = commits.groupBy(e => (e.commit.committer.name, e.commit.committer.email)).view.mapValues(_.size).toVector.sortBy(-_._2)
+      AuthorStats(login, commits.size, authorCounts, committerCounts)
+    }
+
+  @main def auth() =
+    allAuthorStats.foreach { stats =>
+      println(s"--- ${stats.login} (${stats.totalCommits} commits) ---")
+      println("  authors:")
+      stats.authorCounts.foreach { case ((name, email), count) =>
+        println(s"    $count  $name <$email>")
+      }
+      println("  committers:")
+      stats.committerCounts.foreach { case ((name, email), count) =>
+        println(s"    $count  $name <$email>")
+      }
+      println()
+    }
 
   private val conventionalCommitPattern =
     "^([a-z]+)(?:\\([^\\r\\n()]+\\))?(!)?:\\s+(.+)$".r
