@@ -212,7 +212,7 @@ object SVGGraphLib {
     s"<polyline fill='none' stroke='${line.stroke}' stroke-width='2' stroke-dasharray='${line.dashArray}' points='$polyPoints' />\n$markers"
   }
 
-  private def renderLegend(
+  def renderLegend(
       layout: ChartLayout,
       activeKeys: Vector[String],
       colors: Map[String, String],
@@ -469,7 +469,8 @@ $footer
       lineSeries: Vector[LineSeries],
       yAxisLabel: String = "Commits",
       xAxisLabel: String = "",
-      totalLabel: String = "Embedded records"
+      totalLabel: String = "Embedded records",
+      showLegend: Boolean = true
   ): String = {
     val activeStacks = activeStackKeys(points, stackOrder)
     val activeLines  = activeLineSeries(lineSeries)
@@ -497,10 +498,46 @@ ${renderTitles(layout, title, yAxisLabel, xAxisLabel)}
 $bars
 $lines
 ${renderBarLabels(layout, points)}
-${renderLegend(layout, activeStacks, colors, activeLines)}
+${if showLegend then renderLegend(layout, activeStacks, colors, activeLines) else ""}
 ${renderFooter(layout, points, activeStacks, topLabel, activeLines, totalLabel)}
 </svg>
 """
+  }
+
+  def renderLegendOnlySvg(
+      stackOrder: Vector[String],
+      colors: Map[String, String],
+      lineSeries: Vector[LineSeries]
+  ): String = {
+    val activeStacks = activeStackKeys(Vector.empty, stackOrder)
+    val activeLines  = activeLineSeries(lineSeries)
+    val layout       = ChartLayout(
+      width = 400,
+      height = 300,
+      left = 10,
+      right = 10,
+      top = 10,
+      bottom = 10,
+      legendWidth = 380
+    )
+    s"""<svg xmlns='http://www.w3.org/2000/svg' width='${layout.width}' height='${layout.height}' viewBox='0 0 ${layout.width} ${layout.height}'>
+${renderBackground()}
+${renderLegend(layout, activeStacks, colors, activeLines)}
+</svg>
+"""
+  }
+
+  def renderLegendSvg(
+      stackOrder: Vector[String],
+      colors: Map[String, String]
+  ): String = {
+    val allKeys = stackOrder.filterNot(_ == "no signal")
+    val dummyPoint = StackedBarPoint("", allKeys.map(k => k -> 1).toMap)
+    val layout = ChartLayout(width = 220, height = 360, left = 10, right = 10, top = 10, bottom = 10, legendWidth = 200)
+    s"""<svg xmlns='http://www.w3.org/2000/svg' width='220' height='360' viewBox='0 0 220 360'>
+<rect width='100%' height='100%' fill='white'/>
+${renderLegend(layout, activeStackKeys(Vector(dummyPoint), stackOrder), colors, Vector.empty)}
+</svg>"""
   }
 
   def writeSvg(path: java.nio.file.Path, svg: String): Unit = {

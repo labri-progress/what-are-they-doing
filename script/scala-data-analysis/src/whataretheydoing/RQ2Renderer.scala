@@ -254,7 +254,13 @@ object RQ2Renderer {
         .toVector
         .groupMapReduce(identity)(_ => 1)(_ + _)
 
-    heuristicsByAgent.keys.toVector.sorted
+    val legendSync = Sync {
+      val svgPath = GlobalPaths.outputPath.resolve("commit-types-legend.svg")
+      writeSvgAndConvertToPdf(svgPath, renderLegendSvg(commitTypeOrder, commitTypeColors))
+      println(s"Wrote commit-types legend SVG to $svgPath")
+    }
+
+    val agentSyncs = heuristicsByAgent.keys.toVector.sorted
       .filter(agent => agentCommitCounts.getOrElse(agent, 0) >= 50)
       .map { agent =>
       Sync {
@@ -269,12 +275,15 @@ object RQ2Renderer {
                 commitTypeOrder,
                 commitTypeColors,
                 "Top type",
-                defaultLines(data)
+                defaultLines(data),
+                showLegend = false
               )
             )
             println(s"Wrote commit-type-by-agent SVG for $agent to $svgPath")
       }
     }
+
+    legendSync +: agentSyncs
   }
 
   def makeRq2LinesChangedWeeklyStackedSvgs(): Seq[Sync[Any, Unit]] = {
