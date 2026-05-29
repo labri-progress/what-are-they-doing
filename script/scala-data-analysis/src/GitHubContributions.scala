@@ -7,7 +7,6 @@ import java.net.URI
 import java.net.http.{HttpClient, HttpRequest, HttpResponse}
 import java.nio.file.Files
 import java.nio.file.Path
-
 import whataretheydoing.given
 
 object GitHubContributions {
@@ -17,7 +16,7 @@ object GitHubContributions {
 
   val httpClient: HttpClient = HttpClient.newHttpClient()
   val githubGraphQLEndpoint  = "https://api.github.com/graphql"
-  val summaryDir: Path       = DataAnalysis.repoRoot.resolve("data/contribution-summaries")
+  val summaryDir: Path       = GlobalPaths.repoRoot.resolve("data/contribution-summaries")
 
   private def getContributions(
       token: String,

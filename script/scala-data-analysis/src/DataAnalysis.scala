@@ -13,14 +13,6 @@ import scala.util.Using
 
 object DataAnalysis {
 
-  val repoRoot: Path    = Path.of("").toAbsolutePath.normalize.getParent.getParent
-  val dataPath: Path    = repoRoot.resolve("data")
-  val heuristics: Path  = repoRoot.resolve("agent-mining/agents")
-  val commitsPath: Path = repoRoot.resolve("data/commits")
-  val devFile: Path     = repoRoot.resolve("developers.json")
-  val outputPath: Path  = repoRoot.resolve("figures").resolve("rq2")
-  val contributionSummaryDir: Path = repoRoot.resolve("data/contribution-summaries")
-
   enum CommitType:
       case Build, Chore, Ci, Docs, Feat, Fix, Perf, Refactor, Revert, Style, Test, Unknown
 
@@ -82,13 +74,13 @@ object DataAnalysis {
 
   // Load developers
   lazy val developers: List[DevSummary] = time("load devs"):
-      val developersJson = Files.readAllBytes(devFile)
+      val developersJson = Files.readAllBytes(GlobalPaths.devFile)
       readFromArray[List[DevSummary]](developersJson)
 
   lazy val trackedHandles: Set[String] = developers.map(_.handle).toSet
 
   lazy val baseHeuristics: Map[String, AgentHeuristic] =
-    time("load heuristics")(HeuristicMatcher.loadHeuristics(heuristics))
+    time("load heuristics")(HeuristicMatcher.loadHeuristics(GlobalPaths.heuristics))
 
   lazy val heuristicsByAgent: Map[String, AgentHeuristic] =
       import de.rmgk.Associative.mapAssoc
@@ -96,7 +88,7 @@ object DataAnalysis {
 
   lazy val aggregateData: Vector[(dev: String, month: YearMonth, path: Path, data: MonthlySnapshot)] =
     time("loading aggregate data") {
-      val jsonFiles = Using(Files.list(dataPath)) {
+      val jsonFiles = Using(Files.list(GlobalPaths.dataPath)) {
         _.iterator().asScala.filter { path =>
           Files.isRegularFile(path) && path.getFileName.toString.endsWith(".json")
         }.toVector

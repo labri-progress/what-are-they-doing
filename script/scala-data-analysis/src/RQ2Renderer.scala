@@ -197,7 +197,7 @@ object RQ2Renderer {
       Sync {
         val data = agentSeriesForDeveloper(handle)
         if data.points.nonEmpty then
-            val outputFile = outputPath.resolve(s"rq2-agent-use-$handle.svg")
+            val outputFile = GlobalPaths.outputPath.resolve(s"rq2-agent-use-$handle.svg")
             writeSvg(
               outputFile,
               renderStackedTimeSeriesSvg(
@@ -215,13 +215,13 @@ object RQ2Renderer {
   }
 
   def makeRq2CommitTypeSvgs(): Seq[Sync[Any, Unit]] = {
-    Files.createDirectories(outputPath)
+    Files.createDirectories(GlobalPaths.outputPath)
 
     trackedHandles.toVector.map { handle =>
       Sync {
         val data = commitTypeSeriesForDeveloper(handle)
         if data.points.nonEmpty then
-            val svgPath = outputPath.resolve(s"commit-types-$handle.svg")
+            val svgPath = GlobalPaths.outputPath.resolve(s"commit-types-$handle.svg")
             writeSvg(
               svgPath,
               renderStackedTimeSeriesSvg(
@@ -239,13 +239,13 @@ object RQ2Renderer {
   }
 
   def makeRq2CommitTypePerAgentSvgs(): Seq[Sync[Any, Unit]] = {
-    Files.createDirectories(outputPath)
+    Files.createDirectories(GlobalPaths.outputPath)
 
     heuristicsByAgent.keys.toVector.sorted.map { agent =>
       Sync {
         val data = commitTypeSeriesForAgent(agent)
         if data.points.nonEmpty && activeStackKeys(data.points, commitTypeOrder).nonEmpty then
-            val svgPath = outputPath.resolve(s"commit-types-agent-$agent.svg")
+            val svgPath = GlobalPaths.outputPath.resolve(s"commit-types-agent-$agent.svg")
             writeSvg(
               svgPath,
               renderStackedTimeSeriesSvg(
@@ -263,7 +263,7 @@ object RQ2Renderer {
   }
 
   def makeRq2LinesChangedWeeklyStackedSvgs(): Seq[Sync[Any, Unit]] = {
-    Files.createDirectories(outputPath)
+    Files.createDirectories(GlobalPaths.outputPath)
 
     trackedHandles.toVector.sorted.map { handle =>
       Sync {
@@ -272,7 +272,7 @@ object RQ2Renderer {
           TimeSeriesData(Vector.empty, Vector.empty, Vector.empty)
         )
         if data.points.nonEmpty && activeStackKeys(data.points, agentColorOrder).nonEmpty then
-            val svgPath = outputPath.resolve(s"lines-changed-weekly-agents-$handle.svg")
+            val svgPath = GlobalPaths.outputPath.resolve(s"lines-changed-weekly-agents-$handle.svg")
             writeSvg(
               svgPath,
               renderStackedTimeSeriesSvg(
@@ -305,7 +305,7 @@ object RQ2Renderer {
     )
 
     variants.foreach { case (suffix, variantTitle, scale, suppressOutliers) =>
-      val svgPath = outputPath.resolve(s"$stem$suffix.svg")
+      val svgPath = GlobalPaths.outputPath.resolve(s"$stem$suffix.svg")
       writeSvg(
         svgPath,
         renderBoxPlotSvg(
@@ -323,7 +323,7 @@ object RQ2Renderer {
   }
 
   def makeRq2LinesChangedBoxplots(): Seq[Sync[Any, Unit]] = {
-    Files.createDirectories(outputPath)
+    Files.createDirectories(GlobalPaths.outputPath)
 
     val byDeveloper      = boxPlotStatsByDeveloper
     val byDeveloperSyncs =

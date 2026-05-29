@@ -1,9 +1,9 @@
 package whataretheydoing
 
 import com.github.plokhotnyuk.jsoniter_scala.core.*
-import whataretheydoing.DataAnalysis.{CommitType, ClassifiedCommit, commitsPath}
+import whataretheydoing.DataAnalysis.{ClassifiedCommit, CommitType}
 
-import java.nio.file.{Files, Path}
+import java.nio.file.Files
 import java.time.LocalDate
 import java.util.Locale
 import scala.collection.parallel.immutable.ParVector
@@ -49,19 +49,19 @@ object CommitProcessing {
   private def inferCommitTypeFromHeader(header: String): CommitType =
       val normalized = header.trim.toLowerCase
       if normalized.isEmpty then CommitType.Unknown
-    // format: off
-    else if startsWithAny(normalized, "feat", "add ", "implement ", "introduce ", "support ", "enable ", "allow ", "create ", "wire ", "integrate ", "expose ", "provide ", "initialize ", "bootstrap ", "accept ", "share ") then CommitType.Feat
-    else if startsWithAny(normalized, "fix", "bugfix", "hotfix", "repair ", "resolve ", "correct ", "prevent ", "stabilize ", "hardening", "harden ", "security:", "security ") then CommitType.Fix
-    else if startsWithAny(normalized, "perf", "optimize ", "optimise ", "speed up ", "reduce ", "benchmark", "cache ", "faster ", "lazy ") then CommitType.Perf
-    else if startsWithAny(normalized, "refactor", "rename ", "move ", "extract ", "reorganize ", "reorganise ", "modularize ", "modularise ", "consolidate ", "simplify ", "streamline ", "cleanup", "clean up", "deduplicate ", "split ", "port ", "migrate ", "rewrite ", "rework ") then CommitType.Refactor
-    else if startsWithAny(normalized, "docs", "doc:", "document ", "documentation", "readme", "guide", "tutorial", "blog", "changelog", "adr-", "spec", "planning", "plan ", "prompt:") then CommitType.Docs
-    else if startsWithAny(normalized, "test", "tests", "e2e", "integration test", "unit test", "property", "conformance", "coverage", "smoke test", "test:") then CommitType.Test
-    else if startsWithAny(normalized, "style", "format", "fmt", "lint", "lint:", "prettier", "rustfmt", "clang-format", "shfmt", "shellcheck", "typo", "whitespace") then CommitType.Style
-    else if startsWithAny(normalized, "build", "bump ", "release", "publish ", "package", "packaging", "installer", "install ", "cargo", "cmake", "docker", "homebrew", "nix", "npm ", "pnpm ", "wasm build", "binary", "artifact") then CommitType.Build
-    else if startsWithAny(normalized, "ci ", "ci:", "github actions", "workflow", "workflows", "pipeline", "buildkite", "lint/test") then CommitType.Ci
-    else if startsWithAny(normalized, "revert") then CommitType.Revert
-    else if startsWithAny(normalized, "merge ", "sync ", "track ", "checkpoint", "wip", "tmp", "oops", "updates", "update ", "adjust ", "tweak ", "tune ", "polish ", "note ", "use ", "switch ", "set ", "bake ", "prepare ", "release ") then CommitType.Chore
-    // format: on
+      // format: off
+      else if startsWithAny(normalized, "feat", "add ", "implement ", "introduce ", "support ", "enable ", "allow ", "create ", "wire ", "integrate ", "expose ", "provide ", "initialize ", "bootstrap ", "accept ", "share ") then CommitType.Feat
+      else if startsWithAny(normalized, "fix", "bugfix", "hotfix", "repair ", "resolve ", "correct ", "prevent ", "stabilize ", "hardening", "harden ", "security:", "security ") then CommitType.Fix
+      else if startsWithAny(normalized, "perf", "optimize ", "optimise ", "speed up ", "reduce ", "benchmark", "cache ", "faster ", "lazy ") then CommitType.Perf
+      else if startsWithAny(normalized, "refactor", "rename ", "move ", "extract ", "reorganize ", "reorganise ", "modularize ", "modularise ", "consolidate ", "simplify ", "streamline ", "cleanup", "clean up", "deduplicate ", "split ", "port ", "migrate ", "rewrite ", "rework ") then CommitType.Refactor
+      else if startsWithAny(normalized, "docs", "doc:", "document ", "documentation", "readme", "guide", "tutorial", "blog", "changelog", "adr-", "spec", "planning", "plan ", "prompt:") then CommitType.Docs
+      else if startsWithAny(normalized, "test", "tests", "e2e", "integration test", "unit test", "property", "conformance", "coverage", "smoke test", "test:") then CommitType.Test
+      else if startsWithAny(normalized, "style", "format", "fmt", "lint", "lint:", "prettier", "rustfmt", "clang-format", "shfmt", "shellcheck", "typo", "whitespace") then CommitType.Style
+      else if startsWithAny(normalized, "build", "bump ", "release", "publish ", "package", "packaging", "installer", "install ", "cargo", "cmake", "docker", "homebrew", "nix", "npm ", "pnpm ", "wasm build", "binary", "artifact") then CommitType.Build
+      else if startsWithAny(normalized, "ci ", "ci:", "github actions", "workflow", "workflows", "pipeline", "buildkite", "lint/test") then CommitType.Ci
+      else if startsWithAny(normalized, "revert") then CommitType.Revert
+      else if startsWithAny(normalized, "merge ", "sync ", "track ", "checkpoint", "wip", "tmp", "oops", "updates", "update ", "adjust ", "tweak ", "tune ", "polish ", "note ", "use ", "switch ", "set ", "bake ", "prepare ", "release ") then CommitType.Chore
+      // format: on
       else CommitType.Unknown
 
   def classifyCommitMessage(message: String): CommitType =
@@ -71,7 +71,7 @@ object CommitProcessing {
         case _                                              => CommitType.Unknown
 
   private def loadFullCommitData(commit: CommitEntry): CommitDetail =
-      val detailFile = commitsPath.resolve(s"${commit.sha}.json")
+      val detailFile = GlobalPaths.commitsPath.resolve(s"${commit.sha}.json")
       val detail     =
         if Files.exists(detailFile) then
             val bytes = Files.readAllBytes(detailFile)
@@ -113,7 +113,7 @@ object CommitProcessing {
 
   lazy val contributionSummaries: Map[String, DeveloperContributionSummary] =
     DataAnalysis.time("load contribution summaries"):
-        val dir = DataAnalysis.contributionSummaryDir
+        val dir = GlobalPaths.contributionSummaryDir
         if Files.isDirectory(dir) then
             Files.list(dir).nn.iterator.nn.asScala
               .filter(p => Files.isRegularFile(p) && p.getFileName.toString.endsWith(".json"))
