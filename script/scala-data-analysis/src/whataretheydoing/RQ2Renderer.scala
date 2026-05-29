@@ -1,14 +1,13 @@
 package whataretheydoing
 
 import de.rmgk.delay.Sync
-import DataAnalysis.*
 import whataretheydoing.CommitProcessing.{aggregateCommitData, allCommitDetailsBySha1, commitSignals}
+import whataretheydoing.DataAnalysis.*
 import whataretheydoing.HeuristicMatcher.heuristicsByAgent
 import whataretheydoing.SVGGraphLib.*
 
 import java.nio.file.Files
 import java.time.LocalDate
-import scala.collection.parallel.CollectionConverters.ImmutableIterableIsParallelizable
 
 object RQ2Renderer {
   private val commitTypeOrder: Vector[String] =
@@ -382,6 +381,8 @@ object RQ2Renderer {
       // makeRq2LinesChangedWeeklyStackedSvgs(),
     ).flatten
 
-    allSyncs.par.foreach(_.run(using ()))
+    allSyncs.strucMap(_.run(using ()))
+    ()
+
   }
 }

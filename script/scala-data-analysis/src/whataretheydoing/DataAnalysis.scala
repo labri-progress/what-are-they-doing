@@ -7,6 +7,9 @@ import whataretheydoing.{CommitDetail, CommitEntry, CommitProcessing, DayData, D
 
 import java.nio.file.{Files, Path}
 import java.time.{DayOfWeek, LocalDate}
+import java.util.concurrent.StructuredTaskScope.Joiner
+import scala.util.Using
+import scala.jdk.CollectionConverters.given
 
 object DataAnalysis {
 
@@ -43,7 +46,7 @@ object DataAnalysis {
           _.size
         ).toVector.sortBy(-_._2)
         AuthorStats(login, commits.size, authorCounts, committerCounts)
-      }
+      }.toVector.sortBy(_.login)
 
   @main def auth() =
     allAuthorStats.foreach { stats =>
@@ -341,6 +344,19 @@ object DataAnalysis {
       ).toVector.sorted.mkString("\n")
     )
     ()
+  }
+
+
+  extension [T](it: Iterable[T]) def strucMap[B](f: T => B): Vector[B] = {
+    Using(java.util.concurrent.StructuredTaskScope.open(Joiner.allSuccessfulOrThrow[B]())) { scope =>
+      it.foreach(elem =>
+        scope.fork { () =>
+          f(elem)
+        }
+      )
+      val results = scope.join()
+      results.map(_.get()).iterator.asScala.toVector
+    }.get
   }
 
 }

@@ -1,12 +1,11 @@
 package whataretheydoing
 
 import com.github.plokhotnyuk.jsoniter_scala.core.*
-import whataretheydoing.DataAnalysis.time
+import whataretheydoing.DataAnalysis.{strucMap, time}
 
 import java.nio.file.{Files, Path}
 import java.time.{LocalDate, YearMonth}
 import java.util.Locale
-import scala.collection.parallel.immutable.ParVector
 import scala.jdk.CollectionConverters.*
 import scala.util.Using
 import scala.util.matching.Regex
@@ -113,21 +112,21 @@ object CommitProcessing {
       }
     }
 
-  def allCommits: Iterator[CommitEntry] =
-    aggregateCommitData.iterator.flatMap(_.data.days.valuesIterator.flatMap(_.commits))
+  lazy val allCommits: Vector[CommitEntry] =
+    aggregateCommitData.iterator.flatMap(_.data.days.valuesIterator.flatMap(_.commits)).toVector
 
   lazy val allDays: Seq[LocalDate] = aggregateCommitData.flatMap(_.data.days.keysIterator)
 
-  lazy val allCommitDetails: ParVector[(commit: CommitEntry, detail: CommitDetail, classification: ClassifiedCommit)] = {
+  lazy val allCommitDetails: Vector[(commit: CommitEntry, detail: CommitDetail, classification: ClassifiedCommit)] = {
     DataAnalysis.time("load commit details") {
-      allCommits.to(ParVector).map { commit =>
+
+      allCommits.strucMap { commit =>
         val detail         = loadFullCommitData(commit)
         val classification = classifyCommit(commit, detail)
         (commit = commit, detail = detail, classification = classification)
       }
     }
   }
-
   lazy val allCommitDetailsBySha1
       : Map[String, (commit: CommitEntry, detail: CommitDetail, classification: ClassifiedCommit)] =
     allCommitDetails.iterator.map(det => det.commit.sha -> det).toMap
