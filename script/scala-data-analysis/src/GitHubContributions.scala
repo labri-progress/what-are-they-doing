@@ -8,21 +8,16 @@ import java.net.http.{HttpClient, HttpRequest, HttpResponse}
 import java.nio.file.Files
 import java.nio.file.Path
 
+import whataretheydoing.given
+
 object GitHubContributions {
 
-  given codecContributionDay: JsonValueCodec[ContributionDay] = JsonCodecMaker.make
-  given codecWeek: JsonValueCodec[Week] = JsonCodecMaker.make
-  given codecContributionCalendar: JsonValueCodec[ContributionCalendar] = JsonCodecMaker.make
-  given codecContributionsCollection: JsonValueCodec[ContributionsCollection] = JsonCodecMaker.make
-  given codecUserData: JsonValueCodec[UserData] = JsonCodecMaker.make
-  given codecGraphQLData: JsonValueCodec[GraphQLData] = JsonCodecMaker.make
   given codecGraphQLResponse: JsonValueCodec[GraphQLResponse] = JsonCodecMaker.make
-  given codecGraphQLQuery: JsonValueCodec[GraphQLQuery] = JsonCodecMaker.make
-  given codecDeveloperContributionSummary: JsonValueCodec[DeveloperContributionSummary] = JsonCodecMaker.make
+  given codecGraphQLQuery: JsonValueCodec[GraphQLQuery]       = JsonCodecMaker.make
 
   val httpClient: HttpClient = HttpClient.newHttpClient()
-  val githubGraphQLEndpoint = "https://api.github.com/graphql"
-  val summaryDir: Path = DataAnalysis.repoRoot.resolve("data/contribution-summaries")
+  val githubGraphQLEndpoint  = "https://api.github.com/graphql"
+  val summaryDir: Path       = DataAnalysis.repoRoot.resolve("data/contribution-summaries")
 
   private def getContributions(
       token: String,
@@ -81,7 +76,7 @@ object GitHubContributions {
       println(s"Fetching contributions for @$handle ...")
       try
           val contributions = getContributions(token, handle, fromDate, toDate)
-          val summary = DeveloperContributionSummary(
+          val summary       = DeveloperContributionSummary(
             developer = handle,
             fromDate = fromDate,
             toDate = toDate,

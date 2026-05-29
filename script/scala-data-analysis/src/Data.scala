@@ -19,6 +19,9 @@ given codecHeuristicJson: JsonValueCodec[List[AgentHeuristic]] = JsonCodecMaker.
 
 given codecDeveloperEntry: JsonValueCodec[List[DevSummary]] = JsonCodecMaker.make
 
+given codecContributionDay: JsonValueCodec[ContributionDay] = JsonCodecMaker.make
+given codecDeveloperContributionSummary: JsonValueCodec[DeveloperContributionSummary] = JsonCodecMaker.make
+
 case class MonthlySnapshot(
     developer: String,
     month: String,

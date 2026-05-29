@@ -21,6 +21,7 @@ object DataAnalysis {
   val commitsPath: Path = repoRoot.resolve("data/commits")
   val devFile: Path     = repoRoot.resolve("developers.json")
   val outputPath: Path  = repoRoot.resolve("figures").resolve("rq2")
+  val contributionSummaryDir: Path = repoRoot.resolve("data/contribution-summaries")
 
   enum CommitType:
       case Build, Chore, Ci, Docs, Feat, Fix, Perf, Refactor, Revert, Style, Test, Unknown
@@ -114,6 +115,25 @@ object DataAnalysis {
               System.err.println(s"Warning: could not parse ${path.getFileName} as MonthlySnapshot, skipping")
               None
       }.toVector
+    }
+
+  lazy val contributionSummaries: Map[String, DeveloperContributionSummary] =
+    time("load contribution summaries") {
+      if Files.isDirectory(contributionSummaryDir) then
+          Using(Files.list(contributionSummaryDir)) { stream =>
+            stream.iterator().asScala
+              .filter(p => Files.isRegularFile(p) && p.getFileName.toString.endsWith(".json"))
+              .flatMap { path =>
+                try
+                    val summary = readFromArray[DeveloperContributionSummary](Files.readAllBytes(path))
+                    Some(summary.developer -> summary)
+                catch
+                    case _: Exception =>
+                      System.err.println(s"Warning: could not parse ${path.getFileName} as contribution summary, skipping")
+                      None
+              }.toMap
+          }.get
+      else Map.empty
     }
 
   def allCommits: Iterator[CommitEntry] = aggregateData.iterator.flatMap(_.data.days.valuesIterator.flatMap(_.commits))
@@ -449,7 +469,11 @@ object DataAnalysis {
             }
           )
         },
-        totalCommits = weeks.map(week => commitTypeTotalsByDeveloperWeek((handle, week))),
+        totalCommits = weeks.map { week =>
+          val fromSummary = totalCommitsFromSummary(handle, week)
+          if fromSummary > 0 then fromSummary
+          else commitTypeTotalsByDeveloperWeek((handle, week))
+        },
         sampledCommits = weeks.map(week => commitTypeSampledByDeveloperWeek.getOrElse((handle, week), 0))
       )
     }.toMap
@@ -483,6 +507,18 @@ object DataAnalysis {
     }
   }
 
+  def totalCommitsFromSummary(handle: String, week: LocalDate): Int =
+    contributionSummaries.get(handle) match
+      case Some(summary) =>
+        val weekEnd = week.plusDays(6)
+        summary.contributions
+          .filter { d =>
+            val date = LocalDate.parse(d.date)
+            !date.isBefore(week) && !date.isAfter(weekEnd)
+          }
+          .map(_.contributionCount).sum
+      case None => 0
+
   lazy val agentSeriesForDeveloper: Map[String, TimeSeriesData] = {
     val rows = periodRows.groupBy(_.developer)
     rows.map { (handle, rows) =>
@@ -495,7 +531,11 @@ object DataAnalysis {
             values = weekRows.map(row => row.agent -> row.count).toMap
           )
         },
-        totalCommits = weekKeys.map(week => rows.find(_.period_iso == week).map(_.total_commits).getOrElse(0)).toVector,
+        totalCommits = weekKeys.map { week =>
+          val fromSummary = totalCommitsFromSummary(handle, LocalDate.parse(week))
+          if fromSummary > 0 then fromSummary
+          else rows.find(_.period_iso == week).map(_.total_commits).getOrElse(0)
+        }.toVector,
         sampledCommits =
           weekKeys.map(week => rows.find(_.period_iso == week).map(_.sampled_commits).getOrElse(0)).toVector
       )
