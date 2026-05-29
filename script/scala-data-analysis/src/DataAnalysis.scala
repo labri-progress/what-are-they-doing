@@ -9,6 +9,7 @@ import java.time.{DayOfWeek, LocalDate, YearMonth}
 import scala.collection.parallel.immutable.ParVector
 import scala.jdk.CollectionConverters.*
 import scala.util.Using
+import scala.util.matching.Regex
 
 object DataAnalysis {
 
@@ -26,7 +27,8 @@ object DataAnalysis {
       agentSignals: Map[String, Set[SignalType]],
       commitType: CommitType,
       message: String,
-      files: List[String]
+      files: List[String],
+      trailers: Map[String, String]
   ) {
     def agents: Set[String] = agentSignals.keySet
   }
@@ -297,9 +299,24 @@ object DataAnalysis {
     detail.copy(message = Some(detail.message.getOrElse(commit.commit.message)))
   }
 
+  private val trailerPattern: Regex = """^([a-zA-Z][a-zA-Z0-9_.-]+):\s+(.+)$""".r
+
+  private def parseTrailers(message: String): Map[String, String] =
+    message.linesIterator.toVector
+      .drop(1)
+      .map(_.trim)
+      .filter(_.nonEmpty)
+      .flatMap { line =>
+        line match
+          case trailerPattern(key, value) => Some((key.nn, value.nn))
+          case _                          => None
+      }
+      .toMap
+
   private def classifyCommit(commit: CommitEntry, detail: CommitDetail): ClassifiedCommit = {
 
     val message = detail.message.get
+    val trailers = parseTrailers(message)
 
     val agentSignals = HeuristicMatcher.detectAgents(
       commit,
@@ -311,7 +328,8 @@ object DataAnalysis {
       agentSignals = agentSignals,
       commitType = classifyCommitMessage(message),
       message = message,
-      files = detail.files.map(_.filename)
+      files = detail.files.map(_.filename),
+      trailers = trailers
     )
   }
 
