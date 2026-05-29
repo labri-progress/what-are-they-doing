@@ -11,7 +11,7 @@ import scala.util.matching.Regex
 object HeuristicMatcher {
 
   enum SignalType:
-      case PrimaryAuthor, CoAuthor, CommitMessage, Files
+      case CommitAuthor, Committer, CoAuthoredBy, CommitMessage, Files
 
   private val coauthorPattern: Regex =
     """(?im)^\s*co-?authored-?by:\s*(.*?)\s*<([^>]+)>\s*$""".r
@@ -58,22 +58,24 @@ object HeuristicMatcher {
         stream.close()
 
   def detectAgents(
-      commitMessage: String,
-      commitAuthor: String,
-      filenames: List[String],
+      commit: CommitEntry,
+      detail: CommitDetail,
       heuristicsByAgent: Map[String, List[AgentHeuristic]]
   ): Map[String, Set[SignalType]] =
     heuristicsByAgent.iterator.flatMap { case (agentName, heuristics) =>
-      val signals = heuristics.iterator.flatMap(h => detectSignals(commitMessage, commitAuthor, filenames, h)).toSet
+      val signals = heuristics.iterator.flatMap(h => detectSignals(commit, detail, h)).toSet
       if signals.nonEmpty then Some(agentName -> signals) else None
     }.toMap
 
   private def detectSignals(
-      commitMessage: String,
-      commitAuthor: String,
-      filenames: List[String],
+      commit: CommitEntry,
+      detail: CommitDetail,
       h: AgentHeuristic
   ): Set[SignalType] =
+      val commitMessage  = detail.message.getOrElse(commit.commit.message)
+      val commitAuthor   = s"${commit.commit.author.name} <${commit.commit.author.email}>"
+      val commitCommitter = s"${commit.commit.committer.name} <${commit.commit.committer.email}>"
+      val filenames      = detail.files.map(_.filename)
       val coauthors = coauthorPattern.findAllMatchIn(commitMessage).map { m =>
         (name = normalize(m.group(1).nn), mail = normalize(m.group(2).nn))
       }.toVector
@@ -82,7 +84,14 @@ object HeuristicMatcher {
         if h.author_names.exists(n => matchPattern(n, commitAuthor)) || h.author_mails.exists(m =>
               matchPattern(m, commitAuthor)
             )
-        then Set(SignalType.PrimaryAuthor)
+        then Set(SignalType.CommitAuthor)
+        else Set.empty
+
+      val committerSignal =
+        if h.author_names.exists(n => matchPattern(n, commitCommitter)) || h.author_mails.exists(m =>
+              matchPattern(m, commitCommitter)
+            )
+        then Set(SignalType.Committer)
         else Set.empty
 
       val coauthorSignal =
@@ -90,7 +99,7 @@ object HeuristicMatcher {
               h.author_names.exists(n => matchPattern(n, coName)) ||
               h.author_mails.exists(m => matchPattern(m, coMail))
             }
-        then Set(SignalType.CoAuthor)
+        then Set(SignalType.CoAuthoredBy)
         else Set.empty
 
       val messageSignal =
@@ -102,5 +111,5 @@ object HeuristicMatcher {
             Set(SignalType.Files)
         else Set.empty
 
-      authorSignal ++ coauthorSignal ++ messageSignal ++ fileSignal
+      authorSignal ++ committerSignal ++ coauthorSignal ++ messageSignal ++ fileSignal
 }

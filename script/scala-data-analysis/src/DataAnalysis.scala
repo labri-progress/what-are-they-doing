@@ -120,12 +120,16 @@ object DataAnalysis {
   )
 
   lazy val allAuthorStats: Vector[AuthorStats] =
-    val grouped = allCommits.toVector.groupBy(_.author.login)
-    grouped.toVector.sortBy((k, _) => k)(using summon[Ordering[String]]).map { case (login, commits) =>
-      val authorCounts = commits.groupBy(e => (e.commit.author.name, e.commit.author.email)).view.mapValues(_.size).toVector.sortBy(-_._2)
-      val committerCounts = commits.groupBy(e => (e.commit.committer.name, e.commit.committer.email)).view.mapValues(_.size).toVector.sortBy(-_._2)
-      AuthorStats(login, commits.size, authorCounts, committerCounts)
-    }
+      val grouped = allCommits.toVector.groupBy(_.author.login)
+      grouped.toVector.sortBy((k, _) => k)(using summon[Ordering[String]]).map { case (login, commits) =>
+        val authorCounts = commits.groupBy(e => (e.commit.author.name, e.commit.author.email)).view.mapValues(
+          _.size
+        ).toVector.sortBy(-_._2)
+        val committerCounts = commits.groupBy(e => (e.commit.committer.name, e.commit.committer.email)).view.mapValues(
+          _.size
+        ).toVector.sortBy(-_._2)
+        AuthorStats(login, commits.size, authorCounts, committerCounts)
+      }
 
   @main def auth() =
     allAuthorStats.foreach { stats =>
@@ -145,7 +149,7 @@ object DataAnalysis {
     allCommitDetails.valuesIterator
       .flatMap { entry =>
         entry.classification.agentSignals.iterator.collect {
-          case (agent, signals) if signals.contains(SignalType.CoAuthor) => agent
+          case (agent, signals) if signals.contains(SignalType.CoAuthoredBy) => agent
         }
       }
       .toVector
@@ -156,10 +160,10 @@ object DataAnalysis {
       .sortBy(-_._2)
 
   @main def coauthored() =
-    println("Detections via CoAuthor signal per agent:")
-    coAuthorAgentCounts.foreach { case (agent, count) =>
-      println(s"  $count  $agent")
-    }
+      println("Detections via CoAuthor signal per agent:")
+      coAuthorAgentCounts.foreach { case (agent, count) =>
+        println(s"  $count  $agent")
+      }
 
   private val conventionalCommitPattern =
     "^([a-z]+)(?:\\([^\\r\\n()]+\\))?(!)?:\\s+(.+)$".r
@@ -295,14 +299,11 @@ object DataAnalysis {
 
   private def classifyCommit(commit: CommitEntry, detail: CommitDetail): ClassifiedCommit = {
 
-    val message      = detail.message.get
-    val changedFiles = detail.files.map(_.filename)
-    val author       = commit.commit.author
-    val commitAuthor = s"${author.name} <${author.email}>"
+    val message = detail.message.get
+
     val agentSignals = HeuristicMatcher.detectAgents(
-      message,
-      commitAuthor,
-      changedFiles,
+      commit,
+      detail,
       heuristicsByAgent
     )
 
@@ -310,7 +311,7 @@ object DataAnalysis {
       agentSignals = agentSignals,
       commitType = classifyCommitMessage(message),
       message = message,
-      files = changedFiles
+      files = detail.files.map(_.filename)
     )
   }
 
