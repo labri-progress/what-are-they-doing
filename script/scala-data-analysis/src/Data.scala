@@ -112,7 +112,8 @@ case class AgentHeuristic(
     executed_by_prefixes: List[String] = Nil,
     role_prefixes: List[String] = Nil,
     data_source: Option[String] = None,
-    agent_log_url_patterns: List[String] = Nil,
+    trailer_prefixes: Map[String, List[String]] = Map.empty,
+    assisted_by_patterns: List[(String, String)] = Nil,
 )
 object  AgentHeuristic {
   given Associative[AgentHeuristic] = Associative.derived

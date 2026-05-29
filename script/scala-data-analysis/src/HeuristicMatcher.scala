@@ -11,9 +11,10 @@ import scala.util.matching.Regex
 object HeuristicMatcher {
 
   enum SignalType:
-      case CommitAuthor, Committer, CoAuthoredBy, SignedOffBy, ExecutedBy, Role, AgentLogUrl, CommitMessage, Files
+      case CommitAuthor, Committer, CoAuthoredBy, SignedOffBy, ExecutedBy, Role, AssistedBy, TrailerValueMatch, CommitMessage, Files
 
   private val trailerPersonPattern: Regex = """^\s*(.+?)\s*<\s*([^>]+)\s*>\s*$""".r
+  private val assistedByPattern: Regex = """^\s*(.+?)\s+\(([^)]+)\)\s*$""".r
 
   def parseNameEmail(value: String): (name: String, mail: String) =
     value.trim match
@@ -106,15 +107,28 @@ object HeuristicMatcher {
         then Set(SignalType.Role)
         else Set.empty
 
-      val agentLogUrlSignal =
-        if h.agent_log_url_patterns.nonEmpty then
-          val logUrls = trailers.collect { case ("agent-logs-url", v) => normalize(v) }
-          if logUrls.exists(url => h.agent_log_url_patterns.exists(p => url.contains(p.toLowerCase)))
-          then Set(SignalType.AgentLogUrl)
-          else Set.empty
+      val assistedBySignal =
+        val parsed = trailers.collect { case ("assisted-by", v) =>
+          v.trim match
+            case assistedByPattern(model, tool) => (normalize(model.nn), normalize(tool.nn))
+            case _                             => (normalize(v), "")
+        }
+        if h.assisted_by_patterns.exists((pfxModel, pfxTool) =>
+              parsed.exists((model, tool) => matchPattern(pfxModel, model) && matchPattern(pfxTool, tool))
+            )
+        then Set(SignalType.AssistedBy)
         else Set.empty
 
-      coauthorSignal ++ signedOffBySignal ++ executedBySignal ++ roleSignal ++ agentLogUrlSignal
+      val trailerPrefixSignal =
+        if h.trailer_prefixes.nonEmpty then
+          val matched = h.trailer_prefixes.exists { (trailerKey, prefixes) =>
+            val values = trailers.collect { case (k, v) if k == trailerKey => normalize(v) }
+            values.exists(v => prefixes.exists(p => matchPattern(p, v)))
+          }
+          if matched then Set(SignalType.TrailerValueMatch) else Set.empty
+        else Set.empty
+
+      coauthorSignal ++ signedOffBySignal ++ executedBySignal ++ roleSignal ++ assistedBySignal ++ trailerPrefixSignal
 
   def detectAgents(
       commit: CommitEntry,

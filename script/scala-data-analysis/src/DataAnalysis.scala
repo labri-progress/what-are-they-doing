@@ -558,8 +558,18 @@ object DataAnalysis {
         "bead" -> "unused", // likely also gastown
         "beads" -> "unused", // likely also gastown
         "agent-logs-url" -> "signal", // copilot
+        "amp-thread-id" -> "signal", // amp
+        "assisted-by" -> "signal", // pi
+        "tool" -> "signal", // codex
         "fixes" -> "unused", // may have some stuff, but unclear
         "ref" -> "unused", // mayb have some bead stuff
+        "refs" -> "unused", // mayb have some bead stuff
+        "reported-by" -> "no-signal", // no useful signals in dataset
+        "amp-thread-id" -> "signal",
+        "author" -> "unused", // low quality
+        "agent" -> "unused", // surprisingly, not about coding agents. has a "RusticMeadow" entry, but who knows.
+        "agent_name" -> "no-signal", // not about agents
+
       ) ++ (List("note", "verified", "before", "resolves", "covers") ++ definitions.NoSignalList.noSignalTrailers).map(key => key -> "no-signal").toMap
 
       val allTrailersByKey = allTrailers.groupBy(_.key)
@@ -573,11 +583,9 @@ object DataAnalysis {
           (key, entries.size, maxOccurrences, valueCounts.iterator.map((v, n) => s"$n x $v").toVector.sorted)
         }
         .toVector
-        .filter((_, _, maxOcc, _) => maxOcc <= 2)
         .sortBy(_._2)(using summon[Ordering[Int]].reverse)
         .foreach { (key: String, count: Int, _: Int, valueLines: Vector[String]) =>
-          println(s"$count  $key")
-          valueLines.foreach(v => println(s"           $v"))
+          println(s"\"$key\",")
         }
 
 }
