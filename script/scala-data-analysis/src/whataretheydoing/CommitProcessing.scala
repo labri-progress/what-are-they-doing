@@ -85,11 +85,10 @@ object CommitProcessing {
   private def classifyCommit(
       commit: CommitEntry,
       detail: CommitDetail,
-      heuristicsByAgent: Map[String, AgentHeuristic]
   ): ClassifiedCommit =
       val message      = detail.message.get
       val trailers     = parseTrailers(message)
-      val agentSignals = HeuristicMatcher.detectAgents(commit, detail, trailers, heuristicsByAgent)
+      val agentSignals = HeuristicMatcher.detectAgents(commit, detail, trailers)
       ClassifiedCommit(
         agentSignals = agentSignals,
         commitType = classifyCommitMessage(message),
@@ -103,7 +102,7 @@ object CommitProcessing {
     DataAnalysis.time("load commit details"):
         DataAnalysis.allCommits.to(ParVector).map { commit =>
           val detail         = loadFullCommitData(commit)
-          val classification = classifyCommit(commit, detail, DataAnalysis.heuristicsByAgent)
+          val classification = classifyCommit(commit, detail)
           (commit.sha, (commit = commit, detail = detail, classification = classification))
         }.to(Map)
 

@@ -2,6 +2,8 @@ package whataretheydoing
 
 import com.github.plokhotnyuk.jsoniter_scala.core.readFromArray
 import whataretheydoing.AgentHeuristic
+import whataretheydoing.DataAnalysis.time
+import whataretheydoing.definitions.CustomHeuristics
 
 import java.nio.file.Files
 import java.nio.file.Path
@@ -15,6 +17,13 @@ object HeuristicMatcher {
 
   private val trailerPersonPattern: Regex = """^\s*(.+?)\s*<\s*([^>]+)\s*>\s*$""".r
   private val assistedByPattern: Regex = """^\s*(.+?)\s+\(([^)]+)\)\s*$""".r
+
+  lazy val baseHeuristics: Map[String, AgentHeuristic] =
+    time("load heuristics")(HeuristicMatcher.loadHeuristics(GlobalPaths.heuristics))
+
+  lazy val heuristicsByAgent: Map[String, AgentHeuristic] =
+    import de.rmgk.Associative.mapAssoc
+    mapAssoc.combine(baseHeuristics, CustomHeuristics.customHeuristics)
 
   def parseNameEmail(value: String): (name: String, mail: String) =
     value.trim match
@@ -134,7 +143,6 @@ object HeuristicMatcher {
       commit: CommitEntry,
       detail: CommitDetail,
       trailers: Seq[(key: String, value: String)],
-      heuristicsByAgent: Map[String, AgentHeuristic]
   ): Map[String, Set[SignalType]] =
     heuristicsByAgent.iterator.flatMap { case (agentName, heuristics) =>
       val signals = detectSignals(commit, detail, trailers, heuristics).toSet

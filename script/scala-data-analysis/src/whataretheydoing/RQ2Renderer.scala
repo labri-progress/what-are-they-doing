@@ -3,6 +3,7 @@ package whataretheydoing
 import de.rmgk.delay.Sync
 import DataAnalysis.*
 import whataretheydoing.CommitProcessing.{allCommitDetails, commitSignals}
+import whataretheydoing.HeuristicMatcher.heuristicsByAgent
 import whataretheydoing.SVGGraphLib.*
 
 import java.nio.file.Files

@@ -13,8 +13,6 @@ import scala.util.Using
 
 object DataAnalysis {
 
-// ── Shared output helpers ──────────────────────────────────────────────────
-
   inline def time[A](label: String)(inline body: A): A = {
     val start  = System.nanoTime()
     val result = body
@@ -30,12 +28,7 @@ object DataAnalysis {
 
   lazy val trackedHandles: Set[String] = developers.map(_.handle).toSet
 
-  lazy val baseHeuristics: Map[String, AgentHeuristic] =
-    time("load heuristics")(HeuristicMatcher.loadHeuristics(GlobalPaths.heuristics))
 
-  lazy val heuristicsByAgent: Map[String, AgentHeuristic] =
-      import de.rmgk.Associative.mapAssoc
-      mapAssoc.combine(baseHeuristics, CustomHeuristics.customHeuristics)
 
   lazy val aggregateData: Vector[(dev: String, month: YearMonth, path: Path, data: MonthlySnapshot)] =
     time("loading aggregate data") {

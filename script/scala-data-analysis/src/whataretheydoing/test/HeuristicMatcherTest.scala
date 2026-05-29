@@ -42,7 +42,7 @@ class HeuristicMatcherTest extends FunSuite {
   ).map((raw) => ("signed-off-by", raw))
 
   test("signed-off-by trailer values correctly detect actual bots/agents and reject humans") {
-    val allAgents = DataAnalysis.heuristicsByAgent.values.toVector
+    val allAgents = HeuristicMatcher.heuristicsByAgent.values.toVector
 
     // ── Should be detected as an agent ──
     val shouldBeAgent = Set(
@@ -119,6 +119,6 @@ class HeuristicMatcherTest extends FunSuite {
 
   test("loaded heuristics contain all expected agents") {
     val expected = Set("claude_code", "copilot", "opencode", "codex", "cursor", "windsurf")
-    expected.foreach(agent => assert(clue(DataAnalysis.heuristicsByAgent.contains(agent)), s"$agent heuristic should be loaded"))
+    expected.foreach(agent => assert(clue(HeuristicMatcher.heuristicsByAgent.contains(agent)), s"$agent heuristic should be loaded"))
   }
 }
