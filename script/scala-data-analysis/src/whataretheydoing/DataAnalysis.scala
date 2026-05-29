@@ -1,7 +1,7 @@
 package whataretheydoing
 
 import com.github.plokhotnyuk.jsoniter_scala.core.*
-import whataretheydoing.CommitProcessing.commitSignals
+import whataretheydoing.CommitProcessing.{aggregateCommitData, commitSignals}
 import whataretheydoing.HeuristicMatcher.SignalType
 import whataretheydoing.definitions.CustomHeuristics
 import whataretheydoing.{AgentHeuristic, CommitDetail, CommitEntry, CommitProcessing, DayData, DevSummary, HeuristicMatcher, MonthlySnapshot, SVGGraphLib}
@@ -28,23 +28,6 @@ object DataAnalysis {
 
   lazy val trackedHandles: Set[String] = developers.map(_.handle).toSet
 
-  lazy val aggregateCommitData: Vector[(dev: String, month: YearMonth, path: Path, data: MonthlySnapshot)] =
-    time("loading aggregate data") {
-      val jsonFiles = Using(Files.list(GlobalPaths.dataPath)) {
-        _.iterator().asScala.filter { path =>
-          Files.isRegularFile(path) && path.getFileName.toString.endsWith(".json")
-        }.toVector
-      }.get
-
-      jsonFiles.map { path =>
-        val snapshot = readFromArray[MonthlySnapshot](Files.readAllBytes(path))
-        (snapshot.developer, YearMonth.parse(snapshot.month), path, snapshot)
-      }
-    }
-
-  def allCommits: Iterator[CommitEntry] = aggregateCommitData.iterator.flatMap(_.data.days.valuesIterator.flatMap(_.commits))
-
-  lazy val allDays: Seq[LocalDate] = aggregateCommitData.flatMap(_.data.days.keysIterator)
 
   case class AuthorStats(
       login: String,
@@ -54,7 +37,7 @@ object DataAnalysis {
   )
 
   lazy val allAuthorStats: Vector[AuthorStats] =
-      val grouped = allCommits.toVector.groupBy(_.author.login)
+      val grouped = CommitProcessing.allCommits.toVector.groupBy(_.author.login)
       grouped.toVector.sortBy((k, _) => k)(using summon[Ordering[String]]).map { case (login, commits) =>
         val authorCounts = commits.groupBy(e => (e.commit.author.name, e.commit.author.email)).view.mapValues(
           _.size
@@ -80,7 +63,7 @@ object DataAnalysis {
     }
 
   lazy val coAuthorAgentCounts: Vector[(String, Int)] =
-    CommitProcessing.allCommitDetails.valuesIterator
+    CommitProcessing.allCommitDetailsBySha1.valuesIterator
       .flatMap { entry =>
         entry.classification.agentSignals.iterator.collect {
           case (agent, signals) if signals.contains(SignalType.CoAuthoredBy) => agent
@@ -269,7 +252,7 @@ object DataAnalysis {
           )
         },
         totalCommits = weeks.map { week =>
-          val fromSummary = CommitProcessing.totalCommitsFromSummary(handle, week)
+          val fromSummary = ContributionSummaries.totalCommitsFromSummary(handle, week)
           if fromSummary > 0 then fromSummary
           else commitTypeTotalsByDeveloperWeek((handle, week))
         },
@@ -287,7 +270,7 @@ object DataAnalysis {
           val values   = weekRows.flatMap { row =>
             val totalLines =
               weeklyData.get((handle, LocalDate.parse(week))).toVector.flatten.flatMap(_.commits).flatMap { commit =>
-                CommitProcessing.allCommitDetails.get(commit.sha).toVector.filter { entry =>
+                CommitProcessing.allCommitDetailsBySha1.get(commit.sha).toVector.filter { entry =>
                   val agents = entry.classification.agents
                   val bucket =
                     if agents.isEmpty then "no signal"
@@ -319,7 +302,7 @@ object DataAnalysis {
           )
         },
         totalCommits = weekKeys.map { week =>
-          val fromSummary = CommitProcessing.totalCommitsFromSummary(handle, LocalDate.parse(week))
+          val fromSummary = ContributionSummaries.totalCommitsFromSummary(handle, LocalDate.parse(week))
           if fromSummary > 0 then fromSummary
           else rows.find(_.period_iso == week).map(_.total_commits).getOrElse(0)
         }.toVector,
@@ -332,7 +315,7 @@ object DataAnalysis {
   private val commitUrl = "^https://github.com/(?<org>[^/]+)/(?<repo>[^/]+)/commit/".r.unanchored
 
   def repoOfCommit(sha: String): String =
-    CommitProcessing.allCommitDetails.get(sha) match {
+    CommitProcessing.allCommitDetailsBySha1.get(sha) match {
       case Some(value) => value.commit.html_url match {
           case Some(commitUrl(org, repo)) => s"$org/$repo"
           case _                          => ""
@@ -341,7 +324,7 @@ object DataAnalysis {
     }
 
   lazy val multiagent: Map[String, (commit: CommitEntry, detail: CommitDetail, classification: ClassifiedCommit)] =
-    CommitProcessing.allCommitDetails.filter((_, cc) => cc.classification.agentSignals.sizeIs > 1)
+    CommitProcessing.allCommitDetailsBySha1.filter((_, cc) => cc.classification.agentSignals.sizeIs > 1)
 
   def printMultiagentRepos(): Unit = {
     pprint.pprintln(multiagent)
@@ -353,7 +336,7 @@ object DataAnalysis {
 
   def writeUnknowCommitTypes(): Unit = {
     val unknownType =
-      CommitProcessing.allCommitDetails.filter((_, cc) => cc.classification.commitType == CommitType.Unknown)
+      CommitProcessing.allCommitDetailsBySha1.filter((_, cc) => cc.classification.commitType == CommitType.Unknown)
     Files.writeString(
       Path.of("commitheader.txt"),
       unknownType.values.map(

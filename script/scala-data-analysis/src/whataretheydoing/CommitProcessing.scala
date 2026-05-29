@@ -1,12 +1,14 @@
 package whataretheydoing
 
 import com.github.plokhotnyuk.jsoniter_scala.core.*
+import whataretheydoing.DataAnalysis.time
 
-import java.nio.file.Files
-import java.time.LocalDate
+import java.nio.file.{Files, Path}
+import java.time.{LocalDate, YearMonth}
 import java.util.Locale
 import scala.collection.parallel.immutable.ParVector
 import scala.jdk.CollectionConverters.*
+import scala.util.Using
 import scala.util.matching.Regex
 
 object CommitProcessing {
@@ -97,46 +99,40 @@ object CommitProcessing {
         trailers = trailers
       )
 
-  lazy val allCommitDetails
+  lazy val aggregateCommitData: Vector[(dev: String, month: YearMonth, path: Path, data: MonthlySnapshot)] =
+    time("loading aggregate data") {
+      val jsonFiles = Using(Files.list(GlobalPaths.dataPath)) {
+        _.iterator().asScala.filter { path =>
+          Files.isRegularFile(path) && path.getFileName.toString.endsWith(".json")
+        }.toVector
+      }.get
+
+      jsonFiles.map { path =>
+        val snapshot = readFromArray[MonthlySnapshot](Files.readAllBytes(path))
+        (snapshot.developer, YearMonth.parse(snapshot.month), path, snapshot)
+      }
+    }
+
+  def allCommits: Iterator[CommitEntry] =
+    aggregateCommitData.iterator.flatMap(_.data.days.valuesIterator.flatMap(_.commits))
+
+  lazy val allDays: Seq[LocalDate] = aggregateCommitData.flatMap(_.data.days.keysIterator)
+
+  lazy val allCommitDetails: Vector[(commit: CommitEntry, detail: CommitDetail, classification: ClassifiedCommit)] = {
+    DataAnalysis.time("load commit details") {
+      allCommits.to(ParVector).map { commit =>
+        val detail         = loadFullCommitData(commit)
+        val classification = classifyCommit(commit, detail)
+        (commit = commit, detail = detail, classification = classification)
+      }.toVector
+    }
+  }
+
+  lazy val allCommitDetailsBySha1
       : Map[String, (commit: CommitEntry, detail: CommitDetail, classification: ClassifiedCommit)] =
-    DataAnalysis.time("load commit details"):
-        DataAnalysis.allCommits.to(ParVector).map { commit =>
-          val detail         = loadFullCommitData(commit)
-          val classification = classifyCommit(commit, detail)
-          (commit.sha, (commit = commit, detail = detail, classification = classification))
-        }.to(Map)
+    allCommitDetails.iterator.map(det => det.commit.sha -> det).toMap
 
   def commitSignals(sha: String): Option[ClassifiedCommit] =
-    allCommitDetails.get(sha).map(_.classification)
+    allCommitDetailsBySha1.get(sha).map(_.classification)
 
-  lazy val contributionSummaries: Map[String, DeveloperContributionSummary] =
-    DataAnalysis.time("load contribution summaries"):
-        val dir = GlobalPaths.contributionSummaryDir
-        if Files.isDirectory(dir) then
-            Files.list(dir).nn.iterator.nn.asScala
-              .filter(p => Files.isRegularFile(p) && p.getFileName.toString.endsWith(".json"))
-              .flatMap { path =>
-                try
-                    val summary = readFromArray[DeveloperContributionSummary](Files.readAllBytes(path))
-                    Some(summary.developer -> summary)
-                catch
-                    case _: Exception =>
-                      System.err.println(
-                        s"Warning: could not parse ${path.getFileName} as contribution summary, skipping"
-                      )
-                      None
-              }.toMap
-        else Map.empty
-
-  def totalCommitsFromSummary(handle: String, week: LocalDate): Int =
-    contributionSummaries.get(handle) match
-        case Some(summary) =>
-          val weekEnd = week.plusDays(6)
-          summary.contributions
-            .filter { d =>
-              val date = LocalDate.parse(d.date)
-              !date.isBefore(week) && !date.isAfter(weekEnd)
-            }
-            .map(_.contributionCount).sum
-        case None => 0
 }

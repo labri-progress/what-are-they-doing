@@ -2,7 +2,7 @@ package whataretheydoing
 
 import de.rmgk.delay.Sync
 import DataAnalysis.*
-import whataretheydoing.CommitProcessing.{allCommitDetails, commitSignals}
+import whataretheydoing.CommitProcessing.{aggregateCommitData, allCommitDetailsBySha1, commitSignals}
 import whataretheydoing.HeuristicMatcher.heuristicsByAgent
 import whataretheydoing.SVGGraphLib.*
 
@@ -96,7 +96,7 @@ object RQ2Renderer {
       .flatMap { case (_, _, _, snapshot) =>
         snapshot.days.iterator.flatMap { case (_, dayData) =>
           dayData.commits.iterator.flatMap { commit =>
-            allCommitDetails.get(commit.sha)
+            allCommitDetailsBySha1.get(commit.sha)
           }
         }
       }
@@ -138,7 +138,7 @@ object RQ2Renderer {
 
   private def boxPlotStatsByAgent: Vector[BoxPlotStats] =
     agentColorOrder.flatMap { agent =>
-      val bucket = allCommitDetails.valuesIterator.filter(entry => commitAgentBucket(entry) == agent).toVector
+      val bucket = allCommitDetailsBySha1.valuesIterator.filter(entry => commitAgentBucket(entry) == agent).toVector
       if bucket.nonEmpty then Some(toBoxPlotStats(agent, bucket)) else None
     }
 
@@ -149,7 +149,7 @@ object RQ2Renderer {
         snapshot.days.iterator.flatMap { case (day, dayData) =>
           val week = weekStart(day)
           dayData.commits.iterator.flatMap { commit =>
-            allCommitDetails.get(commit.sha).map(entry => week -> entry)
+            allCommitDetailsBySha1.get(commit.sha).map(entry => week -> entry)
           }
         }
       }
