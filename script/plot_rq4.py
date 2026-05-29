@@ -297,6 +297,153 @@ def plot_switches_by_day_line(df_commits: pd.DataFrame, out: Path, author: Optio
     plt.close()
 
 
+def _make_subplots_grid(n: int, figsize=(12, 8)):
+    import math
+    ncols = int(math.ceil(math.sqrt(n)))
+    nrows = int(math.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(figsize[0], figsize[1] * nrows / 2))
+    axes = axes.flatten() if hasattr(axes, 'flatten') else [axes]
+    return fig, axes[:n]
+
+
+def plot_active_repos_subplots(df_week: pd.DataFrame, out: Path, color_map: dict | None = None):
+    """Bar subplots: active_repos_ge2 per `iso_week` for each developer."""
+    df = df_week.copy()
+    if df.empty:
+        print("No weekly data for active repos; skipping subplots.")
+        return
+    developers = sorted(df['developer'].unique())
+    # full week range
+    all_weeks = sorted(df_week['iso_week'].unique(), key=lambda s: tuple(int(x) for x in s.split("-")))
+    # ensure we have a color_map for all developers
+    if color_map is None:
+        palette = sns.color_palette("colorblind", n_colors=len(developers))
+        color_map = {dev: palette[i] for i, dev in enumerate(developers)}
+
+    fig, axes = _make_subplots_grid(len(developers), figsize=(12, 9))
+    for ax, dev in zip(axes, developers):
+        series = df[df.developer == dev].groupby('iso_week', as_index=True)['active_repos_ge2'].mean()
+        d = series.reindex(all_weeks).fillna(0)
+        ax.bar(range(len(all_weeks)), d.values, color=color_map[dev])
+        ax.set_title(dev)
+        # show ticks every 4th week
+        ticks = list(range(0, len(all_weeks), 4))
+        ax.set_xticks(ticks)
+        ax.set_xticklabels([all_weeks[i] for i in ticks], rotation=45)
+        ax.set_ylabel('Active repos')
+        ax.grid(axis='y')
+    plt.tight_layout()
+    plt.savefig(out / 'active_repos_per_week_subplots.pdf')
+    plt.close()
+
+
+def plot_gini_subplots(df_week: pd.DataFrame, out: Path, color_map: dict | None = None):
+    """Bar subplots: weekly Gini per developer."""
+    df = df_week.copy()
+    if df.empty:
+        print("No weekly data for gini; skipping subplots.")
+        return
+    developers = sorted(df['developer'].unique())
+    all_weeks = sorted(df_week['iso_week'].unique(), key=lambda s: tuple(int(x) for x in s.split("-")))
+    if color_map is None:
+        palette = sns.color_palette("colorblind", n_colors=len(developers))
+        color_map = {dev: palette[i] for i, dev in enumerate(developers)}
+
+    fig, axes = _make_subplots_grid(len(developers), figsize=(12, 9))
+    for ax, dev in zip(axes, developers):
+        series = df[df.developer == dev].groupby('iso_week', as_index=True)['gini'].mean()
+        d = series.reindex(all_weeks).fillna(0)
+        ax.bar(range(len(all_weeks)), d.values, color=color_map[dev])
+        ax.set_ylim(0, 1)
+        ax.set_title(dev)
+        ticks = list(range(0, len(all_weeks), 4))
+        ax.set_xticks(ticks)
+        ax.set_xticklabels([all_weeks[i] for i in ticks], rotation=45)
+        ax.set_ylabel('Gini')
+        ax.grid(axis='y')
+    plt.tight_layout()
+    plt.savefig(out / 'gini_per_week_subplots.pdf')
+    plt.close()
+
+
+def plot_switches_day_subplots(df_commits: pd.DataFrame, out: Path, color_map: dict | None = None):
+    """Bar subplots: switches per day for each developer (computed from commits).
+    Ensure full week coverage by reindexing days across the global date range and
+    show x-labels monthly to avoid overcrowding."""
+    grouped = compute_switches_per_day_from_commits(df_commits)
+    if grouped.empty:
+        print("No daily switches computed; skipping day subplots.")
+        return
+    # full date range from commits
+    df_commits['committed_at_iso'] = pd.to_datetime(df_commits['committed_at_iso'], utc=True)
+    all_days = pd.date_range(start=df_commits['committed_at_iso'].dt.date.min(), end=df_commits['committed_at_iso'].dt.date.max(), freq='D')
+    all_days_str = [d.strftime('%Y-%m-%d') for d in all_days]
+
+    developers = sorted(grouped['developer'].unique())
+    if color_map is None:
+        palette = sns.color_palette("colorblind", n_colors=len(developers))
+        color_map = {dev: palette[i] for i, dev in enumerate(developers)}
+
+    fig, axes = _make_subplots_grid(len(developers), figsize=(14, 10))
+    for ax, dev in zip(axes, developers):
+        series = grouped[grouped.developer == dev].groupby('day', as_index=True)['switches_in_day'].sum()
+        d = series.reindex(all_days_str).fillna(0)
+        x = list(range(len(all_days_str)))
+        ax.bar(x, d.values, color=color_map[dev], width=1.0)
+        ax.set_title(dev)
+        # label only the first day of each month (e.g., "Sep 2025"); fallback to sparse labels
+        ticks = [i for i, day in enumerate(all_days_str) if day.endswith('-01')]
+        if not ticks:
+            step = max(1, len(all_days_str) // 60)
+            ticks = list(range(0, len(all_days_str), step))
+            labels = [all_days_str[i] for i in ticks]
+        else:
+            labels = [pd.to_datetime(all_days_str[i]).strftime('%b %Y') for i in ticks]
+        ax.set_xticks(ticks)
+        ax.set_xticklabels(labels, rotation=45, fontsize=8)
+        ax.set_xlim(-0.5, len(all_days_str) - 0.5)
+        ax.set_ylabel('Switches/day')
+        ax.grid(axis='y')
+    plt.tight_layout()
+    plt.savefig(out / 'switches_per_day_subplots.pdf')
+    plt.close()
+
+
+def plot_switches_session_subplots(df_sessions: pd.DataFrame, out: Path, color_map: dict | None = None):
+    """Bar subplots: switches per session for each developer (sessions on x-axis)."""
+    df = df_sessions.copy()
+    if df.empty:
+        print("No session data; skipping session subplots.")
+        return
+    df['start_iso'] = pd.to_datetime(df['start_iso'], utc=True)
+    developers = sorted(df['developer'].unique())
+    if color_map is None:
+        palette = sns.color_palette("colorblind", n_colors=len(developers))
+        color_map = {dev: palette[i] for i, dev in enumerate(developers)}
+
+    fig, axes = _make_subplots_grid(len(developers), figsize=(14, 10))
+    for ax, dev in zip(axes, developers):
+        d = df[df.developer == dev].sort_values('start_iso')
+        if d.empty:
+            ax.set_visible(False)
+            continue
+        x = list(range(len(d)))
+        ax.bar(x, d['switches_in_session'].values, color=color_map[dev], width=0.9)
+        ax.set_title(dev)
+        # sparse tick labels showing session start datetimes every N sessions
+        step = max(1, len(d) // 10)
+        ticks = list(range(0, len(d), step))
+        labels = [d['start_iso'].dt.strftime('%Y-%m-%d %H:%M').iloc[i] for i in ticks]
+        ax.set_xticks(ticks)
+        ax.set_xticklabels(labels, rotation=45)
+        ax.set_xlim(-0.5, len(d) - 0.5)
+        ax.set_ylabel('Switches/session')
+        ax.grid(axis='y')
+    plt.tight_layout()
+    plt.savefig(out / 'switches_per_session_subplots.pdf')
+    plt.close()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--export-dir", type=Path, default=Path("data/exports-RQ4"))
@@ -319,13 +466,27 @@ def main():
     #plot_switches_per_week(df_sessions, out_dir, args.author)
 
     # additional plots: weeks on x-axis (distribution across developers)
-    plot_active_repos_by_week(df_week, out_dir, args.author)
-    plot_gini_by_week(df_week, out_dir, args.author)
-    plot_switches_by_week_commits(df_commits, out_dir, args.author)
+    #plot_active_repos_by_week(df_week, out_dir, args.author)
+    #plot_gini_by_week(df_week, out_dir, args.author)
+    #plot_switches_by_week_commits(df_commits, out_dir, args.author)
     # also produce per-developer lineplot for switches per week
-    plot_switches_by_week_line(df_commits, df_week, out_dir, args.author)
+    #plot_switches_by_week_line(df_commits, df_week, out_dir, args.author)
     # per-day switches lineplot
-    plot_switches_by_day_line(df_commits, out_dir, args.author)
+    #plot_switches_by_day_line(df_commits, out_dir, args.author)
+
+    # New small-multiple bar subplots per developer
+    # build a canonical developer list and color_map so colors stay consistent
+    devs_week = set(df_week['developer'].unique()) if 'developer' in df_week.columns else set()
+    devs_sess = set(df_sessions['developer'].unique()) if 'developer' in df_sessions.columns else set()
+    devs_comm = set(df_commits['developer'].unique()) if 'developer' in df_commits.columns else set()
+    devs_all = sorted(devs_week.union(devs_sess).union(devs_comm))
+    palette = sns.color_palette("colorblind", n_colors=len(devs_all))
+    color_map = {dev: palette[i] for i, dev in enumerate(devs_all)}
+
+    plot_active_repos_subplots(df_week, out_dir, color_map=color_map)
+    plot_gini_subplots(df_week, out_dir, color_map=color_map)
+    plot_switches_day_subplots(df_commits, out_dir, color_map=color_map)
+    plot_switches_session_subplots(df_sessions, out_dir, color_map=color_map)
 
     print(f"Saved plots to {out_dir}")
     if args.show:
