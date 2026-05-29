@@ -91,8 +91,8 @@ object DataAnalysis {
     time("load heuristics")(HeuristicMatcher.loadHeuristics(heuristics))
 
   lazy val heuristicsByAgent: Map[String, AgentHeuristic] =
-    import de.rmgk.Associative.mapAssoc
-    mapAssoc.combine(baseHeuristics, CustomHeuristics.customHeuristics)
+      import de.rmgk.Associative.mapAssoc
+      mapAssoc.combine(baseHeuristics, CustomHeuristics.customHeuristics)
 
   lazy val aggregateData: Vector[(dev: String, month: YearMonth, path: Path, data: MonthlySnapshot)] =
     time("loading aggregate data") {
@@ -536,37 +536,46 @@ object DataAnalysis {
     ()
   }
 
-  @main def trailerStats() =
-      val counts = allCommitDetails.valuesIterator
-        .flatMap(_.classification.trailers.map(_.key))
+  @main def trailerStats(): Unit =
+      val allTrailers = allCommitDetails.valuesIterator
+        .flatMap(_.classification.trailers)
         .toVector
-        .groupBy(identity)
-        .view
-        .mapValues(_.size)
-        .toVector
-        .sortBy(-_._2)
+
+      println("")
 
       println("Trailer key counts across all commits:")
       // counts.foreach { case (key, count) => println(s"  $count  $key") }
 
-
-
       val trailerCategories: Map[String, String] = Map(
         "co-authored-by" -> "signal",
-        "signed-off-by" -> "signal"
-      )
+        "signed-off-by"  -> "signal",
+        "fix"            -> "no-signal",
+        "closes" -> "unhandled", // contains values like: bd-59er, bd-r4od, bd-dh8a which I belive is for the beads task tracking system
+        "executed-by" -> "signal", // gastown
+        "role"        -> "signal", // gastown
+        "rig"         -> "unused", // also gastown
+        "bead" -> "unused", // likely also gastown
+        "beads" -> "unused", // likely also gastown
+        "fixes" -> "unused", // may have some stuff, but unclear
+        "ref" -> "unused", // mayb have some bead stuff
+      ) ++ (List("note", "verified", "before", "resolves", "covers) ++ CustomHeuristics.noSignalTrailers).map(key => key -> "no-signal").toMap
 
-      val knownTrailersSet = trailerCategories.keys
+      val allTrailersByKey = allTrailers.groupBy(_.key)
 
-      val topUnknown = counts.filter((k, _) => !trailerCategories.contains(k)).maxByOption(_._2)
-      topUnknown match
-        case Some((key, count)) =>
-          println(s"\nMost common uncategorized trailer: '$key' ($count occurrences)")
-          println("All values:")
-          val values = allCommitDetails.valuesIterator
-            .flatMap(_.classification.trailers.collect { case (k, v) if k == key => v })
-            .toVector.groupBy(identity).view.mapValues(_.size).toVector.sortBy(-_._2)
-          values.foreach(v => println(s"  ${v._2} ${v._1}"))
-        case None => println("No uncategorized trailers found")
+      println(s"\nUncategorized keys with max 2 occurrences (from ${allTrailersByKey.size} total keys):")
+      allTrailersByKey.iterator
+        .filter((k: String, _: Vector[(key: String, value: String)]) => !trailerCategories.contains(k))
+        .map { (key: String, entries: Vector[(key: String, value: String)]) =>
+          val valueCounts = entries.iterator.map(_.value).toVector.groupBy(identity).view.mapValues(_.size)
+          val maxOccurrences = valueCounts.values.maxOption.getOrElse(0)
+          (key, entries.size, maxOccurrences, valueCounts.iterator.map((v, n) => s"$n x $v").toVector.sorted)
+        }
+        .toVector
+        .filter((_, _, maxOcc, _) => maxOcc <= 2)
+        .sortBy(_._2)(using summon[Ordering[Int]].reverse)
+        .foreach { (key: String, count: Int, _: Int, valueLines: Vector[String]) =>
+          println(s"$count  $key")
+          valueLines.foreach(v => println(s"           $v"))
+        }
 
 }

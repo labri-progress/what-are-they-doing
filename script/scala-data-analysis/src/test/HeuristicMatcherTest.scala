@@ -56,9 +56,28 @@ class HeuristicMatcherTest extends FunSuite {
     )
 
     shouldBeAgent.foreach { case (name, mail) =>
-      val matched = allAgents.flatMap(h => HeuristicMatcher.detectTrailerSignals(Seq.empty, Seq((name, mail)), h)).toSet
+      val trailers = Seq(("signed-off-by", s"$name <$mail>"))
+      val matched = allAgents.flatMap { h =>
+        HeuristicMatcher.detectTrailerSignals(trailers, h)
+      }.toSet
       assert(clue(matched).nonEmpty, s"'$name <$mail>' should be detected as an agent (matched: $matched)")
     }
+
+    // ── Should be detected as gastown via executed-by ──
+    val gastownExecBy = Seq("beads/crew/emma", "gastown/refinery", "mayor", "beads/polecats/obsidian")
+    val gastownMatch = allAgents.flatMap { h =>
+      HeuristicMatcher.detectTrailerSignals(gastownExecBy.map(v => ("executed-by", v)), h)
+    }
+    assert(clue(gastownMatch).contains(HeuristicMatcher.SignalType.ExecutedBy),
+      "gastown/beads/mayor executed-by values should trigger ExecutedBy")
+
+    // ── Should be detected as gastown via role ──
+    val gastownRoles = Seq("crew", "polecats", "refinery", "mayor", "witness", "boot")
+    val roleMatch = allAgents.flatMap { h =>
+      HeuristicMatcher.detectTrailerSignals(gastownRoles.map(v => ("role", v)), h)
+    }
+    assert(clue(roleMatch).contains(HeuristicMatcher.SignalType.Role),
+      "gastown role values should trigger Role signal")
 
     // ── Should NOT be detected as any agent ──
     val shouldBeHuman = Set(
@@ -90,7 +109,10 @@ class HeuristicMatcherTest extends FunSuite {
     )
 
     shouldBeHuman.foreach { case (name, mail) =>
-      val matched = allAgents.flatMap(h => HeuristicMatcher.detectTrailerSignals(Seq.empty, Seq((name, mail)), h)).toSet
+      val trailers = Seq(("signed-off-by", s"$name <$mail>"))
+      val matched = allAgents.flatMap { h =>
+        HeuristicMatcher.detectTrailerSignals(trailers, h)
+      }.toSet
       assert(clue(matched).isEmpty, s"'$name <$mail>' should NOT be detected as any agent (matched: $matched)")
     }
   }

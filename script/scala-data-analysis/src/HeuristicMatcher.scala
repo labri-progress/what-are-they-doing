@@ -11,7 +11,7 @@ import scala.util.matching.Regex
 object HeuristicMatcher {
 
   enum SignalType:
-      case CommitAuthor, Committer, CoAuthoredBy, SignedOffBy, CommitMessage, Files
+      case CommitAuthor, Committer, CoAuthoredBy, SignedOffBy, ExecutedBy, Role, CommitMessage, Files
 
   private val trailerPersonPattern: Regex = """^\s*(.+?)\s*<\s*([^>]+)\s*>\s*$""".r
 
@@ -68,10 +68,14 @@ object HeuristicMatcher {
     }
 
   def detectTrailerSignals(
-      coauthors: Seq[(name: String, mail: String)],
-      signedOffs: Seq[(name: String, mail: String)],
+      trailers: Seq[(key: String, value: String)],
       h: AgentHeuristic
   ): Set[SignalType] =
+      val coauthors  = extractTrailerValues(trailers, "co-authored-by")
+      val signedOffs = extractTrailerValues(trailers, "signed-off-by")
+      val executedBys = trailers.collect { case ("executed-by", v) => normalize(v) }
+      val roles       = trailers.collect { case ("role", v) => normalize(v) }
+
       val coauthorSignal =
         if coauthors.exists { case (coName, coMail) =>
               h.author_names.exists(n => matchPattern(n, coName)) ||
@@ -88,7 +92,21 @@ object HeuristicMatcher {
         then Set(SignalType.SignedOffBy)
         else Set.empty
 
-      coauthorSignal ++ signedOffBySignal
+      val executedBySignal =
+        if executedBys.nonEmpty && h.executed_by_prefixes.exists(prefix =>
+              executedBys.exists(eb => matchPattern(prefix, eb))
+            )
+        then Set(SignalType.ExecutedBy)
+        else Set.empty
+
+      val roleSignal =
+        if roles.nonEmpty && h.executed_by_prefixes.exists(prefix =>
+              roles.exists(r => matchPattern(prefix, r))
+            )
+        then Set(SignalType.Role)
+        else Set.empty
+
+      coauthorSignal ++ signedOffBySignal ++ executedBySignal ++ roleSignal
 
   def detectAgents(
       commit: CommitEntry,
@@ -111,8 +129,6 @@ object HeuristicMatcher {
       val commitAuthor    = s"${commit.commit.author.name} <${commit.commit.author.email}>"
       val commitCommitter = s"${commit.commit.committer.name} <${commit.commit.committer.email}>"
       val filenames       = detail.files.map(_.filename)
-      val coauthors       = extractTrailerValues(trailers, "co-authored-by")
-      val signedOffs      = extractTrailerValues(trailers, "signed-off-by")
 
       val authorSignal =
         if h.author_names.exists(n => matchPattern(n, commitAuthor)) || h.author_mails.exists(m =>
@@ -128,7 +144,7 @@ object HeuristicMatcher {
         then Set(SignalType.Committer)
         else Set.empty
 
-      val trailerSignals = detectTrailerSignals(coauthors, signedOffs, h)
+      val trailerSignals = detectTrailerSignals(trailers, h)
 
       val messageSignal =
         if h.commit_message_prefix.exists(p => matchPattern(p, commitMessage)) then Set(SignalType.CommitMessage)
