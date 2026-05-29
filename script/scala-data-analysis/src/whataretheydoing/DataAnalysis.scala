@@ -28,9 +28,7 @@ object DataAnalysis {
 
   lazy val trackedHandles: Set[String] = developers.map(_.handle).toSet
 
-
-
-  lazy val aggregateData: Vector[(dev: String, month: YearMonth, path: Path, data: MonthlySnapshot)] =
+  lazy val aggregateCommitData: Vector[(dev: String, month: YearMonth, path: Path, data: MonthlySnapshot)] =
     time("loading aggregate data") {
       val jsonFiles = Using(Files.list(GlobalPaths.dataPath)) {
         _.iterator().asScala.filter { path =>
@@ -38,22 +36,15 @@ object DataAnalysis {
         }.toVector
       }.get
 
-      jsonFiles.flatMap { path =>
-        try
-            val snapshot = readFromArray[MonthlySnapshot](Files.readAllBytes(path))
-            if trackedHandles.contains(snapshot.developer) then
-                Some((snapshot.developer, YearMonth.parse(snapshot.month), path, snapshot))
-            else None
-        catch
-            case _: Exception =>
-              System.err.println(s"Warning: could not parse ${path.getFileName} as MonthlySnapshot, skipping")
-              None
-      }.toVector
+      jsonFiles.map { path =>
+        val snapshot = readFromArray[MonthlySnapshot](Files.readAllBytes(path))
+        (snapshot.developer, YearMonth.parse(snapshot.month), path, snapshot)
+      }
     }
 
-  def allCommits: Iterator[CommitEntry] = aggregateData.iterator.flatMap(_.data.days.valuesIterator.flatMap(_.commits))
+  def allCommits: Iterator[CommitEntry] = aggregateCommitData.iterator.flatMap(_.data.days.valuesIterator.flatMap(_.commits))
 
-  lazy val allDays: Seq[LocalDate] = aggregateData.flatMap(_.data.days.keysIterator)
+  lazy val allDays: Seq[LocalDate] = aggregateCommitData.flatMap(_.data.days.keysIterator)
 
   case class AuthorStats(
       login: String,
@@ -184,7 +175,7 @@ object DataAnalysis {
   private lazy val periodRows: Vector[PeriodCsvRow] = {
     time("build weekly period rows") {
       val totalsByDeveloperWeek =
-        aggregateData.iterator
+        aggregateCommitData.iterator
           .flatMap { case (developer, _, _, snapshot) =>
             snapshot.days.iterator.map { case (day, dayData) =>
               ((developer, weekStart(day)), dayData.total_count)
@@ -194,7 +185,7 @@ object DataAnalysis {
           .groupMapReduce(_._1)(_._2)(_ + _)
 
       val sampledByDeveloperWeek =
-        aggregateData.iterator
+        aggregateCommitData.iterator
           .flatMap { case (developer, _, _, snapshot) =>
             snapshot.days.iterator.map { case (day, dayData) =>
               ((developer, weekStart(day)), dayData.commits.size)
@@ -204,7 +195,7 @@ object DataAnalysis {
           .groupMapReduce(_._1)(_._2)(_ + _)
 
       val countsByDeveloperWeekAgent =
-        aggregateData.iterator
+        aggregateCommitData.iterator
           .flatMap { case (developer, _, _, snapshot) =>
             snapshot.days.iterator.flatMap { case (day, dayData) =>
               val week = weekStart(day)
@@ -237,7 +228,7 @@ object DataAnalysis {
   }
 
   lazy val dailyData: Vector[(developer: String, day: LocalDate, dayData: DayData)] =
-    aggregateData.iterator.flatMap { case (developer, _, _, snapshot) =>
+    aggregateCommitData.iterator.flatMap { case (developer, _, _, snapshot) =>
       snapshot.days.iterator.map { case (day, dayData) => (developer, day, dayData) }
     }.toVector
 

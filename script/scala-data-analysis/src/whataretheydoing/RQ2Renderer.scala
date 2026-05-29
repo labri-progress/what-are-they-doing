@@ -91,7 +91,7 @@ object RQ2Renderer {
 
   private def commitsForDeveloper(handle: String)
       : Vector[(commit: CommitEntry, detail: CommitDetail, classification: ClassifiedCommit)] =
-    aggregateData.iterator
+    aggregateCommitData.iterator
       .filter(_.dev == handle)
       .flatMap { case (_, _, _, snapshot) =>
         snapshot.days.iterator.flatMap { case (_, dayData) =>
@@ -143,7 +143,7 @@ object RQ2Renderer {
     }
 
   private def boxPlotStatsByDeveloperWeek(handle: String): Vector[BoxPlotStats] =
-    aggregateData.iterator
+    aggregateCommitData.iterator
       .filter(_.dev == handle)
       .flatMap { case (_, _, _, snapshot) =>
         snapshot.days.iterator.flatMap { case (day, dayData) =>
@@ -163,7 +163,7 @@ object RQ2Renderer {
 
   private def commitTypeSeriesForAgent(agent: String): TimeSeriesData = {
     val agentCommitsByWeek: Vector[(LocalDate, CommitType)] =
-      aggregateData.iterator
+      aggregateCommitData.iterator
         .flatMap { case (_, _, _, snapshot) =>
           snapshot.days.iterator.flatMap { case (day, dayData) =>
             val week = weekStart(day)
