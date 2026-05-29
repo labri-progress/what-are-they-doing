@@ -197,12 +197,20 @@ object RQ2Renderer {
       Sync {
         val data = agentSeriesForDeveloper(handle)
         if data.points.nonEmpty then
+            val agentTotals =
+              data.points.iterator.flatMap(_.values).toVector.groupMapReduce(_._1)(_._2)(_ + _)
+            val activeAgents = agentTotals.filter(_._2 >= 50).keySet
+
+            val points = data.points.map { pt =>
+              pt.copy(values = pt.values.filter((k, _) => activeAgents.contains(k)))
+            }
+
             val outputFile = GlobalPaths.outputPath.resolve(s"rq2-agent-use-$handle.svg")
             writeSvg(
               outputFile,
               renderStackedTimeSeriesSvg(
                 s"Agent Usage Over Time — @$handle",
-                data.points,
+                points,
                 agentColorOrder,
                 agentColors,
                 "Top agent",
@@ -241,7 +249,15 @@ object RQ2Renderer {
   def makeRq2CommitTypePerAgentSvgs(): Seq[Sync[Any, Unit]] = {
     Files.createDirectories(GlobalPaths.outputPath)
 
-    heuristicsByAgent.keys.toVector.sorted.map { agent =>
+    val agentCommitCounts: Map[String, Int] =
+      CommitProcessing.allCommitDetailsBySha1.valuesIterator
+        .flatMap(entry => entry.classification.agents)
+        .toVector
+        .groupMapReduce(identity)(_ => 1)(_ + _)
+
+    heuristicsByAgent.keys.toVector.sorted
+      .filter(agent => agentCommitCounts.getOrElse(agent, 0) >= 50)
+      .map { agent =>
       Sync {
         val data = commitTypeSeriesForAgent(agent)
         if data.points.nonEmpty && activeStackKeys(data.points, commitTypeOrder).nonEmpty then
