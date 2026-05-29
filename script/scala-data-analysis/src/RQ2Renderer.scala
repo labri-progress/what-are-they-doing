@@ -324,7 +324,7 @@ object RQ2Renderer {
   def makeRq2LinesChangedBoxplots(): Seq[Sync[Any, Unit]] = {
     Files.createDirectories(outputPath)
 
-    val byDeveloper = boxPlotStatsByDeveloper
+    val byDeveloper      = boxPlotStatsByDeveloper
     val byDeveloperSyncs =
       if byDeveloper.nonEmpty then
           val colors = developerColors(byDeveloper.map(_.label))
@@ -339,7 +339,7 @@ object RQ2Renderer {
           )
       else Seq.empty
 
-    val byAgent = boxPlotStatsByAgent
+    val byAgent      = boxPlotStatsByAgent
     val byAgentSyncs =
       if byAgent.nonEmpty then
           Seq(
@@ -372,12 +372,13 @@ object RQ2Renderer {
   }
 
   @main def makeAllRq2Svgs(): Unit = {
-    val allSyncs =
-      makeWeeklyPlotSvgs() ++
-      makeRq2CommitTypeSvgs() ++
-      makeRq2CommitTypePerAgentSvgs() ++
-      makeRq2LinesChangedBoxplots() ++
-      makeRq2LinesChangedWeeklyStackedSvgs()
+    val allSyncs = Vector(
+      makeWeeklyPlotSvgs(),
+      // makeRq2CommitTypeSvgs(),
+      makeRq2CommitTypePerAgentSvgs(),
+      // makeRq2LinesChangedBoxplots(),
+      // makeRq2LinesChangedWeeklyStackedSvgs(),
+    ).flatten
 
     allSyncs.par.foreach(_.run(using ()))
   }
