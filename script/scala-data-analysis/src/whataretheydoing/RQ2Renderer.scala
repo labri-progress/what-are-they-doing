@@ -84,8 +84,7 @@ object RQ2Renderer {
 
   private def defaultLines(data: TimeSeriesData): Vector[LineSeries] =
     Vector(
-      LineSeries("sampled commits", "#1d4ed8", "3 3", "#1d4ed8", data.sampledCommits),
-      LineSeries("total commits (snapshot)", "#343a40", "6 4", "#343a40", data.totalCommits)
+      LineSeries("total commits", "#343a40", "6 4", "#343a40", data.totalCommits)
     )
 
   private def commitsForDeveloper(handle: String)

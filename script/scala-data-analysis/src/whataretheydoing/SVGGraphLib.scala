@@ -49,10 +49,27 @@ object SVGGraphLib {
     val plotWidth: Double  = width - left - right
     val plotHeight: Double = height - top - bottom
     val legendX: Double    = plotX + 10
-    val legendY: Double    = plotY + 12
+    val legendY: Double    = plotY + 10
   }
 
   case class ChartScale(yMax: Int, yStep: Int)
+
+  object FontConfig:
+    val title         = 22
+    val axisLabel     = 24
+    val tick          = 24
+    val barLabel      = 22
+    val legend        = 22
+    val legendEntry   = 16
+    val footer        = 18
+    val boxPlotTick   = 12
+    val boxPlotLabel  = 11
+    val boxPlotTitle  = 18
+    val boxPlotAxis   = 14
+
+  private def yAxisLabelPos: Double = FontConfig.axisLabel * 1.5
+
+  private def autoLeftMargin: Double = yAxisLabelPos + FontConfig.axisLabel * 1.5 + FontConfig.tick * 2.0
 
   private def svgEscape(text: String): String =
     text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;")
@@ -125,7 +142,7 @@ object SVGGraphLib {
       (0 to scale.yMax by scale.yStep).map { tick =>
         val y = yForValue(layout, scale, tick.toDouble)
         s"<line x1='${fmt(layout.plotX)}' y1='${fmt(y)}' x2='${fmt(layout.plotX + layout.plotWidth)}' y2='${fmt(y)}' stroke='#e9ecef' stroke-width='1' />" +
-        s"<text x='${fmt(layout.plotX - 10)}' y='${fmt(y + 4)}' text-anchor='end' font-size='12' fill='#495057'>${formatSi(tick.toDouble)}</text>"
+        s"<text x='${fmt(layout.plotX - 10)}' y='${fmt(y + 4)}' text-anchor='end' font-size='${FontConfig.tick}' fill='#495057'>${formatSi(tick.toDouble)}</text>"
       }.mkString("\n")
 
     val axes =
@@ -163,10 +180,14 @@ object SVGGraphLib {
   }
 
   private def renderBarLabels(layout: ChartLayout, points: Vector[StackedBarPoint]): String =
-    points.zipWithIndex.map { case (point, index) =>
-      val x = xForBar(layout, points.size, index) + barWidth(layout, points.size) / 2.0
-      val y = layout.plotY + layout.plotHeight + 28.0
-      s"<text x='${fmt(x)}' y='${fmt(y)}' transform='rotate(45 ${fmt(x)} ${fmt(y)})' text-anchor='start' font-size='11' fill='#495057'>${svgEscape(point.xLabel)}</text>"
+    val step = math.max(1, (points.size + 7) / 8)
+    points.zipWithIndex.collect { case (point, index) if index % step == 0 =>
+      val cx = xForBar(layout, points.size, index) + barWidth(layout, points.size) / 2.0
+      val cy = layout.plotY + layout.plotHeight + 28.0
+      val txtX = cx + 8.0
+      val txtY = cy + FontConfig.barLabel / 3
+      s"<circle cx='${fmt(cx)}' cy='${fmt(cy)}' r='3' fill='#495057' />" +
+      s"<text x='${fmt(txtX)}' y='${fmt(txtY)}' transform='rotate(45 ${fmt(cx)} ${fmt(cy)})' font-size='${FontConfig.barLabel}' text-anchor='start' fill='#495057'>${svgEscape(point.xLabel)}</text>"
     }.mkString("\n")
 
   private def renderLineSeries(
@@ -197,30 +218,37 @@ object SVGGraphLib {
       colors: Map[String, String],
       activeLines: Vector[LineSeries]
   ): String = {
-    val entries   = activeKeys.map(Left(_)) ++ activeLines.map(Right(_))
-    val boxHeight = 18 + entries.size * 20
-    val box       =
+    val entries    = activeKeys.map(Left(_)) ++ activeLines.map(Right(_))
+    val rowSpacing = 24
+    val padY       = 8
+    val boxHeight  = 2 * padY + entries.size * rowSpacing
+    val box        =
       s"<rect x='${fmt(layout.legendX)}' y='${fmt(layout.legendY)}' width='${fmt(layout.legendWidth)}' height='${fmt(boxHeight)}' rx='4' ry='4' fill='white' fill-opacity='0.92' stroke='#ced4da' stroke-width='1' />"
 
-    val legendItems = entries.reverse.zipWithIndex.map {
-      case (Left(key), idx) =>
-        val y = layout.legendY + 18 + idx * 20
-        s"<rect x='${fmt(layout.legendX + 10)}' y='${fmt(y - 10)}' width='18' height='12' fill='${colors.getOrElse(key, "#adb5bd")}' stroke='#ffffff' stroke-width='0.6' />" +
-        s"<text x='${fmt(layout.legendX + 38)}' y='${fmt(y)}' font-size='12' fill='#212529'>${svgEscape(key)}</text>"
-      case (Right(line), idx) =>
-        val y = layout.legendY + 18 + idx * 20
-        s"<line x1='${fmt(layout.legendX + 10)}' y1='${fmt(y - 4)}' x2='${fmt(layout.legendX + 30)}' y2='${fmt(y - 4)}' stroke='${line.stroke}' stroke-width='2' stroke-dasharray='${line.dashArray}' />" +
-        s"<rect x='${fmt(layout.legendX + 17)}' y='${fmt(y - 7)}' width='6' height='6' fill='${line.markerFill}' transform='rotate(45 ${fmt(layout.legendX + 20)} ${fmt(y - 4)})' />" +
-        s"<text x='${fmt(layout.legendX + 38)}' y='${fmt(y)}' font-size='12' fill='#212529'>${svgEscape(line.label)}</text>"
+    def textEl(label: String, cy: Double): String =
+      s"<text x='${fmt(layout.legendX + 38)}' y='${fmt(cy + 8)}' font-size='${FontConfig.legend}' fill='#212529'>${svgEscape(label)}</text>"
+
+    val legendItems = entries.reverse.zipWithIndex.map { case (entry, idx) =>
+      val cy = layout.legendY + padY + rowSpacing / 2.0 + idx * rowSpacing
+      entry match
+        case Left(key)   =>
+          val sx = layout.legendX + 10
+          s"<rect x='${fmt(sx)}' y='${fmt(cy - 6)}' width='18' height='12' fill='${colors.getOrElse(key, "#adb5bd")}' stroke='#ffffff' stroke-width='0.6' />" + textEl(key, cy)
+        case Right(line) =>
+          val sx = layout.legendX + 10
+          s"<line x1='${fmt(sx)}' y1='${fmt(cy)}' x2='${fmt(sx + 20)}' y2='${fmt(cy)}' stroke='${line.stroke}' stroke-width='2' stroke-dasharray='${line.dashArray}' />" +
+          s"<rect x='${fmt(sx + 7)}' y='${fmt(cy - 3)}' width='6' height='6' fill='${line.markerFill}' transform='rotate(45 ${fmt(sx + 10)} ${fmt(cy)})' />" + textEl(line.label, cy)
     }.mkString("\n")
 
     box + "\n" + legendItems
   }
 
   private def renderTitles(layout: ChartLayout, title: String, yAxisLabel: String, xAxisLabel: String): String =
-    s"<text x='${fmt(layout.width / 2.0)}' y='24' text-anchor='middle' font-size='18' font-weight='700' fill='#111827'>${svgEscape(title)}</text>" +
-    s"\n<text x='20' y='${fmt(layout.plotY + layout.plotHeight / 2.0)}' transform='rotate(-90 20 ${fmt(layout.plotY + layout.plotHeight / 2.0)})' text-anchor='middle' font-size='14' fill='#212529'>${svgEscape(yAxisLabel)}</text>" +
-    s"\n<text x='${fmt(layout.plotX + layout.plotWidth / 2.0)}' y='${fmt(layout.height - 40.0)}' text-anchor='middle' font-size='14' fill='#212529'>${svgEscape(xAxisLabel)}</text>"
+    val xLabel = if xAxisLabel.isEmpty then "" else
+      s"\n<text x='${fmt(layout.plotX + layout.plotWidth / 2.0)}' y='${fmt(layout.height - 40.0)}' text-anchor='middle' font-size='${FontConfig.axisLabel}' fill='#212529'>${svgEscape(xAxisLabel)}</text>"
+    s"<text x='${fmt(layout.width / 2.0)}' y='18' text-anchor='middle' font-size='${FontConfig.title}' font-weight='700' fill='#111827'>${svgEscape(title)}</text>" +
+    s"\n<text x='${fmt(yAxisLabelPos)}' y='${fmt(layout.plotY + layout.plotHeight / 2.0)}' transform='rotate(-90 ${fmt(yAxisLabelPos)} ${fmt(layout.plotY + layout.plotHeight / 2.0)})' text-anchor='middle' font-size='${FontConfig.axisLabel}' fill='#212529'>${svgEscape(yAxisLabel)}</text>" +
+    xLabel
 
   private def renderFooter(
       layout: ChartLayout,
@@ -237,7 +265,7 @@ object SVGGraphLib {
     val lineSummaries = activeLines.map(line => s"${line.label}: ${line.values.sum}")
     val footer        =
       (lineSummaries :+ s"$totalLabel: $totalValue" :+ s"Periods: ${points.size}" :+ dominant).mkString("  |  ")
-    s"<text x='${fmt(layout.width / 2.0)}' y='${fmt(layout.height - 12.0)}' text-anchor='middle' font-size='12' fill='#212529'>${svgEscape(footer)}</text>"
+    ""
   }
 
   private def computeBoxPlotYMax(stats: Vector[BoxPlotStats], suppressOutliers: Boolean): Double = {
@@ -279,7 +307,7 @@ object SVGGraphLib {
             case BoxPlotScale.Linear => formatSi(tick)
             case BoxPlotScale.Log10  => formatSi(tick)
       s"<line x1='${fmt(layout.plotX)}' y1='${fmt(y)}' x2='${fmt(layout.plotX + layout.plotWidth)}' y2='${fmt(y)}' stroke='#e9ecef' stroke-width='1' />" +
-      s"<text x='${fmt(layout.plotX - 10)}' y='${fmt(y + 4)}' text-anchor='end' font-size='12' fill='#495057'>$label</text>"
+      s"<text x='${fmt(layout.plotX - 10)}' y='${fmt(y + 4)}' text-anchor='end' font-size='${FontConfig.boxPlotTick}' fill='#495057'>$label</text>"
     }.mkString("\n")
 
     val axes =
@@ -293,7 +321,7 @@ object SVGGraphLib {
     stats.zipWithIndex.map { case (stat, index) =>
       val x = xForBar(layout, stats.size, index) + barWidth(layout, stats.size) / 2.0
       val y = layout.plotY + layout.plotHeight + 28.0
-      s"<text x='${fmt(x)}' y='${fmt(y)}' transform='rotate(45 ${fmt(x)} ${fmt(y)})' text-anchor='start' font-size='11' fill='#495057'>${svgEscape(stat.label)}</text>"
+      s"<text x='${fmt(x)}' y='${fmt(y)}' transform='rotate(45 ${fmt(x)} ${fmt(y)})' text-anchor='start' font-size='${FontConfig.boxPlotLabel}' fill='#495057'>${svgEscape(stat.label)}</text>"
     }.mkString("\n")
 
   private def renderBoxPlot(
@@ -360,10 +388,10 @@ $outliers"""
 
     val legendColor = "#111827"
     val entries     = Vector(
-      s"<rect x='${fmt(layout.legendX + 10)}' y='${fmt(layout.legendY + 8)}' width='18' height='12' fill='white' stroke='$legendColor' stroke-width='1.2' /><text x='${fmt(layout.legendX + 38)}' y='${fmt(layout.legendY + 18)}' font-size='12' fill='#212529'>IQR (Q1–Q3)</text>",
-      s"<line x1='${fmt(layout.legendX + 10)}' y1='${fmt(layout.legendY + 34)}' x2='${fmt(layout.legendX + 30)}' y2='${fmt(layout.legendY + 34)}' stroke='$legendColor' stroke-width='2' /><text x='${fmt(layout.legendX + 38)}' y='${fmt(layout.legendY + 38)}' font-size='12' fill='#212529'>Median</text>",
-      s"<rect x='${fmt(layout.legendX + 17)}' y='${fmt(layout.legendY + 47)}' width='6' height='6' fill='$legendColor' transform='rotate(45 ${fmt(layout.legendX + 20)} ${fmt(layout.legendY + 50)})' /><text x='${fmt(layout.legendX + 38)}' y='${fmt(layout.legendY + 54)}' font-size='12' fill='#212529'>Mean</text>",
-      s"<circle cx='${fmt(layout.legendX + 20)}' cy='${fmt(layout.legendY + 70)}' r='3' fill='$legendColor' fill-opacity='0.85' /><text x='${fmt(layout.legendX + 38)}' y='${fmt(layout.legendY + 74)}' font-size='12' fill='#212529'>Outliers</text>"
+      s"<rect x='${fmt(layout.legendX + 10)}' y='${fmt(layout.legendY + 8)}' width='18' height='12' fill='white' stroke='$legendColor' stroke-width='1.2' /><text x='${fmt(layout.legendX + 38)}' y='${fmt(layout.legendY + 18)}' font-size='${FontConfig.boxPlotTick}' fill='#212529'>IQR (Q1–Q3)</text>",
+      s"<line x1='${fmt(layout.legendX + 10)}' y1='${fmt(layout.legendY + 34)}' x2='${fmt(layout.legendX + 30)}' y2='${fmt(layout.legendY + 34)}' stroke='$legendColor' stroke-width='2' /><text x='${fmt(layout.legendX + 38)}' y='${fmt(layout.legendY + 38)}' font-size='${FontConfig.boxPlotTick}' fill='#212529'>Median</text>",
+      s"<rect x='${fmt(layout.legendX + 17)}' y='${fmt(layout.legendY + 47)}' width='6' height='6' fill='$legendColor' transform='rotate(45 ${fmt(layout.legendX + 20)} ${fmt(layout.legendY + 50)})' /><text x='${fmt(layout.legendX + 38)}' y='${fmt(layout.legendY + 54)}' font-size='${FontConfig.boxPlotTick}' fill='#212529'>Mean</text>",
+      s"<circle cx='${fmt(layout.legendX + 20)}' cy='${fmt(layout.legendY + 70)}' r='3' fill='$legendColor' fill-opacity='0.85' /><text x='${fmt(layout.legendX + 38)}' y='${fmt(layout.legendY + 74)}' font-size='${FontConfig.boxPlotTick}' fill='#212529'>Outliers</text>"
     ).mkString("\n")
 
     box + "\n" + entries
@@ -382,10 +410,10 @@ $outliers"""
   ): String = {
     val layout = ChartLayout(
       width = math.max(1200, stats.size * 72 + 220),
-      height = 620,
-      left = 72,
+      height = 520,
+      left = autoLeftMargin,
       right = 24,
-      top = 32,
+      top = 44,
       bottom = 132,
       legendWidth = 170
     )
@@ -410,20 +438,20 @@ $outliers"""
     }.mkString("\n")
 
     val footer =
-      s"<text x='${fmt(layout.width / 2.0)}' y='${fmt(layout.height - 12.0)}' text-anchor='middle' font-size='12' fill='#212529'>Groups: ${stats.size}  |  Samples: ${stats.map(_.count).sum}</text>"
+      s"<text x='${fmt(layout.width / 2.0)}' y='${fmt(layout.height - 12.0)}' text-anchor='middle' font-size='${FontConfig.boxPlotTick}' fill='#212529'>Groups: ${stats.size}  |  Samples: ${stats.map(_.count).sum}</text>"
 
     s"""<svg xmlns='http://www.w3.org/2000/svg' width='${layout.width}' height='${layout.height}' viewBox='0 0 ${layout.width} ${layout.height}'>
 ${renderBackground()}
 ${renderContinuousGridAndAxes(layout, yMax, scale)}
 <text x='${fmt(
         layout.width / 2.0
-      )}' y='24' text-anchor='middle' font-size='18' font-weight='700' fill='#111827'>${svgEscape(title)}</text>
-<text x='20' y='${fmt(layout.plotY + layout.plotHeight / 2.0)}' transform='rotate(-90 20 ${fmt(
+      )}' y='18' text-anchor='middle' font-size='${FontConfig.boxPlotTitle}' font-weight='700' fill='#111827'>${svgEscape(title)}</text>
+<text x='${fmt(yAxisLabelPos)}' y='${fmt(layout.plotY + layout.plotHeight / 2.0)}' transform='rotate(-90 ${fmt(yAxisLabelPos)} ${fmt(
         layout.plotY + layout.plotHeight / 2.0
-      )})' text-anchor='middle' font-size='14' fill='#212529'>${svgEscape(yLabel)}</text>
+      )})' text-anchor='middle' font-size='${FontConfig.boxPlotAxis}' fill='#212529'>${svgEscape(yLabel)}</text>
 <text x='${fmt(layout.plotX + layout.plotWidth / 2.0)}' y='${fmt(
         layout.height - 40.0
-      )}' text-anchor='middle' font-size='14' fill='#212529'>Group</text>
+      )}' text-anchor='middle' font-size='${FontConfig.boxPlotAxis}' fill='#212529'>Group</text>
 $plots
 ${renderBoxPlotLabels(layout, stats)}
 ${renderBoxPlotLegend(layout)}
@@ -440,17 +468,17 @@ $footer
       topLabel: String,
       lineSeries: Vector[LineSeries],
       yAxisLabel: String = "Commits",
-      xAxisLabel: String = "Period",
+      xAxisLabel: String = "",
       totalLabel: String = "Embedded records"
   ): String = {
     val activeStacks = activeStackKeys(points, stackOrder)
     val activeLines  = activeLineSeries(lineSeries)
     val layout       = ChartLayout(
       width = math.max(700, points.size * 18 + 140),
-      height = 620,
-      left = 64,
+      height = 480,
+      left = autoLeftMargin,
       right = 24,
-      top = 32,
+      top = 44,
       bottom = 132,
       legendWidth = 190
     )
@@ -482,13 +510,6 @@ ${renderFooter(layout, points, activeStacks, topLabel, activeLines, totalLabel)}
 
   def writeSvgAndConvertToPdf(path: java.nio.file.Path, svg: String): Unit = {
     Files.writeString(path, svg, StandardCharsets.UTF_8)
-    val pdfPath = path.resolveSibling(path.getFileName.toString.replaceAll("\\.svg$", ".pdf"))
-    import scala.sys.process.*
-    val cmd = s"rsvg-convert -f pdf -o ${pdfPath.toAbsolutePath} ${path.toAbsolutePath}"
-    val result = cmd.!
-    if result != 0 then
-      System.err.println(s"Warning: rsvg-convert failed for $path, keeping SVG")
-    else
-      Files.delete(path)
+    ()
   }
 }
