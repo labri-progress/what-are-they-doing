@@ -1,10 +1,12 @@
 package whataretheydoing
 
+import de.rmgk.delay.Sync
 import whataretheydoing.DataAnalysis.*
 import whataretheydoing.SVGGraphLib.*
 
 import java.nio.file.Files
 import java.time.LocalDate
+import scala.collection.parallel.CollectionConverters.ImmutableIterableIsParallelizable
 
 object RQ2Renderer {
   private val commitTypeOrder: Vector[String] =
@@ -188,97 +190,104 @@ object RQ2Renderer {
     TimeSeriesData(points = points, totalCommits = totals, sampledCommits = totals)
   }
 
-  @main def makeWeeklyPlotSvgs(): Unit = {
-    Files.createDirectories(outputPath)
+  def makeWeeklyPlotSvgs(): Seq[Sync[Any, Unit]] = {
 
-    trackedHandles.toVector.sorted.foreach { handle =>
-      val data = agentSeriesForDeveloper(handle)
-      if data.points.nonEmpty then
-          val outputFile = outputPath.resolve(s"rq2-agent-use-$handle.svg")
-          writeSvg(
-            outputFile,
-            renderStackedTimeSeriesSvg(
-              s"Agent Usage Over Time — @$handle",
-              data.points,
-              agentColorOrder,
-              agentColors,
-              "Top agent",
-              defaultLines(data)
+    trackedHandles.toVector.map { handle =>
+      Sync {
+        val data = agentSeriesForDeveloper(handle)
+        if data.points.nonEmpty then
+            val outputFile = outputPath.resolve(s"rq2-agent-use-$handle.svg")
+            writeSvg(
+              outputFile,
+              renderStackedTimeSeriesSvg(
+                s"Agent Usage Over Time — @$handle",
+                data.points,
+                agentColorOrder,
+                agentColors,
+                "Top agent",
+                defaultLines(data)
+              )
             )
-          )
-          println(s"Wrote agent-use SVG for @$handle to $outputFile")
+            println(s"Wrote agent-use SVG for @$handle to $outputFile")
+      }
     }
   }
 
-  @main def makeRq2CommitTypeSvgs(): Unit = {
+  def makeRq2CommitTypeSvgs(): Seq[Sync[Any, Unit]] = {
     Files.createDirectories(outputPath)
 
-    trackedHandles.toVector.sorted.foreach { handle =>
-      val data = commitTypeSeriesForDeveloper(handle)
-      if data.points.nonEmpty then
-          val svgPath = outputPath.resolve(s"commit-types-$handle.svg")
-          writeSvg(
-            svgPath,
-            renderStackedTimeSeriesSvg(
-              s"Commit Types Over Time — @$handle",
-              data.points,
-              commitTypeOrder,
-              commitTypeColors,
-              "Top type",
-              defaultLines(data)
+    trackedHandles.toVector.map { handle =>
+      Sync {
+        val data = commitTypeSeriesForDeveloper(handle)
+        if data.points.nonEmpty then
+            val svgPath = outputPath.resolve(s"commit-types-$handle.svg")
+            writeSvg(
+              svgPath,
+              renderStackedTimeSeriesSvg(
+                s"Commit Types Over Time — @$handle",
+                data.points,
+                commitTypeOrder,
+                commitTypeColors,
+                "Top type",
+                defaultLines(data)
+              )
             )
-          )
-          println(s"Wrote commit-type SVG for @$handle to $svgPath")
+            println(s"Wrote commit-type SVG for @$handle to $svgPath")
+      }
     }
   }
 
-  @main def makeRq2CommitTypePerAgentSvgs(): Unit = {
+  def makeRq2CommitTypePerAgentSvgs(): Seq[Sync[Any, Unit]] = {
     Files.createDirectories(outputPath)
 
-    heuristicsByAgent.keys.toVector.sorted.foreach { agent =>
-      val data = commitTypeSeriesForAgent(agent)
-      if data.points.nonEmpty && activeStackKeys(data.points, commitTypeOrder).nonEmpty then
-          val svgPath = outputPath.resolve(s"commit-types-agent-$agent.svg")
-          writeSvg(
-            svgPath,
-            renderStackedTimeSeriesSvg(
-              s"Commit Types Over Time — agent:$agent",
-              data.points,
-              commitTypeOrder,
-              commitTypeColors,
-              "Top type",
-              defaultLines(data)
+    heuristicsByAgent.keys.toVector.sorted.map { agent =>
+      Sync {
+        val data = commitTypeSeriesForAgent(agent)
+        if data.points.nonEmpty && activeStackKeys(data.points, commitTypeOrder).nonEmpty then
+            val svgPath = outputPath.resolve(s"commit-types-agent-$agent.svg")
+            writeSvg(
+              svgPath,
+              renderStackedTimeSeriesSvg(
+                s"Commit Types Over Time — agent:$agent",
+                data.points,
+                commitTypeOrder,
+                commitTypeColors,
+                "Top type",
+                defaultLines(data)
+              )
             )
-          )
-          println(s"Wrote commit-type-by-agent SVG for $agent to $svgPath")
+            println(s"Wrote commit-type-by-agent SVG for $agent to $svgPath")
+      }
     }
   }
 
-  @main def makeRq2LinesChangedWeeklyStackedSvgs(): Unit = {
+  def makeRq2LinesChangedWeeklyStackedSvgs(): Seq[Sync[Any, Unit]] = {
     Files.createDirectories(outputPath)
 
-    trackedHandles.toVector.sorted.foreach { handle =>
-      val data = linesChangedByAgentSeriesForDeveloper.getOrElse(
-        handle,
-        TimeSeriesData(Vector.empty, Vector.empty, Vector.empty)
-      )
-      if data.points.nonEmpty && activeStackKeys(data.points, agentColorOrder).nonEmpty then
-          val svgPath = outputPath.resolve(s"lines-changed-weekly-agents-$handle.svg")
-          writeSvg(
-            svgPath,
-            renderStackedTimeSeriesSvg(
-              s"Lines Changed by Agent Over Time — @$handle",
-              data.points,
-              agentColorOrder,
-              agentColors,
-              "Top agent",
-              Vector.empty,
-              yAxisLabel = "Lines changed",
-              xAxisLabel = "Week",
-              totalLabel = "Total lines changed"
+    trackedHandles.toVector.sorted.map { handle =>
+      Sync {
+        val data = linesChangedByAgentSeriesForDeveloper.getOrElse(
+          handle,
+          TimeSeriesData(Vector.empty, Vector.empty, Vector.empty)
+        )
+        if data.points.nonEmpty && activeStackKeys(data.points, agentColorOrder).nonEmpty then
+            val svgPath = outputPath.resolve(s"lines-changed-weekly-agents-$handle.svg")
+            writeSvg(
+              svgPath,
+              renderStackedTimeSeriesSvg(
+                s"Lines Changed by Agent Over Time — @$handle",
+                data.points,
+                agentColorOrder,
+                agentColors,
+                "Top agent",
+                Vector.empty,
+                yAxisLabel = "Lines changed",
+                xAxisLabel = "Week",
+                totalLabel = "Total lines changed"
+              )
             )
-          )
-          println(s"Wrote weekly lines-changed-by-agent SVG for @$handle to $svgPath")
+            println(s"Wrote weekly lines-changed-by-agent SVG for @$handle to $svgPath")
+      }
     }
   }
 
@@ -312,49 +321,64 @@ object RQ2Renderer {
     }
   }
 
-  @main def makeRq2LinesChangedBoxplots(): Unit = {
+  def makeRq2LinesChangedBoxplots(): Seq[Sync[Any, Unit]] = {
     Files.createDirectories(outputPath)
 
     val byDeveloper = boxPlotStatsByDeveloper
-    if byDeveloper.nonEmpty then
-        val colors = developerColors(byDeveloper.map(_.label))
-        writeLinesChangedVariants(
-          stem = "lines-changed-by-developer",
-          title = "Lines Changed by Developer",
-          stats = byDeveloper,
-          fillByLabel = colors,
-          strokeByLabel = colors
-        )
+    val byDeveloperSyncs =
+      if byDeveloper.nonEmpty then
+          val colors = developerColors(byDeveloper.map(_.label))
+          Seq(
+            Sync(writeLinesChangedVariants(
+              stem = "lines-changed-by-developer",
+              title = "Lines Changed by Developer",
+              stats = byDeveloper,
+              fillByLabel = colors,
+              strokeByLabel = colors
+            ))
+          )
+      else Seq.empty
 
     val byAgent = boxPlotStatsByAgent
-    if byAgent.nonEmpty then
-        writeLinesChangedVariants(
-          stem = "lines-changed-by-agent",
-          title = "Lines Changed by Agent Bucket",
-          stats = byAgent,
-          fillByLabel = agentColors,
-          strokeByLabel = agentColors
-        )
-
-    trackedHandles.toVector.sorted.foreach { handle =>
-      val byWeek = boxPlotStatsByDeveloperWeek(handle)
-      if byWeek.nonEmpty then
-          val colors = developerColors(byWeek.map(_.label))
-          writeLinesChangedVariants(
-            stem = s"lines-changed-by-week-$handle",
-            title = s"Lines Changed by Week — @$handle",
-            stats = byWeek,
-            fillByLabel = colors,
-            strokeByLabel = colors
+    val byAgentSyncs =
+      if byAgent.nonEmpty then
+          Seq(
+            Sync(writeLinesChangedVariants(
+              stem = "lines-changed-by-agent",
+              title = "Lines Changed by Agent Bucket",
+              stats = byAgent,
+              fillByLabel = agentColors,
+              strokeByLabel = agentColors
+            ))
           )
+      else Seq.empty
+
+    val byWeekSyncs = trackedHandles.toVector.sorted.map { handle =>
+      Sync {
+        val byWeek = boxPlotStatsByDeveloperWeek(handle)
+        if byWeek.nonEmpty then
+            val colors = developerColors(byWeek.map(_.label))
+            writeLinesChangedVariants(
+              stem = s"lines-changed-by-week-$handle",
+              title = s"Lines Changed by Week — @$handle",
+              stats = byWeek,
+              fillByLabel = colors,
+              strokeByLabel = colors
+            )
+      }
     }
+
+    byDeveloperSyncs ++ byAgentSyncs ++ byWeekSyncs
   }
 
   @main def makeAllRq2Svgs(): Unit = {
-    makeWeeklyPlotSvgs()
-    makeRq2CommitTypeSvgs()
-    makeRq2CommitTypePerAgentSvgs()
-    makeRq2LinesChangedBoxplots()
-    makeRq2LinesChangedWeeklyStackedSvgs()
+    val allSyncs =
+      makeWeeklyPlotSvgs() ++
+      makeRq2CommitTypeSvgs() ++
+      makeRq2CommitTypePerAgentSvgs() ++
+      makeRq2LinesChangedBoxplots() ++
+      makeRq2LinesChangedWeeklyStackedSvgs()
+
+    allSyncs.par.foreach(_.run(using ()))
   }
 }
