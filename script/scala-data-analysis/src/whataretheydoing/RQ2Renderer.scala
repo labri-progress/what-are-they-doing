@@ -206,7 +206,7 @@ object RQ2Renderer {
             }
 
             val outputFile = GlobalPaths.outputPath.resolve(s"rq2-agent-use-$handle.svg")
-            writeSvg(
+            writeSvgAndConvertToPdf(
               outputFile,
               renderStackedTimeSeriesSvg(
                 s"Agent Usage Over Time — @$handle",
@@ -230,7 +230,7 @@ object RQ2Renderer {
         val data = commitTypeSeriesForDeveloper(handle)
         if data.points.nonEmpty then
             val svgPath = GlobalPaths.outputPath.resolve(s"commit-types-$handle.svg")
-            writeSvg(
+            writeSvgAndConvertToPdf(
               svgPath,
               renderStackedTimeSeriesSvg(
                 s"Commit Types Over Time — @$handle",
@@ -262,7 +262,7 @@ object RQ2Renderer {
         val data = commitTypeSeriesForAgent(agent)
         if data.points.nonEmpty && activeStackKeys(data.points, commitTypeOrder).nonEmpty then
             val svgPath = GlobalPaths.outputPath.resolve(s"commit-types-agent-$agent.svg")
-            writeSvg(
+            writeSvgAndConvertToPdf(
               svgPath,
               renderStackedTimeSeriesSvg(
                 s"Commit Types Over Time — agent:$agent",
@@ -289,7 +289,7 @@ object RQ2Renderer {
         )
         if data.points.nonEmpty && activeStackKeys(data.points, agentColorOrder).nonEmpty then
             val svgPath = GlobalPaths.outputPath.resolve(s"lines-changed-weekly-agents-$handle.svg")
-            writeSvg(
+            writeSvgAndConvertToPdf(
               svgPath,
               renderStackedTimeSeriesSvg(
                 s"Lines Changed by Agent Over Time — @$handle",
@@ -322,7 +322,7 @@ object RQ2Renderer {
 
     variants.foreach { case (suffix, variantTitle, scale, suppressOutliers) =>
       val svgPath = GlobalPaths.outputPath.resolve(s"$stem$suffix.svg")
-      writeSvg(
+      writeSvgAndConvertToPdf(
         svgPath,
         renderBoxPlotSvg(
           title = variantTitle,

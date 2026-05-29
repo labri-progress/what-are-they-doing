@@ -446,7 +446,7 @@ $footer
     val activeStacks = activeStackKeys(points, stackOrder)
     val activeLines  = activeLineSeries(lineSeries)
     val layout       = ChartLayout(
-      width = math.max(1200, points.size * 48 + 240),
+      width = math.max(700, points.size * 18 + 140),
       height = 620,
       left = 64,
       right = 24,
@@ -478,5 +478,17 @@ ${renderFooter(layout, points, activeStacks, topLabel, activeLines, totalLabel)}
   def writeSvg(path: java.nio.file.Path, svg: String): Unit = {
     Files.writeString(path, svg, StandardCharsets.UTF_8)
     ()
+  }
+
+  def writeSvgAndConvertToPdf(path: java.nio.file.Path, svg: String): Unit = {
+    Files.writeString(path, svg, StandardCharsets.UTF_8)
+    val pdfPath = path.resolveSibling(path.getFileName.toString.replaceAll("\\.svg$", ".pdf"))
+    import scala.sys.process.*
+    val cmd = s"rsvg-convert -f pdf -o ${pdfPath.toAbsolutePath} ${path.toAbsolutePath}"
+    val result = cmd.!
+    if result != 0 then
+      System.err.println(s"Warning: rsvg-convert failed for $path, keeping SVG")
+    else
+      Files.delete(path)
   }
 }
