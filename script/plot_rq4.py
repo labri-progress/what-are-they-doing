@@ -17,9 +17,6 @@ from pathlib import Path
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
-from datetime import datetime
-from typing import Optional
-import os
 
 
 def ensure_outdir(p: Path):
@@ -41,204 +38,6 @@ def load_commits(export_dir: Path) -> pd.DataFrame:
     if "committed_at_iso" not in df.columns and "committed_at" in df.columns:
         df["committed_at_iso"] = pd.to_datetime(df["committed_at"])
     return df
-
-
-def compute_switches_per_week_from_commits(df_commits: pd.DataFrame) -> pd.DataFrame:
-    # expects columns: developer, committed_at_iso, repo
-    df = df_commits.copy()
-    df["committed_at_iso"] = pd.to_datetime(df["committed_at_iso"], utc=True)
-    df = df.sort_values(["developer", "committed_at_iso"])
-
-    rows = []
-    for dev, g in df.groupby("developer"):
-        prev_week = None
-        prev_repo = None
-        counts = {}
-        for _, row in g.iterrows():
-            wk = row["committed_at_iso"].strftime("%G-%V")
-            repo = row.get("repo") or "(unknown)"
-            if wk != prev_week:
-                prev_repo = None
-                prev_week = wk
-            if prev_repo is not None and repo != prev_repo:
-                counts[wk] = counts.get(wk, 0) + 1
-            prev_repo = repo
-        for wk, cnt in counts.items():
-            rows.append({"developer": dev, "iso_year_week": wk, "switches_in_week": cnt})
-
-    if not rows:
-        return pd.DataFrame(columns=["developer", "iso_year_week", "switches_in_week"])
-    return pd.DataFrame(rows)
-
-
-def plot_active_repos_week(df_week: pd.DataFrame, out: Path, author: str | None = None):
-    d = df_week.copy()
-    if author:
-        d = d[d.developer == author]
-    plt.figure(figsize=(8, 6))
-    sns.boxplot(x="developer", y="active_repos_ge2", data=d)
-    plt.xticks(rotation=45)
-    plt.title("Active repositories per week (>=2 commits)")
-    plt.tight_layout()
-    plt.savefig(out / "active_repos_per_week_boxplot.png")
-    plt.close()
-
-
-def plot_gini_week(df_week: pd.DataFrame, out: Path, author: str | None = None):
-    d = df_week.copy()
-    if author:
-        d = d[d.developer == author]
-    plt.figure(figsize=(8, 6))
-    sns.boxplot(x="developer", y="gini", data=d)
-    plt.xticks(rotation=45)
-    plt.title("Repository concentration (Gini) per week")
-    plt.tight_layout()
-    plt.savefig(out / "gini_per_week_boxplot.png")
-    plt.close()
-
-
-def plot_switches_per_session(df_sessions: pd.DataFrame, out: Path, author: str | None = None):
-    d = df_sessions.copy()
-    if author:
-        d = d[d.developer == author]
-    plt.figure(figsize=(8, 6))
-    sns.boxplot(x="developer", y="switches_in_session", data=d)
-    plt.xticks(rotation=45)
-    plt.title("Repository switches per session")
-    plt.tight_layout()
-    plt.savefig(out / "switches_per_session_boxplot.png")
-    plt.close()
-
-
-def plot_switches_per_week(df_sessions: pd.DataFrame, out: Path, author: str | None = None):
-    d = df_sessions.copy()
-    # compute week key from start_iso
-    d["start_iso"] = pd.to_datetime(d["start_iso"], utc=True)
-    d["iso_year_week"] = d["start_iso"].dt.strftime("%G-%V")
-    grouped = d.groupby(["developer", "iso_year_week"]).switches_in_session.sum().reset_index(name="switches_in_week")
-    if author:
-        grouped = grouped[grouped.developer == author]
-    plt.figure(figsize=(10, 6))
-    sns.boxplot(x="developer", y="switches_in_week", data=grouped)
-    plt.xticks(rotation=45)
-    plt.title("Repository switches per week (summed from sessions)")
-    plt.tight_layout()
-    plt.savefig(out / "switches_per_week_boxplot.png")
-    plt.close()
-
-
-def plot_active_repos_by_week(df_week: pd.DataFrame, out: Path, author: Optional[str] = None):
-    d = df_week.copy()
-    if author:
-        d = d[d.developer == author]
-    # pivot so each developer becomes a column and weeks are the index
-    df = d[["developer", "iso_week", "active_repos_ge2"]].dropna()
-    if df.empty:
-        print("No weekly active-repos data available; skipping lineplot.")
-        return
-    
-    sns.set_style("whitegrid")
-    
-    pivot = df.pivot_table(index="iso_week", columns="developer", values="active_repos_ge2", aggfunc="mean")
-    pivot = pivot.sort_index()
-    plt.figure(figsize=(14, 6))
-    ax = plt.gca()
-    pivot.plot(ax=ax, linewidth=1)
-    plt.xticks(rotation=90)
-    plt.ylabel("Active repositories")
-    plt.xlabel("")
-    #plt.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
-    plt.legend(loc="upper left")
-    plt.tight_layout()
-    plt.savefig(out / "active_repos_by_week_lineplot.pdf")
-    plt.close()
-
-
-def plot_gini_by_week(df_week: pd.DataFrame, out: Path, author: Optional[str] = None):
-    d = df_week.copy()
-    if author:
-        d = d[d.developer == author]
-    # pivot to have weeks x developers
-    df = d[["developer", "iso_week", "gini"]]
-    if df.empty:
-        print("No weekly gini data available; skipping gini lineplot.")
-        return
-    pivot = df.pivot_table(index="iso_week", columns="developer", values="gini", aggfunc="mean")
-    pivot = pivot.sort_index()
-    # ensure all weeks present
-    all_weeks = sorted(df_week["iso_week"].unique(), key=lambda s: tuple(int(x) for x in s.split("-")))
-    pivot = pivot.reindex(all_weeks)
-    pivot = pivot.fillna(0)
-
-    sns.set_theme(style="whitegrid")
-    sns.set_palette("colorblind")
-
-    plt.figure(figsize=(14, 6))
-    ax = plt.gca()
-    pivot.plot(ax=ax, linewidth=1.25, marker='o', markersize=4)
-    ax.set_ylim(0, 1)
-    plt.xticks(rotation=90)
-    plt.ylabel("Gini coefficient")
-    plt.xlabel("ISO year-week")
-    plt.title("Repository concentration (Gini) per week — per-developer time series")
-    plt.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
-    plt.tight_layout()
-    plt.savefig(out / "gini_by_week_lineplot.pdf")
-    plt.close()
-
-
-def plot_switches_by_week_commits(df_commits: pd.DataFrame, out: Path, author: Optional[str] = None):
-    grouped = compute_switches_per_week_from_commits(df_commits)
-    if author:
-        grouped = grouped[grouped.developer == author]
-    if grouped.empty:
-        print("No switches computed from commits; skipping switches-by-week plot.")
-        return
-    plt.figure(figsize=(14, 6))
-    sns.boxplot(x="iso_year_week", y="switches_in_week", data=grouped)
-    plt.xticks(rotation=90)
-    plt.title("Repository switches per week (from raw commits)")
-    plt.tight_layout()
-    plt.savefig(out / "switches_by_week_from_commits_boxplot.pdf")
-    plt.close()
-
-
-def plot_switches_by_week_line(df_commits: pd.DataFrame, df_week: pd.DataFrame, out: Path, author: Optional[str] = None):
-    """Per-developer line plot of switches per week (computed from raw commits)."""
-    grouped = compute_switches_per_week_from_commits(df_commits)
-    if grouped.empty:
-        print("No switches computed from commits; skipping lineplot.")
-        return
-    # pivot so weeks are rows and developers are columns
-    pivot = grouped.pivot_table(index="iso_year_week", columns="developer", values="switches_in_week", aggfunc="sum")
-    pivot = pivot.sort_index()
-
-    # ensure all weeks present (use weekly summary if available)
-    if df_week is not None and "iso_week" in df_week.columns:
-        all_weeks = sorted(df_week["iso_week"].unique(), key=lambda s: tuple(int(x) for x in s.split("-")))
-        pivot = pivot.reindex(all_weeks)
-    # fill missing with zeros
-    pivot = pivot.fillna(0)
-
-    # styling
-    sns.set_theme(style="whitegrid")
-    sns.set_palette("colorblind")
-
-    plt.figure(figsize=(14, 6))
-    ax = plt.gca()
-    pivot.plot(ax=ax, linewidth=1.5, marker="o", markersize=4)
-    ax.set_ylim(bottom=0)
-    plt.xticks(rotation=90)
-    plt.ylabel("Repository switches per week")
-    plt.xlabel("ISO year-week")
-    plt.title("Repository switches per week — per-developer time series (log scale)")
-    # use symmetric log scale to handle zeros while showing log-like behavior
-    ax.set_yscale("symlog", linthresh=1, base=10)
-    plt.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
-    plt.tight_layout()
-    plt.savefig(out / "switches_by_week_lineplot.pdf")
-    plt.close()
-
 
 def compute_switches_per_day_from_commits(df_commits: pd.DataFrame) -> pd.DataFrame:
     df = df_commits.copy()
@@ -265,36 +64,6 @@ def compute_switches_per_day_from_commits(df_commits: pd.DataFrame) -> pd.DataFr
     if not rows:
         return pd.DataFrame(columns=["developer", "day", "switches_in_day"])
     return pd.DataFrame(rows)
-
-
-def plot_switches_by_day_line(df_commits: pd.DataFrame, out: Path, author: Optional[str] = None):
-    grouped = compute_switches_per_day_from_commits(df_commits)
-    if grouped.empty:
-        print("No daily switches computed; skipping day-line plot.")
-        return
-    pivot = grouped.pivot_table(index="day", columns="developer", values="switches_in_day", aggfunc="sum")
-    pivot = pivot.sort_index()
-    # ensure full date range from commits
-    all_days = sorted(pd.to_datetime(df_commits["committed_at_iso"], utc=True).dt.strftime("%Y-%m-%d").unique())
-    pivot = pivot.reindex(all_days)
-    pivot = pivot.fillna(0)
-
-    sns.set_theme(style="whitegrid")
-    sns.set_palette("colorblind")
-
-    plt.figure(figsize=(14, 6))
-    ax = plt.gca()
-    pivot.plot(ax=ax, linewidth=1.0, marker='.', markersize=3)
-    ax.set_ylim(bottom=0)
-    plt.xticks(rotation=90)
-    #ax.set_yscale("symlog", linthresh=1, base=10)
-    plt.ylabel("Repository switches per day")
-    plt.xlabel("Date")
-    plt.title("Repository switches per day — per-developer time series")
-    plt.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
-    plt.tight_layout()
-    plt.savefig(out / "switches_by_day_lineplot.pdf")
-    plt.close()
 
 
 def _make_subplots_grid(n: int, figsize=(12, 8)):
@@ -326,10 +95,12 @@ def plot_active_repos_subplots(df_week: pd.DataFrame, out: Path, color_map: dict
         d = series.reindex(all_weeks).fillna(0)
         ax.bar(range(len(all_weeks)), d.values, color=color_map[dev])
         ax.set_title(dev)
-        # show ticks every 4th week
+        # show ticks every 4th week and format as YYYY-MM using week_start_iso where available
         ticks = list(range(0, len(all_weeks), 4))
+        week_label_map = {row['iso_week']: pd.to_datetime(row['week_start_iso']).strftime('%Y-%m') for _, row in df_week[['iso_week', 'week_start_iso']].drop_duplicates().iterrows()}
+        labels = [week_label_map.get(all_weeks[i], all_weeks[i]) for i in ticks]
         ax.set_xticks(ticks)
-        ax.set_xticklabels([all_weeks[i] for i in ticks], rotation=45)
+        ax.set_xticklabels(labels, rotation=45)
         ax.set_ylabel('Active repos')
         ax.grid(axis='y')
     plt.tight_layout()
@@ -357,8 +128,10 @@ def plot_gini_subplots(df_week: pd.DataFrame, out: Path, color_map: dict | None 
         ax.set_ylim(0, 1)
         ax.set_title(dev)
         ticks = list(range(0, len(all_weeks), 4))
+        week_label_map = {row['iso_week']: pd.to_datetime(row['week_start_iso']).strftime('%Y-%m') for _, row in df_week[['iso_week', 'week_start_iso']].drop_duplicates().iterrows()}
+        labels = [week_label_map.get(all_weeks[i], all_weeks[i]) for i in ticks]
         ax.set_xticks(ticks)
-        ax.set_xticklabels([all_weeks[i] for i in ticks], rotation=45)
+        ax.set_xticklabels(labels, rotation=45)
         ax.set_ylabel('Gini')
         ax.grid(axis='y')
     plt.tight_layout()
@@ -396,9 +169,9 @@ def plot_switches_day_subplots(df_commits: pd.DataFrame, out: Path, color_map: d
         if not ticks:
             step = max(1, len(all_days_str) // 60)
             ticks = list(range(0, len(all_days_str), step))
-            labels = [all_days_str[i] for i in ticks]
+            labels = [pd.to_datetime(all_days_str[i]).strftime('%Y-%m') for i in ticks]
         else:
-            labels = [pd.to_datetime(all_days_str[i]).strftime('%b %Y') for i in ticks]
+            labels = [pd.to_datetime(all_days_str[i]).strftime('%Y-%m') for i in ticks]
         ax.set_xticks(ticks)
         ax.set_xticklabels(labels, rotation=45, fontsize=8)
         ax.set_xlim(-0.5, len(all_days_str) - 0.5)
@@ -430,10 +203,10 @@ def plot_switches_session_subplots(df_sessions: pd.DataFrame, out: Path, color_m
         x = list(range(len(d)))
         ax.bar(x, d['switches_in_session'].values, color=color_map[dev], width=0.9)
         ax.set_title(dev)
-        # sparse tick labels showing session start datetimes every N sessions
+        # sparse tick labels showing session start datetimes every N sessions (YYYY-MM)
         step = max(1, len(d) // 10)
         ticks = list(range(0, len(d), step))
-        labels = [d['start_iso'].dt.strftime('%Y-%m-%d %H:%M').iloc[i] for i in ticks]
+        labels = [d['start_iso'].dt.strftime('%Y-%m').iloc[i] for i in ticks]
         ax.set_xticks(ticks)
         ax.set_xticklabels(labels, rotation=45)
         ax.set_xlim(-0.5, len(d) - 0.5)
@@ -444,11 +217,103 @@ def plot_switches_session_subplots(df_sessions: pd.DataFrame, out: Path, color_m
     plt.close()
 
 
+def _plot_row_for_developers(fig_type: str, developers: list[str], df_week: pd.DataFrame, df_commits: pd.DataFrame, df_sessions: pd.DataFrame, out: Path, color_map: dict):
+    """Helper to plot a single-row figure for a small list of developers.
+    fig_type: one of 'active_repos', 'gini', 'switches_day', 'switches_session'"""
+    n = len(developers)
+    if n == 0:
+        return
+    fig, axes = plt.subplots(1, n, figsize=(4 * n, 4), squeeze=False)
+    axes = axes[0]
+
+    # full week/day ranges
+    all_weeks = sorted(df_week['iso_week'].unique(), key=lambda s: tuple(int(x) for x in s.split('-'))) if (df_week is not None and 'iso_week' in df_week.columns) else []
+    df_commits_local = df_commits.copy()
+    df_commits_local['committed_at_iso'] = pd.to_datetime(df_commits_local['committed_at_iso'], utc=True)
+    all_days = pd.date_range(start=df_commits_local['committed_at_iso'].dt.date.min(), end=df_commits_local['committed_at_iso'].dt.date.max(), freq='D')
+    all_days_str = [d.strftime('%Y-%m-%d') for d in all_days]
+
+    for ax, dev in zip(axes, developers):
+        if fig_type == 'active_repos':
+            series = df_week[df_week.developer == dev].groupby('iso_week', as_index=True)['active_repos_ge2'].mean()
+            d = series.reindex(all_weeks).fillna(0)
+            ax.bar(range(len(all_weeks)), d.values, color=color_map.get(dev))
+            ax.set_title(dev)
+            ticks = list(range(0, len(all_weeks), 4))
+            week_label_map = {row['iso_week']: pd.to_datetime(row['week_start_iso']).strftime('%Y-%m') for _, row in df_week[['iso_week', 'week_start_iso']].drop_duplicates().iterrows()}
+            ax.set_xticks(ticks)
+            ax.set_xticklabels([week_label_map.get(all_weeks[i], all_weeks[i]) for i in ticks], rotation=45)
+            ax.set_ylabel('Active repos')
+            ax.grid(axis='y')
+
+        elif fig_type == 'gini':
+            series = df_week[df_week.developer == dev].groupby('iso_week', as_index=True)['gini'].mean()
+            d = series.reindex(all_weeks).fillna(0)
+            ax.bar(range(len(all_weeks)), d.values, color=color_map.get(dev))
+            ax.set_ylim(0, 1)
+            ax.set_title(dev)
+            ticks = list(range(0, len(all_weeks), 4))
+            week_label_map = {row['iso_week']: pd.to_datetime(row['week_start_iso']).strftime('%Y-%m') for _, row in df_week[['iso_week', 'week_start_iso']].drop_duplicates().iterrows()}
+            ax.set_xticks(ticks)
+            ax.set_xticklabels([week_label_map.get(all_weeks[i], all_weeks[i]) for i in ticks], rotation=45)
+            ax.set_ylabel('Gini')
+            ax.grid(axis='y')
+
+        elif fig_type == 'switches_day':
+            grouped = compute_switches_per_day_from_commits(df_commits)
+            series = grouped[grouped.developer == dev].groupby('day', as_index=True)['switches_in_day'].sum()
+            d = series.reindex(all_days_str).fillna(0)
+            x = list(range(len(all_days_str)))
+            ax.bar(x, d.values, color=color_map.get(dev), width=1.0)
+            ax.set_title(dev)
+            # label only first day of month
+            ticks = [i for i, day in enumerate(all_days_str) if day.endswith('-01')]
+            if not ticks:
+                step = max(1, len(all_days_str) // 60)
+                ticks = list(range(0, len(all_days_str), step))
+                labels = [pd.to_datetime(all_days_str[i]).strftime('%Y-%m') for i in ticks]
+            else:
+                labels = [pd.to_datetime(all_days_str[i]).strftime('%Y-%m') for i in ticks]
+            ax.set_xticks(ticks)
+            ax.set_xticklabels(labels, rotation=45, fontsize=8)
+            ax.set_xlim(-0.5, len(all_days_str) - 0.5)
+            ax.set_ylabel('Switches/day')
+            ax.grid(axis='y')
+
+        elif fig_type == 'switches_session':
+            df = df_sessions.copy()
+            df['start_iso'] = pd.to_datetime(df['start_iso'], utc=True)
+            d = df[df.developer == dev].sort_values('start_iso')
+            x = list(range(len(d)))
+            ax.bar(x, d['switches_in_session'].values, color=color_map.get(dev), width=0.9)
+            ax.set_title(dev)
+            step = max(1, len(d) // 10)
+            ticks = list(range(0, len(d), step))
+            labels = [d['start_iso'].dt.strftime('%Y-%m').iloc[i] for i in ticks] if len(d) else []
+            ax.set_xticks(ticks)
+            ax.set_xticklabels(labels, rotation=45, fontsize=8)
+            ax.set_xlim(-0.5, len(d) - 0.5)
+            ax.set_ylabel('Switches/session')
+            ax.grid(axis='y')
+
+    plt.tight_layout()
+    filename = f"{fig_type}_four_devs_row.pdf"
+    plt.savefig(out / filename)
+    plt.close()
+
+
+def plot_four_devs_row_plots(df_week: pd.DataFrame, df_commits: pd.DataFrame, df_sessions: pd.DataFrame, out: Path, devs: list[str], color_map: dict):
+    # create the four requested figures (one row with four subplots each)
+    _plot_row_for_developers('active_repos', devs, df_week, df_commits, df_sessions, out, color_map)
+    _plot_row_for_developers('gini', devs, df_week, df_commits, df_sessions, out, color_map)
+    _plot_row_for_developers('switches_day', devs, df_week, df_commits, df_sessions, out, color_map)
+    _plot_row_for_developers('switches_session', devs, df_week, df_commits, df_sessions, out, color_map)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--export-dir", type=Path, default=Path("data/exports-RQ4"))
     parser.add_argument("--out-dir", type=Path, default=Path("data/exports-RQ4/plots"))
-    parser.add_argument("--author", type=str, default=None, help="Filter to single developer")
     parser.add_argument("--show", action="store_true", help="Show plots interactively")
     args = parser.parse_args()
 
@@ -460,22 +325,6 @@ def main():
     df_sessions = load_sessions(export_dir)
     df_commits = load_commits(export_dir)
 
-    #plot_active_repos_week(df_week, out_dir, args.author)
-    #plot_gini_week(df_week, out_dir, args.author)
-    #plot_switches_per_session(df_sessions, out_dir, args.author)
-    #plot_switches_per_week(df_sessions, out_dir, args.author)
-
-    # additional plots: weeks on x-axis (distribution across developers)
-    #plot_active_repos_by_week(df_week, out_dir, args.author)
-    #plot_gini_by_week(df_week, out_dir, args.author)
-    #plot_switches_by_week_commits(df_commits, out_dir, args.author)
-    # also produce per-developer lineplot for switches per week
-    #plot_switches_by_week_line(df_commits, df_week, out_dir, args.author)
-    # per-day switches lineplot
-    #plot_switches_by_day_line(df_commits, out_dir, args.author)
-
-    # New small-multiple bar subplots per developer
-    # build a canonical developer list and color_map so colors stay consistent
     devs_week = set(df_week['developer'].unique()) if 'developer' in df_week.columns else set()
     devs_sess = set(df_sessions['developer'].unique()) if 'developer' in df_sessions.columns else set()
     devs_comm = set(df_commits['developer'].unique()) if 'developer' in df_commits.columns else set()
@@ -487,6 +336,10 @@ def main():
     plot_gini_subplots(df_week, out_dir, color_map=color_map)
     plot_switches_day_subplots(df_commits, out_dir, color_map=color_map)
     plot_switches_session_subplots(df_sessions, out_dir, color_map=color_map)
+
+    # Also create compact one-row figures for the requested four developers
+    chosen_devs = ["Dicklesworthstone", "steipete", "teamchong", "steveyegge"]
+    plot_four_devs_row_plots(df_week, df_commits, df_sessions, out_dir, chosen_devs, color_map)
 
     print(f"Saved plots to {out_dir}")
     if args.show:
