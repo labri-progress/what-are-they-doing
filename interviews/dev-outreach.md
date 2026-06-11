@@ -20,6 +20,10 @@ For this, we already have an initial draft, with questions that *should* address
 
 ---
 
+### Including Questions
+
+Subject: Questions About Your GitHub Activity for a Research Paper
+
 Hey INSERT_FIRST_NAME_IF_KNOWN!
 
 We're academic researchers from several universities across Europe and Canada, and are currently analyzing your development patterns and workflow to publish in a research paper.  
@@ -61,9 +65,39 @@ Dr. Thomas Degueule (CNRS Researcher at the LaBRI Software Engineering group), D
 Prof. Shane McIntosh (Associate Professor for Software Data Mining) & team
 
 **Technical University of Darmstadt, Germany**
-Prof. Mira Mezini (Professor of Computer Science, with extensive background in programming systems and AI research) & team
+Prof. Mira Mezini (Professor of Software Technology, with extensive background in programming systems and AI research) & team
+
+### Excluding Questions (Ask for interview first, then follow up with questions if they don't want to do the interview)
+
+Subject: Interview for Research Paper About Your GitHub Activity
+
+Hey INSERT_FIRST_NAME_IF_KNOWN!
+
+We're academic researchers from several universities across Europe and Canada, and are currently analyzing your development patterns and workflow to publish in a research paper.  
+Your GitHub activity caught out attention, as you can probably understand. The amount of activity on your profile is exactly what we are curious about, and we would like to know a bit more.  
+
+While we have already performed some analysis (scraping and commit-level analysis), there simply are things this data alone cannot tell us. Additionally, we'd like to ensure our findings are valid. This helps **us** to publish more accurate insights, and allows **you** to ensure we're not making incorrect claims about your workflow.
+
+If you are curious about what we're doing or simply interested in supporting open-access research, we would be super happy to interview you! This way we could discuss your activity patterns and workflow in detail, and ask any follow-up questions we might have. Just get back to us and we'll figure out a time that works for us both.  
+
+Thank you for your cooperation in advance!
 
 ---
+
+About Us:  
+We're researchers from four different universities, with a long history of research about AI-supported development. Specifically, here's who we are:
+
+**KTH Royal Institute of Technology, Sweden**
+Prof. Martin Monperrus (Professor of Software Technology, pioneer of AI-assisted coding) & team
+
+**University of Bordeaux, France**
+Dr. Thomas Degueule (CNRS Researcher at the LaBRI Software Engineering group), Dr. Romain Robbes (Senior Scientist for Empirical Software Engineering and Machine Learning at CNRS/LaBRI) & team
+
+**University of Waterloo, Canada**
+Prof. Shane McIntosh (Associate Professor for Software Data Mining) & team
+
+**Technical University of Darmstadt, Germany**
+Prof. Mira Mezini (Professor of Software Technology, with extensive background in programming systems and AI research) & team
 
 ## Semi-Structured Interview
 
