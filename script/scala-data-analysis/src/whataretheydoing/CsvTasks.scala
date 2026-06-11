@@ -1,35 +1,16 @@
 package whataretheydoing
 
 import com.github.tototoshi.csv.*
+import whataretheydoing.DataAnalysis.taskTypeCounts
 
 import java.nio.file.Files
 
 object CsvTasks {
 
-  private def agentBucket(agents: Set[String]): String =
-    if agents.isEmpty then "no signal"
-    else if agents.size > 1 then "multi agent"
-    else agents.head
-
   @main def exportTasksPerAgent(): Unit = {
     val commitTypeColumns = CommitType.values.toVector.sortBy(_.ordinal)
 
-    val rows = CommitProcessing.aggregateCommitData.iterator
-      .flatMap { case (developer, _, _, snapshot) =>
-        snapshot.days.valuesIterator.flatMap { dayData =>
-          dayData.commits.iterator.flatMap { commit =>
-            CommitProcessing.commitSignals(commit.sha).map { classified =>
-              (developer, agentBucket(classified.agents), classified.commitType)
-            }
-          }
-        }
-      }
-      .toVector
-      .groupMapReduce(entry => (entry._1, entry._2))(e => Map[CommitType, Int](e._3 -> 1)) { (a, b) =>
-        a ++ b.view.mapValues(_ + a.getOrElse(b.head._1, 0))
-      }
-
-    val csvData = rows.toVector.sortBy((k, _) => (k._1, k._2)).map { case ((developer, agent), typeCounts) =>
+    val csvData = taskTypeCounts.toVector.sortBy((k, _) => (k.developer, k.agent)).map { case ((developer, agent), typeCounts) =>
       val total = typeCounts.values.sum
       Map[String, String](
         "developer"       -> developer,

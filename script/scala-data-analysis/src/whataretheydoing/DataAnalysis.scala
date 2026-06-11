@@ -311,6 +311,27 @@ object DataAnalysis {
     }
   }
 
+  private def agentBucket(agents: Set[String]): String =
+    if agents.isEmpty then "no signal"
+    else if agents.size > 1 then "multi agent"
+    else agents.head
+
+  lazy val taskTypeCounts: Map[(developer: String, agent: String), Map[CommitType, Int]] = CommitProcessing.aggregateCommitData.iterator
+    .flatMap { case (developer, _, _, snapshot) =>
+      snapshot.days.valuesIterator.flatMap { dayData =>
+        dayData.commits.iterator.flatMap { commit =>
+          CommitProcessing.commitSignals(commit.sha).map { classified =>
+            (developer, agentBucket(classified.agents), classified.commitType)
+          }
+        }
+      }
+    }
+    .toVector
+    .groupMapReduce(entry => (entry._1, entry._2))(e => Map[CommitType, Int](e._3 -> 1)) { (a, b) =>
+      a ++ b.view.mapValues(_ + a.getOrElse(b.head._1, 0))
+    }
+
+
   private val commitUrl = "^https://github.com/(?<org>[^/]+)/(?<repo>[^/]+)/commit/".r.unanchored
 
   def repoOfCommit(sha: String): String =
