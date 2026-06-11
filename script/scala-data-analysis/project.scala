@@ -5,7 +5,7 @@
 // specifies to use the installed jvm, or error if none is present
 // otherwise the default is to always download a jdk, even if one is installed (except if JAVA_HOME is set explicitly)
 // check if this is overridden in project-local.scala
-//> using jvm system
+//> using jvm 26
 
 // for compiler options:
 // see https://docs.scala-lang.org/overviews/compiler-options/
@@ -18,7 +18,7 @@
 // 2) sets the classfile version (and maybe enables some associated classfile features)
 // should generally be set to something, otherwise all features from the randomly selected current JDK are available
 // check if this is overridden in project-local.scala
-//> using option -java-output-version 25
+//> using option -java-output-version 26
 
 // workarounds for deprecated JVM features introduced in JDK 25, these are needed until all dependencies are built with 3.8
 //> using java-options -XX:+IgnoreUnrecognizedVMOptions --sun-misc-unsafe-memory-access=allow --enable-native-access=ALL-UNNAMED
@@ -96,5 +96,5 @@
 //////////// Tests
 
 // munit is an excellent compromise on simplicity with a couple of simple features
-//> using test.dep org.scalameta::munit::1.3.1
+//> using test.dep org.scalameta::munit::1.3.3
 //> using test.dep org.scalameta::munit-scalacheck::1.3.0

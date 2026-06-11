@@ -8,8 +8,8 @@ import whataretheydoing.{CommitDetail, CommitEntry, CommitProcessing, DayData, D
 import java.nio.file.{Files, Path}
 import java.time.{DayOfWeek, LocalDate}
 import java.util.concurrent.StructuredTaskScope.Joiner
-import scala.util.Using
 import scala.jdk.CollectionConverters.given
+import scala.util.Using
 
 object DataAnalysis {
 
@@ -27,7 +27,6 @@ object DataAnalysis {
       readFromArray[List[DevSummary]](developersJson)
 
   lazy val trackedHandles: Set[String] = developers.map(_.handle).toSet
-
 
   case class AuthorStats(
       login: String,
@@ -346,7 +345,6 @@ object DataAnalysis {
     ()
   }
 
-
   extension [T](it: Iterable[T]) def strucMap[B](f: T => B): Vector[B] = {
     Using(java.util.concurrent.StructuredTaskScope.open(Joiner.allSuccessfulOrThrow[B]())) { scope =>
       it.foreach(elem =>
@@ -354,8 +352,7 @@ object DataAnalysis {
           f(elem)
         }
       )
-      val results = scope.join()
-      results.map(_.get()).iterator.asScala.toVector
+      scope.join().asScala.toVector
     }.get
   }
 
