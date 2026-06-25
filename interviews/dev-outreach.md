@@ -27,7 +27,7 @@ Subject: Questions About Your GitHub Activity for a Research Paper
 Hey INSERT_FIRST_NAME_IF_KNOWN!
 
 We're academic researchers from several universities across Europe and Canada, and are currently analyzing your development patterns and workflow to publish in a research paper.  
-Your GitHub activity caught out attention, as you can probably understand. The amount of activity on your profile is exactly what we are curious about, and we would like to know a bit more.  
+Your GitHub activity caught our attention, as you can probably understand. The amount of activity on your profile is exactly what we are curious about, and we would like to know a bit more.  
 
 While we have already performed some analysis (scraping and commit-level analysis), there simply are things this data alone cannot tell us. Additionally, we'd like to ensure our findings are valid. This helps **us** to publish more accurate insights, and allows **you** to ensure we're not making incorrect claims about your workflow.
 
@@ -74,7 +74,7 @@ Subject: Interview for Research Paper About Your GitHub Activity
 Hey INSERT_FIRST_NAME_IF_KNOWN!
 
 We're academic researchers from several universities across Europe and Canada, and are currently analyzing your development patterns and workflow to publish in a research paper.  
-Your GitHub activity caught out attention, as you can probably understand. The amount of activity on your profile is exactly what we are curious about, and we would like to know a bit more.  
+Your GitHub activity caught our attention, as you can probably understand. The amount of activity on your profile is exactly what we are curious about, and we would like to know a bit more.  
 
 While we have already performed some analysis (scraping and commit-level analysis), there simply are things this data alone cannot tell us. Additionally, we'd like to ensure our findings are valid. This helps **us** to publish more accurate insights, and allows **you** to ensure we're not making incorrect claims about your workflow.
 
