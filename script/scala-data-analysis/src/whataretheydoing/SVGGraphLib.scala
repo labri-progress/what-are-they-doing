@@ -180,14 +180,10 @@ object SVGGraphLib {
   }
 
   private def renderBarLabels(layout: ChartLayout, points: Vector[StackedBarPoint]): String =
-    val step = math.max(1, (points.size + 7) / 8)
-    points.zipWithIndex.collect { case (point, index) if index % step == 0 =>
+    points.zipWithIndex.map { case (point, index) =>
       val cx = xForBar(layout, points.size, index) + barWidth(layout, points.size) / 2.0
-      val cy = layout.plotY + layout.plotHeight + 28.0
-      val txtX = cx + 8.0
-      val txtY = cy + FontConfig.barLabel / 3
-      s"<circle cx='${fmt(cx)}' cy='${fmt(cy)}' r='3' fill='#495057' />" +
-      s"<text x='${fmt(txtX)}' y='${fmt(txtY)}' transform='rotate(45 ${fmt(cx)} ${fmt(cy)})' font-size='${FontConfig.barLabel}' text-anchor='start' fill='#495057'>${svgEscape(point.xLabel)}</text>"
+      val cy = layout.plotY + layout.plotHeight + 10.0
+      s"<text x='${fmt(cx)}' y='${fmt(cy)}' transform='rotate(45 ${fmt(cx)} ${fmt(cy)})' font-size='10' text-anchor='start' fill='#495057'>${svgEscape(point.xLabel)}</text>"
     }.mkString("\n")
 
   private def renderLineSeries(
@@ -538,6 +534,123 @@ ${renderLegend(layout, activeStacks, colors, activeLines)}
 <rect width='100%' height='100%' fill='white'/>
 ${renderLegend(layout, activeStackKeys(Vector(dummyPoint), stackOrder), colors, Vector.empty)}
 </svg>"""
+  }
+
+  private def renderPctBar(
+      layout: ChartLayout,
+      pointCount: Int,
+      index: Int,
+      pctValues: Map[String, Double],
+      activeKeys: Vector[String],
+      colors: Map[String, String]
+  ): String = {
+    val x     = xForBar(layout, pointCount, index)
+    val width = barWidth(layout, pointCount)
+    def yForPct(v: Double): Double =
+      layout.plotY + layout.plotHeight - (v / 100.0) * layout.plotHeight
+    activeKeys.foldLeft((0.0, Vector.empty[String])) { case ((bottom, acc), key) =>
+      val pct = pctValues.getOrElse(key, 0.0)
+      if pct < 0.01 then (bottom, acc)
+      else
+        val yTop    = yForPct(bottom + pct)
+        val yBottom = yForPct(bottom)
+        (bottom + pct, acc :+ renderBarSegment(x, yTop, width, yBottom - yTop, colors.getOrElse(key, "#adb5bd")))
+    }._2.mkString("\n")
+  }
+
+  def renderPercentageStackedWithCountLineSvg(
+      title: String,
+      points: Vector[StackedBarPoint],
+      stackOrder: Vector[String],
+      colors: Map[String, String],
+      countPerWeek: Vector[Int],
+      yRightLabel: String = "Commits",
+      xAxisLabel: String = "Week",
+      showLegend: Boolean = true
+  ): String = {
+    val activeStacks = activeStackKeys(points, stackOrder)
+    val layout = ChartLayout(
+      width = math.max(700, points.size * 18 + 140),
+      height = 480,
+      left = autoLeftMargin,
+      right = 80,
+      top = 44,
+      bottom = 132,
+      legendWidth = 190
+    )
+
+    val pctByPoint: Vector[Map[String, Double]] = points.map { pt =>
+      val total = pt.values.values.sum.toDouble
+      if total == 0 then Map.empty
+      else pt.values.view.mapValues(_.toDouble / total * 100.0).toMap
+    }
+
+    // Left y-axis: fixed 0-100%
+    val leftAxis: String =
+      (0 to 100 by 10).map { tick =>
+        val y = layout.plotY + layout.plotHeight - (tick / 100.0) * layout.plotHeight
+        s"<line x1='${fmt(layout.plotX)}' y1='${fmt(y)}' x2='${fmt(layout.plotX + layout.plotWidth)}' y2='${fmt(y)}' stroke='#e9ecef' stroke-width='1' />" +
+        s"<text x='${fmt(layout.plotX - 10)}' y='${fmt(y + 4)}' text-anchor='end' font-size='${FontConfig.tick}' fill='#495057'>$tick%</text>"
+      }.mkString("\n") +
+      s"\n<line x1='${fmt(layout.plotX)}' y1='${fmt(layout.plotY + layout.plotHeight)}' x2='${fmt(layout.plotX + layout.plotWidth)}' y2='${fmt(layout.plotY + layout.plotHeight)}' stroke='#343a40' stroke-width='1.2' />" +
+      s"\n<line x1='${fmt(layout.plotX)}' y1='${fmt(layout.plotY)}' x2='${fmt(layout.plotX)}' y2='${fmt(layout.plotY + layout.plotHeight)}' stroke='#343a40' stroke-width='1.2' />"
+
+    // Right y-axis: commit count scale
+    val countMax      = math.max(1, countPerWeek.maxOption.getOrElse(1))
+    val countStep     = niceStep(countMax, 6)
+    val countScaleMax = math.max(countStep, ((countMax + countStep - 1) / countStep) * countStep)
+    val rightX        = layout.plotX + layout.plotWidth
+
+    def yForCount(v: Double): Double =
+      layout.plotY + layout.plotHeight - (v / countScaleMax) * layout.plotHeight
+
+    val rightAxis: String =
+      (0 to countScaleMax by countStep).map { tick =>
+        val y = yForCount(tick.toDouble)
+        s"<text x='${fmt(rightX + 8)}' y='${fmt(y + 4)}' text-anchor='start' font-size='${FontConfig.tick}' fill='#343a40'>${formatSi(tick.toDouble)}</text>"
+      }.mkString("\n") +
+      s"\n<line x1='${fmt(rightX)}' y1='${fmt(layout.plotY)}' x2='${fmt(rightX)}' y2='${fmt(layout.plotY + layout.plotHeight)}' stroke='#343a40' stroke-width='1.2' />"
+
+    val rightAxisLabel: String = {
+      val rx = layout.plotX + layout.plotWidth + layout.right - FontConfig.axisLabel * 0.5
+      val ry = layout.plotY + layout.plotHeight / 2.0
+      s"<text x='${fmt(rx)}' y='${fmt(ry)}' transform='rotate(90 ${fmt(rx)} ${fmt(ry)})' text-anchor='middle' font-size='${FontConfig.axisLabel}' fill='#343a40'>${svgEscape(yRightLabel)}</text>"
+    }
+
+    val bars: String = pctByPoint.zipWithIndex.map { case (pctValues, index) =>
+      renderPctBar(layout, points.size, index, pctValues, activeStacks, colors)
+    }.mkString("\n")
+
+    val countLine: String = {
+      val counts = countPerWeek.padTo(points.size, 0).take(points.size)
+      val poly   = counts.zipWithIndex.map { case (c, i) =>
+        val cx = xForBar(layout, points.size, i) + barWidth(layout, points.size) / 2.0
+        s"${fmt(cx)},${fmt(yForCount(c.toDouble))}"
+      }.mkString(" ")
+      val markers = counts.zipWithIndex.map { case (c, i) =>
+        val cx = xForBar(layout, points.size, i) + barWidth(layout, points.size) / 2.0
+        val cy = yForCount(c.toDouble)
+        s"<rect x='${fmt(cx - 2.5)}' y='${fmt(cy - 2.5)}' width='5' height='5' fill='#343a40' transform='rotate(45 ${fmt(cx)} ${fmt(cy)})' />"
+      }.mkString("\n")
+      s"<polyline fill='none' stroke='#343a40' stroke-width='2' stroke-dasharray='6 4' points='$poly' />\n$markers"
+    }
+
+    val legendSvg = if showLegend then
+      renderLegend(layout, activeStacks, colors, Vector(LineSeries(yRightLabel, "#343a40", "6 4", "#343a40", countPerWeek)))
+    else ""
+
+    s"""<svg xmlns='http://www.w3.org/2000/svg' width='${layout.width}' height='${layout.height}' viewBox='0 0 ${layout.width} ${layout.height}'>
+${renderBackground()}
+$leftAxis
+$rightAxis
+${renderTitles(layout, title, "Agent share (%)", xAxisLabel)}
+$rightAxisLabel
+$bars
+$countLine
+${renderBarLabels(layout, points)}
+$legendSvg
+</svg>
+"""
   }
 
   def writeSvg(path: java.nio.file.Path, svg: String): Unit = {
