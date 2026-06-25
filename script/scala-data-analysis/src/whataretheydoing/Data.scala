@@ -19,7 +19,7 @@ given codecHeuristicJson: JsonValueCodec[List[AgentHeuristic]] = JsonCodecMaker.
 
 given codecDeveloperEntry: JsonValueCodec[List[DevSummary]] = JsonCodecMaker.make
 
-given codecContributionDay: JsonValueCodec[ContributionDay] = JsonCodecMaker.make
+given codecContributionDay: JsonValueCodec[ContributionDay]                           = JsonCodecMaker.make
 given codecDeveloperContributionSummary: JsonValueCodec[DeveloperContributionSummary] = JsonCodecMaker.make
 
 case class MonthlySnapshot(
@@ -44,7 +44,13 @@ case class CommitEntry(
     html_url: Option[String],
     author: GitHubUser,
     committer: Option[GitHubUser]
-)
+) {
+  def repository: String =
+    commit.url match {
+      case s"https://api.github.com/repos/$owner/$repo/commits/$_" => s"$owner/$repo"
+      case _                                                       => "unknown"
+    }
+}
 
 case class CommitInfo(
     author: GitAuthor,
@@ -118,7 +124,7 @@ case class AgentHeuristic(
     trailer_prefixes: Map[String, List[String]] = Map.empty,
     assisted_by_patterns: List[(String, String)] = Nil,
 )
-object  AgentHeuristic {
+object AgentHeuristic {
   given Associative[AgentHeuristic] = Associative.derived
 }
 
