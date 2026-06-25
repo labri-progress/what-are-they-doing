@@ -47,8 +47,8 @@ object CsvTasks {
       (countRow, pctRow)
     }.unzip
 
-    writeCsv(GlobalPaths.outputPath.resolve("tasks-per-agent.csv"), header, countRows)
-    writeCsv(GlobalPaths.outputPath.resolve("tasks-per-agent-percentage.csv"), header, pctRows)
+    writeCsv(GlobalPaths.outputPath.resolve("csv").resolve("tasks-per-agent.csv"), header, countRows)
+    writeCsv(GlobalPaths.outputPath.resolve("csv").resolve("tasks-per-agent-percentage.csv"), header, pctRows)
   }
 
   @main def exportCommitTypesByAgent(): Unit = {
@@ -82,8 +82,22 @@ object CsvTasks {
       (countRow, pctRow)
     }.unzip
 
-    writeCsv(GlobalPaths.outputPath.resolve("commit-types-by-agent.csv"), header, countRows)
-    writeCsv(GlobalPaths.outputPath.resolve("commit-types-by-agent-percentage.csv"), header, pctRows)
+    writeCsv(GlobalPaths.outputPath.resolve("commit-types").resolve("commit-types-by-agent.csv"), header, countRows)
+    writeCsv(GlobalPaths.outputPath.resolve("commit-types").resolve("commit-types-by-agent-percentage.csv"), header, pctRows)
+
+    val developers = taskTypeCounts.keys.map(_.developer).toVector.distinct.sorted
+    for developer <- developers do
+      val devAgentCounts = taskTypeCounts.collect { case (k, v) if k.developer == developer => k.agent -> v }
+      val (devCountRows, devPctRows) = devAgentCounts.toVector.sortBy(_._1).map { case (agent, typeCounts) =>
+        val total = typeCounts.values.sum
+        val countRow = Map[String, String]("agent" -> agent, "commits_total" -> total.toString) ++
+          commitTypeColumns.map(ct => s"commits_${ct.toString.toLowerCase}" -> typeCounts.getOrElse(ct, 0).toString).toMap
+        val pctRow = Map[String, String]("agent" -> agent, "commits_total" -> "100.0") ++
+          commitTypeColumns.map(ct => s"commits_${ct.toString.toLowerCase}" -> fmtPct(typeCounts.getOrElse(ct, 0), total)).toMap
+        (countRow, pctRow)
+      }.unzip
+      writeCsv(GlobalPaths.outputPath.resolve("commit-types").resolve("per-developer").resolve(s"$developer.csv"), header, devCountRows)
+      writeCsv(GlobalPaths.outputPath.resolve("commit-types").resolve("per-developer").resolve(s"$developer-percentage.csv"), header, devPctRows)
   }
 
   @main def exportAgentsByCommitType(): Unit = {
@@ -111,8 +125,42 @@ object CsvTasks {
       (countRow, pctRow)
     }.unzip
 
-    writeCsv(GlobalPaths.outputPath.resolve("agents-by-commit-type.csv"), header, countRows)
-    writeCsv(GlobalPaths.outputPath.resolve("agents-by-commit-type-percentage.csv"), header, pctRows)
+    val totalCounts = agents.map { agent =>
+      agent -> commitTypeColumns.map(ct => agentTypeCounts.getOrElse(agent, Map.empty).getOrElse(ct, 0)).sum
+    }
+    val grandTotal = totalCounts.map(_._2).sum
+    val totalCountRow = Map[String, String]("commit_type" -> "total") ++
+      totalCounts.map((agent, count) => agent -> count.toString).toMap
+    val totalPctRow = Map[String, String]("commit_type" -> "total") ++
+      totalCounts.map((agent, count) => agent -> fmtPct(count, grandTotal)).toMap
+
+    writeCsv(GlobalPaths.outputPath.resolve("agents-by-commit-type").resolve("agents-by-commit-type.csv"), header, countRows :+ totalCountRow)
+    writeCsv(GlobalPaths.outputPath.resolve("agents-by-commit-type").resolve("agents-by-commit-type-percentage.csv"), header, pctRows :+ totalPctRow)
+
+    val developers = taskTypeCounts.keys.map(_.developer).toVector.distinct.sorted
+    for developer <- developers do
+      val devAgentTypeCounts: Map[String, Map[CommitType, Int]] =
+        taskTypeCounts.collect { case (k, v) if k.developer == developer => k.agent -> v }
+      val devAgents = devAgentTypeCounts.keys.toVector.sorted
+      val devHeader = "commit_type" +: devAgents
+      val (devCountRows, devPctRows) = commitTypeColumns.map { ct =>
+        val counts = devAgents.map(agent => agent -> devAgentTypeCounts.getOrElse(agent, Map.empty).getOrElse(ct, 0))
+        val rowTotal = counts.map(_._2).sum
+        val countRow = Map[String, String]("commit_type" -> ct.toString.toLowerCase) ++
+          counts.map((agent, count) => agent -> count.toString).toMap
+        val pctRow = Map[String, String]("commit_type" -> ct.toString.toLowerCase) ++
+          counts.map((agent, count) => agent -> fmtPct(count, rowTotal)).toMap
+        (countRow, pctRow)
+      }.unzip
+      val devTotalCounts = devAgents.map(agent =>
+        agent -> commitTypeColumns.map(ct => devAgentTypeCounts.getOrElse(agent, Map.empty).getOrElse(ct, 0)).sum)
+      val devGrandTotal = devTotalCounts.map(_._2).sum
+      val devTotalCountRow = Map[String, String]("commit_type" -> "total") ++
+        devTotalCounts.map((agent, count) => agent -> count.toString).toMap
+      val devTotalPctRow = Map[String, String]("commit_type" -> "total") ++
+        devTotalCounts.map((agent, count) => agent -> fmtPct(count, devGrandTotal)).toMap
+      writeCsv(GlobalPaths.outputPath.resolve("agents-by-commit-type").resolve("per-developer").resolve(s"$developer.csv"), devHeader, devCountRows :+ devTotalCountRow)
+      writeCsv(GlobalPaths.outputPath.resolve("agents-by-commit-type").resolve("per-developer").resolve(s"$developer-percentage.csv"), devHeader, devPctRows :+ devTotalPctRow)
   }
 
   @main def exportAgentSignalRatePerDeveloper(): Unit = {
@@ -207,7 +255,7 @@ object CsvTasks {
           }.toMap
         }
 
-        val outputDir = GlobalPaths.outputPath.resolve("agent-signal-rate")
+        val outputDir = GlobalPaths.outputPath.resolve("agent-share")
         writeCsv(outputDir.resolve(s"$developer.csv"), header, dataRows ++ Vector(sepRow) ++ summaryRows)
       }
   }
@@ -237,6 +285,6 @@ object CsvTasks {
         }.toMap
     }
 
-    writeCsv(GlobalPaths.outputPath.resolve("agent-harness-distribution.csv"), header, rows)
+    writeCsv(GlobalPaths.outputPath.resolve("csv").resolve("agent-harness-distribution.csv"), header, rows)
   }
 }

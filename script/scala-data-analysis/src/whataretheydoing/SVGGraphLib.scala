@@ -48,8 +48,8 @@ object SVGGraphLib {
     val plotY: Double      = top
     val plotWidth: Double  = width - left - right
     val plotHeight: Double = height - top - bottom
-    val legendX: Double    = plotX + 10
-    val legendY: Double    = plotY + 10
+    val legendX: Double    = plotX + plotWidth + 16
+    val legendY: Double    = plotY
   }
 
   case class ChartScale(yMax: Int, yStep: Int)
@@ -212,26 +212,30 @@ object SVGGraphLib {
       layout: ChartLayout,
       activeKeys: Vector[String],
       colors: Map[String, String],
-      activeLines: Vector[LineSeries]
+      activeLines: Vector[LineSeries],
+      lxOverride: Option[Double] = None,
+      lyOverride: Option[Double] = None
   ): String = {
+    val lx         = lxOverride.getOrElse(layout.legendX)
+    val ly         = lyOverride.getOrElse(layout.legendY)
     val entries    = activeKeys.map(Left(_)) ++ activeLines.map(Right(_))
     val rowSpacing = 24
     val padY       = 8
     val boxHeight  = 2 * padY + entries.size * rowSpacing
     val box        =
-      s"<rect x='${fmt(layout.legendX)}' y='${fmt(layout.legendY)}' width='${fmt(layout.legendWidth)}' height='${fmt(boxHeight)}' rx='4' ry='4' fill='white' fill-opacity='0.92' stroke='#ced4da' stroke-width='1' />"
+      s"<rect x='${fmt(lx)}' y='${fmt(ly)}' width='${fmt(layout.legendWidth)}' height='${fmt(boxHeight)}' rx='4' ry='4' fill='white' fill-opacity='0.92' stroke='#ced4da' stroke-width='1' />"
 
     def textEl(label: String, cy: Double): String =
-      s"<text x='${fmt(layout.legendX + 38)}' y='${fmt(cy + 8)}' font-size='${FontConfig.legend}' fill='#212529'>${svgEscape(label)}</text>"
+      s"<text x='${fmt(lx + 38)}' y='${fmt(cy + 8)}' font-size='${FontConfig.legend}' fill='#212529'>${svgEscape(label)}</text>"
 
     val legendItems = entries.reverse.zipWithIndex.map { case (entry, idx) =>
-      val cy = layout.legendY + padY + rowSpacing / 2.0 + idx * rowSpacing
+      val cy = ly + padY + rowSpacing / 2.0 + idx * rowSpacing
       entry match
         case Left(key)   =>
-          val sx = layout.legendX + 10
+          val sx = lx + 10
           s"<rect x='${fmt(sx)}' y='${fmt(cy - 6)}' width='18' height='12' fill='${colors.getOrElse(key, "#adb5bd")}' stroke='#ffffff' stroke-width='0.6' />" + textEl(key, cy)
         case Right(line) =>
-          val sx = layout.legendX + 10
+          val sx = lx + 10
           s"<line x1='${fmt(sx)}' y1='${fmt(cy)}' x2='${fmt(sx + 20)}' y2='${fmt(cy)}' stroke='${line.stroke}' stroke-width='2' stroke-dasharray='${line.dashArray}' />" +
           s"<rect x='${fmt(sx + 7)}' y='${fmt(cy - 3)}' width='6' height='6' fill='${line.markerFill}' transform='rotate(45 ${fmt(sx + 10)} ${fmt(cy)})' />" + textEl(line.label, cy)
     }.mkString("\n")
@@ -406,7 +410,7 @@ $outliers"""
   ): String = {
     val layout = ChartLayout(
       width = math.max(1200, stats.size * 72 + 220),
-      height = 520,
+      height = 600,
       left = autoLeftMargin,
       right = 24,
       top = 44,
@@ -470,14 +474,15 @@ $footer
   ): String = {
     val activeStacks = activeStackKeys(points, stackOrder)
     val activeLines  = activeLineSeries(lineSeries)
+    val legendW      = 220.0
     val layout       = ChartLayout(
-      width = math.max(700, points.size * 18 + 140),
-      height = 480,
+      width = math.max(900, points.size * 20 + legendW.toInt + 200),
+      height = 560,
       left = autoLeftMargin,
-      right = 24,
+      right = legendW + 40,
       top = 44,
-      bottom = 132,
-      legendWidth = 190
+      bottom = 140,
+      legendWidth = legendW
     )
     val scale = computeScale(points, activeLines)
 
@@ -518,7 +523,7 @@ ${renderFooter(layout, points, activeStacks, topLabel, activeLines, totalLabel)}
     )
     s"""<svg xmlns='http://www.w3.org/2000/svg' width='${layout.width}' height='${layout.height}' viewBox='0 0 ${layout.width} ${layout.height}'>
 ${renderBackground()}
-${renderLegend(layout, activeStacks, colors, activeLines)}
+${renderLegend(layout, activeStacks, colors, activeLines, lxOverride = Some(10.0), lyOverride = Some(10.0))}
 </svg>
 """
   }
@@ -532,7 +537,7 @@ ${renderLegend(layout, activeStacks, colors, activeLines)}
     val layout = ChartLayout(width = 220, height = 360, left = 10, right = 10, top = 10, bottom = 10, legendWidth = 200)
     s"""<svg xmlns='http://www.w3.org/2000/svg' width='220' height='360' viewBox='0 0 220 360'>
 <rect width='100%' height='100%' fill='white'/>
-${renderLegend(layout, activeStackKeys(Vector(dummyPoint), stackOrder), colors, Vector.empty)}
+${renderLegend(layout, activeStackKeys(Vector(dummyPoint), stackOrder), colors, Vector.empty, lxOverride = Some(10.0), lyOverride = Some(10.0))}
 </svg>"""
   }
 
@@ -569,14 +574,16 @@ ${renderLegend(layout, activeStackKeys(Vector(dummyPoint), stackOrder), colors, 
       showLegend: Boolean = true
   ): String = {
     val activeStacks = activeStackKeys(points, stackOrder)
-    val layout = ChartLayout(
-      width = math.max(700, points.size * 18 + 140),
-      height = 480,
+    val legendW    = 220.0
+    val rightAxisW = 80.0
+    val layout     = ChartLayout(
+      width = math.max(900, points.size * 20 + legendW.toInt + 200),
+      height = 560,
       left = autoLeftMargin,
-      right = 80,
+      right = rightAxisW + legendW + 40,
       top = 44,
-      bottom = 132,
-      legendWidth = 190
+      bottom = 140,
+      legendWidth = legendW
     )
 
     val pctByPoint: Vector[Map[String, Double]] = points.map { pt =>
@@ -612,7 +619,7 @@ ${renderLegend(layout, activeStackKeys(Vector(dummyPoint), stackOrder), colors, 
       s"\n<line x1='${fmt(rightX)}' y1='${fmt(layout.plotY)}' x2='${fmt(rightX)}' y2='${fmt(layout.plotY + layout.plotHeight)}' stroke='#343a40' stroke-width='1.2' />"
 
     val rightAxisLabel: String = {
-      val rx = layout.plotX + layout.plotWidth + layout.right - FontConfig.axisLabel * 0.5
+      val rx = layout.plotX + layout.plotWidth + rightAxisW - FontConfig.axisLabel * 0.5
       val ry = layout.plotY + layout.plotHeight / 2.0
       s"<text x='${fmt(rx)}' y='${fmt(ry)}' transform='rotate(90 ${fmt(rx)} ${fmt(ry)})' text-anchor='middle' font-size='${FontConfig.axisLabel}' fill='#343a40'>${svgEscape(yRightLabel)}</text>"
     }
@@ -636,7 +643,8 @@ ${renderLegend(layout, activeStackKeys(Vector(dummyPoint), stackOrder), colors, 
     }
 
     val legendSvg = if showLegend then
-      renderLegend(layout, activeStacks, colors, Vector(LineSeries(yRightLabel, "#343a40", "6 4", "#343a40", countPerWeek)))
+      renderLegend(layout, activeStacks, colors, Vector(LineSeries(yRightLabel, "#343a40", "6 4", "#343a40", countPerWeek)),
+        lxOverride = Some(layout.plotX + layout.plotWidth + rightAxisW + 16))
     else ""
 
     s"""<svg xmlns='http://www.w3.org/2000/svg' width='${layout.width}' height='${layout.height}' viewBox='0 0 ${layout.width} ${layout.height}'>

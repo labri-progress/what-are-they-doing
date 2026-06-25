@@ -193,6 +193,7 @@ object RQ2Renderer {
   }
 
   def makeWeeklyPlotSvgs(): Seq[Sync[Any, Unit]] = {
+    Files.createDirectories(GlobalPaths.outputPath.resolve("agent-use"))
 
     trackedHandles.toVector.map { handle =>
       Sync {
@@ -206,7 +207,7 @@ object RQ2Renderer {
               pt.copy(values = pt.values.filter((k, _) => activeAgents.contains(k)))
             }
 
-            val outputFile = GlobalPaths.outputPath.resolve(s"rq2-agent-use-$handle.svg")
+            val outputFile = GlobalPaths.outputPath.resolve("agent-use").resolve(s"rq2-agent-use-$handle.svg")
             writeSvgAndConvertToPdf(
               outputFile,
               renderStackedTimeSeriesSvg(
@@ -224,13 +225,13 @@ object RQ2Renderer {
   }
 
   def makeRq2CommitTypeSvgs(): Seq[Sync[Any, Unit]] = {
-    Files.createDirectories(GlobalPaths.outputPath)
+    Files.createDirectories(GlobalPaths.outputPath.resolve("commit-types"))
 
     trackedHandles.toVector.map { handle =>
       Sync {
         val data = commitTypeSeriesForDeveloper(handle)
         if data.points.nonEmpty then
-            val svgPath = GlobalPaths.outputPath.resolve(s"commit-types-$handle.svg")
+            val svgPath = GlobalPaths.outputPath.resolve("commit-types").resolve(s"commit-types-$handle.svg")
             writeSvgAndConvertToPdf(
               svgPath,
               renderStackedTimeSeriesSvg(
@@ -248,7 +249,7 @@ object RQ2Renderer {
   }
 
   def makeRq2CommitTypePerAgentSvgs(): Seq[Sync[Any, Unit]] = {
-    Files.createDirectories(GlobalPaths.outputPath)
+    Files.createDirectories(GlobalPaths.outputPath.resolve("commit-types"))
 
     val agentCommitCounts: Map[String, Int] =
       CommitProcessing.allCommitDetailsBySha1.valuesIterator
@@ -257,7 +258,7 @@ object RQ2Renderer {
         .groupMapReduce(identity)(_ => 1)(_ + _)
 
     val legendSync = Sync {
-      val svgPath = GlobalPaths.outputPath.resolve("commit-types-legend.svg")
+      val svgPath = GlobalPaths.outputPath.resolve("commit-types").resolve("commit-types-legend.svg")
       writeSvgAndConvertToPdf(svgPath, renderLegendSvg(commitTypeOrder, commitTypeColors))
       println(s"Wrote commit-types legend SVG to $svgPath")
     }
@@ -268,7 +269,7 @@ object RQ2Renderer {
       Sync {
         val data = commitTypeSeriesForAgent(agent)
         if data.points.nonEmpty && activeStackKeys(data.points, commitTypeOrder).nonEmpty then
-            val svgPath = GlobalPaths.outputPath.resolve(s"commit-types-agent-$agent.svg")
+            val svgPath = GlobalPaths.outputPath.resolve("commit-types").resolve(s"commit-types-agent-$agent.svg")
             writeSvgAndConvertToPdf(
               svgPath,
               renderStackedTimeSeriesSvg(
@@ -289,7 +290,7 @@ object RQ2Renderer {
   }
 
   def makeRq2LinesChangedWeeklyStackedSvgs(): Seq[Sync[Any, Unit]] = {
-    Files.createDirectories(GlobalPaths.outputPath)
+    Files.createDirectories(GlobalPaths.outputPath.resolve("lines-changed"))
 
     trackedHandles.toVector.sorted.map { handle =>
       Sync {
@@ -298,7 +299,7 @@ object RQ2Renderer {
           TimeSeriesData(Vector.empty, Vector.empty, Vector.empty)
         )
         if data.points.nonEmpty && activeStackKeys(data.points, agentColorOrder).nonEmpty then
-            val svgPath = GlobalPaths.outputPath.resolve(s"lines-changed-weekly-agents-$handle.svg")
+            val svgPath = GlobalPaths.outputPath.resolve("lines-changed").resolve(s"lines-changed-weekly-agents-$handle.svg")
             writeSvgAndConvertToPdf(
               svgPath,
               renderStackedTimeSeriesSvg(
@@ -331,7 +332,7 @@ object RQ2Renderer {
     )
 
     variants.foreach { case (suffix, variantTitle, scale, suppressOutliers) =>
-      val svgPath = GlobalPaths.outputPath.resolve(s"$stem$suffix.svg")
+      val svgPath = GlobalPaths.outputPath.resolve("lines-changed").resolve(s"$stem$suffix.svg")
       writeSvgAndConvertToPdf(
         svgPath,
         renderBoxPlotSvg(
@@ -349,7 +350,7 @@ object RQ2Renderer {
   }
 
   def makeRq2LinesChangedBoxplots(): Seq[Sync[Any, Unit]] = {
-    Files.createDirectories(GlobalPaths.outputPath)
+    Files.createDirectories(GlobalPaths.outputPath.resolve("lines-changed"))
 
     val byDeveloper      = boxPlotStatsByDeveloper
     val byDeveloperSyncs =
@@ -399,40 +400,86 @@ object RQ2Renderer {
   }
 
   private def agentsByCommitTypeSyncs(): Seq[Sync[Any, Unit]] = {
-    Files.createDirectories(GlobalPaths.outputPath)
+    Files.createDirectories(GlobalPaths.outputPath.resolve("agents-by-commit-type"))
+    Files.createDirectories(GlobalPaths.outputPath.resolve("agents-by-commit-type").resolve("per-developer"))
 
-    val agentTypeCounts: Map[String, Map[CommitType, Int]] = DataAnalysis.taskTypeCounts
-      .groupMapReduce((k, _) => k.agent)((_, v) => v) { (a, b) =>
-        CommitType.values.map { ct =>
-          ct -> (a.getOrElse(ct, 0) + b.getOrElse(ct, 0))
+    val commitTypeColumns = CommitType.values.toVector.sortBy(_.ordinal)
+
+    // Reorganize: developer → commit_type → agent → count
+    val byDevByTypeByAgent: Map[String, Map[CommitType, Map[String, Int]]] =
+      taskTypeCounts.toVector
+        .flatMap { case ((developer, agent), typeCounts) =>
+          typeCounts.toVector.map { case (ct, count) => (developer, ct, agent, count) }
+        }
+        .groupBy(_._1)
+        .view.mapValues { entries =>
+          entries.groupBy(_._2)
+            .view.mapValues(ctEntries => ctEntries.map(e => e._3 -> e._4).toMap)
+            .toMap
         }.toMap
-      }
 
-    CommitType.values.toVector.sortBy(_.ordinal).map { ct =>
+    val developers = byDevByTypeByAgent.keys.toVector.sorted
+
+    // One percentage-stacked SVG per developer: x=commit_type, stacked by agent
+    val perDevSyncs: Vector[Sync[Any, Unit]] = developers.map { developer =>
       Sync {
-        val points: Vector[StackedBarPoint] = agentColorOrder.flatMap { agent =>
-          val count = agentTypeCounts.getOrElse(agent, Map.empty).getOrElse(ct, 0)
-          if count > 0 then Some(StackedBarPoint(xLabel = agent, values = Map(agent -> count)))
-          else None
+        val typeMap = byDevByTypeByAgent.getOrElse(developer, Map.empty)
+        val points: Vector[StackedBarPoint] = commitTypeColumns.flatMap { ct =>
+          val agentCounts = typeMap.getOrElse(ct, Map.empty)
+          if agentCounts.isEmpty then None
+          else Some(StackedBarPoint(xLabel = ct.toString.toLowerCase, values = agentCounts))
         }.toVector
 
         if points.nonEmpty then
-            val svgPath = GlobalPaths.outputPath.resolve(s"agents-by-commit-type-${ct.toString.toLowerCase}.svg")
-            writeSvgAndConvertToPdf(
-              svgPath,
-              renderStackedTimeSeriesSvg(
-                s"Commits by Agent — ${ct.toString.toLowerCase}",
-                points,
-                agentColorOrder,
-                agentColors,
-                "Top agent",
-                Vector.empty,
-                xAxisLabel = "Agent"
-              )
+          val countPerType = points.map(p => p.values.values.sum)
+          val svgPath = GlobalPaths.outputPath.resolve("agents-by-commit-type").resolve("per-developer").resolve(s"$developer.svg")
+          writeSvgAndConvertToPdf(
+            svgPath,
+            renderPercentageStackedWithCountLineSvg(
+              s"Agent Distribution by Task — $developer",
+              points,
+              agentColorOrder,
+              agentColors,
+              countPerType,
+              yRightLabel = "Commits",
+              xAxisLabel = "Task"
             )
-            println(s"Wrote agents-by-commit-type SVG for ${ct.toString.toLowerCase} to $svgPath")
+          )
+          println(s"Wrote agents-by-commit-type SVG for $developer to $svgPath")
       }
     }
+
+    // Aggregate total: overall agent distribution across all types
+    val agentTypeCounts: Map[String, Map[CommitType, Int]] = taskTypeCounts
+      .groupMapReduce((k, _) => k.agent)((_, v) => v) { (a, b) =>
+        commitTypeColumns.map(ct => ct -> (a.getOrElse(ct, 0) + b.getOrElse(ct, 0))).toMap
+      }
+
+    val totalSync: Sync[Any, Unit] = Sync {
+      val points: Vector[StackedBarPoint] = agentColorOrder.flatMap { agent =>
+        val count = commitTypeColumns.map(ct => agentTypeCounts.getOrElse(agent, Map.empty).getOrElse(ct, 0)).sum
+        if count > 0 then Some(StackedBarPoint(xLabel = agent, values = Map(agent -> count)))
+        else None
+      }.toVector
+
+      if points.nonEmpty then
+        val svgPath = GlobalPaths.outputPath.resolve("agents-by-commit-type").resolve("agents-by-commit-type-total.svg")
+        writeSvgAndConvertToPdf(
+          svgPath,
+          renderStackedTimeSeriesSvg(
+            "Commits by Agent — all types",
+            points,
+            agentColorOrder,
+            agentColors,
+            "Top agent",
+            Vector.empty,
+            xAxisLabel = "Agent"
+          )
+        )
+        println(s"Wrote agents-by-commit-type SVG for total to $svgPath")
+    }
+
+    perDevSyncs :+ totalSync
   }
 
   @main def makeAgentsByCommitTypeSvgs(): Unit = {
@@ -440,12 +487,12 @@ object RQ2Renderer {
   }
 
   private def agentShareWeeklyPlotSyncs(): Seq[Sync[Any, Unit]] = {
-    Files.createDirectories(GlobalPaths.outputPath)
+    Files.createDirectories(GlobalPaths.outputPath.resolve("agent-share"))
     trackedHandles.toVector.map { handle =>
       Sync {
         val data = agentSeriesForDeveloper(handle)
         if data.points.nonEmpty then
-          val svgPath = GlobalPaths.outputPath.resolve(s"agent-share-weekly-$handle.svg")
+          val svgPath = GlobalPaths.outputPath.resolve("agent-share").resolve(s"agent-share-weekly-$handle.svg")
           writeSvgAndConvertToPdf(
             svgPath,
             renderPercentageStackedWithCountLineSvg(
@@ -463,6 +510,115 @@ object RQ2Renderer {
 
   @main def makeAgentShareWeeklyPlotSvgs(): Unit = {
     agentShareWeeklyPlotSyncs().foreach(_.run(using ()))
+  }
+
+  @main def makeCommitTypesByAgentSvg(): Unit = {
+    Files.createDirectories(GlobalPaths.outputPath.resolve("commit-types"))
+
+    val agentTypeCounts: Map[String, Map[CommitType, Int]] = DataAnalysis.taskTypeCounts
+      .groupMapReduce((k, _) => k.agent)((_, v) => v) { (a, b) =>
+        CommitType.values.map { ct =>
+          ct -> (a.getOrElse(ct, 0) + b.getOrElse(ct, 0))
+        }.toMap
+      }
+
+    val points: Vector[StackedBarPoint] = agentColorOrder.flatMap { agent =>
+      val typeCounts = agentTypeCounts.getOrElse(agent, Map.empty)
+      if typeCounts.values.sum > 0 then
+        Some(StackedBarPoint(agent, typeCounts.map((ct, c) => ct.toString.toLowerCase -> c)))
+      else None
+    }.toVector
+
+    if points.nonEmpty then
+      val countPerAgent = points.map(_.values.values.sum)
+
+      val svgPath = GlobalPaths.outputPath.resolve("commit-types").resolve("commit-types-by-agent.svg")
+      writeSvgAndConvertToPdf(
+        svgPath,
+        renderStackedTimeSeriesSvg(
+          "Commit Types by Agent",
+          points,
+          commitTypeOrder,
+          commitTypeColors,
+          "Top type",
+          Vector.empty,
+          xAxisLabel = "Agent"
+        )
+      )
+      println(s"Wrote commit-types-by-agent SVG to $svgPath")
+
+      val svgPathPct = GlobalPaths.outputPath.resolve("commit-types").resolve("commit-types-by-agent-percentage.svg")
+      writeSvgAndConvertToPdf(
+        svgPathPct,
+        renderPercentageStackedWithCountLineSvg(
+          "Commit Type Distribution by Agent",
+          points,
+          commitTypeOrder,
+          commitTypeColors,
+          countPerAgent,
+          yRightLabel = "Total commits",
+          xAxisLabel = "Agent"
+        )
+      )
+      println(s"Wrote commit-types-by-agent-percentage SVG to $svgPathPct")
+  }
+
+  private def commitTypesByAgentPerDeveloperSyncs(): Seq[Sync[Any, Unit]] = {
+    Files.createDirectories(GlobalPaths.outputPath.resolve("commit-types").resolve("per-developer"))
+
+    val developers = DataAnalysis.taskTypeCounts.keys.map(_.developer).toVector.distinct.sorted
+
+    developers.map { developer =>
+      Sync {
+        val devAgentCounts = DataAnalysis.taskTypeCounts.collect {
+          case (k, v) if k.developer == developer => k.agent -> v
+        }
+
+        val points: Vector[StackedBarPoint] = agentColorOrder.flatMap { agent =>
+          val typeCounts = devAgentCounts.getOrElse(agent, Map.empty)
+          if typeCounts.values.sum > 0 then
+            Some(StackedBarPoint(agent, typeCounts.map((ct, c) => ct.toString.toLowerCase -> c)))
+          else None
+        }.toVector
+
+        if points.nonEmpty then
+          val countPerAgent = points.map(_.values.values.sum)
+
+          val svgPath = GlobalPaths.outputPath.resolve("commit-types").resolve("per-developer").resolve(s"$developer.svg")
+          writeSvgAndConvertToPdf(
+            svgPath,
+            renderStackedTimeSeriesSvg(
+              s"Commit Types by Agent \u2014 $developer",
+              points,
+              commitTypeOrder,
+              commitTypeColors,
+              "Top type",
+              Vector.empty,
+              xAxisLabel = "Agent"
+            )
+          )
+          println(s"Wrote commit-types-by-agent SVG for $developer to $svgPath")
+
+          val svgPathPct = GlobalPaths.outputPath.resolve("commit-types").resolve("per-developer").resolve(s"$developer-percentage.svg")
+          writeSvgAndConvertToPdf(
+            svgPathPct,
+            renderPercentageStackedWithCountLineSvg(
+              s"Commit Type Distribution by Agent \u2014 $developer",
+              points,
+              commitTypeOrder,
+              commitTypeColors,
+              countPerAgent,
+              yRightLabel = "Total commits",
+              xAxisLabel = "Agent"
+            )
+          )
+          println(s"Wrote commit-types-by-agent-percentage SVG for $developer to $svgPathPct")
+      }
+    }
+  }
+
+  @main def makeCommitTypesByAgentPerDeveloperSvgs(): Unit = {
+    commitTypesByAgentPerDeveloperSyncs().foreach(_.run(using ()))
   }
 
   @main def makeAllRq2Svgs(): Unit = {
