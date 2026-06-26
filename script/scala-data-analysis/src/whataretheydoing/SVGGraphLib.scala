@@ -58,7 +58,7 @@ object SVGGraphLib {
     val title         = 22
     val axisLabel     = 24
     val tick          = 24
-    val barLabel      = 22
+    val barLabel      = 16
     val legend        = 22
     val legendEntry   = 16
     val footer        = 18
@@ -183,7 +183,7 @@ object SVGGraphLib {
     points.zipWithIndex.map { case (point, index) =>
       val cx = xForBar(layout, points.size, index) + barWidth(layout, points.size) / 2.0
       val cy = layout.plotY + layout.plotHeight + 10.0
-      s"<text x='${fmt(cx)}' y='${fmt(cy)}' transform='rotate(45 ${fmt(cx)} ${fmt(cy)})' font-size='10' text-anchor='start' fill='#495057'>${svgEscape(point.xLabel)}</text>"
+      s"<text x='${fmt(cx)}' y='${fmt(cy)}' transform='rotate(60 ${fmt(cx)} ${fmt(cy)})' font-size='${FontConfig.barLabel}' text-anchor='start' fill='#495057'>${svgEscape(point.xLabel)}</text>"
     }.mkString("\n")
 
   private def renderLineSeries(
@@ -410,7 +410,7 @@ $outliers"""
   ): String = {
     val layout = ChartLayout(
       width = math.max(1200, stats.size * 72 + 220),
-      height = 600,
+      height = 500,
       left = autoLeftMargin,
       right = 24,
       top = 44,
