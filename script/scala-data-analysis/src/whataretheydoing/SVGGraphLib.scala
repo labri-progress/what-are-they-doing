@@ -56,6 +56,7 @@ object SVGGraphLib {
 
   object FontConfig:
     val title         = 22
+    val subtitle      = 14
     val axisLabel     = 24
     val tick          = 24
     val barLabel      = 16
@@ -258,13 +259,6 @@ object SVGGraphLib {
       activeLines: Vector[LineSeries],
       totalLabel: String
   ): String = {
-    val totalValue  = points.map(_.values.values.sum).sum
-    val totalsByKey = activeKeys.map(key => key -> points.map(_.values.getOrElse(key, 0)).sum).filter(_._2 > 0)
-    val dominant    =
-      totalsByKey.sortBy(-_._2).headOption.map { case (key, c) => s"$topLabel: $key ($c)" }.getOrElse(s"$topLabel: -")
-    val lineSummaries = activeLines.map(line => s"${line.label}: ${line.values.sum}")
-    val footer        =
-      (lineSummaries :+ s"$totalLabel: $totalValue" :+ s"Periods: ${points.size}" :+ dominant).mkString("  |  ")
     ""
   }
 
@@ -669,5 +663,148 @@ $legendSvg
   def writeSvgAndConvertToPdf(path: java.nio.file.Path, svg: String): Unit = {
     Files.writeString(path, svg, StandardCharsets.UTF_8)
     ()
+  }
+
+  case class TableData(
+      headers: Vector[String],
+      rows: Vector[Vector[String]],
+      rowLabels: Vector[String],
+      cellValues: Vector[Vector[Double]]
+  )
+
+  def renderColoredTable(
+      title: String,
+      subtitle: String = "",
+      tableData: TableData,
+      columnStats: Vector[(Double, Double)], // (mean, stdDev) for each column
+      thresholdSigma: Double = 0.25
+  ): String = {
+    val cellWidth = 80.0
+    val cellHeight = 30.0
+    val headerHeight = 40.0
+    val leftMargin = 150.0
+    val topMargin = 60.0
+    val rightMargin = 20.0
+    val bottomMargin = 60.0
+
+    val numCols = tableData.headers.size
+    val numRows = tableData.rows.size
+
+    val width = leftMargin + numCols * cellWidth + rightMargin
+    val height = topMargin + headerHeight + numRows * cellHeight + bottomMargin
+
+    // Fine-grained color shading: low opacity for small deviations, full opacity for large deviations
+    // Uses a non-linear scaling for better visual distinction
+    def getColor(value: Double, colIndex: Int): String = {
+      val (mean, stdDev) = columnStats(colIndex)
+      if stdDev == 0 then "#ffffff"
+      else
+        val diff = value - mean
+        val sigma = diff / stdDev
+        if math.abs(sigma) < thresholdSigma then "#ffffff"
+        else
+          // Define discrete opacity steps for different sigma ranges
+          val absSigma = math.abs(sigma)
+          val opacity = 
+            if absSigma < 0.5 then 0.2  // 0.25σ - 0.5σ
+            else if absSigma < 0.75 then 0.35  // 0.5σ - 0.75σ
+            else if absSigma < 1.0 then 0.5  // 0.75σ - 1.0σ
+            else if absSigma < 1.5 then 0.6  // 1.0σ - 1.5σ
+            else if absSigma < 2.0 then 0.7  // 1.5σ - 2.0σ
+            else if absSigma < 3.0 then 0.8  // 2.0σ - 3.0σ
+            else 0.9  // 3.0σ+
+          
+          // Use warmer/cooler colors similar to the existing palette
+          if sigma > 0 then s"rgba(230, 57, 70, $opacity)"  // Warmer red
+          else s"rgba(13, 110, 253, $opacity)"  // Cooler blue
+    }
+
+    val headerCells = tableData.headers.zipWithIndex.map { case (header, colIndex) =>
+      s"""<text x='${fmt(leftMargin + colIndex * cellWidth + cellWidth / 2)}' y='${fmt(topMargin + headerHeight - 10)}'
+text-anchor='middle' font-size='${FontConfig.boxPlotLabel}' font-weight='600' fill='#111827'>${svgEscape(header)}</text>"""
+    }.mkString("\n    ")
+
+    val gridLines = (0 to numCols).map { colIndex =>
+      s"""<line x1='${fmt(leftMargin + colIndex * cellWidth)}' y1='${fmt(topMargin + headerHeight)}'
+x2='${fmt(leftMargin + colIndex * cellWidth)}' y2='${fmt(topMargin + headerHeight + numRows * cellHeight)}'
+stroke='#e9ecef' stroke-width='1'/>"""
+    }.mkString("\n    ")
+
+    val rowLines = (0 to numRows).map { rowIndex =>
+      s"""<line x1='${fmt(leftMargin)}' y1='${fmt(topMargin + headerHeight + rowIndex * cellHeight)}'
+x2='${fmt(leftMargin + numCols * cellWidth)}' y2='${fmt(topMargin + headerHeight + rowIndex * cellHeight)}'
+stroke='#e9ecef' stroke-width='1'/>"""
+    }.mkString("\n    ")
+
+    val rowLabels = tableData.rowLabels.zipWithIndex.map { case (label, rowIndex) =>
+      val isLastRow = rowIndex == numRows - 1
+      s"""<text x='${fmt(leftMargin - 10)}' y='${fmt(topMargin + headerHeight + rowIndex * cellHeight + cellHeight / 2 + 4)}'
+text-anchor='end' font-size='${FontConfig.boxPlotLabel}' fill='${if isLastRow then "#6c757d" else "#212529"}' font-weight='${if isLastRow then "600" else "400"}'>${svgEscape(label)}</text>"""
+    }.mkString("\n    ")
+
+    val dataCells = tableData.rows.zipWithIndex.flatMap { case (row, rowIndex) =>
+      row.zipWithIndex.map { case (cellValue, colIndex) =>
+        val value = tableData.cellValues(rowIndex)(colIndex)
+        val isLastRow = rowIndex == numRows - 1
+        val color = if isLastRow then "#e9ecef" else getColor(value, colIndex)
+        val textColor = if isLastRow then "#495057" else "#212529"
+        val fontWeight = if isLastRow then "600" else "400"
+
+        s"""<rect x='${fmt(leftMargin + colIndex * cellWidth + 1)}' y='${fmt(topMargin + headerHeight + rowIndex * cellHeight + 1)}'
+width='${fmt(cellWidth - 2)}' height='${fmt(cellHeight - 2)}' fill='$color' rx='2' ry='2'/>
+<text x='${fmt(leftMargin + colIndex * cellWidth + cellWidth / 2)}' y='${fmt(topMargin + headerHeight + rowIndex * cellHeight + cellHeight / 2 + 4)}'
+text-anchor='middle' font-size='${FontConfig.boxPlotLabel}' fill='$textColor' font-weight='$fontWeight'>$cellValue</text>"""
+      }
+    }.mkString("\n    ")
+
+    val legendX = leftMargin - 140  // Position legend further to the left of the table
+    val legendYStart = topMargin + headerHeight  // Start legend at the same height as table content
+    
+    // Create vertical legend with color boxes and labels
+    val legendItems = List(
+      ("rgba(230, 57, 70, 0.9)", "&gt;= +3.0σ"),
+      ("rgba(230, 57, 70, 0.8)", "+2.0σ to +3.0σ"),
+      ("rgba(230, 57, 70, 0.7)", "+1.5σ to +2.0σ"),
+      ("rgba(230, 57, 70, 0.6)", "+1.0σ to +1.5σ"),
+      ("rgba(230, 57, 70, 0.5)", "+0.75σ to +1.0σ"),
+      ("rgba(230, 57, 70, 0.35)", "+0.5σ to +0.75σ"),
+      ("rgba(230, 57, 70, 0.2)", "+0.25σ to +0.5σ"),
+      ("#ffffff", "-0.25σ to +0.25σ"),
+      ("rgba(13, 110, 253, 0.2)", "-0.25σ to -0.5σ"),
+      ("rgba(13, 110, 253, 0.35)", "-0.5σ to -0.75σ"),
+      ("rgba(13, 110, 253, 0.5)", "-0.75σ to -1.0σ"),
+      ("rgba(13, 110, 253, 0.6)", "-1.0σ to -1.5σ"),
+      ("rgba(13, 110, 253, 0.7)", "-1.5σ to -2.0σ"),
+      ("rgba(13, 110, 253, 0.8)", "-2.0σ to -3.0σ"),
+      ("rgba(13, 110, 253, 0.9)", "&lt;= -3.0σ")
+    )
+    
+    val legendText = legendItems.zipWithIndex.map { case ((color, label), index) =>
+      val yPos = legendYStart + index * 20
+      val borderColor = if color == "#ffffff" then "#6c757d" else color
+      s"""<rect x='${fmt(legendX)}' y='${fmt(yPos)}' width='15' height='15' fill='$color' stroke='$borderColor' stroke-width='1'/>""" + 
+      s"""<text x='${fmt(legendX + 20)}' y='${fmt(yPos + 12)}' font-size='10' fill='#6c757d'>$label</text>"""
+    }.mkString("\n    ")
+
+    val titleY = topMargin - 10
+    val subtitleY = topMargin + 10
+    
+    val titleText = if subtitle.isEmpty then 
+      s"""<text x='${fmt(width / 2)}' y='${fmt(titleY)}' text-anchor='middle' font-size='${FontConfig.title}' font-weight='700' fill='#111827'>${svgEscape(title)}</text>""" 
+    else
+      s"""<text x='${fmt(width / 2)}' y='${fmt(titleY)}' text-anchor='middle' font-size='${FontConfig.title}' font-weight='700' fill='#111827'>${svgEscape(title)}</text>
+<text x='${fmt(width / 2)}' y='${fmt(subtitleY)}' text-anchor='middle' font-size='${FontConfig.subtitle}' font-weight='400' fill='#495057'>${svgEscape(subtitle)}</text>"""
+
+    s"""<svg xmlns='http://www.w3.org/2000/svg' width='${fmt(width)}' height='${fmt(height)}' viewBox='0 0 ${fmt(width)} ${fmt(height)}'>
+${renderBackground()}
+$titleText
+$headerCells
+$gridLines
+$rowLines
+$rowLabels
+$dataCells
+$legendText
+</svg>
+"""
   }
 }

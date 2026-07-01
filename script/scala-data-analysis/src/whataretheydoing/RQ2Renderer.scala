@@ -621,6 +621,88 @@ object RQ2Renderer {
     commitTypesByAgentPerDeveloperSyncs().foreach(_.run(using ()))
   }
 
+  private def makeAgentsByCommitTypeColoredTableSyncs(): Seq[Sync[Any, Unit]] = {
+    import com.github.tototoshi.csv.*
+
+    Files.createDirectories(GlobalPaths.outputPath.resolve("agents-by-commit-type").resolve("per-developer"))
+
+    val developers = trackedHandles.toVector.sorted
+
+    developers.map { developer =>
+      Sync {
+        val csvPath = GlobalPaths.outputPath.resolve("agents-by-commit-type").resolve("per-developer").resolve(s"$developer-percentage.csv")
+
+        if Files.exists(csvPath) then
+          val reader = CSVReader.open(csvPath.toFile)
+          try
+            val rows = reader.allWithHeaders()
+            reader.close()
+
+            val headers = rows.head.keys.filter(_ != "commit_type").toVector.sorted
+
+            // Extract data excluding the "total" row
+            val dataRows = rows.filter(_.get("commit_type").exists(_ != "total"))
+
+            val rowLabels = dataRows.map(_("commit_type")).toVector
+            val cellValues = dataRows.map { row =>
+              headers.map(header => row.get(header).flatMap(_.toDoubleOption).getOrElse(0.0)).toVector
+            }.toVector
+
+            val displayValues = dataRows.map { row =>
+              headers.map(header => row.get(header).getOrElse("0.0")).toVector
+            }.toVector
+
+            // Find the "All Commits" row first
+            val totalRow = rows.find(_.get("commit_type").exists(_ == "total"))
+
+            // Use "All Commits" row values as means and calculate standard deviation based on deviation from those means
+            val columnStats: Vector[(Double, Double)] = headers.map { header =>
+              val allCommitsValue = totalRow.flatMap(_.get(header).flatMap(_.toDoubleOption)).getOrElse(0.0)
+              val values = dataRows.flatMap(_.get(header).flatMap(_.toDoubleOption))
+              val mean = allCommitsValue  // Use All Commits value as the mean
+              val variance = if values.isEmpty then 0.0 else values.map(v => math.pow(v - mean, 2)).sum / values.size
+              val stdDev = math.sqrt(variance)
+              (mean, stdDev)
+            }
+            val totalDisplayValues: Vector[Vector[String]] = totalRow match
+              case Some(row) => displayValues ++ Vector(headers.map(header => row.get(header).getOrElse("0.0")).toVector)
+              case None      => displayValues ++ Vector(headers.map(_ => "0.0").toVector)
+
+            val totalCellValues: Vector[Vector[Double]] = totalRow match
+              case Some(row) => cellValues ++ Vector(headers.map(header => row.get(header).flatMap(_.toDoubleOption).getOrElse(0.0)).toVector)
+              case None      => cellValues ++ Vector(headers.map(_ => 0.0).toVector)
+
+            val allRowLabels = rowLabels ++ Vector("All Commits")
+
+            val tableData = TableData(
+              headers = headers,
+              rows = totalDisplayValues,
+              rowLabels = allRowLabels,
+              cellValues = totalCellValues
+            )
+
+            val svgPath = GlobalPaths.outputPath.resolve("agents-by-commit-type").resolve("per-developer").resolve(s"$developer-colored-table.svg")
+            val svg = renderColoredTable(
+              s"Agent Use by Task — @$developer",
+              s"Colored by deviation from mean",
+              tableData,
+              columnStats,
+              thresholdSigma = 0.25
+            )
+            writeSvgAndConvertToPdf(svgPath, svg)
+            println(s"Wrote colored table SVG for $developer to $svgPath")
+          catch
+            case e: Exception =>
+              println(s"Error processing $csvPath: ${e.getMessage}")
+              reader.close()
+      }
+    }
+  }
+
+  @main def makeAgentsByCommitTypeColoredTables(): Unit = {
+    makeAgentsByCommitTypeColoredTableSyncs().foreach(_.run(using ()))
+  }
+
   @main def makeAllRq2Svgs(): Unit = {
     val allSyncs = Vector(
       makeWeeklyPlotSvgs(),
