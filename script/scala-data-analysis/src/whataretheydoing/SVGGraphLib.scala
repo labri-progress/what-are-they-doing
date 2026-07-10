@@ -665,6 +665,115 @@ $legendSvg
     ()
   }
 
+  def renderPercentageStackedWithCountLineSvgLog(
+      title: String,
+      points: Vector[StackedBarPoint],
+      stackOrder: Vector[String],
+      colors: Map[String, String],
+      countPerWeek: Vector[Int],
+      yRightLabel: String = "Commits",
+      xAxisLabel: String = "Week",
+      showLegend: Boolean = true
+  ): String = {
+    val activeStacks = activeStackKeys(points, stackOrder)
+    val legendW    = 220.0
+    val rightAxisW = 80.0
+    val layout     = ChartLayout(
+      width = math.max(900, points.size * 20 + legendW.toInt + 200),
+      height = 560,
+      left = autoLeftMargin,
+      right = rightAxisW + legendW + 40,
+      top = 44,
+      bottom = 140,
+      legendWidth = legendW
+    )
+
+    val pctByPoint: Vector[Map[String, Double]] = points.map { pt =>
+      val total = pt.values.values.sum.toDouble
+      if total == 0 then Map.empty
+      else pt.values.view.mapValues(_.toDouble / total * 100.0).toMap
+    }
+
+    // Left y-axis: fixed 0-100%
+    val leftAxis: String =
+      (0 to 100 by 10).map { tick =>
+        val y = layout.plotY + layout.plotHeight - (tick / 100.0) * layout.plotHeight
+        s"<line x1='${fmt(layout.plotX)}' y1='${fmt(y)}' x2='${fmt(layout.plotX + layout.plotWidth)}' y2='${fmt(y)}' stroke='#e9ecef' stroke-width='1' />" +
+        s"<text x='${fmt(layout.plotX - 10)}' y='${fmt(y + 4)}' text-anchor='end' font-size='${FontConfig.tick}' fill='#495057'>$tick%</text>"
+      }.mkString("\n") +
+      s"\n<line x1='${fmt(layout.plotX)}' y1='${fmt(layout.plotY + layout.plotHeight)}' x2='${fmt(layout.plotX + layout.plotWidth)}' y2='${fmt(layout.plotY + layout.plotHeight)}' stroke='#343a40' stroke-width='1.2' />" +
+      s"\n<line x1='${fmt(layout.plotX)}' y1='${fmt(layout.plotY)}' x2='${fmt(layout.plotX)}' y2='${fmt(layout.plotY + layout.plotHeight)}' stroke='#343a40' stroke-width='1.2' />"
+
+    // Right y-axis: logarithmic commit count scale
+    val countMax      = math.max(1, countPerWeek.maxOption.getOrElse(1))
+    
+    // For logarithmic scale, we'll use powers of 10
+    def yForCountLog(v: Double): Double = {
+      val logMin = math.log10(1.0)  // Start at 1 (log10(1) = 0)
+      val logMax = math.log10(countMax.toDouble)
+      val logVal = math.log10(math.max(1.0, v))
+      layout.plotY + layout.plotHeight - ((logVal - logMin) / (logMax - logMin)) * layout.plotHeight
+    }
+
+    val rightX = layout.plotX + layout.plotWidth
+    
+    // Generate logarithmic ticks (1, 10, 100, 1000, etc.)
+    val logTicks = {
+      val maxExp = math.ceil(math.log10(countMax.toDouble)).toInt
+      val ticks = (0 to maxExp).map(exp => math.pow(10, exp.toDouble).toInt)
+      ticks
+    }
+
+    val rightAxis: String =
+      logTicks.map { tick =>
+        val y = yForCountLog(tick.toDouble)
+        s"<text x='${fmt(rightX + 8)}' y='${fmt(y + 4)}' text-anchor='start' font-size='${FontConfig.tick}' fill='#343a40'>${formatSi(tick.toDouble)}</text>"
+      }.mkString("\n") +
+      s"\n<line x1='${fmt(rightX)}' y1='${fmt(layout.plotY)}' x2='${fmt(rightX)}' y2='${fmt(layout.plotY + layout.plotHeight)}' stroke='#343a40' stroke-width='1.2' />"
+
+    val rightAxisLabel: String = {
+      val rx = layout.plotX + layout.plotWidth + rightAxisW - FontConfig.axisLabel * 0.5
+      val ry = layout.plotY + layout.plotHeight / 2.0
+      s"<text x='${fmt(rx)}' y='${fmt(ry)}' transform='rotate(90 ${fmt(rx)} ${fmt(ry)})' text-anchor='middle' font-size='${FontConfig.axisLabel}' fill='#343a40'>${svgEscape(yRightLabel)}</text>"
+    }
+
+    val bars: String = pctByPoint.zipWithIndex.map { case (pctValues, index) =>
+      renderPctBar(layout, points.size, index, pctValues, activeStacks, colors)
+    }.mkString("\n")
+
+    val countLine: String = {
+      val counts = countPerWeek.padTo(points.size, 0).take(points.size)
+      val poly   = counts.zipWithIndex.map { case (c, i) =>
+        val cx = xForBar(layout, points.size, i) + barWidth(layout, points.size) / 2.0
+        s"${fmt(cx)},${fmt(yForCountLog(c.toDouble))}"
+      }.mkString(" ")
+      val markers = counts.zipWithIndex.map { case (c, i) =>
+        val cx = xForBar(layout, points.size, i) + barWidth(layout, points.size) / 2.0
+        val cy = yForCountLog(c.toDouble)
+        s"<rect x='${fmt(cx - 2.5)}' y='${fmt(cy - 2.5)}' width='5' height='5' fill='#343a40' transform='rotate(45 ${fmt(cx)} ${fmt(cy)})' />"
+      }.mkString("\n")
+      s"<polyline fill='none' stroke='#343a40' stroke-width='2' stroke-dasharray='6 4' points='$poly' />\n$markers"
+    }
+
+    val legendSvg = if showLegend then
+      renderLegend(layout, activeStacks, colors, Vector(LineSeries(yRightLabel, "#343a40", "6 4", "#343a40", countPerWeek)),
+        lxOverride = Some(layout.plotX + layout.plotWidth + rightAxisW + 16))
+    else ""
+
+    s"""<svg xmlns='http://www.w3.org/2000/svg' width='${layout.width}' height='${layout.height}' viewBox='0 0 ${layout.width} ${layout.height}'>
+${renderBackground()}
+$leftAxis
+$rightAxis
+${renderTitles(layout, title, "Agent share (%)", xAxisLabel)}
+$rightAxisLabel
+$bars
+$countLine
+${renderBarLabels(layout, points)}
+$legendSvg
+</svg>
+"""
+  }
+
   case class TableData(
       headers: Vector[String],
       rows: Vector[Vector[String]],
