@@ -331,6 +331,68 @@ object DataAnalysis {
       a ++ b.view.mapValues(_ + a.getOrElse(b.head._1, 0))
     }
 
+  /** Commits per (developer, agent bucket), derived by summing commit types. */
+  lazy val commitsPerDeveloperAgent: Map[(developer: String, agent: String), Int] =
+    taskTypeCounts.map { case ((developer, agent), typeCounts) =>
+      (developer, agent) -> typeCounts.values.sum
+    }
+
+  /** Total commits per developer across all agent buckets. */
+  lazy val totalCommitsPerDeveloper: Map[String, Int] =
+    commitsPerDeveloperAgent
+      .groupMapReduce((k, _) => k.developer)((_, v) => v)(_ + _)
+
+  /**
+   * Weighted harness frequency, normalized by developer volume.
+   *
+   * For each agent bucket, we compute each developer's share of commits
+   * attributed to that bucket (commits / developer total), then average those
+   * shares across all developers. Each developer therefore contributes equal
+   * weight regardless of absolute commit volume, removing the skew introduced
+   * by a single highly prolific developer.
+   */
+  case class HarnessWeightedFrequency(
+      agent: String,
+      commitsTotal: Int,
+      shareOfTotalPct: Double,
+      developersUsing: Int,
+      meanDeveloperSharePct: Double,
+      medianDeveloperSharePct: Double
+  )
+
+  lazy val harnessWeightedFrequencies: Vector[HarnessWeightedFrequency] = {
+    val totalCommitsAll = totalCommitsPerDeveloper.values.sum
+    val agents = commitsPerDeveloperAgent.keys.map(_.agent).toVector.distinct.sorted
+
+    agents.map { agent =>
+      val agentDevCommits: Vector[(String, Int)] = commitsPerDeveloperAgent.toVector.collect {
+        case (devAgent, count) if devAgent.agent == agent => devAgent.developer -> count
+      }
+      val commitsTotal = agentDevCommits.map(_._2).sum
+      val developersUsing = agentDevCommits.count(_._2 > 0)
+      val shares: Vector[Double] = agentDevCommits.flatMap { case (dev, count) =>
+        val devTotal = totalCommitsPerDeveloper(dev)
+        if devTotal > 0 then Some(count.toDouble / devTotal * 100.0) else None
+      }
+      val meanShare = if shares.nonEmpty then shares.sum / shares.size else 0.0
+      val sortedShares = shares.sorted
+      val n = sortedShares.size
+      val medianShare =
+        if n == 0 then 0.0
+        else if n % 2 == 1 then sortedShares(n / 2)
+        else (sortedShares(n / 2 - 1) + sortedShares(n / 2)) / 2.0
+
+      HarnessWeightedFrequency(
+        agent = agent,
+        commitsTotal = commitsTotal,
+        shareOfTotalPct = if totalCommitsAll > 0 then commitsTotal.toDouble / totalCommitsAll * 100.0 else 0.0,
+        developersUsing = developersUsing,
+        meanDeveloperSharePct = meanShare,
+        medianDeveloperSharePct = medianShare
+      )
+    }
+  }
+
 
   private val commitUrl = "^https://github.com/(?<org>[^/]+)/(?<repo>[^/]+)/commit/".r.unanchored
 

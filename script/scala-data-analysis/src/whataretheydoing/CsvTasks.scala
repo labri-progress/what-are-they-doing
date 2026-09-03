@@ -287,4 +287,45 @@ object CsvTasks {
 
     writeCsv(GlobalPaths.outputPath.resolve("csv").resolve("agent-harness-distribution.csv"), header, rows)
   }
+
+  @main def exportHarnessWeightedFrequency(): Unit = {
+    val rows = DataAnalysis.harnessWeightedFrequencies
+      .sortBy(f => (-f.meanDeveloperSharePct, -f.commitsTotal))
+      .map { f =>
+        Map[String, String](
+          "agent"                   -> f.agent,
+          "commits_total"           -> f.commitsTotal.toString,
+          "share_of_total_pct"      -> f"${f.shareOfTotalPct}%.2f",
+          "developers_using"        -> f.developersUsing.toString,
+          "mean_developer_share_pct" -> f"${f.meanDeveloperSharePct}%.2f",
+          "median_developer_share_pct" -> f"${f.medianDeveloperSharePct}%.2f"
+        )
+      }
+
+    val header = Vector(
+      "agent",
+      "commits_total",
+      "share_of_total_pct",
+      "developers_using",
+      "mean_developer_share_pct",
+      "median_developer_share_pct"
+    )
+
+    writeCsv(GlobalPaths.outputPath.resolve("harness-frequency").resolve("harness-weighted-frequency.csv"), header, rows)
+
+    // Per-developer share matrix, useful for understanding which developers drive each agent.
+    val agents = DataAnalysis.commitsPerDeveloperAgent.keys.map(_.agent).toVector.distinct.sorted
+    val devShareHeader = "developer" +: "commits_total" +: agents
+    val devShareRows = DataAnalysis.totalCommitsPerDeveloper.toVector.sortBy(_._1).map { case (developer, total) =>
+      val devTotals = total.toDouble
+      Map[String, String]("developer" -> developer, "commits_total" -> total.toString) ++
+        agents.flatMap { agent =>
+          val count = DataAnalysis.commitsPerDeveloperAgent.getOrElse((developer, agent), 0)
+          Vector(
+            agent -> (if count == 0 then "0.0" else f"${count.toDouble / devTotals * 100}%.2f")
+          )
+        }.toMap
+    }
+    writeCsv(GlobalPaths.outputPath.resolve("harness-frequency").resolve("harness-weighted-frequency-per-developer.csv"), devShareHeader, devShareRows)
+  }
 }

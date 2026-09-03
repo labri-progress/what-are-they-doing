@@ -763,6 +763,41 @@ object RQ2Renderer {
     makeAgentsByCommitTypeColoredTableSyncs().foreach(_.run(using ()))
   }
 
+  @main def makeHarnessWeightedFrequencySvg(): Unit = {
+    Files.createDirectories(GlobalPaths.outputPath.resolve("harness-frequency"))
+
+    val frequencies = DataAnalysis.harnessWeightedFrequencies
+
+    // One bar per agent, value = mean developer share (%), colored by the
+    // standard agent palette used across the RQ2 plots.
+    val points: Vector[StackedBarPoint] =
+      activeStackKeys(
+        frequencies.map(f => StackedBarPoint(f.agent, Map(f.agent -> math.round(f.meanDeveloperSharePct).toInt))),
+        agentColorOrder
+      ).flatMap { agent =>
+        frequencies.find(_.agent == agent).map { f =>
+          StackedBarPoint(agent, Map(agent -> math.max(1, math.round(f.meanDeveloperSharePct).toInt)))
+        }
+      }.toVector
+
+    if points.nonEmpty then
+      val svgPath = GlobalPaths.outputPath.resolve("harness-frequency").resolve("harness-weighted-frequency.svg")
+      writeSvgAndConvertToPdf(
+        svgPath,
+        renderStackedTimeSeriesSvg(
+          title = "Harness Frequency, Weighted by Developer",
+          points = points,
+          stackOrder = agentColorOrder,
+          colors = agentColors,
+          topLabel = "Mean developer share (%)",
+          lineSeries = Vector.empty,
+          yAxisLabel = "Mean developer share (%)",
+          xAxisLabel = "Agent"
+        )
+      )
+      println(s"Wrote harness-weighted-frequency SVG to $svgPath")
+  }
+
   @main def makeAllRq2Svgs(): Unit = {
     val allSyncs = Vector(
       makeWeeklyPlotSvgs(),
