@@ -5,6 +5,7 @@ import tempfile
 import unittest
 
 import numpy as np
+from openpyxl import Workbook
 import pandas as pd
 
 import rq4_analysis as rq4
@@ -80,6 +81,63 @@ class AggregationTests(unittest.TestCase):
             self.assertEqual(manifest["project"].tolist(), ["owner-project"])
             self.assertTrue(manifest["zero_byte_workbook"].iloc[0])
             self.assertFalse(manifest["has_summary"].iloc[0])
+
+    def test_xlsx_only_snapshot_is_loaded_without_sidecar_writes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = root / "owner-project"
+            project.mkdir()
+            workbook_path = project / "owner-project_2026-01-01_abcdef0_analyse.xlsx"
+            workbook = Workbook()
+            workbook.remove(workbook.active)
+            for kind, sheet_name in rq4.SHEETS.items():
+                sheet = workbook.create_sheet(sheet_name)
+                sheet.append(rq4.HEADERS[kind])
+            summary = workbook[rq4.SHEETS["summary"]]
+            metrics = {
+                "last_commit_date": 1767225600000,
+                "ncloc": 10,
+                "functions": 1,
+                "complexity": 2,
+                "cognitive_complexity": 3,
+                "code_smells": 1,
+                "violations": 1,
+                "blocker_violations": 0,
+                "critical_violations": 1,
+                "sqale_index": 5,
+                "bugs": 0,
+                "vulnerabilities": 0,
+                "security_hotspots": 0,
+                "git_churn_commits": 2,
+                "git_churn_lines": 20,
+            }
+            for metric, value in metrics.items():
+                summary.append((metric, value))
+            workbook[rq4.SHEETS["files"]].append(
+                ("src/main.py", 10, 2, 3, 1, 0, 0, 0, 10, 5, 1, 2, 2, 1, 1, 0, 0)
+            )
+            workbook[rq4.SHEETS["functions"]].append(("src/main.py", "main", 1, 10, 10))
+            workbook[rq4.SHEETS["issues"]].append(
+                ("i1", "src/main.py", "S1", "python", "CRITICAL", "OPEN", 1,
+                 "example", None, None, None)
+            )
+            workbook.save(workbook_path)
+            workbook.close()
+
+            manifest, schema = rq4.discover(root, settle_seconds=0)
+            self.assertEqual(manifest["source_format"].tolist(), ["xlsx"])
+            self.assertTrue(manifest["complete_tables"].iloc[0])
+            self.assertEqual(set(schema["kind"]), set(rq4.SHEETS))
+
+            with self.assertRaisesRegex(ValueError, "outside read-only report tree"):
+                rq4.load_snapshots(manifest, project / "forbidden-cache", refresh=True)
+            cache = root / "analysis-cache"
+            snapshots = rq4.load_snapshots(manifest, cache, refresh=True)
+            self.assertEqual(snapshots["ncloc"].iloc[0], 10)
+            self.assertEqual(snapshots["detailed_issue_rows"].iloc[0], 1)
+            self.assertEqual(snapshots["issue_count_matches_summary"].iloc[0], 1)
+            self.assertEqual(snapshots["severe_violations_per_kloc"].iloc[0], 100)
+            self.assertEqual(list(project.glob("*")), [workbook_path])
 
 
 if __name__ == "__main__":
