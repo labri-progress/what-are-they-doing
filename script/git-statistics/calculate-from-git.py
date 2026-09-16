@@ -31,6 +31,7 @@ import re
 import subprocess
 import sys
 import threading
+import zlib
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -42,6 +43,7 @@ DEFAULT_START = "2025-11-01"
 DEFAULT_END = "2026-04-30"
 REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 REPOSITORY_URL_RE = re.compile(r"/repos/([^/]+/[^/]+)/commits/")
+GZIP_MAGIC = b"\x1f\x8b\x08"
 
 
 @dataclass(frozen=True)
@@ -301,9 +303,27 @@ def fetch_targeted_batch(repository_path: Path, shas: list[str]) -> None:
     )
 
 
+def anchor_commits(repository_path: Path, shas: Iterable[str]) -> None:
+    """Point a ref at every selected commit.
+
+    Objects fetched by SHA alone are unreachable, so any later repack or garbage
+    collection discards them and the next run downloads them again. An audit ref
+    per commit keeps the commit, its trees, and the blobs fetched for its diff.
+    """
+    commands = "".join(f"update refs/audit/{sha} {sha}\n" for sha in shas)
+    if commands:
+        subprocess.run(
+            ["git", "update-ref", "--stdin"],
+            cwd=repository_path, env=git_environment(),
+            input=commands.encode(), stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, check=False,
+        )
+
+
 def prepare_targeted_commits(
     repository_path: Path, shas: Iterable[str], batch_size: int
 ) -> dict[str, str]:
+    shas = list(shas)
     missing = sorted({sha for sha in shas if not commit_exists(repository_path, sha)})
     errors: dict[str, str] = {}
     for batch in chunks(missing, batch_size):
@@ -319,6 +339,7 @@ def prepare_targeted_commits(
         for sha in batch:
             if sha not in errors and not commit_exists(repository_path, sha):
                 errors[sha] = f"commit {sha} is unavailable after targeted fetch"
+    anchor_commits(repository_path, [sha for sha in shas if sha not in errors])
     return errors
 
 
@@ -422,6 +443,125 @@ def calculate_commit(repository_path: Path, sha: str) -> tuple[dict, list[FileCh
     return statistics, changes
 
 
+def looks_like_records(chunk: bytes) -> bool:
+    """A recovered chunk is kept only when it decodes as the CSV text we wrote."""
+    if not chunk or b"," not in chunk:
+        return False
+    try:
+        chunk[:4096].decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def decompress_member(data: bytes, start: int, step: int = 1 << 16) -> tuple[bytes, bool, int | None]:
+    """Decompress one gzip member, keeping what precedes any damage.
+
+    zlib raises from the call that meets the damage and discards that call's
+    output, so the member is decompressed again byte by byte from the failing
+    block. Returns the recovered bytes, whether the member ended cleanly, and
+    where it ended when it did.
+    """
+    decompressor = zlib.decompressobj(31)
+    recovered = bytearray()
+    offset = start
+    failed_at = None
+    while offset < len(data) and not decompressor.eof:
+        try:
+            recovered += decompressor.decompress(data[offset : offset + step])
+        except zlib.error:
+            failed_at = offset
+            break
+        offset += step
+
+    if failed_at is None:
+        try:
+            recovered += decompressor.flush()
+        except zlib.error:
+            return bytes(recovered), False, None
+        ended = decompressor.eof
+        return bytes(recovered), ended, len(data) - len(decompressor.unused_data) if ended else None
+
+    retry = zlib.decompressobj(31)
+    recovered = bytearray()
+    try:
+        recovered += retry.decompress(data[start:failed_at])
+        for index in range(failed_at, min(failed_at + step, len(data))):
+            if retry.eof:
+                break
+            recovered += retry.decompress(data[index : index + 1])
+    except zlib.error:
+        pass
+    return bytes(recovered), False, None
+
+
+def recover_gzip_members(data: bytes) -> tuple[bytes, bool]:
+    """Decompress a gzip file member by member, tolerating a truncated one.
+
+    A run that is interrupted leaves its member without an end-of-stream marker.
+    The next run appends a new member after it, and a plain reader stops at that
+    junction, silently losing every record written afterwards. Each member is
+    therefore decompressed on its own and the recovered text is concatenated.
+    The three-byte magic also occurs inside compressed data, so a candidate is
+    kept only when it decompresses to the CSV text this script writes.
+
+    Returns the recovered bytes and whether any member ended without its marker.
+    """
+    recovered = bytearray()
+    truncated = False
+    position = data.find(GZIP_MAGIC)
+    while position != -1:
+        chunk, ended, consumed = decompress_member(data, position)
+        if looks_like_records(chunk):
+            recovered += chunk
+            if ended and consumed is not None:
+                position = data.find(GZIP_MAGIC, consumed)
+                continue
+            truncated = True
+        position = data.find(GZIP_MAGIC, position + 1)
+    return bytes(recovered), truncated
+
+
+def repair_file_changes(path: Path) -> None:
+    """Rewrite the file-record archive as a single clean member when damaged.
+
+    Leaving the damage in place is worse than the cost of rewriting, because one
+    interrupted run hides the records of every run that follows it.
+    """
+    if not path.is_file() or path.stat().st_size == 0:
+        return
+    data = path.read_bytes()
+    try:
+        with gzip.open(path, "rb") as handle:
+            plain = handle.read()
+        damaged = False
+    except (EOFError, OSError, zlib.error):
+        plain = b""
+        damaged = True
+
+    recovered, truncated = recover_gzip_members(data)
+    if not damaged and not truncated and len(recovered) == len(plain):
+        return
+
+    lines = recovered.split(b"\n")
+    header = lines[0]
+    body = [line for line in lines[1:] if line and line != header]
+    # A run killed mid-row leaves a partial last record, which is dropped.
+    if body and body[-1].count(b",") < header.count(b","):
+        body.pop()
+
+    backup = path.with_name(path.name + ".damaged")
+    path.rename(backup)
+    with gzip.open(path, "wb") as handle:
+        handle.write(header + b"\n" + b"\n".join(body) + b"\n")
+    readable_before = plain.count(b"\n") - 1 if plain else 0
+    hidden = max(len(body) - readable_before, 0)
+    print(
+        f"repaired {path.name}: {len(body):,} records kept, {hidden:,} of which a plain "
+        f"reader could not reach; previous file saved as {backup.name}"
+    )
+
+
 def result_key(item: dict) -> tuple[str, str, str]:
     return item.get("developer", ""), item.get("repository", ""), item.get("sha", "")
 
@@ -505,6 +645,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="repositories processed concurrently (default: 4)",
     )
     parser.add_argument(
+        "--commit-jobs",
+        type=int,
+        default=1,
+        help=(
+            "commits computed concurrently inside one repository (default: 1); "
+            "raise it when a partial clone has to fetch blobs per commit"
+        ),
+    )
+    parser.add_argument(
         "--fetch-batch-size",
         type=int,
         default=128,
@@ -534,6 +683,8 @@ def main() -> int:
         raise SystemExit("--start-date must not be later than --end-date")
     if args.jobs < 1:
         raise SystemExit("--jobs must be at least 1")
+    if args.commit_jobs < 1:
+        raise SystemExit("--commit-jobs must be at least 1")
     if args.fetch_batch_size < 1:
         raise SystemExit("--fetch-batch-size must be at least 1")
 
@@ -571,6 +722,8 @@ def main() -> int:
         return 0
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    if files_output_path is not None:
+        repair_file_changes(files_output_path)
     completed = load_completed(output_path, args.retry_errors, files_output_path is not None)
     pending = [item for item in observations if result_key(item.__dict__) not in completed]
     grouped = grouped_by_repository(pending)
@@ -612,18 +765,38 @@ def main() -> int:
         statistics_by_sha: dict[str, dict] = {}
         changes_by_sha: dict[str, list[FileChange]] = {}
         error_by_sha = preparation_errors.copy()
-        for observation in items:
-            if observation.sha not in statistics_by_sha and observation.sha not in error_by_sha:
-                try:
-                    if args.clone_mode != "targeted":
-                        ensure_commit(repository_path, observation.sha, args.clone_mode)
-                    statistics, changes = calculate_commit(repository_path, observation.sha)
-                    statistics_by_sha[observation.sha] = statistics
-                    if file_writer is not None:
-                        changes_by_sha[observation.sha] = changes
-                except Exception as error:
-                    error_by_sha[observation.sha] = str(error)
 
+        def compute(sha: str) -> tuple[str, tuple[dict, list[FileChange]] | None, str | None]:
+            try:
+                if args.clone_mode != "targeted":
+                    ensure_commit(repository_path, sha, args.clone_mode)
+                return sha, calculate_commit(repository_path, sha), None
+            except Exception as error:
+                return sha, None, str(error)
+
+        # In a partial clone the diff of a commit whose blobs are absent costs one
+        # request to the promisor remote, so the work is dominated by network
+        # latency rather than by Git itself and gains from being overlapped.
+        distinct = [
+            sha for sha in dict.fromkeys(observation.sha for observation in items)
+            if sha not in error_by_sha
+        ]
+        if args.commit_jobs > 1 and len(distinct) > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=args.commit_jobs) as pool:
+                computed = list(pool.map(compute, distinct))
+        else:
+            computed = [compute(sha) for sha in distinct]
+
+        for sha, result, error in computed:
+            if error is not None:
+                error_by_sha[sha] = error
+                continue
+            statistics, changes = result
+            statistics_by_sha[sha] = statistics
+            if file_writer is not None:
+                changes_by_sha[sha] = changes
+
+        for observation in items:
             if observation.sha in statistics_by_sha:
                 if file_writer is not None:
                     file_writer.write(observation, changes_by_sha[observation.sha])
