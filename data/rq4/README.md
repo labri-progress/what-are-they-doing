@@ -3,21 +3,17 @@
 Input for the commit- and code-quality pipeline: which repositories to clone,
 for which developer, over which dates.
 
-## Observation window
+## RQ4 observation window
 
 ```
-2025-09-01 .. 2026-04-30
+2025-11-01 .. 2026-04-30
 ```
 
-Inclusive on both ends, UTC. This is the full extent of the collected data in
-`data/{developer}-{YYYY-MM}.json` and matches the window used by RQ1-RQ3, so
-RQ4 results line up with the temporal trajectories reported there.
-
-The first two months are thin: September and October 2025 hold 2,591 commits,
-1.8% of the 146,940 collected. Only `mavam` and `ruvnet` are meaningfully
-active before November 2025. Keeping them costs almost nothing to mine and
-captures the onset of hyperactivity, but per-month comparisons across the whole
-cohort should start in November 2025.
+Inclusive on both ends, UTC, for all nine handles in `developers.json`. The
+commit-level notebook filters the collected snapshots to this six-month window.
+Snapshots also exist for September and October 2025, and the repository-selection
+artifacts below were originally computed over that longer September--April
+collection period. Those two sparse months are not part of the RQ4 statistics.
 
 ## Files
 
@@ -26,11 +22,9 @@ cohort should start in November 2025.
 | `repos.txt` | 179 GitHub URLs, one per line. Direct input to the mining tool. |
 | `repos.csv` | One row per developer-repository pair with the attribution breakdown described below. |
 
-Regenerate both with:
-
-```bash
-python script/select-rq4-repos.py
-```
+The script that originally produced these two selection files is not currently
+present in the repository. Treat them as recorded selection artifacts until the
+generator is restored.
 
 ## Selection rule
 
@@ -68,15 +62,17 @@ The list in `all.txt` at the repository root is *not* this list: it is the
 union of every repository name in `data/*.json` with no developer mapping, no
 canonicalisation and no filtering.
 
-## Attribution: which commits to analyse
+## Contributor identities in the selected repositories
 
-`repos.csv` splits every repository's window commits into five buckets, from
-GitHub's weekly contributor statistics:
+`repos.csv` splits each repository's window totals into five primary-contributor
+buckets using GitHub's weekly contributor-statistics endpoint. These are
+aggregate counts. They contain neither commit SHAs nor commit messages, so they
+cannot reveal `Co-authored-by` trailers.
 
 | Column | Meaning |
 | --- | --- |
-| `by_developer` | Commits authored under the target developer's own login. |
-| `by_claude` | Commits authored by `claude`, the Claude Code GitHub App, which commits under its own identity rather than the developer's. |
+| `by_developer` | Commits assigned to the target developer's primary contributor identity. |
+| `by_claude` | Commits assigned to the primary contributor identity `claude`; the aggregate data does not say whether a target developer is also named as a co-author. |
 | `by_other_agents` | `codex`, `cursoragent`, `factory-droid[bot]`, `devin-ai-integration[bot]`, and similar. |
 | `by_infra_bots` | CI, release and dependency automation: `github-actions[bot]`, `dependabot[bot]`, `renovate[bot]`, `tenzir-bot`, and so on. |
 | `by_other_humans` | Everyone else. |
@@ -85,29 +81,25 @@ Across the 179 selected repositories the split is:
 
 | Bucket | Commits | Share |
 | --- | ---: | ---: |
-| Target developers | 153,632 | 55.8% |
+| Target developers | 153,699 | 55.8% |
 | `claude` | 85,123 | 30.9% |
 | Other coding agents | 116 | 0.04% |
-| Infrastructure bots | 8,701 | 3.2% |
-| Other humans | 27,917 | 10.1% |
+| Infrastructure bots | 8,690 | 3.2% |
+| Other humans | 28,002 | 10.1% |
 
-**`claude` is the largest single author identity in the corpus**: 85,123 commits
-across 137 of the 179 repositories, more than any individual human including
-`Dicklesworthstone` (78,762). This drives the filtering decision:
+GitHub assigns 85,123 commits to `claude` as the primary contributor identity,
+but this artifact does not establish that they are "Claude-only" commits. A
+commit-level spot check confirms that some such commits have no target-developer
+co-author trailer, while others name a human co-author; the aggregate endpoint
+cannot quantify either case. A check of the November--April target-author
+snapshots instead finds 67,415 unique
+developer-authored commits with a Claude or Anthropic `Co-authored-by` trailer.
+The commit-level notebook therefore keeps the target-author corpus and applies
+the `agent-mining` heuristics to identify agent-attributed commits. The
+`developer_plus_agent_share` column below is an inventory statistic, not the
+filter used by that notebook and not proof of mutually exclusive authorship.
 
-- Filtering on `author == developer` **discards the agent's own commits**, which
-  are the object of study. Do not do this.
-- Analysing every commit in the clone pulls in unrelated contributors. That is
-  mostly harmless for `teamchong` (99.7% developer-plus-agent) and
-  `Dicklesworthstone` (99.2%), but not for `steipete`, where 17,356 commits
-  (30.0%) come from other humans, almost all of them in `openclaw/openclaw`, a
-  337-contributor project.
-- The workable filter is an **identity set per developer**: the developer's
-  login plus `claude` plus the other agent logins, excluding infrastructure bots
-  and unrelated humans. `developer_plus_agent_share` in `repos.csv` is the
-  fraction of each repository that survives it.
-
-Developer-plus-agent share by developer, over the selected repositories:
+Primary-identity shares by developer over the selected repositories are:
 
 | Developer | Repos | Commits in window | Developer | `claude` | Other humans | Dev+agent share |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -117,17 +109,15 @@ Developer-plus-agent share by developer, over the selected repositories:
 | obra | 22 | 8,238 | 4,698 | 2,781 | 758 | 90.8% |
 | philipp-spiess | 2 | 801 | 696 | 9 | 96 | 88.0% |
 | steveyegge | 2 | 18,904 | 8,504 | 6,066 | 4,154 | 77.2% |
-| clubanderson | 12 | 17,395 | 9,507 | 2,758 | 2,825 | 70.5% |
+| clubanderson | 12 | 17,536 | 9,574 | 2,758 | 2,910 | 70.3% |
 | mavam | 10 | 6,301 | 2,878 | 1,223 | 1,885 | 65.1% |
 | steipete | 33 | 57,859 | 35,028 | 774 | 17,356 | 62.0% |
 
-Two entries deserve care when reading results:
+Two entries deserve care when planning future repository-level analyses:
 
-- `steipete` shows only 774 `claude` commits. His agent traces are in commit
-  trailers rather than the author field, consistent with the near-zero hard
-  agent signal reported for him in RQ2. Author-identity attribution understates
-  his agent usage; the `agent-mining` heuristics remain the right instrument
-  there.
+- `steipete` has only 774 commits assigned to the `claude` primary identity,
+  while his agent traces are mainly in commit trailers. Primary-contributor
+  identity is therefore not a substitute for the `agent-mining` heuristics.
 - `mavam` and `clubanderson` work in genuine multi-contributor projects
   (`tenzir/tenzir` at 27.0% developer share, `kubestellar/console` at 61.4%,
   `llm-d/llm-d-workload-variant-autoscaler` at 13.8%). Code-level metrics
