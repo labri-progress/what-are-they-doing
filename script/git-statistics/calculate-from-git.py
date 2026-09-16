@@ -5,15 +5,26 @@ The default ``capped`` scope targets commits whose cached GitHub REST response
 contains 300 files. Use ``--scope all`` for a complete independent audit. The
 default targeted clone mode fetches only observed commits and their parents.
 
-Results are appended to JSON Lines as soon as each commit is processed, making
-the run resumable. Existing successful rows are skipped; use ``--retry-errors``
-to retry rows that previously failed because a repository was unavailable.
+Two result files are produced. Per-commit totals are appended to JSON Lines, and
+the path of every changed file is appended to a gzip CSV, which supports the
+breadth, revisit, and file-type analyses. The file-level records come from the
+same ``git diff-tree --numstat`` output as the totals, so they cost no
+additional Git work; use ``--no-files`` to skip them.
+
+Results are written as soon as each commit is processed, making the run
+resumable. Existing successful rows are skipped, and a row recorded before the
+file-level output existed is recomputed so that its file records are added; use
+``--retry-errors`` to retry rows that previously failed because a repository was
+unavailable.
 """
 
 from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
+import csv
+import gzip
 import json
 import os
 import re
@@ -39,6 +50,63 @@ class Observation:
     day: str
     repository: str
     sha: str
+
+
+@dataclass(frozen=True)
+class FileChange:
+    path: str
+    previous_path: str | None
+    additions: int | None
+    deletions: int | None
+    is_binary: bool
+
+
+class FileChangeWriter:
+    """Append one gzip CSV row per changed file.
+
+    Extension and top-level directory are derived from ``path`` by the consumer
+    rather than stored, which keeps the file small and the definitions in one
+    place.
+    """
+
+    FIELDS = (
+        "developer", "repository", "sha", "day",
+        "path", "previous_path", "additions", "deletions", "binary",
+    )
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+        self._needs_header = not path.is_file() or path.stat().st_size == 0
+        self._handle = None
+        self._writer = None
+
+    def __enter__(self) -> "FileChangeWriter":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = gzip.open(self.path, "at", newline="", encoding="utf-8")
+        self._writer = csv.writer(self._handle)
+        if self._needs_header:
+            self._writer.writerow(self.FIELDS)
+        return self
+
+    def __exit__(self, *exception: object) -> None:
+        if self._handle is not None:
+            self._handle.close()
+
+    def write(self, observation: "Observation", changes: list[FileChange]) -> None:
+        rows = [
+            (
+                observation.developer, observation.repository, observation.sha, observation.day,
+                change.path, change.previous_path or "",
+                "" if change.additions is None else change.additions,
+                "" if change.deletions is None else change.deletions,
+                int(change.is_binary),
+            )
+            for change in changes
+        ]
+        with self._lock:
+            self._writer.writerows(rows)
+            self._handle.flush()
 
 
 class GitFailure(RuntimeError):
@@ -254,13 +322,23 @@ def prepare_targeted_commits(
     return errors
 
 
-def parse_numstat(output: bytes) -> dict[str, int]:
-    """Parse ``git diff-tree --numstat -z`` including rename records."""
+def decode_path(raw: bytes) -> str:
+    """Git emits raw bytes; paths outside UTF-8 are kept rather than dropped."""
+    return raw.decode("utf-8", errors="replace")
+
+
+def parse_numstat(output: bytes) -> tuple[dict[str, int], list[FileChange]]:
+    """Parse ``git diff-tree --numstat -z`` including rename records.
+
+    Returns the per-commit totals and one record per changed file. Binary files
+    carry no line counts, which Git reports as ``-``.
+    """
     fields = output.split(b"\0")
     if fields and fields[-1] == b"":
         fields.pop()
 
     additions = deletions = files_touched = binary_files = renames = 0
+    changes: list[FileChange] = []
     index = 0
     while index < len(fields):
         record = fields[index]
@@ -269,20 +347,35 @@ def parse_numstat(output: bytes) -> dict[str, int]:
         if len(parts) != 3:
             raise ValueError(f"unexpected numstat record: {record!r}")
         added_raw, deleted_raw, path = parts
+        previous_path = None
         if path == b"":
             if index + 1 >= len(fields):
                 raise ValueError("incomplete numstat rename record")
             # The following fields are the old and new path. A rename is one touch.
+            previous_path, path = fields[index], fields[index + 1]
             index += 2
             renames += 1
-        if added_raw == b"-" or deleted_raw == b"-":
-            binary_files += 1
-        else:
-            additions += int(added_raw)
-            deletions += int(deleted_raw)
-        files_touched += 1
 
-    return {
+        is_binary = added_raw == b"-" or deleted_raw == b"-"
+        if is_binary:
+            binary_files += 1
+            file_additions = file_deletions = None
+        else:
+            file_additions, file_deletions = int(added_raw), int(deleted_raw)
+            additions += file_additions
+            deletions += file_deletions
+        files_touched += 1
+        changes.append(
+            FileChange(
+                path=decode_path(path),
+                previous_path=decode_path(previous_path) if previous_path else None,
+                additions=file_additions,
+                deletions=file_deletions,
+                is_binary=is_binary,
+            )
+        )
+
+    statistics = {
         "additions": additions,
         "deletions": deletions,
         "churn": additions + deletions,
@@ -290,9 +383,10 @@ def parse_numstat(output: bytes) -> dict[str, int]:
         "binary_files": binary_files,
         "renames_detected": renames,
     }
+    return statistics, changes
 
 
-def calculate_commit(repository_path: Path, sha: str) -> dict:
+def calculate_commit(repository_path: Path, sha: str) -> tuple[dict, list[FileChange]]:
     revision = run_git(["rev-list", "--parents", "-n", "1", sha], cwd=repository_path)
     fields = revision.stdout.decode("ascii").strip().split()
     if not fields or fields[0] != sha:
@@ -316,7 +410,7 @@ def calculate_commit(repository_path: Path, sha: str) -> dict:
         arguments.extend(["--root", sha])
         parent_sha = None
 
-    statistics = parse_numstat(run_git(arguments, cwd=repository_path).stdout)
+    statistics, changes = parse_numstat(run_git(arguments, cwd=repository_path).stdout)
     statistics.update(
         {
             "parent_sha": parent_sha,
@@ -325,14 +419,16 @@ def calculate_commit(repository_path: Path, sha: str) -> dict:
             "rename_policy": "git-find-renames-50-percent",
         }
     )
-    return statistics
+    return statistics, changes
 
 
 def result_key(item: dict) -> tuple[str, str, str]:
     return item.get("developer", ""), item.get("repository", ""), item.get("sha", "")
 
 
-def load_completed(path: Path, retry_errors: bool) -> set[tuple[str, str, str]]:
+def load_completed(
+    path: Path, retry_errors: bool, require_files: bool = False
+) -> set[tuple[str, str, str]]:
     completed: set[tuple[str, str, str]] = set()
     if not path.is_file():
         return completed
@@ -343,7 +439,13 @@ def load_completed(path: Path, retry_errors: bool) -> set[tuple[str, str, str]]:
             item = json.loads(line)
         except json.JSONDecodeError as error:
             raise ValueError(f"invalid JSON on {path}:{line_number}: {error}") from error
-        if item.get("status") == "ok" or not retry_errors:
+        if item.get("status") == "ok":
+            # Rows written before the file-level output existed are recomputed so
+            # that their file records are added; Git objects are already cached.
+            if require_files and not item.get("files_recorded"):
+                continue
+            completed.add(result_key(item))
+        elif not retry_errors:
             completed.add(result_key(item))
     return completed
 
@@ -410,6 +512,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--cache-dir", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--files-output",
+        type=Path,
+        help="gzip CSV of per-file records (default: output/git-file-changes.csv.gz)",
+    )
+    parser.add_argument(
+        "--no-files",
+        action="store_true",
+        help="record per-commit totals only, without the per-file records",
+    )
     parser.add_argument("--refresh", action="store_true", help="refresh existing mirrors")
     parser.add_argument("--retry-errors", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -430,6 +542,9 @@ def main() -> int:
     output_path = (
         args.output or root / "script/git-statistics/output/git-diff-statistics.jsonl"
     ).resolve()
+    files_output_path = None if args.no_files else (
+        args.files_output or root / "script/git-statistics/output/git-file-changes.csv.gz"
+    ).resolve()
     repository_filter = {item.lower() for item in args.repository}
     observations = load_observations(
         root,
@@ -447,6 +562,7 @@ def main() -> int:
     )
     print(f"repository cache: {cache_root}")
     print(f"results: {output_path}")
+    print(f"file records: {files_output_path or 'disabled'}")
     if args.dry_run:
         for repository, items in sorted(
             grouped.items(), key=lambda item: (-len(item[1]), item[0].lower())
@@ -455,7 +571,7 @@ def main() -> int:
         return 0
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    completed = load_completed(output_path, args.retry_errors)
+    completed = load_completed(output_path, args.retry_errors, files_output_path is not None)
     pending = [item for item in observations if result_key(item.__dict__) not in completed]
     grouped = grouped_by_repository(pending)
     print(f"already recorded: {len(observations) - len(pending):,}; pending: {len(pending):,}")
@@ -467,6 +583,7 @@ def main() -> int:
         stream,
         write_lock: threading.Lock,
         print_lock: threading.Lock,
+        file_writer: FileChangeWriter | None,
     ) -> tuple[int, int]:
         local_successes = local_failures = 0
         with print_lock:
@@ -493,24 +610,29 @@ def main() -> int:
             )
 
         statistics_by_sha: dict[str, dict] = {}
+        changes_by_sha: dict[str, list[FileChange]] = {}
         error_by_sha = preparation_errors.copy()
         for observation in items:
             if observation.sha not in statistics_by_sha and observation.sha not in error_by_sha:
                 try:
                     if args.clone_mode != "targeted":
                         ensure_commit(repository_path, observation.sha, args.clone_mode)
-                    statistics_by_sha[observation.sha] = calculate_commit(
-                        repository_path, observation.sha
-                    )
+                    statistics, changes = calculate_commit(repository_path, observation.sha)
+                    statistics_by_sha[observation.sha] = statistics
+                    if file_writer is not None:
+                        changes_by_sha[observation.sha] = changes
                 except Exception as error:
                     error_by_sha[observation.sha] = str(error)
 
             if observation.sha in statistics_by_sha:
+                if file_writer is not None:
+                    file_writer.write(observation, changes_by_sha[observation.sha])
                 append_result(
                     stream,
                     write_lock,
                     observation,
                     "ok",
+                    files_recorded=file_writer is not None,
                     **statistics_by_sha[observation.sha],
                 )
                 local_successes += 1
@@ -528,7 +650,13 @@ def main() -> int:
     successes = failures = 0
     write_lock = threading.Lock()
     print_lock = threading.Lock()
-    with output_path.open("a", encoding="utf-8") as stream:
+    with contextlib.ExitStack() as stack:
+        stream = stack.enter_context(output_path.open("a", encoding="utf-8"))
+        file_writer = (
+            stack.enter_context(FileChangeWriter(files_output_path))
+            if files_output_path is not None
+            else None
+        )
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as executor:
             futures = [
                 executor.submit(
@@ -539,6 +667,7 @@ def main() -> int:
                     stream,
                     write_lock,
                     print_lock,
+                    file_writer,
                 )
                 for repo_index, (repository, items) in enumerate(grouped.items(), start=1)
             ]

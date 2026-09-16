@@ -47,8 +47,24 @@ branch, tag, or historical commit. Repositories are processed concurrently;
 four workers are used by default. Existing partial or full mirrors remain
 usable, so changing modes does not invalidate completed JSONL results.
 
-Repository objects and JSONL output are stored under `.cache/` and `output/`,
-respectively, and both are ignored by Git. Use `--help` for worker and fetch
+Two result files are written to `output/`. `git-diff-statistics.jsonl` holds one
+row per commit with its totals. `git-file-changes.csv.gz` holds one row per
+changed file, with the developer, repository, SHA, day, path, previous path for
+renames, and per-file additions and deletions; binary files carry empty counts
+and `binary=1`. Extension and top-level directory are derived from `path` by the
+consumer rather than stored. Both come from the same `git diff-tree --numstat`
+output, so the file-level records cost no additional Git work; pass `--no-files`
+to skip them, or `--files-output` to write them elsewhere.
+
+A commit is considered done only once its file records exist, so rows written
+before this output was introduced are recomputed on the next run. An interrupted
+run can leave a commit whose file rows were written but whose per-commit row was
+not; that commit is recomputed and its file rows are then appended twice, so
+consumers should drop duplicates on developer, SHA, and path. The repository
+objects they need are already cached, so that pass performs no network fetch.
+
+Repository objects and both output files are stored under `.cache/` and
+`output/`, respectively, and are ignored by Git. Use `--help` for worker and fetch
 batch counts, developer/repository filters, alternate paths, refresh behavior,
 and error retries. Do not run two audit processes against the same cache and
 output paths concurrently.
