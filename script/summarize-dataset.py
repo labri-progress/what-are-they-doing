@@ -28,7 +28,7 @@ COMMITS_DIR = DATA_DIR / "commits"
 DEVELOPERS_FILE = REPO_ROOT / "developers.json"
 DEFAULT_OUTPUT = REPO_ROOT / "figures" / "zenodo-dataset-summary.md"
 AGENTS_DIR = REPO_ROOT / "agent-mining" / "agents"
-SNAPSHOT_RE = re.compile(r"^(?P<handle>.+)-(?P<month>\d{4}-\d{2})$")
+SNAPSHOT_RE = re.compile(r"^(?P<handle>.+)-(?P<month>\d{4}-\d{2})(?:-\d+)?$")
 
 sys.path.insert(0, str(REPO_ROOT / "agent-mining"))
 from heuristic import load_heuristics, _match_pattern  # noqa: E402
