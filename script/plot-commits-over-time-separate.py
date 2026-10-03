@@ -39,12 +39,12 @@ def load_commits_per_developer() -> dict[str, dict[str, int]]:
 
     for handle in handles:
         monthly: dict[str, int] = {}
-        pattern = str(DATA_DIR / f"{handle}-????-??.json")
+        pattern = str(DATA_DIR / f"{handle}-????-??*.json")
         for filepath in sorted(glob.glob(pattern)):
-            m = re.search(r"-(\d{4}-\d{2})\.json$", filepath)
+            m = re.search(r"-(\d{4}-\d{2})(?:-\d+)?\.json$", filepath)
             if m:
                 month_key = m.group(1)
-                monthly[month_key] = load_month_commit_count(Path(filepath))
+                monthly[month_key] = monthly.get(month_key, 0) + load_month_commit_count(Path(filepath))
         if monthly:
             result[handle] = monthly
 

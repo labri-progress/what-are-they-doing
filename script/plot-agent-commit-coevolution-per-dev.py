@@ -131,7 +131,7 @@ def collect_developer_stats(
     """Load all monthly snapshots for one developer and bucket by period."""
     dev_stats = DeveloperStats(handle=handle)
 
-    for path in sorted(DATA_DIR.glob(f"{handle}-????-??.json")):
+    for path in sorted(DATA_DIR.glob(f"{handle}-????-??*.json")):
         payload = json.loads(path.read_text())
         for day_str, day_info in payload.get("days", {}).items():
             day_value = date.fromisoformat(day_str)

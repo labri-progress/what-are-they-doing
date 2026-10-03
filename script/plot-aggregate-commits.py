@@ -48,7 +48,7 @@ def load_daily_totals(handles: list[str]) -> dict[date, int]:
     daily_totals: Counter[date] = Counter()
 
     for handle in handles:
-        for path in sorted(DATA_DIR.glob(f"{handle}-????-??.json")):
+        for path in sorted(DATA_DIR.glob(f"{handle}-????-??*.json")):
             payload = json.loads(path.read_text())
             for day_str, day_info in payload.get("days", {}).items():
                 daily_totals[date.fromisoformat(day_str)] += day_info.get("total_count", 0)
