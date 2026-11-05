@@ -154,6 +154,74 @@ object DataAnalysis {
 
   def weekStart(day: LocalDate): LocalDate = day.`with`(DayOfWeek.MONDAY)
 
+  /** First Monday of the shared observation window (2025-09-01 is a Monday). */
+  val timelineStart: LocalDate = weekStart(LocalDate.of(2025, 9, 1))
+
+  /** Last Monday of the shared observation window (2026-04-30 is the last day). */
+  val timelineEnd: LocalDate = weekStart(LocalDate.of(2026, 4, 30))
+
+  /** All calendar weeks in the shared observation window, in order. */
+  lazy val timelineWeeks: Vector[LocalDate] = {
+    val builder = Vector.newBuilder[LocalDate]
+    var week    = timelineStart
+    while !week.isAfter(timelineEnd) do
+      builder += week
+      week = week.plusWeeks(1)
+    builder.result()
+  }
+
+  /**
+   * Formats a week label as a bare calendar-week number. When `includeYear` is set,
+   * the two-digit year is appended (e.g. "1 '26") so the year boundary is visible.
+   */
+  def weekLabel(week: LocalDate, includeYear: Boolean): String =
+    val wf = java.time.temporal.WeekFields.ISO
+    val cw = week.get(wf.weekOfWeekBasedYear())
+    if includeYear then s"$cw '${week.get(wf.weekBasedYear()) % 100}"
+    else cw.toString
+
+  /** Week labels for the shared timeline, annotated where the ISO week-based year changes. */
+  lazy val timelineWeekLabels: Vector[String] = {
+    val wf    = java.time.temporal.WeekFields.ISO
+    val years = timelineWeeks.map(_.get(wf.weekBasedYear()))
+    timelineWeeks.indices.map { index =>
+      val yearChanged = index == 0 || years(index - 1) != years(index)
+      weekLabel(timelineWeeks(index), yearChanged)
+    }.toVector
+  }
+
+  /**
+   * Reindexes a sparse, week-keyed series onto the shared timeline, filling
+   * missing weeks with empty points. `weekKeys` must align with the provided
+   * per-week vectors.
+   */
+  def alignToTimeline(
+      weekKeys: Vector[LocalDate],
+      points: Vector[SVGGraphLib.StackedBarPoint],
+      totalCommits: Vector[Int],
+      sampledCommits: Vector[Int]
+  ): TimeSeriesData = {
+    val byWeek = weekKeys.zipWithIndex.map((week, index) => week -> index).toMap
+    val alignedPoints = timelineWeeks.zipWithIndex.map { (week, index) =>
+      byWeek.get(week) match
+        case Some(src) => points(src).copy(xLabel = timelineWeekLabels(index))
+        case None      => SVGGraphLib.StackedBarPoint(timelineWeekLabels(index), Map.empty)
+    }
+    TimeSeriesData(
+      points = alignedPoints,
+      totalCommits = timelineWeeks.indices.map { index =>
+        byWeek.get(timelineWeeks(index)).map(totalCommits).getOrElse(0)
+      }.toVector,
+      sampledCommits = timelineWeeks.indices.map { index =>
+        byWeek.get(timelineWeeks(index)).map(sampledCommits).getOrElse(0)
+      }.toVector
+    )
+  }
+
+  /** Number of leading weeks on the shared timeline without any data. */
+  def leadingGapWeeks(data: TimeSeriesData): Int =
+    data.points.takeWhile(point => point.values.isEmpty).size
+
   private lazy val periodRows: Vector[PeriodCsvRow] = {
     time("build weekly period rows") {
       val totalsByDeveloperWeek =
@@ -291,23 +359,23 @@ object DataAnalysis {
   lazy val agentSeriesForDeveloper: Map[String, TimeSeriesData] = {
     val rows = periodRows.groupBy(_.developer)
     rows.map { (handle, rows) =>
-      val weekKeys = rows.map(_.period_iso).distinct.sorted
-      handle -> TimeSeriesData(
-        points = weekKeys.map { week =>
-          val weekRows = rows.filter(_.period_iso == week)
-          SVGGraphLib.StackedBarPoint(
-            xLabel = week,
-            values = weekRows.map(row => row.agent -> row.count).toMap
-          )
-        },
-        totalCommits = weekKeys.map { week =>
-          val fromSummary = ContributionSummaries.totalCommitsFromSummary(handle, LocalDate.parse(week))
-          if fromSummary > 0 then fromSummary
-          else rows.find(_.period_iso == week).map(_.total_commits).getOrElse(0)
-        }.toVector,
-        sampledCommits =
-          weekKeys.map(week => rows.find(_.period_iso == week).map(_.sampled_commits).getOrElse(0)).toVector
-      )
+      val weekKeys = rows.map(_.period_iso).distinct.sorted.map(LocalDate.parse)
+      val points = weekKeys.map { week =>
+        val weekRows = rows.filter(_.period_iso == week.toString)
+        SVGGraphLib.StackedBarPoint(
+          xLabel = week.toString,
+          values = weekRows.map(row => row.agent -> row.count).toMap
+        )
+      }.toVector
+      val totals = weekKeys.map { week =>
+        val fromSummary = ContributionSummaries.totalCommitsFromSummary(handle, week)
+        if fromSummary > 0 then fromSummary
+        else rows.find(_.period_iso == week.toString).map(_.total_commits).getOrElse(0)
+      }.toVector
+      val sampled = weekKeys.map { week =>
+        rows.find(_.period_iso == week.toString).map(_.sampled_commits).getOrElse(0)
+      }.toVector
+      handle -> alignToTimeline(weekKeys, points, totals, sampled)
     }
   }
 

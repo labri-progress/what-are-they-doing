@@ -72,17 +72,49 @@ object SVGGraphLib {
 
   private def autoLeftMargin: Double = yAxisLabelPos + FontConfig.axisLabel * 1.5 + FontConfig.tick * 2.0
 
+  private def compactLeftMargin(fontSize: Int, labelFontSize: Int = FontConfig.axisLabel): Double =
+    labelFontSize * 1.1 + fontSize * 2.0 + fontSize * 1.3
+
+  /**
+   * Approximate advance width of a single character, as a fraction of the font size,
+   * for the default sans-serif face. A flat per-character estimate misjudges labels
+   * containing wide letters such as `m` against labels made of narrow ones such as
+   * `i` and `l`, which visibly uneven the gaps in a legend.
+   */
+  private def advanceOf(char: Char): Double = char match
+    case 'i' | 'j' | 'l' | '!' | '|' | '\'' => 0.30
+    case 'f' | 't' | 'r' | '(' | ')' | '[' | ']' | '-' | '/' | '\\' => 0.38
+    case 'I' => 0.32
+    case 'm' => 0.88
+    case 'w' => 0.76
+    case 'M' | 'W' => 0.86
+    case ' ' => 0.28
+    case '.' | ',' | ':' | ';' => 0.30
+    case c if c.isUpper => 0.68
+    case c if c.isDigit => 0.57
+    case _ => 0.56
+
   private def svgEscape(text: String): String =
     text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;")
 
   private def fmt(value: Double): String = String.format(Locale.US, "%.2f", Double.box(value))
 
+  /**
+   * Formats an axis tick. Values of a thousand and above are written in thousands
+   * with one decimal (e.g. `1.5k`) so that tick labels keep a constant width, and
+   * whole thousands drop the decimal (e.g. `2k`).
+   */
   private def formatSi(value: Double): String = {
     val rounded = math.rint(value).toLong
     if value != rounded.toDouble then fmt(value)
     else if rounded != 0 && rounded % 1000000000L == 0 then s"${rounded / 1000000000L}G"
     else if rounded != 0 && rounded % 1000000L == 0 then s"${rounded / 1000000L}M"
-    else if rounded != 0 && rounded % 1000L == 0 then s"${rounded / 1000L}k"
+    else if rounded >= 1000L && rounded < 1000000L then
+      if rounded % 1000L == 0 then s"${rounded / 1000L}k"
+      else
+        val thousands = f"${rounded / 1000.0}%.1f"
+        val trimmed   = if thousands.endsWith(".0") then thousands.dropRight(2) else thousands
+        s"${trimmed}k"
     else rounded.toString
   }
 
@@ -138,12 +170,12 @@ object SVGGraphLib {
 
   private def renderBackground(): String = "<rect width='100%' height='100%' fill='white'/>"
 
-  private def renderGridAndAxes(layout: ChartLayout, scale: ChartScale): String = {
+  private def renderGridAndAxes(layout: ChartLayout, scale: ChartScale, tickFontSize: Int = FontConfig.tick): String = {
     val gridLines =
       (0 to scale.yMax by scale.yStep).map { tick =>
         val y = yForValue(layout, scale, tick.toDouble)
         s"<line x1='${fmt(layout.plotX)}' y1='${fmt(y)}' x2='${fmt(layout.plotX + layout.plotWidth)}' y2='${fmt(y)}' stroke='#e9ecef' stroke-width='1' />" +
-        s"<text x='${fmt(layout.plotX - 10)}' y='${fmt(y + 4)}' text-anchor='end' font-size='${FontConfig.tick}' fill='#495057'>${formatSi(tick.toDouble)}</text>"
+        s"<text x='${fmt(layout.plotX - 10)}' y='${fmt(y + 4)}' text-anchor='end' font-size='$tickFontSize' fill='#495057'>${formatSi(tick.toDouble)}</text>"
       }.mkString("\n")
 
     val axes =
@@ -180,33 +212,201 @@ object SVGGraphLib {
     }._2.mkString("\n")
   }
 
-  private def renderBarLabels(layout: ChartLayout, points: Vector[StackedBarPoint]): String =
-    points.zipWithIndex.map { case (point, index) =>
-      val cx = xForBar(layout, points.size, index) + barWidth(layout, points.size) / 2.0
-      val cy = layout.plotY + layout.plotHeight + 10.0
-      s"<text x='${fmt(cx)}' y='${fmt(cy)}' transform='rotate(60 ${fmt(cx)} ${fmt(cy)})' font-size='${FontConfig.barLabel}' text-anchor='start' fill='#495057'>${svgEscape(point.xLabel)}</text>"
+  /**
+   * Renders the week axis below the plot: one tick per week, plus labels that are
+   * connected to their tick by a short leader line. Short labels (bare week numbers)
+   * are staggered over two rows so every week can carry a label; longer labels fall
+   * back to rotated, thinned text.
+   *
+   * Returns the SVG together with the lowest y coordinate the axis content reaches,
+   * so the x-axis title can be placed directly beneath it.
+   */
+  private def renderWeekAxis(
+      layout: ChartLayout,
+      points: Vector[StackedBarPoint],
+      fontSize: Int
+  ): (String, Double) = {
+    if points.isEmpty then ("", layout.plotY + layout.plotHeight)
+    else
+      val slot     = slotWidth(layout, points.size)
+      val axisY    = layout.plotY + layout.plotHeight
+      val tickColor = "#495057"
+
+      def centerX(index: Int) =
+        xForBar(layout, points.size, index) + barWidth(layout, points.size) / 2.0
+
+      // Advance-width estimate for the default sans-serif face.
+      def labelWidth(label: String) = label.length * fontSize * 0.55
+
+      val shortLabels = points.forall(_.xLabel.length <= 6)
+
+      if !shortLabels then
+        // Rotated fallback for long labels (e.g. ISO dates in other charts).
+        val minSpacing = fontSize * 1.05
+        val step       = math.max(1, math.ceil(minSpacing / math.max(1.0, slot)).toInt)
+        val ticks = (0 until points.size).map { index =>
+          val cx = centerX(index)
+          s"<line x1='${fmt(cx)}' y1='${fmt(axisY)}' x2='${fmt(cx)}' y2='${fmt(axisY + 8)}' stroke='$tickColor' stroke-width='1.2' />"
+        }.mkString("\n")
+        val labels = points.zipWithIndex.flatMap { case (point, index) =>
+          if index % step != 0 then None
+          else
+            val cx = centerX(index)
+            val cy = axisY + 8.0 + fontSize * 0.9
+            Some(
+              s"<text x='${fmt(cx)}' y='${fmt(cy)}' transform='rotate(60 ${fmt(cx)} ${fmt(cy)})' font-size='$fontSize' text-anchor='start' fill='$tickColor'>${svgEscape(point.xLabel)}</text>"
+            )
+        }.mkString("\n")
+        // Rotated text descends below its anchor point, so allow for a full line.
+        (ticks + "\n" + labels, axisY + 8.0 + fontSize * 1.8)
+      else
+        val rowGap   = fontSize * 0.45
+        val rowPitch = fontSize * 1.1
+        // Baseline of each stagger row, measured from the axis. Rows 0/1 carry the
+        // week numbers; row 2 carries the year markers where the year changes.
+        def rowBaseline(row: Int) = axisY + rowGap + fontSize * 0.85 + rowPitch * row
+        def rowTop(row: Int)      = rowBaseline(row) - fontSize * 0.72
+
+        // Year markers are split out of the label (format: "36 '25") and drawn on
+        // their own row so they never crowd out neighbouring week numbers.
+        val parsed = points.map { point =>
+          val parts = point.xLabel.split(" ")
+          (parts.headOption.getOrElse(""), parts.lift(1))
+        }
+
+        def textWidthOf(label: String) = labelWidth(label) + fontSize * 0.3
+
+        // Thin the labels so that neighbours within the same stagger row never
+        // collide, then alternate rows. With two rows this yields roughly every
+        // other week at the font sizes used for the weekly plots.
+        val widestLabel = parsed.map(pair => textWidthOf(pair._1)).maxOption.getOrElse(0.0)
+        val needed      = widestLabel + fontSize * 0.35
+        // Labels sharing a row are `2 * step` slots apart.
+        val step        = math.max(1, math.ceil(needed / math.max(1.0, slot * 2.0)).toInt)
+
+        val drawnIndices = (0 until points.size by step).toVector
+
+        val yearRowBaseline = rowBaseline(2)
+
+        // Also label the weeks where the year changes, so the year marker always
+        // has a week number directly above it. Rows are assigned by position in
+        // the sorted label list, which keeps near neighbours on opposite rows.
+        val yearChangeIndices = parsed.indices.filter(index => parsed(index)._2.isDefined)
+        val labelIndices      = (drawnIndices ++ yearChangeIndices).distinct.sorted
+        val rowOfLabel        = labelIndices.zipWithIndex.map((index, position) => index -> (position % 2)).toMap
+
+        // Every week gets a tick so the axis reads continuously; unlabelled weeks
+        // keep a short stub, labelled weeks reach up to their label row.
+        val stubLength = fontSize * 0.4
+        val ticks = (0 until points.size).map { index =>
+          val cx  = centerX(index)
+          val end = rowOfLabel.get(index) match
+            case Some(row) => rowTop(row)
+            case None      => axisY + stubLength
+          val strokeWidth = if rowOfLabel.contains(index) then 1.6 else 1.2
+          s"<line x1='${fmt(cx)}' y1='${fmt(axisY)}' x2='${fmt(cx)}' y2='${fmt(end)}' stroke='$tickColor' stroke-width='$strokeWidth' />"
+        }
+
+        val labels = labelIndices.zipWithIndex.map { case (index, position) =>
+          val cx  = centerX(index)
+          val row = position % 2
+          s"<text x='${fmt(cx)}' y='${fmt(rowBaseline(row))}' text-anchor='middle' font-size='$fontSize' fill='$tickColor'>${svgEscape(parsed(index)._1)}</text>"
+        }
+
+        // Year markers sit on their own row beneath the week numbers.
+        val yearLabels = parsed.zipWithIndex.flatMap { case ((_, year), index) =>
+          year.map { y =>
+            val cx = centerX(index)
+            s"<text x='${fmt(cx)}' y='${fmt(yearRowBaseline)}' text-anchor='middle' font-size='${math.round(fontSize * 0.8).toInt}' font-style='italic' fill='$tickColor'>${svgEscape(y)}</text>"
+          }
+        }
+
+        (ticks.mkString("\n") + "\n" + (labels ++ yearLabels).mkString("\n"), yearRowBaseline)
+  }
+
+  private def renderBarLabels(
+      layout: ChartLayout,
+      points: Vector[StackedBarPoint],
+      fontSize: Int = FontConfig.barLabel
+  ): String = {
+    // Skip labels that would collide when there are many slots. Week numbers are
+    // short, so the threshold is kept tight to prefer every-other-week labels.
+    val slot       = slotWidth(layout, points.size)
+    val minSpacing = fontSize * 1.05
+    val step       = math.max(1, math.ceil(minSpacing / math.max(1.0, slot)).toInt)
+    points.zipWithIndex.flatMap { case (point, index) =>
+      if index % step != 0 then None
+      else
+        val cx = xForBar(layout, points.size, index) + barWidth(layout, points.size) / 2.0
+        // Leave a clear gap below the axis ticks before the rotated label starts.
+        val cy = layout.plotY + layout.plotHeight + 8.0 + fontSize * 0.9
+        Some(
+          s"<text x='${fmt(cx)}' y='${fmt(cy)}' transform='rotate(60 ${fmt(cx)} ${fmt(cy)})' font-size='$fontSize' text-anchor='start' fill='#495057'>${svgEscape(point.xLabel)}</text>"
+        )
     }.mkString("\n")
+  }
+
+  private val gapHatchDefs: String =
+    """<defs>
+<pattern id='gapHatch' width='7' height='7' patternUnits='userSpaceOnUse' patternTransform='rotate(45)'>
+<rect width='7' height='7' fill='#f8f9fa'/>
+<line x1='0' y1='0' x2='0' y2='7' stroke='#adb5bd' stroke-width='2'/>
+</pattern>
+</defs>"""
+
+  /**
+   * Finer version of `gapHatch`, used for the small legend swatch. The plot-scale
+   * pattern would only fit two or three stripes into a swatch this size and read as
+   * a coarse block rather than as hatching.
+   */
+  private val legendHatchDefs: String =
+    """<defs>
+<pattern id='legendHatch' width='5' height='5' patternUnits='userSpaceOnUse' patternTransform='rotate(45)'>
+<rect width='5' height='5' fill='#f8f9fa'/>
+<line x1='0' y1='0' x2='0' y2='5' stroke='#adb5bd' stroke-width='1.4'/>
+</pattern>
+</defs>"""
+
+  /** Hatches the first `gapCount` slots of the plot to mark "no data yet". */
+  private def renderGapHatch(layout: ChartLayout, pointCount: Int, gapCount: Int): String =
+    if gapCount <= 0 || pointCount <= 0 then ""
+    else
+      val usable    = math.min(gapCount, pointCount)
+      val rightEdge = layout.plotX + slotWidth(layout, pointCount) * usable
+      val regionW   = math.max(0.0, rightEdge - layout.plotX)
+      s"<rect x='${fmt(layout.plotX)}' y='${fmt(layout.plotY)}' width='${fmt(regionW)}' height='${fmt(layout.plotHeight)}' fill='url(#gapHatch)' stroke='none' />"
 
   private def renderLineSeries(
       layout: ChartLayout,
       scale: ChartScale,
       points: Vector[StackedBarPoint],
-      line: LineSeries
+      line: LineSeries,
+      leadingGapPoints: Int
   ): String = {
     val lineValues = line.values.padTo(points.size, 0).take(points.size)
-    val polyPoints = lineValues.zipWithIndex.map { case (value, index) =>
-      val cx = xForBar(layout, points.size, index) + barWidth(layout, points.size) / 2.0
-      val cy = yForValue(layout, scale, value.toDouble)
-      s"${fmt(cx)},${fmt(cy)}"
-    }.mkString(" ")
+    val firstValid = math.max(0, math.min(leadingGapPoints, lineValues.size))
+    val validIdx   = (firstValid until lineValues.size).toVector
 
-    val markers = lineValues.zipWithIndex.map { case (value, index) =>
-      val cx = xForBar(layout, points.size, index) + barWidth(layout, points.size) / 2.0
-      val cy = yForValue(layout, scale, value.toDouble)
+    def cxFor(index: Int): Double =
+      xForBar(layout, points.size, index) + barWidth(layout, points.size) / 2.0
+
+    // Keep the line out of the hatched "no data" region at the start of the plot,
+    // while still connecting runs that are interrupted by interior empty weeks.
+    val polylines =
+      if validIdx.sizeIs < 2 then ""
+      else
+        val polyPoints = validIdx.map { index =>
+          s"${fmt(cxFor(index))},${fmt(yForValue(layout, scale, lineValues(index).toDouble))}"
+        }.mkString(" ")
+        s"<polyline fill='none' stroke='${line.stroke}' stroke-width='3' stroke-dasharray='${line.dashArray}' points='$polyPoints' />"
+
+    val markers = validIdx.map { index =>
+      val cx = cxFor(index)
+      val cy = yForValue(layout, scale, lineValues(index).toDouble)
       s"<rect x='${fmt(cx - 2.5)}' y='${fmt(cy - 2.5)}' width='5' height='5' fill='${line.markerFill}' transform='rotate(45 ${fmt(cx)} ${fmt(cy)})' />"
     }.mkString("\n")
 
-    s"<polyline fill='none' stroke='${line.stroke}' stroke-width='2' stroke-dasharray='${line.dashArray}' points='$polyPoints' />\n$markers"
+    polylines + "\n" + markers
   }
 
   def renderLegend(
@@ -237,19 +437,32 @@ object SVGGraphLib {
           s"<rect x='${fmt(sx)}' y='${fmt(cy - 6)}' width='18' height='12' fill='${colors.getOrElse(key, "#adb5bd")}' stroke='#ffffff' stroke-width='0.6' />" + textEl(key, cy)
         case Right(line) =>
           val sx = lx + 10
-          s"<line x1='${fmt(sx)}' y1='${fmt(cy)}' x2='${fmt(sx + 20)}' y2='${fmt(cy)}' stroke='${line.stroke}' stroke-width='2' stroke-dasharray='${line.dashArray}' />" +
+          s"<line x1='${fmt(sx)}' y1='${fmt(cy)}' x2='${fmt(sx + 20)}' y2='${fmt(cy)}' stroke='${line.stroke}' stroke-width='3' stroke-dasharray='${line.dashArray}' />" +
           s"<rect x='${fmt(sx + 7)}' y='${fmt(cy - 3)}' width='6' height='6' fill='${line.markerFill}' transform='rotate(45 ${fmt(sx + 10)} ${fmt(cy)})' />" + textEl(line.label, cy)
     }.mkString("\n")
 
     box + "\n" + legendItems
   }
 
-  private def renderTitles(layout: ChartLayout, title: String, yAxisLabel: String, xAxisLabel: String): String =
+  private def renderTitles(
+      layout: ChartLayout,
+      title: String,
+      yAxisLabel: String,
+      xAxisLabel: String,
+      yAxisFontSize: Int = FontConfig.axisLabel,
+      xLabelY: Option[Double] = None,
+      xAxisFontSize: Option[Int] = None
+  ): String =
+    val xSize = xAxisFontSize.getOrElse(yAxisFontSize)
     val xLabel = if xAxisLabel.isEmpty then "" else
-      s"\n<text x='${fmt(layout.plotX + layout.plotWidth / 2.0)}' y='${fmt(layout.height - 40.0)}' text-anchor='middle' font-size='${FontConfig.axisLabel}' fill='#212529'>${svgEscape(xAxisLabel)}</text>"
-    s"<text x='${fmt(layout.width / 2.0)}' y='18' text-anchor='middle' font-size='${FontConfig.title}' font-weight='700' fill='#111827'>${svgEscape(title)}</text>" +
-    s"\n<text x='${fmt(yAxisLabelPos)}' y='${fmt(layout.plotY + layout.plotHeight / 2.0)}' transform='rotate(-90 ${fmt(yAxisLabelPos)} ${fmt(layout.plotY + layout.plotHeight / 2.0)})' text-anchor='middle' font-size='${FontConfig.axisLabel}' fill='#212529'>${svgEscape(yAxisLabel)}</text>" +
-    xLabel
+      val y = xLabelY.getOrElse(layout.height - math.max(18.0, xSize * 0.9))
+      s"\n<text x='${fmt(layout.plotX + layout.plotWidth / 2.0)}' y='${fmt(y)}' text-anchor='middle' font-size='$xSize' fill='#212529'>${svgEscape(xAxisLabel)}</text>"
+    val titleEl = if title.isEmpty then "" else
+      s"<text x='${fmt(layout.width / 2.0)}' y='18' text-anchor='middle' font-size='${FontConfig.title}' font-weight='700' fill='#111827'>${svgEscape(title)}</text>"
+    val yLabel = if yAxisLabel.isEmpty then "" else
+      val x = math.max(yAxisFontSize * 1.1, yAxisLabelPos)
+      s"\n<text x='${fmt(x)}' y='${fmt(layout.plotY + layout.plotHeight / 2.0)}' transform='rotate(-90 ${fmt(x)} ${fmt(layout.plotY + layout.plotHeight / 2.0)})' text-anchor='middle' font-size='$yAxisFontSize' fill='#212529'>${svgEscape(yAxisLabel)}</text>"
+    titleEl + yLabel + xLabel
 
   private def renderFooter(
       layout: ChartLayout,
@@ -464,18 +677,26 @@ $footer
       yAxisLabel: String = "Commits",
       xAxisLabel: String = "",
       totalLabel: String = "Embedded records",
-      showLegend: Boolean = true
+      showLegend: Boolean = true,
+      leadingGapPoints: Int = 0,
+      width: Int = 900,
+      height: Int = 560,
+      bottomMargin: Double = 140,
+      labelFontSize: Int = FontConfig.barLabel,
+      axisFontSize: Int = FontConfig.tick,
+      axisTitleFontSize: Int = FontConfig.axisLabel
   ): String = {
     val activeStacks = activeStackKeys(points, stackOrder)
     val activeLines  = activeLineSeries(lineSeries)
     val legendW      = 220.0
     val layout       = ChartLayout(
-      width = math.max(900, points.size * 20 + legendW.toInt + 200),
-      height = 560,
-      left = autoLeftMargin,
-      right = legendW + 40,
+      width = math.max(width, points.size * 15 + (if showLegend then legendW.toInt + 200 else 100)),
+      height = height,
+      left = if axisFontSize == FontConfig.tick then autoLeftMargin
+             else compactLeftMargin(axisFontSize, axisTitleFontSize),
+      right = if showLegend then legendW + 40 else 24,
       top = 44,
-      bottom = 140,
+      bottom = bottomMargin,
       legendWidth = legendW
     )
     val scale = computeScale(points, activeLines)
@@ -484,15 +705,22 @@ $footer
       renderStackedBar(layout, scale, points.size, index, point, activeStacks, colors)
     }.mkString("\n")
 
-    val lines = activeLines.map(renderLineSeries(layout, scale, points, _)).mkString("\n")
+    val lines = activeLines.map(renderLineSeries(layout, scale, points, _, leadingGapPoints)).mkString("\n")
+
+    val (weekAxis, axisContentBottom) = renderWeekAxis(layout, points, labelFontSize)
+    // Place the x-axis title just below the deepest week-axis row instead of
+    // pinning it to the bottom of the canvas.
+    val xLabelY = axisContentBottom + axisTitleFontSize * 1.35
 
     s"""<svg xmlns='http://www.w3.org/2000/svg' width='${layout.width}' height='${layout.height}' viewBox='0 0 ${layout.width} ${layout.height}'>
 ${renderBackground()}
-${renderGridAndAxes(layout, scale)}
-${renderTitles(layout, title, yAxisLabel, xAxisLabel)}
+$gapHatchDefs
+${renderGridAndAxes(layout, scale, axisFontSize)}
+${renderTitles(layout, title, yAxisLabel, xAxisLabel, axisTitleFontSize, Some(xLabelY), Some(axisTitleFontSize))}
+${renderGapHatch(layout, points.size, leadingGapPoints)}
 $bars
 $lines
-${renderBarLabels(layout, points)}
+$weekAxis
 ${if showLegend then renderLegend(layout, activeStacks, colors, activeLines) else ""}
 ${renderFooter(layout, points, activeStacks, topLabel, activeLines, totalLabel)}
 </svg>
@@ -535,6 +763,112 @@ ${renderLegend(layout, activeStackKeys(Vector(dummyPoint), stackOrder), colors, 
 </svg>"""
   }
 
+  /** One entry of a shared legend: a colour swatch, a line symbol, or a hatch swatch. */
+  private sealed trait LegendEntry
+  private case class StackEntry(key: String)                              extends LegendEntry
+  private case class LineEntry(line: LineSeries)                          extends LegendEntry
+  private case class HatchEntry(label: String)                            extends LegendEntry
+
+  /**
+   * Renders a standalone legend that flows entries left-to-right. Used as the single
+   * shared legend for a figure composed of many subplots, so each subplot can omit
+   * its own legend. Column widths hug the labels they contain, which keeps a
+   * single-row legend compact.
+   *
+   * When `splitRows` is set, the colour swatches form the first row while the line
+   * symbol and the optional hatch entry move to a second row, so the long harness
+   * list stays on one line.
+   */
+  def renderSharedLegendSvg(
+      stackOrder: Vector[String],
+      colors: Map[String, String],
+      lineSeries: Vector[LineSeries],
+      columns: Int = 4,
+      fontSize: Int = FontConfig.legend,
+      entryHeight: Double = 26.0,
+      padding: Double = 10.0,
+      hatchLabel: Option[String] = None,
+      splitRows: Boolean = false
+  ): String = {
+    val dummyPoints =
+      if stackOrder.nonEmpty then Vector(StackedBarPoint("", stackOrder.map(k => k -> 1).toMap))
+      else Vector.empty
+    val activeStacks = activeStackKeys(dummyPoints, stackOrder)
+    val activeLines  = activeLineSeries(lineSeries)
+
+    val stackEntries = activeStacks.map(StackEntry(_))
+    val extraEntries: Vector[LegendEntry] =
+      activeLines.map(LineEntry(_)) ++ hatchLabel.map(HatchEntry(_)).toVector
+
+    // Symbol sizes scale with the font so the legend stays balanced at any size.
+    val swatchW   = fontSize * 0.45
+    val swatchH   = fontSize * 0.42
+    val symbolEnd = swatchW + fontSize * 0.1
+    val textGap   = symbolEnd + fontSize * 0.3
+
+    def labelOf(entry: LegendEntry): String = entry match
+      case StackEntry(key)   => key
+      case LineEntry(line)   => line.label
+      case HatchEntry(label) => label
+
+    // Rough advance width for the default sans-serif face. Each entry only reserves
+    // what its own label needs, and a constant gap keeps the spacing even. Reserving
+    // the widest label for every entry would inflate the image and shrink the type
+    // once the legend is scaled down to the text width.
+    def textWidth(label: String): Double = label.map(advanceOf).sum * fontSize
+
+    val entryGap = fontSize * 0.25
+
+    def entryWidth(entry: LegendEntry): Double = textGap + textWidth(labelOf(entry))
+
+    def rowWidth(row: Vector[LegendEntry]): Double =
+      row.map(entryWidth).sum + entryGap * math.max(0, row.size - 1)
+
+    // Rows of entries. Splitting keeps the harness swatches on a single line.
+    val rows: Vector[Vector[LegendEntry]] =
+      if splitRows then
+        Vector(stackEntries, extraEntries).filter(_.nonEmpty)
+      else
+        val all = stackEntries ++ extraEntries
+        val cols = math.max(1, math.min(columns, all.size))
+        all.grouped(cols).toVector
+
+    val width  = math.ceil(padding * 2 + rows.map(rowWidth).maxOption.getOrElse(0.0)).toInt
+    val height = math.ceil(padding * 2 + rows.size * entryHeight).toInt
+
+    def textEl(label: String, x: Double, cy: Double): String =
+      s"<text x='${fmt(x)}' y='${fmt(cy + fontSize * 0.36)}' font-size='$fontSize' fill='#212529'>${svgEscape(label)}</text>"
+
+    def symbol(entry: LegendEntry, x: Double, cy: Double): String = entry match
+      case StackEntry(key) =>
+        s"<rect x='${fmt(x)}' y='${fmt(cy - swatchH / 2)}' width='${fmt(swatchW)}' height='${fmt(swatchH)}' fill='${colors.getOrElse(key, "#adb5bd")}' stroke='#ffffff' stroke-width='0.6' />"
+      case HatchEntry(_) =>
+        s"<rect x='${fmt(x)}' y='${fmt(cy - swatchH / 2)}' width='${fmt(swatchW)}' height='${fmt(swatchH)}' fill='url(#legendHatch)' stroke='#adb5bd' stroke-width='0.8' />"
+      case LineEntry(line) =>
+        val markerR = fontSize * 0.18
+        s"<line x1='${fmt(x)}' y1='${fmt(cy)}' x2='${fmt(x + symbolEnd)}' y2='${fmt(cy)}' stroke='${line.stroke}' stroke-width='3' stroke-dasharray='${line.dashArray}' />" +
+          s"<rect x='${fmt(x + symbolEnd / 2 - markerR)}' y='${fmt(cy - markerR)}' width='${fmt(markerR * 2)}' height='${fmt(markerR * 2)}' fill='${line.markerFill}' transform='rotate(45 ${fmt(x + symbolEnd / 2)} ${fmt(cy)})' />"
+
+    val items = rows.zipWithIndex.map { case (row, rowIndex) =>
+      val cy = padding + entryHeight * (rowIndex + 0.5)
+      // Left-align each row, accumulating its own entry offsets.
+      val (_, rowSvg) = row.foldLeft((padding, Vector.empty[String])) { case ((x, acc), entry) =>
+        val svg = symbol(entry, x, cy) + textEl(labelOf(entry), x + textGap, cy)
+        (x + entryWidth(entry) + entryGap, acc :+ svg)
+      }
+      rowSvg.mkString("\n")
+    }.mkString("\n")
+
+    val defs = if hatchLabel.isDefined then legendHatchDefs else ""
+
+    s"""<svg xmlns='http://www.w3.org/2000/svg' width='$width' height='$height' viewBox='0 0 $width $height'>
+${renderBackground()}
+$defs
+$items
+</svg>
+"""
+  }
+
   private def renderPctBar(
       layout: ChartLayout,
       pointCount: Int,
@@ -565,18 +899,25 @@ ${renderLegend(layout, activeStackKeys(Vector(dummyPoint), stackOrder), colors, 
       countPerWeek: Vector[Int],
       yRightLabel: String = "Commits",
       xAxisLabel: String = "Week",
-      showLegend: Boolean = true
+      showLegend: Boolean = true,
+      leadingGapPoints: Int = 0,
+      width: Int = 900,
+      height: Int = 560,
+      bottomMargin: Double = 140,
+      labelFontSize: Int = FontConfig.barLabel,
+      axisFontSize: Int = FontConfig.tick,
+      axisTitleFontSize: Int = FontConfig.axisLabel
   ): String = {
     val activeStacks = activeStackKeys(points, stackOrder)
     val legendW    = 220.0
-    val rightAxisW = 80.0
+    val rightAxisW = 110.0
     val layout     = ChartLayout(
-      width = math.max(900, points.size * 20 + legendW.toInt + 200),
-      height = 560,
-      left = autoLeftMargin,
-      right = rightAxisW + legendW + 40,
+      width = math.max(width, points.size * 15 + (if showLegend then legendW.toInt + 200 else 100)),
+      height = height,
+      left = if axisFontSize == FontConfig.tick then autoLeftMargin else compactLeftMargin(axisFontSize, axisTitleFontSize),
+      right = rightAxisW + (if showLegend then legendW + 40 else 24),
       top = 44,
-      bottom = 140,
+      bottom = bottomMargin,
       legendWidth = legendW
     )
 
@@ -591,7 +932,7 @@ ${renderLegend(layout, activeStackKeys(Vector(dummyPoint), stackOrder), colors, 
       (0 to 100 by 10).map { tick =>
         val y = layout.plotY + layout.plotHeight - (tick / 100.0) * layout.plotHeight
         s"<line x1='${fmt(layout.plotX)}' y1='${fmt(y)}' x2='${fmt(layout.plotX + layout.plotWidth)}' y2='${fmt(y)}' stroke='#e9ecef' stroke-width='1' />" +
-        s"<text x='${fmt(layout.plotX - 10)}' y='${fmt(y + 4)}' text-anchor='end' font-size='${FontConfig.tick}' fill='#495057'>$tick%</text>"
+        s"<text x='${fmt(layout.plotX - 10)}' y='${fmt(y + 4)}' text-anchor='end' font-size='$axisFontSize' fill='#495057'>$tick</text>"
       }.mkString("\n") +
       s"\n<line x1='${fmt(layout.plotX)}' y1='${fmt(layout.plotY + layout.plotHeight)}' x2='${fmt(layout.plotX + layout.plotWidth)}' y2='${fmt(layout.plotY + layout.plotHeight)}' stroke='#343a40' stroke-width='1.2' />" +
       s"\n<line x1='${fmt(layout.plotX)}' y1='${fmt(layout.plotY)}' x2='${fmt(layout.plotX)}' y2='${fmt(layout.plotY + layout.plotHeight)}' stroke='#343a40' stroke-width='1.2' />"
@@ -608,32 +949,40 @@ ${renderLegend(layout, activeStackKeys(Vector(dummyPoint), stackOrder), colors, 
     val rightAxis: String =
       (0 to countScaleMax by countStep).map { tick =>
         val y = yForCount(tick.toDouble)
-        s"<text x='${fmt(rightX + 8)}' y='${fmt(y + 4)}' text-anchor='start' font-size='${FontConfig.tick}' fill='#343a40'>${formatSi(tick.toDouble)}</text>"
+        s"<text x='${fmt(rightX + 8)}' y='${fmt(y + 4)}' text-anchor='start' font-size='$axisFontSize' fill='#343a40'>${formatSi(tick.toDouble)}</text>"
       }.mkString("\n") +
       s"\n<line x1='${fmt(rightX)}' y1='${fmt(layout.plotY)}' x2='${fmt(rightX)}' y2='${fmt(layout.plotY + layout.plotHeight)}' stroke='#343a40' stroke-width='1.2' />"
 
     val rightAxisLabel: String = {
-      val rx = layout.plotX + layout.plotWidth + rightAxisW - FontConfig.axisLabel * 0.5
+      val rx = layout.plotX + layout.plotWidth + rightAxisW - axisTitleFontSize * 0.9
       val ry = layout.plotY + layout.plotHeight / 2.0
-      s"<text x='${fmt(rx)}' y='${fmt(ry)}' transform='rotate(90 ${fmt(rx)} ${fmt(ry)})' text-anchor='middle' font-size='${FontConfig.axisLabel}' fill='#343a40'>${svgEscape(yRightLabel)}</text>"
+      s"<text x='${fmt(rx)}' y='${fmt(ry)}' transform='rotate(90 ${fmt(rx)} ${fmt(ry)})' text-anchor='middle' font-size='$axisTitleFontSize' fill='#343a40'>${svgEscape(yRightLabel)}</text>"
     }
 
+    // Keep bars and the count line out of the hatched leading gap.
+    val dataStart = math.max(0, math.min(leadingGapPoints, points.size))
     val bars: String = pctByPoint.zipWithIndex.map { case (pctValues, index) =>
-      renderPctBar(layout, points.size, index, pctValues, activeStacks, colors)
+      if index < dataStart then ""
+      else renderPctBar(layout, points.size, index, pctValues, activeStacks, colors)
     }.mkString("\n")
 
     val countLine: String = {
       val counts = countPerWeek.padTo(points.size, 0).take(points.size)
-      val poly   = counts.zipWithIndex.map { case (c, i) =>
+      val valid  = (dataStart until points.size).toVector
+      val poly =
+        if valid.sizeIs < 2 then ""
+        else
+          val polyPoints = valid.map { i =>
+            val cx = xForBar(layout, points.size, i) + barWidth(layout, points.size) / 2.0
+            s"${fmt(cx)},${fmt(yForCount(counts(i).toDouble))}"
+          }.mkString(" ")
+          s"<polyline fill='none' stroke='#343a40' stroke-width='3' stroke-dasharray='6 4' points='$polyPoints' />"
+      val markers = valid.map { i =>
         val cx = xForBar(layout, points.size, i) + barWidth(layout, points.size) / 2.0
-        s"${fmt(cx)},${fmt(yForCount(c.toDouble))}"
-      }.mkString(" ")
-      val markers = counts.zipWithIndex.map { case (c, i) =>
-        val cx = xForBar(layout, points.size, i) + barWidth(layout, points.size) / 2.0
-        val cy = yForCount(c.toDouble)
+        val cy = yForCount(counts(i).toDouble)
         s"<rect x='${fmt(cx - 2.5)}' y='${fmt(cy - 2.5)}' width='5' height='5' fill='#343a40' transform='rotate(45 ${fmt(cx)} ${fmt(cy)})' />"
       }.mkString("\n")
-      s"<polyline fill='none' stroke='#343a40' stroke-width='2' stroke-dasharray='6 4' points='$poly' />\n$markers"
+      poly + "\n" + markers
     }
 
     val legendSvg = if showLegend then
@@ -641,15 +990,20 @@ ${renderLegend(layout, activeStackKeys(Vector(dummyPoint), stackOrder), colors, 
         lxOverride = Some(layout.plotX + layout.plotWidth + rightAxisW + 16))
     else ""
 
+    val (weekAxis, axisContentBottom) = renderWeekAxis(layout, points, labelFontSize)
+    val xLabelY = axisContentBottom + axisTitleFontSize * 1.35
+
     s"""<svg xmlns='http://www.w3.org/2000/svg' width='${layout.width}' height='${layout.height}' viewBox='0 0 ${layout.width} ${layout.height}'>
 ${renderBackground()}
+$gapHatchDefs
 $leftAxis
 $rightAxis
-${renderTitles(layout, title, "Agent share (%)", xAxisLabel)}
+${renderTitles(layout, title, "Agent share (%)", xAxisLabel, axisTitleFontSize, Some(xLabelY), Some(axisTitleFontSize))}
 $rightAxisLabel
+${renderGapHatch(layout, points.size, leadingGapPoints)}
 $bars
 $countLine
-${renderBarLabels(layout, points)}
+$weekAxis
 $legendSvg
 </svg>
 """
@@ -699,7 +1053,7 @@ $legendSvg
       (0 to 100 by 10).map { tick =>
         val y = layout.plotY + layout.plotHeight - (tick / 100.0) * layout.plotHeight
         s"<line x1='${fmt(layout.plotX)}' y1='${fmt(y)}' x2='${fmt(layout.plotX + layout.plotWidth)}' y2='${fmt(y)}' stroke='#e9ecef' stroke-width='1' />" +
-        s"<text x='${fmt(layout.plotX - 10)}' y='${fmt(y + 4)}' text-anchor='end' font-size='${FontConfig.tick}' fill='#495057'>$tick%</text>"
+        s"<text x='${fmt(layout.plotX - 10)}' y='${fmt(y + 4)}' text-anchor='end' font-size='${FontConfig.tick}' fill='#495057'>$tick</text>"
       }.mkString("\n") +
       s"\n<line x1='${fmt(layout.plotX)}' y1='${fmt(layout.plotY + layout.plotHeight)}' x2='${fmt(layout.plotX + layout.plotWidth)}' y2='${fmt(layout.plotY + layout.plotHeight)}' stroke='#343a40' stroke-width='1.2' />" +
       s"\n<line x1='${fmt(layout.plotX)}' y1='${fmt(layout.plotY)}' x2='${fmt(layout.plotX)}' y2='${fmt(layout.plotY + layout.plotHeight)}' stroke='#343a40' stroke-width='1.2' />"
@@ -752,7 +1106,7 @@ $legendSvg
         val cy = yForCountLog(c.toDouble)
         s"<rect x='${fmt(cx - 2.5)}' y='${fmt(cy - 2.5)}' width='5' height='5' fill='#343a40' transform='rotate(45 ${fmt(cx)} ${fmt(cy)})' />"
       }.mkString("\n")
-      s"<polyline fill='none' stroke='#343a40' stroke-width='2' stroke-dasharray='6 4' points='$poly' />\n$markers"
+      s"<polyline fill='none' stroke='#343a40' stroke-width='3' stroke-dasharray='6 4' points='$poly' />\n$markers"
     }
 
     val legendSvg = if showLegend then

@@ -192,36 +192,92 @@ object RQ2Renderer {
     TimeSeriesData(points = points, totalCommits = totals, sampledCommits = totals)
   }
 
-  def makeWeeklyPlotSvgs(): Seq[Sync[Any, Unit]] = {
+  /** Harnesses with at least this many commits over the window get their own bar segment. */
+  private val agentSignificanceThreshold = 50
+
+  /** Legend entries shared by every agent-use subplot. */
+  private def agentUseLegendSeries: Vector[LineSeries] =
+    Vector(LineSeries("total commits", "#343a40", "6 4", "#343a40", Vector(1)))
+
+  private def weeklyPlotSyncs(): Seq[Sync[Any, Unit]] = {
     Files.createDirectories(GlobalPaths.outputPath.resolve("agent-use"))
 
-    trackedHandles.toVector.map { handle =>
+    val handles = trackedHandles.toVector.sorted
+
+    // Compute the set of harnesses that are significant for at least one developer so
+    // that the shared legend lists exactly the entries that appear in the subplots.
+    val significantAgents: Set[String] =
+      handles.iterator
+        .flatMap { handle =>
+          agentSeriesForDeveloper(handle).points.iterator.flatMap(_.values)
+        }
+        .toVector
+        .groupMapReduce(_._1)(_._2)(_ + _)
+        .filter(_._2 >= agentSignificanceThreshold)
+        .keySet
+
+    val legend = Sync {
+      val legendPath = GlobalPaths.outputPath.resolve("agent-use").resolve("rq2-agent-use-legend.svg")
+      val legendAgents = agentColorOrder.filter(significantAgents.contains)
+      val entryCount   = legendAgents.size + agentUseLegendSeries.size
+      writeSvgAndConvertToPdf(
+        legendPath,
+        renderSharedLegendSvg(
+          legendAgents,
+          agentColors,
+          agentUseLegendSeries,
+          columns = entryCount,
+          fontSize = 36,
+          entryHeight = 42.0,
+          padding = 2.0,
+          hatchLabel = Some("no data"),
+          splitRows = true
+        )
+      )
+      println(s"Wrote agent-use legend to $legendPath")
+    }
+
+    val plots = handles.map { handle =>
       Sync {
         val data = agentSeriesForDeveloper(handle)
-        if data.points.nonEmpty then
+        if data.points.exists(_.values.nonEmpty) then
             val agentTotals =
               data.points.iterator.flatMap(_.values).toVector.groupMapReduce(_._1)(_._2)(_ + _)
-            val activeAgents = agentTotals.filter(_._2 >= 50).keySet
+            val activeAgents = agentTotals.filter(_._2 >= agentSignificanceThreshold).keySet
 
             val points = data.points.map { pt =>
               pt.copy(values = pt.values.filter((k, _) => activeAgents.contains(k)))
             }
 
+            val gap = leadingGapWeeks(data)
+
             val outputFile = GlobalPaths.outputPath.resolve("agent-use").resolve(s"rq2-agent-use-$handle.svg")
             writeSvgAndConvertToPdf(
               outputFile,
               renderStackedTimeSeriesSvg(
-                s"Agent Usage Over Time — @$handle",
+                "",
                 points,
                 agentColorOrder,
                 agentColors,
                 "Top agent",
-                defaultLines(data)
+                defaultLines(data),
+                yAxisLabel = "Commits",
+                xAxisLabel = "Calendar week",
+                showLegend = false,
+                leadingGapPoints = gap,
+                width = 640,
+                height = 700,
+                bottomMargin = 175,
+                labelFontSize = 34,
+                axisFontSize = 30,
+                axisTitleFontSize = 32
               )
             )
             println(s"Wrote agent-use SVG for @$handle to $outputFile")
       }
     }
+
+    legend +: plots
   }
 
   def makeRq2CommitTypeSvgs(): Seq[Sync[Any, Unit]] = {
@@ -511,24 +567,72 @@ object RQ2Renderer {
 
   private def agentShareWeeklyPlotSyncs(): Seq[Sync[Any, Unit]] = {
     Files.createDirectories(GlobalPaths.outputPath.resolve("agent-share"))
-    trackedHandles.toVector.map { handle =>
+    val handles = trackedHandles.toVector.sorted
+
+    // Harnesses with at least the significance threshold worth of commits, matching
+    // the agent-use figure so both shared legends stay single-row and comparable.
+    val significantAgents: Set[String] =
+      handles.iterator
+        .flatMap(handle => agentSeriesForDeveloper(handle).points.iterator.flatMap(_.values))
+        .toVector
+        .groupMapReduce(_._1)(_._2)(_ + _)
+        .filter(_._2 >= agentSignificanceThreshold)
+        .keySet
+
+    val legend = Sync {
+      val legendAgents = agentColorOrder.filter(significantAgents.contains)
+      val legendPath = GlobalPaths.outputPath.resolve("agent-share").resolve("agent-share-weekly-legend.svg")
+      val entryCount = legendAgents.size + 1
+      writeSvgAndConvertToPdf(
+        legendPath,
+        renderSharedLegendSvg(
+          legendAgents,
+          agentColors,
+          Vector(LineSeries("total commits", "#343a40", "6 4", "#343a40", Vector(1))),
+          columns = entryCount,
+          fontSize = 36,
+          entryHeight = 42.0,
+          padding = 2.0,
+          hatchLabel = Some("no data"),
+          splitRows = true
+        )
+      )
+      println(s"Wrote agent-share legend to $legendPath")
+    }
+
+    val plots = handles.map { handle =>
       Sync {
         val data = agentSeriesForDeveloper(handle)
-        if data.points.nonEmpty then
+        if data.points.exists(_.values.nonEmpty) then
+          val points = data.points.map { pt =>
+            pt.copy(values = pt.values.filter((k, _) => significantAgents.contains(k)))
+          }
           val svgPath = GlobalPaths.outputPath.resolve("agent-share").resolve(s"agent-share-weekly-$handle.svg")
           writeSvgAndConvertToPdf(
             svgPath,
             renderPercentageStackedWithCountLineSvg(
-              s"Agent Share Over Time — @$handle",
-              data.points,
+              "",
+              points,
               agentColorOrder,
               agentColors,
-              data.totalCommits
+              data.totalCommits,
+              yRightLabel = "Commits",
+              xAxisLabel = "Calendar week",
+              showLegend = false,
+              leadingGapPoints = leadingGapWeeks(data),
+              width = 640,
+              height = 590,
+              bottomMargin = 175,
+              labelFontSize = 34,
+              axisFontSize = 30,
+              axisTitleFontSize = 32
             )
           )
           println(s"Wrote agent-share weekly SVG for @$handle to $svgPath")
       }
     }
+
+    legend +: plots
   }
 
   @main def makeAgentShareWeeklyPlotSvgs(): Unit = {
@@ -759,6 +863,10 @@ object RQ2Renderer {
     }
   }
 
+  @main def makeWeeklyPlotSvgs(): Unit = {
+    weeklyPlotSyncs().foreach(_.run(using ()))
+  }
+
   @main def makeAgentsByCommitTypeColoredTables(): Unit = {
     makeAgentsByCommitTypeColoredTableSyncs().foreach(_.run(using ()))
   }
@@ -800,7 +908,7 @@ object RQ2Renderer {
 
   @main def makeAllRq2Svgs(): Unit = {
     val allSyncs = Vector(
-      makeWeeklyPlotSvgs(),
+      weeklyPlotSyncs(),
       // makeRq2CommitTypeSvgs(),
       makeRq2CommitTypePerAgentSvgs(),
       // makeRq2LinesChangedBoxplots(),
