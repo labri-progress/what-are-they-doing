@@ -5,6 +5,15 @@ import java.nio.file.Files
 import java.util.Locale
 
 object SVGGraphLib {
+  /**
+   * Font stack applied to every generated SVG. Without an explicit
+   * `font-family` each renderer falls back to its own default, which can be a
+   * monospaced face, and the charts then disagree between browsers, Inkscape and
+   * the PDF the paper embeds.
+   */
+  private val fontFamily: String =
+    "font-family='Helvetica, Arial, Liberation Sans, DejaVu Sans, sans-serif'"
+
   case class StackedBarPoint(
       xLabel: String,
       values: Map[String, Int]
@@ -52,7 +61,23 @@ object SVGGraphLib {
     val legendY: Double    = plotY
   }
 
-  case class ChartScale(yMax: Int, yStep: Int)
+  /**
+   * Plot scale. On a linear chart `yMax` is the top value and `yStep` the tick
+   * interval. On a logarithmic chart `yMax` and `yMin` are exponents of ten, so
+   * `yMax = 2` (with `yMin = 0`) means the axis tops out at 100 and ticks at
+   * 1, 10 and 100.
+   *
+   * `valueScale` converts the integer data units into axis units, which lets a
+   * chart carry sub-unit values (such as `0.01%`) without switching the shared
+   * `StackedBarPoint` values to floating point.
+   */
+  case class ChartScale(
+      yMax: Int,
+      yStep: Int,
+      log10: Boolean = false,
+      yMin: Int = 0,
+      valueScale: Double = 1.0
+  )
 
   object FontConfig:
     val title         = 22
@@ -118,6 +143,21 @@ object SVGGraphLib {
     else rounded.toString
   }
 
+  /**
+   * Formats a tick for a logarithmic axis. Powers of ten below one keep as many
+   * decimals as they need (`0.01`, `0.1`) instead of the fixed-width form used for
+   * linear count axes.
+   */
+  private def powerOfTenLabel(value: Double): String =
+    if value >= 1 then formatSi(value)
+    else
+      val decimals = math.max(0, math.ceil(-math.log10(value)).toInt)
+      BigDecimal(value)
+        .setScale(decimals, BigDecimal.RoundingMode.HALF_UP)
+        .underlying()
+        .stripTrailingZeros()
+        .toPlainString
+
   private def niceStep(maxValue: Int, targetTickCount: Int): Int =
     if maxValue <= 0 then 1
     else
@@ -144,13 +184,52 @@ object SVGGraphLib {
   def activeLineSeries(lines: Vector[LineSeries]): Vector[LineSeries] =
     lines.filter(_.values.exists(_ > 0))
 
-  private def computeScale(points: Vector[StackedBarPoint], lines: Vector[LineSeries]): ChartScale = {
+  /**
+   * Builds the y scale. A linear chart rounds the maximum up to a nice tick and
+   * keeps ticks at even intervals. A logarithmic chart snaps both ends to whole
+   * powers of ten so the axis ticks at `0.01, 0.1, 1, 10, 100` and never needs
+   * the zero tick that a log axis cannot show.
+   */
+  private def computeScale(
+      points: Vector[StackedBarPoint],
+      lines: Vector[LineSeries],
+      log10: Boolean = false,
+      valueScale: Double = 1.0,
+      logMinExponent: Option[Int] = None
+  ): ChartScale = {
     val maxStack = points.map(_.values.values.sum).maxOption.getOrElse(0)
     val maxLine  = lines.flatMap(_.values).maxOption.getOrElse(0)
     val yMaxRaw  = math.max(maxStack, maxLine)
-    val yStep    = niceStep(yMaxRaw, 6)
-    val yMax     = math.max(yStep, ((yMaxRaw + yStep - 1) / yStep) * yStep)
-    ChartScale(yMax, yStep)
+    if log10 then
+      def exponentOf(value: Double, roundUp: Boolean): Int =
+        val raw = math.log10(value)
+        (if roundUp then math.ceil(raw) else math.floor(raw)).toInt
+      val minValue = points.iterator
+        .flatMap(_.values.values)
+        .filter(_ > 0)
+        .minOption
+        .getOrElse(yMaxRaw)
+        .toDouble
+      val maxAxis = math.max(1.0, yMaxRaw * valueScale)
+      val minAxis = math.min(maxAxis / 10.0, math.max(1e-6, minValue * valueScale))
+      val minExp  = exponentOf(minAxis, roundUp = false)
+      // A bar exactly at the axis floor would collapse to zero height, so the
+      // axis is widened by one decade whenever the smallest value sits on a
+      // power of ten. An explicit floor overrides this.
+      val bottomExp = logMinExponent.getOrElse(
+        if minAxis == math.pow(10, minExp.toDouble) then minExp - 1 else minExp
+      )
+      ChartScale(
+        exponentOf(maxAxis, roundUp = true),
+        1,
+        log10 = true,
+        yMin = bottomExp,
+        valueScale = valueScale
+      )
+    else
+      val yStep = niceStep(yMaxRaw, 6)
+      val yMax  = math.max(yStep, ((yMaxRaw + yStep - 1) / yStep) * yStep)
+      ChartScale(yMax, yStep, valueScale = valueScale)
   }
 
   private def slotWidth(layout: ChartLayout, count: Int): Double =
@@ -165,17 +244,33 @@ object SVGGraphLib {
       pointCount
     ) * index + (slotWidth(layout, pointCount) - barWidth(layout, pointCount)) / 2.0
 
-  private def yForValue(layout: ChartLayout, scale: ChartScale, value: Double): Double =
-    layout.plotY + layout.plotHeight - (value / scale.yMax) * layout.plotHeight
+  private def yForValue(layout: ChartLayout, scale: ChartScale, value: Double): Double = {
+    val axisValue = value * scale.valueScale
+    if scale.log10 then
+      val bottom = layout.plotY + layout.plotHeight
+      if axisValue <= math.pow(10, scale.yMin.toDouble) then bottom
+      else
+        val logMin = scale.yMin.toDouble
+        val logMax = scale.yMax.toDouble
+        val frac   = (math.log10(axisValue) - logMin) / math.max(1e-9, logMax - logMin)
+        bottom - frac * layout.plotHeight
+    else layout.plotY + layout.plotHeight - (axisValue / scale.yMax) * layout.plotHeight
+  }
 
   private def renderBackground(): String = "<rect width='100%' height='100%' fill='white'/>"
 
   private def renderGridAndAxes(layout: ChartLayout, scale: ChartScale, tickFontSize: Int = FontConfig.tick): String = {
+    // Ticks are expressed in axis units; yForValue expects data units.
+    val ticks: Seq[Double] =
+      if scale.log10 then
+        (scale.yMin to scale.yMax).map(exp => math.pow(10, exp.toDouble))
+      else (0 to scale.yMax by scale.yStep).map(_.toDouble)
+
     val gridLines =
-      (0 to scale.yMax by scale.yStep).map { tick =>
-        val y = yForValue(layout, scale, tick.toDouble)
+      ticks.map { tick =>
+        val y = yForValue(layout, scale, tick / scale.valueScale)
         s"<line x1='${fmt(layout.plotX)}' y1='${fmt(y)}' x2='${fmt(layout.plotX + layout.plotWidth)}' y2='${fmt(y)}' stroke='#e9ecef' stroke-width='1' />" +
-        s"<text x='${fmt(layout.plotX - 10)}' y='${fmt(y + 4)}' text-anchor='end' font-size='$tickFontSize' fill='#495057'>${formatSi(tick.toDouble)}</text>"
+        s"<text x='${fmt(layout.plotX - 10)}' y='${fmt(y + 4)}' text-anchor='end' font-size='$tickFontSize' fill='#495057'>${powerOfTenLabel(tick)}</text>"
       }.mkString("\n")
 
     val axes =
@@ -199,15 +294,20 @@ object SVGGraphLib {
   ): String = {
     val x     = xForBar(layout, pointCount, index)
     val width = barWidth(layout, pointCount)
+    // On a log axis a value sitting on the floor would collapse to nothing, so
+    // every non-empty segment keeps a thin sliver to stay visible and countable.
+    val minSegmentHeight = if scale.log10 then 2.0 else 0.0
     activeKeys.foldLeft((0.0, Vector.empty[String])) { case ((bottomValue, acc), key) =>
       val count = point.values.getOrElse(key, 0)
       if count <= 0 then (bottomValue, acc)
       else
-          val yTop    = yForValue(layout, scale, bottomValue + count)
-          val yBottom = yForValue(layout, scale, bottomValue)
+          val yBottom  = yForValue(layout, scale, bottomValue)
+          val rawTop   = yForValue(layout, scale, bottomValue + count)
+          val height   = math.max(minSegmentHeight, yBottom - rawTop)
+          val yTop     = yBottom - height
           (
             bottomValue + count,
-            acc :+ renderBarSegment(x, yTop, width, yBottom - yTop, colors.getOrElse(key, "#adb5bd"))
+            acc :+ renderBarSegment(x, yTop, width, height, colors.getOrElse(key, "#adb5bd"))
           )
     }._2.mkString("\n")
   }
@@ -257,8 +357,12 @@ object SVGGraphLib {
               s"<text x='${fmt(cx)}' y='${fmt(cy)}' transform='rotate(60 ${fmt(cx)} ${fmt(cy)})' font-size='$fontSize' text-anchor='start' fill='$tickColor'>${svgEscape(point.xLabel)}</text>"
             )
         }.mkString("\n")
-        // Rotated text descends below its anchor point, so allow for a full line.
-        (ticks + "\n" + labels, axisY + 8.0 + fontSize * 1.8)
+        // Rotated text descends below its anchor point by the vertical projection
+        // of the label length, so the caller needs the real extent to place the
+        // x-axis title beneath it instead of colliding with it.
+        val maxLabelWidth = points.iterator.map(point => labelWidth(point.xLabel)).maxOption.getOrElse(0.0)
+        val rotatedBottom = axisY + 8.0 + fontSize * 0.9 + maxLabelWidth * math.sin(math.Pi / 3.0)
+        (ticks + "\n" + labels, rotatedBottom)
       else
         val rowGap   = fontSize * 0.45
         val rowPitch = fontSize * 1.1
@@ -451,7 +555,8 @@ object SVGGraphLib {
       xAxisLabel: String,
       yAxisFontSize: Int = FontConfig.axisLabel,
       xLabelY: Option[Double] = None,
-      xAxisFontSize: Option[Int] = None
+      xAxisFontSize: Option[Int] = None,
+      yLabelShift: Double = 0.0
   ): String =
     val xSize = xAxisFontSize.getOrElse(yAxisFontSize)
     val xLabel = if xAxisLabel.isEmpty then "" else
@@ -460,8 +565,13 @@ object SVGGraphLib {
     val titleEl = if title.isEmpty then "" else
       s"<text x='${fmt(layout.width / 2.0)}' y='18' text-anchor='middle' font-size='${FontConfig.title}' font-weight='700' fill='#111827'>${svgEscape(title)}</text>"
     val yLabel = if yAxisLabel.isEmpty then "" else
-      val x = math.max(yAxisFontSize * 1.1, yAxisLabelPos)
-      s"\n<text x='${fmt(x)}' y='${fmt(layout.plotY + layout.plotHeight / 2.0)}' transform='rotate(-90 ${fmt(x)} ${fmt(layout.plotY + layout.plotHeight / 2.0)})' text-anchor='middle' font-size='$yAxisFontSize' fill='#212529'>${svgEscape(yAxisLabel)}</text>"
+      // The offset scales with the title size so a smaller title also sits
+      // closer to the canvas edge, leaving room for the tick labels. A shift
+      // lets long titles run down into an unused bottom margin instead of
+      // being capped by the plot height.
+      val x     = yAxisFontSize * 1.5
+      val midY  = layout.plotY + layout.plotHeight / 2.0 + yLabelShift
+      s"\n<text x='${fmt(x)}' y='${fmt(midY)}' transform='rotate(-90 ${fmt(x)} ${fmt(midY)})' text-anchor='middle' font-size='$yAxisFontSize' fill='#212529'>${svgEscape(yAxisLabel)}</text>"
     titleEl + yLabel + xLabel
 
   private def renderFooter(
@@ -684,7 +794,13 @@ $footer
       bottomMargin: Double = 140,
       labelFontSize: Int = FontConfig.barLabel,
       axisFontSize: Int = FontConfig.tick,
-      axisTitleFontSize: Int = FontConfig.axisLabel
+      axisTitleFontSize: Int = FontConfig.axisLabel,
+      yAxisTitleFontSize: Option[Int] = None,
+      yAxisTitleShift: Double = 0.0,
+      logScale: Boolean = false,
+      valueScale: Double = 1.0,
+      logMinExponent: Option[Int] = None,
+      xAxisTitleGap: Double = 0.0
   ): String = {
     val activeStacks = activeStackKeys(points, stackOrder)
     val activeLines  = activeLineSeries(lineSeries)
@@ -699,7 +815,7 @@ $footer
       bottom = bottomMargin,
       legendWidth = legendW
     )
-    val scale = computeScale(points, activeLines)
+    val scale = computeScale(points, activeLines, logScale, valueScale, logMinExponent)
 
     val bars = points.zipWithIndex.map { case (point, index) =>
       renderStackedBar(layout, scale, points.size, index, point, activeStacks, colors)
@@ -710,13 +826,13 @@ $footer
     val (weekAxis, axisContentBottom) = renderWeekAxis(layout, points, labelFontSize)
     // Place the x-axis title just below the deepest week-axis row instead of
     // pinning it to the bottom of the canvas.
-    val xLabelY = axisContentBottom + axisTitleFontSize * 1.35
+    val xLabelY = axisContentBottom + axisTitleFontSize * 1.35 + xAxisTitleGap
 
     s"""<svg xmlns='http://www.w3.org/2000/svg' width='${layout.width}' height='${layout.height}' viewBox='0 0 ${layout.width} ${layout.height}'>
 ${renderBackground()}
 $gapHatchDefs
 ${renderGridAndAxes(layout, scale, axisFontSize)}
-${renderTitles(layout, title, yAxisLabel, xAxisLabel, axisTitleFontSize, Some(xLabelY), Some(axisTitleFontSize))}
+${renderTitles(layout, title, yAxisLabel, xAxisLabel, yAxisTitleFontSize.getOrElse(axisTitleFontSize), Some(xLabelY), Some(axisTitleFontSize), yAxisTitleShift)}
 ${renderGapHatch(layout, points.size, leadingGapPoints)}
 $bars
 $lines
@@ -1009,13 +1125,25 @@ $legendSvg
 """
   }
 
+  /**
+   * Stamps the shared font stack onto the root `<svg>` element. Every chart is
+   * written through {@link writeSvg}, so this guarantees a consistent
+   * typeface across browsers, Inkscape and the PDF embedded in the paper.
+   */
+  private def withFontFamily(svg: String): String = {
+    val rootEnd = "<svg xmlns='http://www.w3.org/2000/svg'"
+    val index   = svg.indexOf(rootEnd)
+    if index < 0 || svg.contains("font-family=") then svg
+    else svg.substring(0, index) + rootEnd + " " + fontFamily + svg.substring(index + rootEnd.length)
+  }
+
   def writeSvg(path: java.nio.file.Path, svg: String): Unit = {
-    Files.writeString(path, svg, StandardCharsets.UTF_8)
+    Files.writeString(path, withFontFamily(svg), StandardCharsets.UTF_8)
     ()
   }
 
   def writeSvgAndConvertToPdf(path: java.nio.file.Path, svg: String): Unit = {
-    Files.writeString(path, svg, StandardCharsets.UTF_8)
+    Files.writeString(path, withFontFamily(svg), StandardCharsets.UTF_8)
     ()
   }
 

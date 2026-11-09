@@ -876,15 +876,17 @@ object RQ2Renderer {
 
     val frequencies = DataAnalysis.harnessWeightedFrequencies
 
-    // One bar per agent, value = mean developer share (%), colored by the
-    // standard agent palette used across the RQ2 plots.
+    // One bar per agent, value = mean developer share (%). Shares span three orders
+    // of magnitude, so values are kept in hundredths of a percent and drawn on a
+    // logarithmic axis; rounding to whole percents would flatten every harness
+    // below one percent to the same bar height.
     val points: Vector[StackedBarPoint] =
       activeStackKeys(
-        frequencies.map(f => StackedBarPoint(f.agent, Map(f.agent -> math.round(f.meanDeveloperSharePct).toInt))),
+        frequencies.map(f => StackedBarPoint(f.agent, Map(f.agent -> math.round(f.meanDeveloperSharePct * 100).toInt))),
         agentColorOrder
       ).flatMap { agent =>
         frequencies.find(_.agent == agent).map { f =>
-          StackedBarPoint(agent, Map(agent -> math.max(1, math.round(f.meanDeveloperSharePct).toInt)))
+          StackedBarPoint(agent, Map(agent -> math.max(1, math.round(f.meanDeveloperSharePct * 100).toInt)))
         }
       }.toVector
 
@@ -893,14 +895,24 @@ object RQ2Renderer {
       writeSvgAndConvertToPdf(
         svgPath,
         renderStackedTimeSeriesSvg(
-          title = "Harness Frequency, Weighted by Developer",
+          title = "",
           points = points,
           stackOrder = agentColorOrder,
           colors = agentColors,
           topLabel = "Mean developer share (%)",
           lineSeries = Vector.empty,
           yAxisLabel = "Mean developer share (%)",
-          xAxisLabel = "Agent"
+          xAxisLabel = "Agent Harness",
+          showLegend = false,
+          height = 420,
+          bottomMargin = 190,
+          logScale = true,
+          valueScale = 0.01,
+          logMinExponent = Some(-1),
+          // The title is as long as the plot is tall, so a small downward nudge
+          // keeps it off the canvas edge without visibly off-centering it.
+          yAxisTitleShift = 12.0,
+          xAxisTitleGap = 12.0
         )
       )
       println(s"Wrote harness-weighted-frequency SVG to $svgPath")
