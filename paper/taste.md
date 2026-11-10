@@ -14,6 +14,7 @@ that taught it, in parentheses. Rules inferred from the author's own edits (not 
 
 ## Style
 - State the measured value (median, min, max) instead of a rounded paraphrase such as 'about three months' or 'two-thousand-fold'. (RQ5 corpus paragraph, observation span)
+- Inferred: Paragraph headers are the shortest noun phrase naming the topic ('Code quality', not 'Code quality measurements'). (RQ5 method, paragraph header renamed by author)
 
 ## Claims
 
