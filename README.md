@@ -2,7 +2,7 @@
 
 This dataset captures the commit activity of a curated set of highly active, agentic software developers on GitHub. For each developer, it provides full commit metadata and daily commit counts spanning the months around the agentic coding explosion.
 
-The goal of this dataset is to enable studies of AI-augmented software engineering behavior, agent adoption patterns, repository switching, commit quality, and temporal activity rhythms. The dataset currently covers 7 developers.
+The goal of this dataset is to enable studies of AI-augmented software engineering behavior, agent adoption patterns, repository switching, commit quality, and temporal activity rhythms. The dataset covers 9 developers from September 2025 to April 2026.
 
 This dataset has been produced at the Bellairs'26 Workshop on Continuous Software Engineering.
 
@@ -12,7 +12,7 @@ This dataset has been produced at the Bellairs'26 Workshop on Continuous Softwar
 
 Candidate developers are identified with the following sources:
 - AI coding conversation on X/Twitter
-- Github queries (see `script/find_agentic_ai_coders.py`)
+- GitHub commit-search queries
 - [Gitista](https://gitista.com/)
 - [committers.top](https://committers.top/)
 - [claudecount.com](https://www.claudecount.com) leaderboard of Claude Code usage, cross-referenced with GitHub profiles
@@ -39,6 +39,8 @@ In other words, the dataset is intentionally **curated rather than mechanically 
 | [philipp-spiess](https://github.com/philipp-spiess)  | [philipp-spiess.md](philipp-spiess.md) | An open-source contributor, proud vibe-coder and AI agent enthusiast |
 | [mavam](https://github.com/mavam) | [mavam.md](mavam.md) | A developer and CEO working on data pipelines for security operations using Claude for productivity |
 | [teamchong](https://github.com/teamchong) | [teamchong.md](teamchong.md) | A developer with a super-human burst of commit productivity followed by a fall from grace |
+| [clubanderson](https://github.com/clubanderson) | [clubanderson.md](clubanderson.md) | Solo maintainer of the KubeStellar console, who engineers the codebase so that coding agents can maintain it |
+| [steveyegge](https://github.com/steveyegge) | [steveyegge.md](steveyegge.md) | Creator of Beads (agent work tracking) and Gas Town (orchestration of 20-30 parallel coding agents) |
 
 ### Candidate Developers Under Evaluation
 
@@ -46,12 +48,10 @@ The following developers are candidates identified during screening; data collec
 
 | Handle | One liner presentation |
 |---|---|
-| [steveyegge](https://github.com/steveyegge) | Vibe-coded popular projects beads (issue tracking) and Gas Town (agent orchestration) |
 | [kaptinlin](https://github.com/kaptinlin) | In the list of top Claude Code users with visible GitHub activity |
 | [Dexploarer](https://github.com/Dexploarer) | Another top Claude Code user with visible GitHub activity |
 | [haasonsaas](https://github.com/haasonsaas) | Top Claude Code user |
 | [Gary Basin](https://github.com/gbasin) | Friend of Dicklesworthstone |
-| [Jesse Vincent](https://github.com/obra) | Creator of "superpowers" skill set, and has cool glasses |
 | [Brian Krabach](https://github.com/bkrabach) | Works on Microsoft Amplifier, and has a cool beard |
 | [Wilson Lin](https://github.com/wilsonzlin) | The "cursor web browser guy" and a few other such projects |
 | [Nirholas](https://github.com/nirholas) | 37 repos with agent activity starting ~ January, ~30K commits | 
@@ -63,41 +63,26 @@ The following developers are candidates identified during screening; data collec
 
 ### False Positives
 
-Notes about inspected developers who appeared to be agent-supported but did not meet our qualitative inspection criteria appear in markdown files in the [false positive](false-positive) directory.
+Notes about inspected developers who appeared to be agent-supported but did not meet our qualitative inspection criteria appear in markdown files in the [false positives](false-positives) directory.
 
 ## Dataset Statistics
 
-### Overview
 | Metric | Value |
 | --- | --- |
-| Observation window | 2025-09-01 to 2026-02-28 |
-| Tracked repositories in dataset | 260 |
-| Total commits from daily totals | 76,749 |
-| Peak aggregate day | 2026-02-16 (1,833 commits) |
-| Commit records with >=1 hard agent signal | 36,565 / 76,749 (47.6%) |
-| Distinct detected agent labels | 8 |
-| Most frequent detected agent | claude_code (36,493 commits) |
+| Observation window | 2025-09-01 to 2026-04-30 |
+| Developers | 9 |
+| Repositories | 455 |
+| Commits | 146,940 |
+| Commits with a detectable agent-harness signal | 48.3% |
+| Most frequent harness | claude_code (69,127 commits) |
 
-### Developer Coverage
-| Developer | Month span | Tracked repos | Commits | Active days | Peak day | Agent commits | Agent % | Top agent |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Dicklesworthstone | 2025-09..2026-02 | 100 | 42,549 | 127 | 1,115 | 29,610 | 77.1% | claude_code |
-| mavam | 2025-09..2026-02 | 21 | 2,543 | 154 | 88 | 981 | 38.6% | claude_code |
-| obra | 2025-09..2026-02 | 36 | 2,656 | 116 | 202 | 1,388 | 52.3% | claude_code |
-| philipp-spiess | 2025-09..2026-02 | 15 | 801 | 69 | 43 | 2 | 0.2% | opencode |
-| ruvnet | 2025-09..2026-02 | 9 | 5,660 | 117 | 350 | 4,483 | 84.5% | claude_code |
-| steipete | 2025-09..2026-02 | 71 | 21,222 | 130 | 630 | 65 | 0.3% | codex |
-| teamchong | 2025-09..2026-02 | 10 | 5,799 | 108 | 295 | 36 | 0.6% | claude_code |
+These figures are those of the paper (`paper/`), which reports the per-developer breakdown.
 
 ### Commits Over Time
 
 ![Commits per month per developer](figures/commits-over-time-separate.png)
 
-Key findings from the figure:
-
-- **Aggregate growth**: Total monthly commits across all developers grew from under 1,000 in Sep 2025 to over 26,000 by Jan–Feb 2026, reflecting a rapid ramp-up in AI-augmented activity over the observation window.
-- **Divergent trajectories**: Developers follow distinct patterns rather than a uniform trend. Dicklesworthstone and obra show sustained monotonic growth; steipete and mavam plateau at a high level after an initial ramp; ruvnet peaks in Jan 2026 and then declines; philipp-spiess shows a sudden late adoption spike starting in Jan 2026.
-- **Burst-and-collapse (teamchong)**: teamchong exhibits the sharpest burst-and-collapse pattern, peaking at ~3,100 commits in Dec 2025 before dropping to near-zero by Feb 2026 — consistent with their description as a developer with "a super-human burst of commit productivity followed by a fall from grace."
+The paper (RQ1) describes these trajectories.
 
 
 ---
@@ -151,7 +136,6 @@ keyring.set_password("login2", "github_token", "<your-token>")
 | `collect-commit-per-month.py` | Collects monthly commit counts for every developer in `developers.json` by iterating over their non-fork repos (avoids fork inflation). Writes results back to `developers.json`. |
 | `list_repos_by_user_with_events.py` | Fetches all repos where a developer committed in the last 3 months via the GitHub GraphQL  API. |
 | `collect-individual-commits.py` | Downloads per-commit file-level details for every commit SHA in `data/*.json` that is not yet cached in `data/commits/{sha}.json`. Also removes stale cache entries. Usage: `python script/collect-individual-commits.py` (optionally `--developer steipete --month 2025-12`) |
-| `collect-tentative-names.py` | Searches GitHub commits for `noreply@anthropic.com` to discover candidate AI-heavy users; filters by commit count and repo count. |
 
 ### Analysis
 
@@ -163,6 +147,7 @@ keyring.set_password("login2", "github_token", "<your-token>")
 | `visualize-file-touches.py` | Fetches per-commit file details and prints a terminal report covering file categories, change sizes, language hotspots, test/docs coupling, and engineering-signal heuristics. Usage: `python script/visualize-file-touches.py developers.json --author steipete --month 2025-12` |
 | `detect-agents.py` | Detects which coding agents (Claude Code, Cursor, etc.) are used in a developer's commits via agent-mining heuristics (co-author trailers, message patterns, config files). Usage: `python script/detect-agents.py data/steipete-2025-12.json` |
 | `histogram-commit-time.py` | Prints a horizontal bar chart of commit counts by UTC hour from a monthly data file. Usage: `python script/histogram-commit-time.py data/steipete-2025-12.json` |
+| `analyze-work-schedule.py` | Clones every repository of the dataset (commits only) to recover each commit's local time from its Git author date, and prints per-developer shares of office-hour, night, Saturday and weekend commits (paper, RQ1). Usage: `python script/analyze-work-schedule.py data CLONE_DIR` |
 | `plot-commits-over-time-separate.py` | Same chart with one subplot per developer. Saves to `data/commits-over-time-separate.png`. |
 
 ### Typical Workflow
@@ -182,7 +167,7 @@ python script/histogram-commit-time.py  data/steipete-2025-12.json
 python script/analyze-repo-switching.py developers.json --author steipete --month 2025-12
 python script/visualize-file-touches.py developers.json --author steipete --month 2025-12
 
-# 3. Visualise trends
+# 4. Visualise trends
 python script/plot-commits-over-time-separate.py
 ```
 
