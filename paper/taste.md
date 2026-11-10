@@ -20,6 +20,7 @@ that taught it, in parentheses. Rules inferred from the author's own edits (not 
 - State the measured value (median, min, max) instead of a rounded paraphrase such as 'about three months' or 'two-thousand-fold'. (RQ5 corpus paragraph, observation span)
 - Inferred: Paragraph headers are the shortest noun phrase naming the topic ('Code quality', not 'Code quality measurements'). (RQ5 method, paragraph header renamed by author)
 - End a non-significant result on a positive recommendation (what to watch), not on a 'remains a hypothesis, would need more data' disclaimer. (RQ5 duplication paragraph)
+- Remove text that names no concrete metric or number, and any figure that only repeats a table. (RQ5 slope-distribution paragraph and figure)
 
 ## Claims
 
