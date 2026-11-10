@@ -21,6 +21,7 @@ that taught it, in parentheses. Rules inferred from the author's own edits (not 
 - Inferred: Paragraph headers are the shortest noun phrase naming the topic ('Code quality', not 'Code quality measurements'). (RQ5 method, paragraph header renamed by author)
 - End a non-significant result on a positive recommendation (what to watch), not on a 'remains a hypothesis, would need more data' disclaimer. (RQ5 duplication paragraph)
 - Remove text that names no concrete metric or number, and any figure that only repeats a table. (RQ5 slope-distribution paragraph and figure)
+- A growth figure always carries its time unit; prefer a rate (doubling every 33 days) over a bare ratio (x7.3). (RQ5 growth summary)
 
 ## Claims
 
