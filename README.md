@@ -134,6 +134,10 @@ keyring.set_password("login2", "github_token", "<your-token>")
 |---|---|
 | `collect-commits-per-day.py` | Collects all commits for a developer in a given month via the GitHub GraphQL API. Writes `data/{developer}-{YYYY-MM}.json`. Usage: `python script/collect-commits-per-day.py --developer steipete --month 2025-12` |
 | `collect-commit-per-month.py` | Collects monthly commit counts for every developer in `developers.json` by iterating over their non-fork repos (avoids fork inflation). Writes results back to `developers.json`. |
+| `collect-march-2026.py`, `collect-april-2026.py` | Collect one month (March or April 2026) of daily commit data for every developer in `developers.json`, after refreshing their repository lists; the April script also caches per-commit details. Usage: `python script/collect-april-2026.py [--force] [--no-refresh-repos]` |
+| `collect-clubanderson.py`, `collect-steveyegge.py` | Collect the eight months (Sep 2025 to Apr 2026) of one developer added later to the dataset, then cache per-commit details. Usage: `python script/collect-clubanderson.py [--force] [--no-refresh-repos]` |
+| `collect_commits_per_day_lib.py`, `collect_commit_cache_lib.py` | Shared helpers of the collection scripts: GitHub session and rate-limit back-off, daily collection per repository, per-commit cache in `data/commits/`. |
+| `split-monthly-json.py` | Splits a monthly data file into two halves by size (`-1.json`, `-2.json`), for files too large for GitHub. Usage: `python script/split-monthly-json.py data/Dicklesworthstone-2026-04.json` |
 | `list_repos_by_user_with_events.py` | Fetches all repos where a developer committed in the last 3 months via the GitHub GraphQL  API. |
 | `collect-individual-commits.py` | Downloads per-commit file-level details for every commit SHA in `data/*.json` that is not yet cached in `data/commits/{sha}.json`. Also removes stale cache entries. Usage: `python script/collect-individual-commits.py` (optionally `--developer steipete --month 2025-12`) |
 
