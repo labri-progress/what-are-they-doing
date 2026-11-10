@@ -13,6 +13,7 @@ that taught it, in parentheses. Rules inferred from the author's own edits (not 
 ## Method
 
 ## Style
+- State the measured value (median, min, max) instead of a rounded paraphrase such as 'about three months' or 'two-thousand-fold'. (RQ5 corpus paragraph, observation span)
 
 ## Claims
 
