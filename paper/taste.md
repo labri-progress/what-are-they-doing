@@ -12,6 +12,7 @@ that taught it, in parentheses. Rules inferred from the author's own edits (not 
 - Each topic (e.g. project size and growth) is discussed at a single location; other sections point to it instead of restating it. (RQ5 corpus paragraph vs Code Growth results)
 
 ## Method
+- Drop cliché SE metrics (e.g. cyclomatic complexity) that say nothing new about the studied phenomenon, even when they yield a result. (RQ5 quality metrics)
 
 ## Style
 - State the measured value (median, min, max) instead of a rounded paraphrase such as 'about three months' or 'two-thousand-fold'. (RQ5 corpus paragraph, observation span)
