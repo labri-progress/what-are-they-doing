@@ -9,6 +9,7 @@ that taught it, in parentheses. Rules inferred from the author's own edits (not 
 
 ## Structure
 - Related Work goes after the Discussion, just before the Conclusion, so it can contrast prior work with our findings. (Q1.1)
+- Each topic (e.g. project size and growth) is discussed at a single location; other sections point to it instead of restating it. (RQ5 corpus paragraph vs Code Growth results)
 
 ## Method
 
