@@ -162,25 +162,25 @@ object RQ2Renderer {
       }
 
   private def commitTypeSeriesForAgent(agent: String): TimeSeriesData = {
-    val agentCommitsByWeek: Vector[(LocalDate, CommitType)] =
+    val countsByWeekType: Map[(LocalDate, CommitType), Int] =
       aggregateCommitData.iterator
         .flatMap { case (_, _, _, snapshot) =>
           snapshot.days.iterator.flatMap { case (day, dayData) =>
             val week = weekStart(day)
             dayData.commits.iterator.flatMap { commit =>
               commitSignals(commit.sha).toVector.flatMap { classified =>
-                if classified.agents.contains(agent) then Vector((week, classified.commitType)) else Vector.empty
+                if classified.agents.contains(agent) then
+                    Vector(((week, classified.commitType), 1))
+                else Vector.empty
               }
             }
           }
         }
         .toVector
+        .groupMapReduce(_._1)(_._2)(_ + _)
 
-    val countsByWeekType: Map[(LocalDate, CommitType), Int] =
-      agentCommitsByWeek.groupMapReduce(identity)(_ => 1)(_ + _)
-
-    val weeks  = agentCommitsByWeek.map(_._1).distinct.sorted
-    val points = weeks.map { week =>
+    val weekKeys = countsByWeekType.keysIterator.map(_._1).toVector.distinct.sorted
+    val points = weekKeys.map { week =>
       StackedBarPoint(
         xLabel = week.toString,
         values = countsByWeekType.collect {
@@ -189,7 +189,9 @@ object RQ2Renderer {
       )
     }.toVector
     val totals = points.map(_.values.values.sum)
-    TimeSeriesData(points = points, totalCommits = totals, sampledCommits = totals)
+    // Align to the shared observation window so every harness panel uses the same
+    // week axis as the agent-use figure.
+    alignToTimeline(weekKeys, points, totals, totals)
   }
 
   /** Harnesses with at least this many commits over the window get their own bar segment. */
@@ -304,7 +306,7 @@ object RQ2Renderer {
     }
   }
 
-  def makeRq2CommitTypePerAgentSvgs(): Seq[Sync[Any, Unit]] = {
+  def commitTypePerAgentSyncs(): Seq[Sync[Any, Unit]] = {
     Files.createDirectories(GlobalPaths.outputPath.resolve("commit-types"))
 
     val agentCommitCounts: Map[String, Int] =
@@ -313,29 +315,55 @@ object RQ2Renderer {
         .toVector
         .groupMapReduce(identity)(_ => 1)(_ + _)
 
+    // Same panel set and ordering as the agent-use figure: harnesses above the
+    // significance threshold, alphabetically.
+    val significantAgents = heuristicsByAgent.keys.toVector.sorted
+      .filter(agent => agentCommitCounts.getOrElse(agent, 0) >= agentSignificanceThreshold)
+
     val legendSync = Sync {
       val svgPath = GlobalPaths.outputPath.resolve("commit-types").resolve("commit-types-legend.svg")
-      writeSvgAndConvertToPdf(svgPath, renderLegendSvg(commitTypeOrder, commitTypeColors))
+      writeSvgAndConvertToPdf(
+        svgPath,
+        renderSharedLegendSvg(
+          commitTypeOrder,
+          commitTypeColors,
+          Vector.empty,
+          columns = 9,
+          fontSize = 36,
+          entryHeight = 42.0,
+          padding = 2.0,
+          hatchLabel = Some("no data"),
+          splitRows = false
+        )
+      )
       println(s"Wrote commit-types legend SVG to $svgPath")
     }
 
-    val agentSyncs = heuristicsByAgent.keys.toVector.sorted
-      .filter(agent => agentCommitCounts.getOrElse(agent, 0) >= 50)
-      .map { agent =>
+    val agentSyncs = significantAgents.map { agent =>
       Sync {
         val data = commitTypeSeriesForAgent(agent)
-        if data.points.nonEmpty && activeStackKeys(data.points, commitTypeOrder).nonEmpty then
+        if data.points.exists(_.values.nonEmpty) && activeStackKeys(data.points, commitTypeOrder).nonEmpty then
             val svgPath = GlobalPaths.outputPath.resolve("commit-types").resolve(s"commit-types-agent-$agent.svg")
             writeSvgAndConvertToPdf(
               svgPath,
               renderStackedTimeSeriesSvg(
-                s"Commit Types Over Time — agent:$agent",
+                "",
                 data.points,
                 commitTypeOrder,
                 commitTypeColors,
                 "Top type",
-                defaultLines(data),
-                showLegend = false
+                Vector.empty,
+                yAxisLabel = "Commits",
+                xAxisLabel = "Calendar week",
+                totalLabel = "Commits with a Conventional Commit type",
+                showLegend = false,
+                leadingGapPoints = leadingGapWeeks(data),
+                width = 640,
+                height = 470,
+                bottomMargin = 175,
+                labelFontSize = 34,
+                axisFontSize = 30,
+                axisTitleFontSize = 32
               )
             )
             println(s"Wrote commit-type-by-agent SVG for $agent to $svgPath")
@@ -343,6 +371,10 @@ object RQ2Renderer {
     }
 
     legendSync +: agentSyncs
+  }
+
+  @main def makeRq2CommitTypePerAgentSvgs(): Unit = {
+    commitTypePerAgentSyncs().foreach(_.run(using ()))
   }
 
   def makeRq2LinesChangedWeeklyStackedSvgs(): Seq[Sync[Any, Unit]] = {
@@ -922,7 +954,7 @@ object RQ2Renderer {
     val allSyncs = Vector(
       weeklyPlotSyncs(),
       // makeRq2CommitTypeSvgs(),
-      makeRq2CommitTypePerAgentSvgs(),
+      commitTypePerAgentSyncs(),
       // makeRq2LinesChangedBoxplots(),
       // makeRq2LinesChangedWeeklyStackedSvgs(),
     ).flatten

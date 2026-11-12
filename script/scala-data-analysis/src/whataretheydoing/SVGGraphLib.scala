@@ -171,6 +171,35 @@ object SVGGraphLib {
           else 10
         math.max(1, math.ceil(niceNormalized * magnitude).toInt)
 
+  /**
+   * Picks the roundest tick interval whose rounded-up maximum still sits close to
+   * the tallest bar. `niceStep` alone can waste a fifth of the plot height (e.g. a
+   * maximum of 6,600 snapped to a 2k step tops out at 8,000), so candidates are
+   * drawn from `{1, 1.5, 2, 2.5, 3, 4, 5, 6, 8} * 10^k` and the smallest axis that
+   * keeps the tick count between four and nine wins.
+   */
+  private def tightCountScale(maxValue: Int): (Int, Int) =
+    if maxValue <= 0 then (1, 1)
+    else
+      // A few percent of headroom keeps the tallest bar from touching the frame.
+      val target      = math.ceil(maxValue * 1.04).toInt
+      val multipliers = Vector(1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0)
+      val steps = (0 to 12).iterator
+        .flatMap(k => multipliers.map(m => math.max(1L, math.round(m * math.pow(10, k.toDouble))))
+        )
+        .distinct
+        .toVector
+        .sorted
+        .filter(step => step <= target)
+        .map(_.toInt)
+      val options = steps.map { step =>
+        val yMax = ((target + step - 1) / step) * step
+        (yMax, step, yMax / step)
+      }.filter { case (_, _, ticks) => ticks >= 4 && ticks <= 9 }
+      options.minByOption { case (yMax, step, _) => (yMax, -step) } match
+        case Some((yMax, step, _)) => (yMax, step)
+        case None                  => (niceStep(target, 6), niceStep(target, 6))
+
   def activeStackKeys(points: Vector[StackedBarPoint], stackOrder: Vector[String]): Vector[String] = {
     val present: Set[String] = points.iterator.flatMap(_.values.iterator.collect {
       case (key, value) if value > 0 => key
@@ -227,8 +256,7 @@ object SVGGraphLib {
         valueScale = valueScale
       )
     else
-      val yStep = niceStep(yMaxRaw, 6)
-      val yMax  = math.max(yStep, ((yMaxRaw + yStep - 1) / yStep) * yStep)
+      val (yMax, yStep) = tightCountScale(yMaxRaw)
       ChartScale(yMax, yStep, valueScale = valueScale)
   }
 
@@ -904,8 +932,12 @@ ${renderLegend(layout, activeStackKeys(Vector(dummyPoint), stackOrder), colors, 
       entryHeight: Double = 26.0,
       padding: Double = 10.0,
       hatchLabel: Option[String] = None,
-      splitRows: Boolean = false
+      splitRows: Boolean = false,
+      symbolFontSize: Int = -1
   ): String = {
+    // Symbol geometry can be sized independently of the label text, so shrinking the
+    // type does not shrink the colour swatches.
+    val symbolSize = if symbolFontSize > 0 then symbolFontSize else fontSize
     val dummyPoints =
       if stackOrder.nonEmpty then Vector(StackedBarPoint("", stackOrder.map(k => k -> 1).toMap))
       else Vector.empty
@@ -916,11 +948,11 @@ ${renderLegend(layout, activeStackKeys(Vector(dummyPoint), stackOrder), colors, 
     val extraEntries: Vector[LegendEntry] =
       activeLines.map(LineEntry(_)) ++ hatchLabel.map(HatchEntry(_)).toVector
 
-    // Symbol sizes scale with the font so the legend stays balanced at any size.
-    val swatchW   = fontSize * 0.45
-    val swatchH   = fontSize * 0.42
-    val symbolEnd = swatchW + fontSize * 0.1
-    val textGap   = symbolEnd + fontSize * 0.3
+    // Symbol sizes scale with the symbol font size so the legend stays balanced at any size.
+    val swatchW   = symbolSize * 0.45
+    val swatchH   = symbolSize * 0.42
+    val symbolEnd = swatchW + symbolSize * 0.1
+    val textGap   = symbolEnd + symbolSize * 0.3
 
     def labelOf(entry: LegendEntry): String = entry match
       case StackEntry(key)   => key
@@ -961,7 +993,7 @@ ${renderLegend(layout, activeStackKeys(Vector(dummyPoint), stackOrder), colors, 
       case HatchEntry(_) =>
         s"<rect x='${fmt(x)}' y='${fmt(cy - swatchH / 2)}' width='${fmt(swatchW)}' height='${fmt(swatchH)}' fill='url(#legendHatch)' stroke='#adb5bd' stroke-width='0.8' />"
       case LineEntry(line) =>
-        val markerR = fontSize * 0.18
+        val markerR = symbolSize * 0.18
         s"<line x1='${fmt(x)}' y1='${fmt(cy)}' x2='${fmt(x + symbolEnd)}' y2='${fmt(cy)}' stroke='${line.stroke}' stroke-width='3' stroke-dasharray='${line.dashArray}' />" +
           s"<rect x='${fmt(x + symbolEnd / 2 - markerR)}' y='${fmt(cy - markerR)}' width='${fmt(markerR * 2)}' height='${fmt(markerR * 2)}' fill='${line.markerFill}' transform='rotate(45 ${fmt(x + symbolEnd / 2)} ${fmt(cy)})' />"
 
